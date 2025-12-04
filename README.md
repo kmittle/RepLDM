@@ -1,5 +1,5 @@
-# AP-LDM
-Official implementation of [***AP-LDM: Attentive and Progressive Latent Diffusion Model for Training-Free High-Resolution Image Generation***](https://arxiv.org/abs/2410.06055v1).
+# RepLDM
+Official implementation of [***RepLDM: Reprogramming Pretrained Latent Diffusion Models for High-Quality, High-Efficiency, High-Resolution Image Generation***](https://openreview.net/pdf?id=QwXpn5IPKk).
 
 The ControlNet version and video generation are coming soon!
 
