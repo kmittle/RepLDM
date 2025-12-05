@@ -112,7 +112,7 @@ $\tilde{\boldsymbol{z}} = \gamma\mathrm{TFSA}(\boldsymbol{z})+(1-\gamma) \boldsy
 \mathrm{TFSA}(\boldsymbol{z}) = \mathrm{f}^{-1}\left(\mathrm{Softmax}\left(\frac{\mathrm{f}(\boldsymbol{z}) \mathrm{f}(\boldsymbol{z})^{\mathrm{T}}}{\lambda}\right) \mathrm{f}(\boldsymbol{z})\right),$
 
 where $\boldsymbol{z}$ is the latent representation, $\mathrm{f}$ denotes reshape operation, and 𝛾 and 𝜆 are hyperparameters.
-Specifically, Attention guidance steers each denoising step closer to the final state, as illustrated in the figure below.
+Specifically, Attention Guidance leads each denoising step closer to the final state, as illustrated in the figure below.
 
 <p align="center">
     <img src="fig/attn_guidance_analyze.png" width="100%">
