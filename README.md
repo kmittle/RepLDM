@@ -71,37 +71,51 @@ pip install -r requirements.txt
 ### **RepLDM** enables the rapid synthesis of high-quality, high-resolution images **without the need for further training**.
 
 It consists of two stages: 
-1. Synthesizing high-quality images at the training resolution using **Attention Guidance**.
+1. Synthesizing high-quality images at the training resolution using ***Attention Guidance***.
 2. Generating finer high-resolution images through pixel upsampling and "diffusion-denoising" loop.
 
 <p align="center">
     <img src="fig/RepLDM.png" width="100%">
 </p>
 
+---
+
+### Attention Guidance can be used in conjunction with plugins such as ControlNet to achieve an enhanced visual experience, as illustrated in the figure below.
+
+<p align="center">
+    <img src="fig/ablation_controlnet.png" width="100%">
+</p>
+
+---
+
+### Attention Guidance enables the generation of images with more vivid colors and richer details, as shown in the figure below.
+
+<p align="center">
+    <img src="fig/ablation_T2I.png" width="100%">
+</p>
+
+### Attention Guidance allows users to freely adjust the level of detail and color richness in an image according to their preferences, simply by modifying the `attention guidance scale`, as shown in the figure below.
+
+<p align="center">
+    <img src="fig/attn_guidance_scale_ablation.png" width="100%">
+</p>
+
 <!-- **Attention Guidance**: Enhances the structural consistency of the latent representation using a training-free self-attention mechanism. -->
-### **Attention Guidance** computes layout-enhanced representations using a training-free self-attention (TFSA) mechanism and leverages them to strengthen layout consistency:
+
+---
+
+### How does attention guidance work?
+Attention Guidance computes layout-enhanced representations using a training-free self-attention (TFSA) mechanism and leverages them to strengthen layout consistency:
 
 $\tilde{\boldsymbol{z}} = \gamma\mathrm{TFSA}(\boldsymbol{z})+(1-\gamma) \boldsymbol{z},
 \quad 
-\mathrm{TFSA}(\boldsymbol{z}) = \mathrm{f}^{-1}\left(\mathrm{Softmax}\left(\frac{\mathrm{f}(\mathbf{z}) \mathrm{f}(\boldsymbol{z})^{\mathrm{T}}}{\lambda}\right) \mathrm{f}(\boldsymbol{z})\right),$
+\mathrm{TFSA}(\boldsymbol{z}) = \mathrm{f}^{-1}\left(\mathrm{Softmax}\left(\frac{\mathrm{f}(\boldsymbol{z}) \mathrm{f}(\boldsymbol{z})^{\mathrm{T}}}{\lambda}\right) \mathrm{f}(\boldsymbol{z})\right),$
 
 where $\boldsymbol{z}$ is the latent representation, $\mathrm{f}$ denotes reshape operation, and 𝛾 and 𝜆 are hyperparameters.
 Specifically, Attention guidance steers each denoising step closer to the final state, as illustrated in the figure below.
 
 <p align="center">
     <img src="fig/attn_guidance_analyze.png" width="100%">
-</p>
-
-### Attention Guidance enables better 
-
-<p align="center">
-    <img src="fig/ablation_T2I.png" width="100%">
-</p>
-
-### **Adjustable Detail**: As shown below, increasing the `attention guidance scale` leads to more details, richer colors, and stronger contrast.
-
-<p align="center">
-    <img src="fig/attn_guidance_scale_ablation.png" width="100%">
 </p>
 
 
