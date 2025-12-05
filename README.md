@@ -51,13 +51,13 @@ From Fudan University
 
 ### Install Environment
 ```
-conda create -n apldm python=3.9
-conda activate apldm
+conda create -n demofusion python=3.9
+conda activate demofusion
 pip install -r requirements.txt
 ```
 
 
-## 🚀 Quik start
+## 🚀 Quik Start
 
 ### Quick start with Gradio
 **TODO**
@@ -75,27 +75,33 @@ It consists of two stages:
 2. Generating finer high-resolution images through pixel upsampling and "diffusion-denoising" loop.
 
 <p align="center">
-    <img src="fig/AP-LDM.png" width="90%">
+    <img src="fig/RepLDM.png" width="100%">
 </p>
 
 <!-- **Attention Guidance**: Enhances the structural consistency of the latent representation using a training-free self-attention mechanism. -->
 ### **Attention Guidance** computes layout-enhanced representations using a training-free self-attention (TFSA) mechanism and leverages them to strengthen layout consistency:
 
-$\tilde{\boldsymbol{z}} = \gamma\operatorname{TFSA}(\boldsymbol{z})+(1-\gamma) \boldsymbol{z},
+$\tilde{\boldsymbol{z}} = \gamma\mathrm{TFSA}(\boldsymbol{z})+(1-\gamma) \boldsymbol{z},
 \quad 
-\operatorname{TFSA}(\boldsymbol{z}) = \operatorname{f}^{-1}\left(\operatorname{Softmax}\left(\frac{\operatorname{f}(\mathbf{z}) \operatorname{f}(\boldsymbol{z})^{\operatorname{T}}}{\lambda}\right) \operatorname{f}(\boldsymbol{z})\right),$
+\mathrm{TFSA}(\boldsymbol{z}) = \mathrm{f}^{-1}\left(\mathrm{Softmax}\left(\frac{\mathrm{f}(\mathbf{z}) \mathrm{f}(\boldsymbol{z})^{\mathrm{T}}}{\lambda}\right) \mathrm{f}(\boldsymbol{z})\right),$
 
-where $\boldsymbol{z}$ is the latent representation, $\operatorname{f}$ denotes reshape operation, and 𝛾 and 𝜆 are hyperparameters.
+where $\boldsymbol{z}$ is the latent representation, $\mathrm{f}$ denotes reshape operation, and 𝛾 and 𝜆 are hyperparameters.
 Specifically, Attention guidance steers each denoising step closer to the final state, as illustrated in the figure below.
 
 <p align="center">
-    <img src="fig/analyze_attn_guidance.png" width="100%">
+    <img src="fig/attn_guidance_analyze.png" width="100%">
 </p>
 
-### **Adjustable Detail**: As shown below, increasing the `attn_guidance_scale` results in more details, richer colors, and stronger contrast.
+### Attention Guidance enables better 
 
 <p align="center">
-    <img src="fig/ablation_guidance_scale.png" width="100%">
+    <img src="fig/ablation_T2I.png" width="100%">
+</p>
+
+### **Adjustable Detail**: As shown below, increasing the `attention guidance scale` leads to more details, richer colors, and stronger contrast.
+
+<p align="center">
+    <img src="fig/attn_guidance_scale_ablation.png" width="100%">
 </p>
 
 
