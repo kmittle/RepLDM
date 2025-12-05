@@ -11,15 +11,16 @@
 _**[Boyuan Cao](https://scholar.google.com/citations?user=VBTZ-GMAAAAJ&hl=zh-CN),
 [Jiaxin Ye](https://scholar.google.com/citations?hl=zh-CN&user=2VCTS-sAAAAJ&view_op=list_works&sortby=pubdate),
 [Yujie Wei](https://weilllllls.github.io/), and
-[Hongming Shan](https://www.hmshan.io/)**_
-<br>
+[Hongming Shan*](https://www.hmshan.io/)**_\
+(* Corresponding Author)\
 From Fudan University
+<br>
 
 <img src="fig/teaser.png" width="100%">
 </div>
 
 ## 📖 Overview
-**RepLDM** (utilizing the **AP-LDM** framework) enables the rapid synthesis of high-quality, high-resolution images **without the need for retraining**. 
+**RepLDM** enables the rapid synthesis of high-quality, high-resolution images **without the need for retraining**. 
 
 It consists of two stages: 
 1.  Synthesizing high-quality images at the training resolution using **Attention Guidance**.
