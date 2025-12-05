@@ -80,6 +80,14 @@ It consists of two stages:
 
 ---
 
+### Attention Guidance enables the generation of images with more vivid colors and richer details, as shown in the figure below.
+
+<p align="center">
+    <img src="fig/ablation_T2I.png" width="100%">
+</p>
+
+---
+
 ### Attention Guidance can be used in conjunction with plugins such as ControlNet to achieve an enhanced visual experience, as illustrated in the figure below.
 
 <p align="center">
@@ -87,12 +95,6 @@ It consists of two stages:
 </p>
 
 ---
-
-### Attention Guidance enables the generation of images with more vivid colors and richer details, as shown in the figure below.
-
-<p align="center">
-    <img src="fig/ablation_T2I.png" width="100%">
-</p>
 
 ### Attention Guidance allows users to freely adjust the level of detail and color richness in an image according to their preferences, simply by modifying the `attention guidance scale`, as shown in the figure below.
 
