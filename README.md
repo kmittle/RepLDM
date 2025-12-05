@@ -6,9 +6,10 @@
     <b>NeurIPS2025 Spotlight ★</b>
 </h2>
 
-<h3>
-🔥🔥🔥 RepLDM is a training-free method for higher-resolution image generation, enabling the 8k image generation! You can freely adjust the richness of colors and details in the generated image through <span style="color: orange">attention guidance</span>.
-</h3>
+
+### 🔥🔥🔥 RepLDM is a training-free method for higher-resolution image generation, enabling the 8k image generation!
+
+### You can freely adjust the richness of colors and details in the generated image through *attention guidance*.
 <!-- ### 🚀🚀🚀 The ControlNet version and video generation are coming soon! -->
 
 
@@ -26,10 +27,6 @@
     <a href='#'>
         <img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue'>
     </a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-    <!-- openreview -->
-    <!-- <a href="https://openreview.net/pdf?id=QwXpn5IPKk">
-        <img src="https://img.shields.io/badge/OpenReview-Paper-FFA500.svg" alt="OpenReview Paper">
-    </a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; -->
 
 <!-- authors -->
 _**[Boyuan Cao](https://scholar.google.com/citations?user=VBTZ-GMAAAAJ&hl=zh-CN),
@@ -63,12 +60,14 @@ conda activate apldm
 pip install -r requirements.txt
 ```
 
-## 🤗 Quick start with Gradio
-### TODO
+## 🚀 Quik start
+
+### 🤗 Quick start with Gradio
+**TODO**
 
 
-## 🔬 For Research Comparison
-The implementation in the <u>main branch</u> includes some modifications based on the original version. If you want to compare with the original method reported in the paper, please refer to the code in the <u>base branch</u>.
+## 🔬 On Research Comparison
+The implementation in the `main branch` includes some modifications based on the original version. If you want to compare with the original method reported in the paper, please refer to the code in the `base branch`.
 
 
 ## 📖 Overview of RepLDM
