@@ -25,10 +25,10 @@
     </a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
 
 <!-- authors -->
-_**[Boyuan Cao](https://scholar.google.com/citations?user=VBTZ-GMAAAAJ&hl=zh-CN),
+***[Boyuan Cao](https://scholar.google.com/citations?user=VBTZ-GMAAAAJ&hl=zh-CN),
 [Jiaxin Ye](https://scholar.google.com/citations?hl=zh-CN&user=2VCTS-sAAAAJ&view_op=list_works&sortby=pubdate),
 [Yujie Wei](https://weilllllls.github.io/), and
-[Hongming Shan*](https://www.hmshan.io/)**_\
+[Hongming Shan*](https://www.hmshan.io/)***\
 (* Corresponding Author)\
 From Fudan University
 <br>
