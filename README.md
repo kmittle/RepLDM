@@ -12,27 +12,17 @@
 <!-- here are urls -->
 <div align="center">
     <!-- arxiv -->
-    <a href="https://openreview.net/pdf?id=QwXpn5IPKk">
-        <img src="https://img.shields.io/badge/arXiv-2410.06055-B31B1B.svg" alt="arXiv Paper">
-    </a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <a href="https://openreview.net/pdf?id=QwXpn5IPKk"><img src="https://img.shields.io/badge/arXiv-2410.06055-B31B1B.svg" alt="arXiv Paper"></a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
     <!-- project page -->
-    <a href='https://kmittle.github.io/project_pages/RepLDM/'>
-        <img src='https://img.shields.io/badge/Project-Page-Green'>
-    </a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <a href='https://kmittle.github.io/project_pages/RepLDM/'><img src='https://img.shields.io/badge/Project-Page-Green'></a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
     <!-- hugging face -->
-    <a href='#'>
-        <img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue'>
-    </a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <a href='#'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue'></a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
 
 <!-- authors -->
-***[Boyuan Cao](https://scholar.google.com/citations?user=VBTZ-GMAAAAJ&hl=zh-CN),
-[Jiaxin Ye](https://scholar.google.com/citations?hl=zh-CN&user=2VCTS-sAAAAJ&view_op=list_works&sortby=pubdate),
-[Yujie Wei](https://weilllllls.github.io/), and
-[Hongming Shan*](https://www.hmshan.io/)***\
-(* Corresponding Author)\
-From Fudan University
+<br>_**[Boyuan Cao](https://scholar.google.com/citations?user=VBTZ-GMAAAAJ&hl=zh-CN), [Jiaxin Ye](https://scholar.google.com/citations?hl=zh-CN&user=2VCTS-sAAAAJ&view_op=list_works&sortby=pubdate), [Yujie Wei](https://weilllllls.github.io/), and [Hongming Shan*](https://www.hmshan.io/)**_
+<br>(* Corresponding Author)
+<br>From Fudan University
 <br>
-
 <img src="fig/teaser.png" width="100%">
 </div>
 <!-- authors end -->
