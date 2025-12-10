@@ -840,7 +840,7 @@ class RepLDMSDXLControlNetPipeline(
         multi_decoder: bool = True,
         show_image: bool = False,
         lowvram: bool = False,
-        test_timecost: bool = True,
+        test_timecost: bool = False,
         encoder_limit_area: int = 4096**2,
         decoder_limit_area: int = 2048**2,
         models_to_cpu: bool = False,
@@ -1382,267 +1382,268 @@ class RepLDMSDXLControlNetPipeline(
         output_images.append(img[0])
         
     ####################################################### Progressive Resample Stage #####################################################
-        # note: images are obtained by self.vae.decoder, thus -1 <= image <= 1.
-        if not height == width == 1024:
-            # calculate sub-stage sizes
-            num_resample_times = len(init_rates)
-            if num_resample_times == 0:  # in this case, only interpolation is performed.
-                h_resized, w_resized = height, width
-                h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
-                image = F.interpolate(image, (h_resized, w_resized), mode="bicubic", align_corners=False).clamp(-1, 1)
+        if height == width == 1024:
+            del latents, condition_image, image, img
+            if test_timecost:
+                print(time_cost)
+            # Offload all models
+            self.maybe_free_model_hooks()
+            return output_images
+        
+        # note: images are obtained by self.vae.decoder, the value is approximately in [-1, 1]
+        self.text_encoder.cpu()
+        self.text_encoder_2.cpu()
+        del img
+        # calculate sub-stage sizes
+        num_resample_times = len(init_rates)
+        if num_resample_times == 0:  # in this case, only interpolation is performed.
+            h_resized, w_resized = height, width
+            h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
+            image = F.interpolate(image, (h_resized, w_resized), mode="bicubic", align_corners=False).clamp(-1, 1)
+        else:
+            h_resized = torch.linspace(h_resized, height, num_resample_times + 1)[1:]
+            w_resized = torch.linspace(w_resized, width, num_resample_times + 1)[1:]
+            h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
+            h_resized, w_resized = h_resized.int().tolist(), w_resized.int().tolist()
+            areas = [h * w for h, w in zip(h_resized, w_resized)]
+        # resampling arguments resetting
+        dtype = self.vae.dtype
+        # reset scheduler timesteps
+        self.scheduler.set_timesteps(num_resample_timesteps, device=device)
+        timesteps = self.scheduler.timesteps
+        # reset tensor stating which controlnets to keep
+        controlnet_keep = []
+        for i in range(len(timesteps)):
+            keeps = [
+                1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
+                for s, e in zip(control_guidance_start, control_guidance_end)
+            ]
+            controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
+        ####################################################### progressive resample loop #######################################################
+        print(f'### total resample times: {num_resample_times} ###')
+        for resample_index in range(num_resample_times):
+            print(f'### resample times: {resample_index + 1}/{num_resample_times} ###')
+            time_start = time.time()
+            current_h, current_w, current_area, init_rate = (h_resized[resample_index],
+                                                             w_resized[resample_index],
+                                                             areas[resample_index],
+                                                             init_rates[resample_index])
+            del latents
+            # reset original and target sizes
+            original_size = (current_h, current_w)
+            target_size = (current_h, current_w)
+            # reset add_time_ids
+            add_time_ids = self._get_add_time_ids(
+                original_size, crops_coords_top_left, target_size, dtype=prompt_embeds.dtype
+            )
+            if negative_original_size is not None and negative_target_size is not None:
+                negative_add_time_ids = self._get_add_time_ids(
+                    negative_original_size,
+                    negative_crops_coords_top_left,
+                    negative_target_size,
+                    dtype=prompt_embeds.dtype,
+                )
             else:
-                h_resized = torch.linspace(h_resized, height, num_resample_times+1)[1:]
-                w_resized = torch.linspace(w_resized, width, num_resample_times+1)[1:]
-                h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
-                h_resized, w_resized = h_resized.int().tolist(), w_resized.int().tolist()
-                areas = [h * w for h, w in zip(h_resized, w_resized)]
-            # resampling arguments resetting
-            del img
-            dtype = self.vae.dtype
-            # reset scheduler timesteps
-            self.scheduler.set_timesteps(num_resample_timesteps, device=device)
-            timesteps = self.scheduler.timesteps
-            # reset tensor stating which controlnets to keep
-            controlnet_keep = []
-            for i in range(len(timesteps)):
-                keeps = [
-                    1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
-                    for s, e in zip(control_guidance_start, control_guidance_end)
-                ]
-                controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
-            ####################################################### progressive resample loop #######################################################
-            for resample_index in range(num_resample_times):
-                print(f'### resample times: {resample_index + 1}/{num_resample_times} ###')
-                time_start = time.time()
-                current_h, current_w, current_area, init_rate = (
-                    h_resized[resample_index], w_resized[resample_index], areas[resample_index], init_rates[resample_index]
-                )
-                # reset original and target sizes
-                original_size = (current_h, current_w)
-                target_size = (current_h, current_w)
-                # reset add_time_ids
-                add_time_ids = self._get_add_time_ids(
-                    original_size, crops_coords_top_left, target_size, dtype=prompt_embeds.dtype
-                )
-                if negative_original_size is not None and negative_target_size is not None:
-                    negative_add_time_ids = self._get_add_time_ids(
-                        negative_original_size,
-                        negative_crops_coords_top_left,
-                        negative_target_size,
-                        dtype=prompt_embeds.dtype,
-                    )
-                else:
-                    negative_add_time_ids = add_time_ids
-                if do_classifier_free_guidance:
-                    add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
-                add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
-                # reset warmup steps
-                num_warmup_steps = len(timesteps) - num_resample_timesteps * self.scheduler.order
-                num_warmup_steps = int(round(num_warmup_steps))
-                # get resampled_timesteps
-                resampled_timesteps = timesteps[int(num_resample_timesteps * init_rate):]
-                resampled_timesteps = resampled_timesteps.round().int()
-                # upsample in pixel space
-                del latents
-                torch.cuda.empty_cache()
-                self.vae.type(torch.float32)
-                image = image.type(torch.float32)
-                image = F.interpolate(image, size=(current_h, current_w), mode='bicubic').clamp(-1, 1)
-                condition_image = F.interpolate(condition_image, size=(current_h, current_w), mode='bicubic')
-                if current_area >= encoder_limit_area:
-                    if models_to_cpu:
-                        self.unet.to('cpu')
-                        self.text_encoder.to('cpu')
-                        self.text_encoder_2.to('cpu')
-                        self.controlnet.to('cpu')
-                        torch.cuda.empty_cache()
-                    if multi_encoder:
-                        print('using tiled encoder...')
-                        latents = self.vae.tiled_encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
-                    else:
-                        print('using normal encoder...')
-                        latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
-                    del image
-                    latents = latents.type(dtype)
-                    self.vae.type(dtype)
-                    if models_to_cpu:
-                        self.unet.to(device)
-                        self.text_encoder.to(device)
-                        self.text_encoder_2.to(device)
-                        self.controlnet.to(device)
-                        torch.cuda.empty_cache()
+                negative_add_time_ids = add_time_ids
+            if do_classifier_free_guidance:
+                add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+            add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+            # reset warmup steps
+            num_warmup_steps = len(timesteps) - num_resample_timesteps * self.scheduler.order
+            num_warmup_steps = int(round(num_warmup_steps))
+            # get resampled_timesteps
+            resampled_timesteps = timesteps[int(num_resample_timesteps * init_rate):]
+            resampled_timesteps = resampled_timesteps.round().int()
+            # upsample in pixel space
+            torch.cuda.empty_cache()
+            self.vae.type(torch.float32)
+            image = image.type(torch.float32)
+            image = F.interpolate(image, size=(current_h, current_w), mode='bicubic').clamp(-1, 1)
+            condition_image = F.interpolate(condition_image, size=(current_h, current_w), mode='bicubic')
+            # encode back to VAE latent space
+            if current_area >= encoder_limit_area:
+                if models_to_cpu:
+                    self.unet.to('cpu')
+                    self.controlnet.to('cpu')
+                    torch.cuda.empty_cache()
+                if multi_encoder:
+                    print('using tiled encoder...')
+                    latents = self.vae.tiled_encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
                 else:
                     print('using normal encoder...')
+                    latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
+                del image
+                latents = latents.type(dtype)
+                self.vae.type(dtype)
+                if models_to_cpu:
+                    self.unet.to(device)
+                    self.controlnet.to(device)
+            else:
+                print('using normal encoder...')
+                if models_to_cpu:
+                    self.unet.to('cpu')
+                    self.controlnet.to('cpu')
+                    torch.cuda.empty_cache()
+                latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
+                del image
+                latents = latents.type(dtype)
+                self.vae.type(dtype)
+                if models_to_cpu:
+                    self.unet.to(device)
+                    self.controlnet.to(device)
+            torch.cuda.empty_cache()
+            # add noise
+            noise = torch.randn_like(latents)
+            latents = self.scheduler.add_noise(latents, noise, resampled_timesteps[0].unsqueeze(0))
+            del noise
+            torch.cuda.empty_cache()
+            ######################################################## denoising loop ########################################################
+            with self.progress_bar(total=len(resampled_timesteps)) as progress_bar:
+                for i, t in enumerate(resampled_timesteps):
+                    i = i + num_resample_timesteps - len(resampled_timesteps)
+                    
+                    if self.lowvram:
+                        self.vae.cpu()
+                        self.unet.to(device)
+                    
+                    latents_for_view = latents
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = (
+                        latents.repeat_interleave(2, dim=0)
+                        if do_classifier_free_guidance
+                        else latents
+                    )
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    
+                    added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    
+                    # controlnet(s) inference
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infer ControlNet only for the conditional batch.
+                        control_model_input = latents
+                        control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+                        controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                        controlnet_added_cond_kwargs = {
+                            "text_embeds": add_text_embeds.chunk(2)[1],
+                            "time_ids": add_time_ids.chunk(2)[1],
+                        }
+                    else:
+                        control_model_input = latent_model_input
+                        controlnet_prompt_embeds = prompt_embeds
+                        controlnet_added_cond_kwargs = added_cond_kwargs
+                    
+                    if isinstance(controlnet_keep[i], list):
+                        cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                    else:
+                        controlnet_cond_scale = controlnet_conditioning_scale
+                        if isinstance(controlnet_cond_scale, list):
+                            controlnet_cond_scale = controlnet_cond_scale[0]
+                        cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                    
+                    # print(latent_model_input.shape, control_model_input.shape, condition_image.shape)
+                    # print(condition_image.shape, control_model_input.shape, controlnet_prompt_embeds.shape, t, cond_scale, guess_mode)
+                    # print(controlnet_added_cond_kwargs["text_embeds"].shape, controlnet_added_cond_kwargs["time_ids"].shape)
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=condition_image,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+                    
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infered ControlNet only for the conditional batch.
+                        # To apply the output of ControlNet to both the unconditional and conditional batches,
+                        # add 0 to the unconditional batch to keep it unchanged.
+                        down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                        mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+                    
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
+                    
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    
+                    # compute the previous noisy sample x_t -> x_t-1
+                    if isinstance(self.scheduler, EulerDiscreteScheduler):
+                        self.scheduler._init_step_index(t)
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    
+                    # Attention Guidance
+                    # if attn_guidance_scale > 0:
+                    #     latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])
+                    
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and i % callback_steps == 0:
+                            step_idx = i // getattr(self.scheduler, "order", 1)
+                            callback(step_idx, t, latents)
+            del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond, down_block_res_samples, mid_block_res_sample
+            latents = (latents - latents.mean()) / latents.std() * anchor_std + anchor_mean
+            
+            if self.lowvram:
+                latents = latents.cpu()
+                torch.cuda.empty_cache()
+            if not output_type == "latent":
+                # make sure the VAE is in float32 mode, as it overflows in float16
+                needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+                if self.lowvram:
+                    needs_upcasting = False # use madebyollin/sdxl-vae-fp16-fix in lowvram mode!
+                    self.unet.cpu()
+                    self.vae.to(device)
+                if needs_upcasting:
+                    self.upcast_vae()
+                    latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
+                # if self.lowvram and multi_decoder:
+                #     current_width_height = self.unet.config.sample_size * self.vae_scale_factor
+                #     image = self.tiled_decode(latents, current_width_height, current_width_height)
+                # else:
+                #     image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                if current_area > decoder_limit_area and multi_decoder:
                     if models_to_cpu:
                         self.unet.to('cpu')
-                        self.text_encoder.to('cpu')
-                        self.text_encoder_2.to('cpu')
                         self.controlnet.to('cpu')
                         torch.cuda.empty_cache()
-                    latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
-                    del image
-                    latents = latents.type(dtype)
-                    self.vae.type(dtype)
+                    print('using tiled decoder...')
+                    image = self.tiled_decode(latents, current_h, current_w)
                     if models_to_cpu:
                         self.unet.to(device)
-                        self.text_encoder.to(device)
-                        self.text_encoder_2.to(device)
                         self.controlnet.to(device)
-                        torch.cuda.empty_cache()
-                # add noise
-                noise = torch.randn_like(latents)
-                latents = self.scheduler.add_noise(latents, noise, resampled_timesteps[0].unsqueeze(0))
-                del noise
-                torch.cuda.empty_cache()
-                ######################################################## denoising loop ########################################################
-                with self.progress_bar(total=len(resampled_timesteps)) as progress_bar:
-                    for i, t in enumerate(resampled_timesteps):
-                        i = i + num_resample_timesteps - len(resampled_timesteps)
-                        
-                        if self.lowvram:
-                            self.vae.cpu()
-                            self.unet.to(device)
-                        
-                        latents_for_view = latents
-                        # expand the latents if we are doing classifier free guidance
-                        latent_model_input = (
-                            latents.repeat_interleave(2, dim=0)
-                            if do_classifier_free_guidance
-                            else latents
-                        )
-                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                        
-                        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                        
-                        # controlnet(s) inference
-                        if guess_mode and do_classifier_free_guidance:
-                            # Infer ControlNet only for the conditional batch.
-                            control_model_input = latents
-                            control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                            controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-                            controlnet_added_cond_kwargs = {
-                                "text_embeds": add_text_embeds.chunk(2)[1],
-                                "time_ids": add_time_ids.chunk(2)[1],
-                            }
-                        else:
-                            control_model_input = latent_model_input
-                            controlnet_prompt_embeds = prompt_embeds
-                            controlnet_added_cond_kwargs = added_cond_kwargs
-                        
-                        if isinstance(controlnet_keep[i], list):
-                            cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
-                        else:
-                            controlnet_cond_scale = controlnet_conditioning_scale
-                            if isinstance(controlnet_cond_scale, list):
-                                controlnet_cond_scale = controlnet_cond_scale[0]
-                            cond_scale = controlnet_cond_scale * controlnet_keep[i]
-                        
-                        # print(latent_model_input.shape, control_model_input.shape, condition_image.shape)
-                        # print(condition_image.shape, control_model_input.shape, controlnet_prompt_embeds.shape, t, cond_scale, guess_mode)
-                        # print(controlnet_added_cond_kwargs["text_embeds"].shape, controlnet_added_cond_kwargs["time_ids"].shape)
-                        down_block_res_samples, mid_block_res_sample = self.controlnet(
-                            control_model_input,
-                            t,
-                            encoder_hidden_states=controlnet_prompt_embeds,
-                            controlnet_cond=condition_image,
-                            conditioning_scale=cond_scale,
-                            guess_mode=guess_mode,
-                            added_cond_kwargs=controlnet_added_cond_kwargs,
-                            return_dict=False,
-                        )
-                        
-                        if guess_mode and do_classifier_free_guidance:
-                            # Infered ControlNet only for the conditional batch.
-                            # To apply the output of ControlNet to both the unconditional and conditional batches,
-                            # add 0 to the unconditional batch to keep it unchanged.
-                            down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
-                            mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
-                        
-                        # predict the noise residual
-                        noise_pred = self.unet(
-                            latent_model_input,
-                            t,
-                            encoder_hidden_states=prompt_embeds,
-                            cross_attention_kwargs=cross_attention_kwargs,
-                            down_block_additional_residuals=down_block_res_samples,
-                            mid_block_additional_residual=mid_block_res_sample,
-                            added_cond_kwargs=added_cond_kwargs,
-                            return_dict=False,
-                        )[0]
-                        
-                        # perform guidance
-                        if do_classifier_free_guidance:
-                            noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
-                            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                        
-                        # compute the previous noisy sample x_t -> x_t-1
-                        if isinstance(self.scheduler, EulerDiscreteScheduler):
-                            self.scheduler._init_step_index(t)
-                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                        
-                        # Attention Guidance
-                        # if attn_guidance_scale > 0:
-                        #     latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])
-                        
-                        # call the callback, if provided
-                        if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                            progress_bar.update()
-                            if callback is not None and i % callback_steps == 0:
-                                step_idx = i // getattr(self.scheduler, "order", 1)
-                                callback(step_idx, t, latents)
-                del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond, down_block_res_samples, mid_block_res_sample
-                if self.lowvram:
-                    latents = latents.cpu()
-                    torch.cuda.empty_cache()
-                if not output_type == "latent":
-                    # make sure the VAE is in float32 mode, as it overflows in float16
-                    needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
-
-                    if self.lowvram:
-                        needs_upcasting = False # use madebyollin/sdxl-vae-fp16-fix in lowvram mode!
-                        self.unet.cpu()
-                        self.vae.to(device)
-
-                    if needs_upcasting:
-                        self.upcast_vae()
-                        latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
-                    # if self.lowvram and multi_decoder:
-                    #     current_width_height = self.unet.config.sample_size * self.vae_scale_factor
-                    #     image = self.tiled_decode(latents, current_width_height, current_width_height)
-                    # else:
-                    #     image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                    if current_area > decoder_limit_area and multi_decoder:
-                        if models_to_cpu:
-                            self.unet.to('cpu')
-                            self.text_encoder.to('cpu')
-                            self.text_encoder_2.to('cpu')
-                            self.controlnet.to('cpu')
-                            torch.cuda.empty_cache()
-                        print('using tiled decoder...')
-                        image = self.tiled_decode(latents, current_h, current_w)
-                        if models_to_cpu:
-                            self.unet.to(device)
-                            self.text_encoder.to(device)
-                            self.text_encoder_2.to(device)
-                            self.controlnet.to(device)
-                    else:
-                        print('using normal decoder...')
-                        image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                    # cast back to fp16 if needed
-                    if needs_upcasting:
-                        self.vae.to(dtype=torch.float16)
-                
-                time_cost[f"sub-stage_{resample_index + 1}"] = time.time() - time_start
-                
-                img = self.image_processor.postprocess(image, output_type=output_type)
-                # if show_image:
-                #     plt.figure(figsize=(10, 10))
-                #     plt.imshow(img[0])
-                #     plt.axis('off')  # Turn off axis numbers and ticks
-                #     plt.show()
-                output_images.append(img[0])
-                del img
-            del latents, image, condition_image
+                else:
+                    print('using normal decoder...')
+                    image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                # cast back to fp16 if needed
+                if needs_upcasting:
+                    self.vae.to(dtype=torch.float16)
+            time_cost[f"sub-stage_{resample_index + 1}"] = time.time() - time_start
+            image = self.image_processor.postprocess(image, output_type=output_type)
+            # if show_image:
+            #     plt.figure(figsize=(10, 10))
+            #     plt.imshow(img[0])
+            #     plt.axis('off')  # Turn off axis numbers and ticks
+            #     plt.show()
+            output_images.append(image[0])
+            del image
+        del latents, condition_image
+        torch.cuda.empty_cache()
+        self.text_encoder.to(device)
+        self.text_encoder_2.to(device)
+        
         if test_timecost:
             print(time_cost)
         
