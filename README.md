@@ -30,10 +30,19 @@
 
 
 ## 📝 TODO List
-- [ √ ] SDXL: T2I pipeline
-- [ √ ] SDXL: T2I & ControlNet pipeline
-- [___] SD3: T2I
-- [___] FLUX: T2I
+- SDXL Based
+    - Text to Image
+        - [ √ ] RepLDM
+        - [ √ ] [FreeScale](https://github.com/ali-vilab/FreeScale#) + AttentionGuidance
+    - +ControlNet
+        - [ √ ] RepLDM
+        - [___] FreeScale + AttentionGuidance
+- FLUX Based
+    - Text to Image
+        - [___] RepLDM
+- SD3 Based
+    - Text to Image
+        - [___] RepLDM
 - [___] Web UI
 
 

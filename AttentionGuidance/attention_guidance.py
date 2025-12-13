@@ -34,8 +34,8 @@ class AttnGuidance:
             0: no calibration
             1: take both signal's mean and variance into consideration.
             2: only take signal's variance into consideration.
-            Default: 0
-        guidance_filter: Apply filtering to IPS-Attention(latents) so that the part used for guidance gradually includes
+            Default: 0/None
+        guidance_filter: Apply filtering to Training-Free-Self-Attention(latents) so that the part used for guidance gradually includes
             more high-frequency signals. Ensure the input is either None or a tuple containing two elements. When set to
             None, no filtering is applied. When set to a tuple, the first parameter is the method of expanding the filter
             window length, which can be chosen from "linear", "cosine", or "exp"; the second parameter represents the
@@ -53,22 +53,29 @@ class AttnGuidance:
         w:int,
         attn_type: str = "vanilla",
         guidance_scale: float = 0.001,
-        guidance_density: Union[str, tuple] = "all",
-        guidance_scale_decay: Union[None, tuple] = None,
-        power_calibrate: float = 0,
-        guidance_filter: Union[None, tuple] = None,
+        guidance_density: Union[str, tuple, list] = "all",
+        guidance_scale_decay: Union[None, tuple, list] = None,
+        power_calibrate: float = None,
+        guidance_filter: Union[None, tuple, list] = None,
         attn_scaling: float = None,
     ) -> None:
         assert num_total_steps > 0
-        assert attn_type in {"vanilla", "linear", "swin", "skipwin"}
+        assert attn_type in {"vanilla"}, "attn_type should be 'vanilla' currently."
         assert 0 <= guidance_scale
         if guidance_density != "all":
-            assert type(guidance_density) is tuple
+            if type(guidance_density) is list:
+                guidance_density = tuple(guidance_density)
+            else:
+                assert type(guidance_density) is tuple
             assert len(guidance_density) > 0
             assert num_total_steps % len(guidance_density) == 0
-            for i in guidance_density: assert 0 <= i <= 1
+            for i in guidance_density:
+                assert 0 <= i <= 1
         if guidance_scale_decay is not None:
-            assert type(guidance_scale_decay) is tuple
+            if type(guidance_scale_decay) is list:
+                guidance_scale_decay = tuple(guidance_scale_decay)
+            else:
+                assert type(guidance_scale_decay) is tuple
             assert len(guidance_scale_decay) == 3
             assert guidance_scale_decay[0] in {"linear", "cosine", "exp"}
             assert 0 <= guidance_scale_decay[1] <= guidance_scale
@@ -76,9 +83,12 @@ class AttnGuidance:
                 assert type(guidance_scale_decay[2]) in {float, int} and guidance_scale_decay[2] >= 1
             elif guidance_scale_decay[0] == 'exp':
                 assert type(guidance_scale_decay[2]) in {float, int} and 0 <= guidance_scale_decay[2] <= 1
-        assert power_calibrate in {0, 1, 2}
-        if guidance_filter is not None: 
-            assert type(guidance_filter) is tuple
+        assert power_calibrate in {0, 1, 2, None}
+        if guidance_filter is not None:
+            if type(guidance_filter) is list:
+                guidance_filter = tuple(guidance_filter)
+            else:
+                assert type(guidance_filter) is tuple
             assert len(guidance_filter) == 2
             assert guidance_filter[0] in {'linear', 'cosine', 'exp'}
             assert 0 <= guidance_filter[1] <= 1

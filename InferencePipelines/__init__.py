@@ -1,2 +1,3 @@
 from .RepLDM.pipeline_repldm_sdxl import RepLDMSDXLPipeline
 from .RepLDM.pipeline_repldm_sdxl_controlnet import RepLDMSDXLControlNetPipeline
+from .FreeScale.pipeline_freescale_sdxl import FreeScaleSDXLPipeline
