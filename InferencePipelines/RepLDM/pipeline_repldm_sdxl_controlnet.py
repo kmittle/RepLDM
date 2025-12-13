@@ -12,25 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import inspect
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import matplotlib.pyplot as plt
 
+import numpy as np
+import PIL.Image
 import torch
 import torch.nn.functional as F
-import numpy as np
 import random
 import warnings
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-from diffusers.image_processor import VaeImageProcessor
-from diffusers.loaders import (
-    FromSingleFileMixin,
-    LoraLoaderMixin,
-    TextualInversionLoaderMixin,
-)
-from diffusers.models import AutoencoderKL, UNet2DConditionModel
+from diffusers.utils.import_utils import is_invisible_watermark_available
+
+from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.loaders import FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin
+from diffusers.models import AutoencoderKL, ControlNetModel, UNet2DConditionModel
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     LoRAAttnProcessor2_0,
@@ -42,36 +42,31 @@ from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import (
     is_accelerate_available,
     is_accelerate_version,
-    is_invisible_watermark_available,
     logging,
     replace_example_docstring,
 )
-from diffusers.utils.torch_utils import randn_tensor
+from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipelineOutput
 
-from attn_guidance import AttnGuidance
 
 if is_invisible_watermark_available():
-    from .watermark import StableDiffusionXLWatermarker
+    from diffusers.pipelines.stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
+
+from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
+
+from AttentionGuidance import AttnGuidance
+import time
+from diffusers import EulerDiscreteScheduler
+import gc
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+
 EXAMPLE_DOC_STRING = """
     Examples:
-        ```py
-        >>> import torch
-        >>> from diffusers import StableDiffusionXLPipeline
-
-        >>> pipe = StableDiffusionXLPipeline.from_pretrained(
-        ...     "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16
-        ... )
-        >>> pipe = pipe.to("cuda")
-
-        >>> prompt = "a photo of an astronaut riding a horse on mars"
-        >>> image = pipe(prompt).images[0]
-        ```
 """
 
 def gaussian_kernel(kernel_size=3, sigma=1.0, channels=3):
@@ -90,67 +85,53 @@ def gaussian_filter(latents, kernel_size=3, sigma=1.0):
     
     return blurred_latents
 
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
-def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
-    """
-    Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
-    Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
-    """
-    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
-    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
-    # rescale the results from guidance (fixes overexposure)
-    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
-    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
-    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
-    return noise_cfg
 
+class RepLDMSDXLControlNetPipeline(
+    DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMixin, FromSingleFileMixin
+):
+    r"""
+    Pipeline for text-to-image generation using Stable Diffusion XL with ControlNet guidance.
 
-class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin):
-    """
-    Pipeline for text-to-image generation using Stable Diffusion XL.
+    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
+    implemented for all pipelines (downloading, saving, running on a particular device, etc.).
 
-    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
-    library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
-
-    In addition the pipeline inherits the following loading methods:
-        - *LoRA*: [`StableDiffusionXLPipeline.load_lora_weights`]
-        - *Ckpt*: [`loaders.FromSingleFileMixin.from_single_file`]
-
-    as well as the following saving methods:
-        - *LoRA*: [`loaders.StableDiffusionXLPipeline.save_lora_weights`]
+    The pipeline also inherits the following loading methods:
+        - [`~loaders.TextualInversionLoaderMixin.load_textual_inversion`] for loading textual inversion embeddings
+        - [`loaders.LoraLoaderMixin.load_lora_weights`] for loading LoRA weights
+        - [`loaders.FromSingleFileMixin.from_single_file`] for loading `.ckpt` files
 
     Args:
         vae ([`AutoencoderKL`]):
-            Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
-        text_encoder ([`CLIPTextModel`]):
-            Frozen text-encoder. Stable Diffusion XL uses the text portion of
-            [CLIP](https://huggingface.co/docs/transformers/model_doc/clip#transformers.CLIPTextModel), specifically
-            the [clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) variant.
-        text_encoder_2 ([` CLIPTextModelWithProjection`]):
-            Second frozen text-encoder. Stable Diffusion XL uses the text and pool portion of
-            [CLIP](https://huggingface.co/docs/transformers/model_doc/clip#transformers.CLIPTextModelWithProjection),
-            specifically the
-            [laion/CLIP-ViT-bigG-14-laion2B-39B-b160k](https://huggingface.co/laion/CLIP-ViT-bigG-14-laion2B-39B-b160k)
-            variant.
-        tokenizer (`CLIPTokenizer`):
-            Tokenizer of class
-            [CLIPTokenizer](https://huggingface.co/docs/transformers/v4.21.0/en/model_doc/clip#transformers.CLIPTokenizer).
-        tokenizer_2 (`CLIPTokenizer`):
-            Second Tokenizer of class
-            [CLIPTokenizer](https://huggingface.co/docs/transformers/v4.21.0/en/model_doc/clip#transformers.CLIPTokenizer).
-        unet ([`UNet2DConditionModel`]): Conditional U-Net architecture to denoise the encoded image latents.
+            Variational Auto-Encoder (VAE) model to encode and decode images to and from latent representations.
+        text_encoder ([`~transformers.CLIPTextModel`]):
+            Frozen text-encoder ([clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14)).
+        text_encoder_2 ([`~transformers.CLIPTextModelWithProjection`]):
+            Second frozen text-encoder
+            ([laion/CLIP-ViT-bigG-14-laion2B-39B-b160k](https://huggingface.co/laion/CLIP-ViT-bigG-14-laion2B-39B-b160k)).
+        tokenizer ([`~transformers.CLIPTokenizer`]):
+            A `CLIPTokenizer` to tokenize text.
+        tokenizer_2 ([`~transformers.CLIPTokenizer`]):
+            A `CLIPTokenizer` to tokenize text.
+        unet ([`UNet2DConditionModel`]):
+            A `UNet2DConditionModel` to denoise the encoded image latents.
+        controlnet ([`ControlNetModel`] or `List[ControlNetModel]`):
+            Provides additional conditioning to the `unet` during the denoising process. If you set multiple
+            ControlNets as a list, the outputs from each ControlNet are added together to create one combined
+            additional conditioning.
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `unet` to denoise the encoded image latents. Can be one of
             [`DDIMScheduler`], [`LMSDiscreteScheduler`], or [`PNDMScheduler`].
         force_zeros_for_empty_prompt (`bool`, *optional*, defaults to `"True"`):
-            Whether the negative prompt embeddings shall be forced to always be set to 0. Also see the config of
+            Whether the negative prompt embeddings should always be set to 0. Also see the config of
             `stabilityai/stable-diffusion-xl-base-1-0`.
         add_watermarker (`bool`, *optional*):
-            Whether to use the [invisible_watermark library](https://github.com/ShieldMnt/invisible-watermark/) to
-            watermark output images. If not defined, it will default to True if the package is installed, otherwise no
-            watermarker will be used.
+            Whether to use the [invisible_watermark](https://github.com/ShieldMnt/invisible-watermark/) library to
+            watermark output images. If not defined, it defaults to `True` if the package is installed; otherwise no
+            watermarker is used.
     """
-    model_cpu_offload_seq = "text_encoder->text_encoder_2->unet->vae"
+    model_cpu_offload_seq = (
+        "text_encoder->text_encoder_2->unet->vae"  # leave controlnet out on purpose because it iterates with unet
+    )
 
     def __init__(
         self,
@@ -160,11 +141,15 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         tokenizer: CLIPTokenizer,
         tokenizer_2: CLIPTokenizer,
         unet: UNet2DConditionModel,
+        controlnet: Union[ControlNetModel, List[ControlNetModel], Tuple[ControlNetModel], MultiControlNetModel],
         scheduler: KarrasDiffusionSchedulers,
         force_zeros_for_empty_prompt: bool = True,
         add_watermarker: Optional[bool] = None,
     ):
         super().__init__()
+
+        if isinstance(controlnet, (list, tuple)):
+            controlnet = MultiControlNetModel(controlnet)
 
         self.register_modules(
             vae=vae,
@@ -173,19 +158,22 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             tokenizer=tokenizer,
             tokenizer_2=tokenizer_2,
             unet=unet,
+            controlnet=controlnet,
             scheduler=scheduler,
         )
-        self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-        self.default_sample_size = self.unet.config.sample_size
-
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
+        self.control_image_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True, do_normalize=False
+        )
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
 
         if add_watermarker:
             self.watermark = StableDiffusionXLWatermarker()
         else:
             self.watermark = None
+
+        self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_vae_slicing
     def enable_vae_slicing(self):
@@ -220,6 +208,7 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         """
         self.vae.disable_tiling()
 
+    # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline.encode_prompt
     def encode_prompt(
         self,
         prompt: str,
@@ -437,8 +426,7 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         self,
         prompt,
         prompt_2,
-        height,
-        width,
+        image,
         callback_steps,
         negative_prompt=None,
         negative_prompt_2=None,
@@ -446,11 +434,10 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         negative_prompt_embeds=None,
         pooled_prompt_embeds=None,
         negative_pooled_prompt_embeds=None,
-        num_images_per_prompt=None,
+        controlnet_conditioning_scale=1.0,
+        control_guidance_start=0.0,
+        control_guidance_end=1.0,
     ):
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
-
         if (callback_steps is None) or (
             callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
         ):
@@ -507,13 +494,168 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
                 "If `negative_prompt_embeds` are provided, `negative_pooled_prompt_embeds` also have to be passed. Make sure to generate `negative_pooled_prompt_embeds` from the same text encoder that was used to generate `negative_prompt_embeds`."
             )
 
-        # DemoFusion specific checks
-        # if max(height, width) % 1024 != 0:
-        #     raise ValueError(f"the larger one of `height` and `width` has to be divisible by 1024 but are {height} and {width}.")
+        # `prompt` needs more sophisticated handling when there are multiple
+        # conditionings.
+        if isinstance(self.controlnet, MultiControlNetModel):
+            if isinstance(prompt, list):
+                logger.warning(
+                    f"You have {len(self.controlnet.nets)} ControlNets and you have passed {len(prompt)}"
+                    " prompts. The conditionings will be fixed across the prompts."
+                )
 
-        if num_images_per_prompt != 1:
-            warnings.warn("num_images_per_prompt != 1 is not supported by DemoFusion and will be ignored.")
-            num_images_per_prompt = 1
+        # Check `image`
+        is_compiled = hasattr(F, "scaled_dot_product_attention") and isinstance(
+            self.controlnet, torch._dynamo.eval_frame.OptimizedModule
+        )
+        if (
+            isinstance(self.controlnet, ControlNetModel)
+            or is_compiled
+            and isinstance(self.controlnet._orig_mod, ControlNetModel)
+        ):
+            self.check_image(image, prompt, prompt_embeds)
+        elif (
+            isinstance(self.controlnet, MultiControlNetModel)
+            or is_compiled
+            and isinstance(self.controlnet._orig_mod, MultiControlNetModel)
+        ):
+            if not isinstance(image, list):
+                raise TypeError("For multiple controlnets: `image` must be type `list`")
+
+            # When `image` is a nested list:
+            # (e.g. [[canny_image_1, pose_image_1], [canny_image_2, pose_image_2]])
+            elif any(isinstance(i, list) for i in image):
+                raise ValueError("A single batch of multiple conditionings are supported at the moment.")
+            elif len(image) != len(self.controlnet.nets):
+                raise ValueError(
+                    f"For multiple controlnets: `image` must have the same length as the number of controlnets, but got {len(image)} images and {len(self.controlnet.nets)} ControlNets."
+                )
+
+            for image_ in image:
+                self.check_image(image_, prompt, prompt_embeds)
+        else:
+            assert False
+
+        # Check `controlnet_conditioning_scale`
+        if (
+            isinstance(self.controlnet, ControlNetModel)
+            or is_compiled
+            and isinstance(self.controlnet._orig_mod, ControlNetModel)
+        ):
+            if not isinstance(controlnet_conditioning_scale, float):
+                raise TypeError("For single controlnet: `controlnet_conditioning_scale` must be type `float`.")
+        elif (
+            isinstance(self.controlnet, MultiControlNetModel)
+            or is_compiled
+            and isinstance(self.controlnet._orig_mod, MultiControlNetModel)
+        ):
+            if isinstance(controlnet_conditioning_scale, list):
+                if any(isinstance(i, list) for i in controlnet_conditioning_scale):
+                    raise ValueError("A single batch of multiple conditionings are supported at the moment.")
+            elif isinstance(controlnet_conditioning_scale, list) and len(controlnet_conditioning_scale) != len(
+                self.controlnet.nets
+            ):
+                raise ValueError(
+                    "For multiple controlnets: When `controlnet_conditioning_scale` is specified as `list`, it must have"
+                    " the same length as the number of controlnets"
+                )
+        else:
+            assert False
+
+        if not isinstance(control_guidance_start, (tuple, list)):
+            control_guidance_start = [control_guidance_start]
+
+        if not isinstance(control_guidance_end, (tuple, list)):
+            control_guidance_end = [control_guidance_end]
+
+        if len(control_guidance_start) != len(control_guidance_end):
+            raise ValueError(
+                f"`control_guidance_start` has {len(control_guidance_start)} elements, but `control_guidance_end` has {len(control_guidance_end)} elements. Make sure to provide the same number of elements to each list."
+            )
+
+        if isinstance(self.controlnet, MultiControlNetModel):
+            if len(control_guidance_start) != len(self.controlnet.nets):
+                raise ValueError(
+                    f"`control_guidance_start`: {control_guidance_start} has {len(control_guidance_start)} elements but there are {len(self.controlnet.nets)} controlnets available. Make sure to provide {len(self.controlnet.nets)}."
+                )
+
+        for start, end in zip(control_guidance_start, control_guidance_end):
+            if start >= end:
+                raise ValueError(
+                    f"control guidance start: {start} cannot be larger or equal to control guidance end: {end}."
+                )
+            if start < 0.0:
+                raise ValueError(f"control guidance start: {start} can't be smaller than 0.")
+            if end > 1.0:
+                raise ValueError(f"control guidance end: {end} can't be larger than 1.0.")
+
+    # Copied from diffusers.pipelines.controlnet.pipeline_controlnet.StableDiffusionControlNetPipeline.check_image
+    def check_image(self, image, prompt, prompt_embeds):
+        image_is_pil = isinstance(image, PIL.Image.Image)
+        image_is_tensor = isinstance(image, torch.Tensor)
+        image_is_np = isinstance(image, np.ndarray)
+        image_is_pil_list = isinstance(image, list) and isinstance(image[0], PIL.Image.Image)
+        image_is_tensor_list = isinstance(image, list) and isinstance(image[0], torch.Tensor)
+        image_is_np_list = isinstance(image, list) and isinstance(image[0], np.ndarray)
+
+        if (
+            not image_is_pil
+            and not image_is_tensor
+            and not image_is_np
+            and not image_is_pil_list
+            and not image_is_tensor_list
+            and not image_is_np_list
+        ):
+            raise TypeError(
+                f"image must be passed and be one of PIL image, numpy array, torch tensor, list of PIL images, list of numpy arrays or list of torch tensors, but is {type(image)}"
+            )
+
+        if image_is_pil:
+            image_batch_size = 1
+        else:
+            image_batch_size = len(image)
+
+        if prompt is not None and isinstance(prompt, str):
+            prompt_batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            prompt_batch_size = len(prompt)
+        elif prompt_embeds is not None:
+            prompt_batch_size = prompt_embeds.shape[0]
+
+        if image_batch_size != 1 and image_batch_size != prompt_batch_size:
+            raise ValueError(
+                f"If image batch size is not 1, image batch size must be same as prompt batch size. image batch size: {image_batch_size}, prompt batch size: {prompt_batch_size}"
+            )
+
+    # Copied from diffusers.pipelines.controlnet.pipeline_controlnet.StableDiffusionControlNetPipeline.prepare_image
+    def prepare_image(
+        self,
+        image,
+        width,
+        height,
+        batch_size,
+        num_images_per_prompt,
+        device,
+        dtype,
+        do_classifier_free_guidance=False,
+        guess_mode=False,
+    ):
+        image = self.control_image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
+        image_batch_size = image.shape[0]
+
+        if image_batch_size == 1:
+            repeat_by = batch_size
+        else:
+            # image batch size is the same as prompt batch size
+            repeat_by = num_images_per_prompt
+
+        image = image.repeat_interleave(repeat_by, dim=0)
+
+        image = image.to(device=device, dtype=dtype)
+
+        if do_classifier_free_guidance and not guess_mode:
+            image = torch.cat([image] * 2)
+
+        return image
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
     def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
@@ -533,6 +675,7 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline._get_add_time_ids
     def _get_add_time_ids(self, original_size, crops_coords_top_left, target_size, dtype):
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
 
@@ -659,15 +802,22 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             self.vae.decoder.mid_block.to(dtype)
 
     @torch.no_grad()
+    def empty_cache(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
+        condition_image: PipelineImageInput = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
-        denoising_end: Optional[float] = None,
         guidance_scale: float = 5.0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         negative_prompt_2: Optional[Union[str, List[str]]] = None,
@@ -680,13 +830,17 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
+        return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        guidance_rescale: float = 0.0,
-        original_size: Optional[Tuple[int, int]] = None,
+        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+        guess_mode: bool = False,
+        control_guidance_start: Union[float, List[float]] = 0.0,
+        control_guidance_end: Union[float, List[float]] = 1.0,
+        original_size: Tuple[int, int] = None,
         crops_coords_top_left: Tuple[int, int] = (0, 0),
-        target_size: Optional[Tuple[int, int]] = None,
+        target_size: Tuple[int, int] = None,
         negative_original_size: Optional[Tuple[int, int]] = None,
         negative_crops_coords_top_left: Tuple[int, int] = (0, 0),
         negative_target_size: Optional[Tuple[int, int]] = None,
@@ -695,6 +849,7 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         multi_decoder: bool = True,
         show_image: bool = False,
         lowvram: bool = False,
+        test_timecost: bool = False,
         encoder_limit_area: int = 4096**2,
         decoder_limit_area: int = 2048**2,
         models_to_cpu: bool = False,
@@ -709,92 +864,92 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
         attn_guidance_filter: str = None,
     ):
         r"""
-        Function invoked when calling the pipeline for generation.
+        The call function to the pipeline for generation.
 
         Args:
             prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.
+                The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts to be sent to the `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
-                used in both text-encoders
-            height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
-                The height in pixels of the generated image. This is set to 1024 by default for the best results.
-                Anything below 512 pixels won't work well for
+                The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
+                used in both text-encoders.
+            image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
+                    `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
+                The ControlNet input condition to provide guidance to the `unet` for generation. If the type is
+                specified as `torch.FloatTensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be
+                accepted as an image. The dimensions of the output image defaults to `image`'s dimensions. If height
+                and/or width are passed, `image` is resized accordingly. If multiple ControlNets are specified in
+                `init`, images must be passed as a list such that each element of the list can be correctly batched for
+                input to a single ControlNet.
+            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The height in pixels of the generated image. Anything below 512 pixels won't work well for
                 [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
                 and checkpoints that are not specifically fine-tuned on low resolutions.
-            width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
-                The width in pixels of the generated image. This is set to 1024 by default for the best results.
-                Anything below 512 pixels won't work well for
+            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The width in pixels of the generated image. Anything below 512 pixels won't work well for
                 [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
                 and checkpoints that are not specifically fine-tuned on low resolutions.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference.
-            denoising_end (`float`, *optional*):
-                When specified, determines the fraction (between 0.0 and 1.0) of the total denoising process to be
-                completed before it is intentionally prematurely terminated. As a result, the returned sample will
-                still retain a substantial amount of noise as determined by the discrete timesteps selected by the
-                scheduler. The denoising_end parameter should ideally be utilized when this pipeline forms a part of a
-                "Mixture of Denoisers" multi-pipeline setup, as elaborated in [**Refining the Image
-                Output**](https://huggingface.co/docs/diffusers/api/pipelines/stable_diffusion/stable_diffusion_xl#refining-the-image-output)
             guidance_scale (`float`, *optional*, defaults to 5.0):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-                usually at the expense of lower image quality.
+                A higher guidance scale value encourages the model to generate images closely linked to the text
+                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
             negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
+                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
             negative_prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation to be sent to `tokenizer_2` and
-                `text_encoder_2`. If not defined, `negative_prompt` is used in both text-encoders
+                The prompt or prompts to guide what to not include in image generation. This is sent to `tokenizer_2`
+                and `text_encoder_2`. If not defined, `negative_prompt` is used in both text-encoders.
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
-                [`schedulers.DDIMScheduler`], will be ignored for others.
+                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
-                to make generation deterministic.
+                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                generation deterministic.
             latents (`torch.FloatTensor`, *optional*):
-                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
                 generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor will ge generated by sampling using the supplied random `generator`.
+                tensor is generated by sampling using the supplied random `generator`.
             prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
+                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+                provided, text embeddings are generated from the `prompt` input argument.
             negative_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
             pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
-                If not provided, pooled text embeddings will be generated from `prompt` input argument.
+                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, pooled text embeddings are generated from `prompt` input argument.
             negative_pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, pooled negative_prompt_embeds will be generated from `negative_prompt`
-                input argument.
+                Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs (prompt
+                weighting). If not provided, pooled `negative_prompt_embeds` are generated from `negative_prompt` input
+                argument.
             output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generate image. Choose between
-                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
             callback (`Callable`, *optional*):
-                A function that will be called every `callback_steps` steps during inference. The function will be
-                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+                A function that calls every `callback_steps` steps during inference. The function is called with the
+                following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
             callback_steps (`int`, *optional*, defaults to 1):
-                The frequency at which the `callback` function will be called. If not specified, the callback will be
-                called at every step.
+                The frequency at which the `callback` function is called. If not specified, the callback is called at
+                every step.
             cross_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            guidance_rescale (`float`, *optional*, defaults to 0.7):
-                Guidance rescale factor proposed by [Common Diffusion Noise Schedules and Sample Steps are
-                Flawed](https://arxiv.org/pdf/2305.08891.pdf) `guidance_scale` is defined as `φ` in equation 16. of
-                [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf).
-                Guidance rescale factor should fix overexposure when using zero terminal SNR.
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
+                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            controlnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
+                The outputs of the ControlNet are multiplied by `controlnet_conditioning_scale` before they are added
+                to the residual in the original `unet`. If multiple ControlNets are specified in `init`, you can set
+                the corresponding scale as a list.
+            guess_mode (`bool`, *optional*, defaults to `False`):
+                The ControlNet encoder tries to recognize the content of the input image even if you remove all
+                prompts. A `guidance_scale` value between 3.0 and 5.0 is recommended.
+            control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
+                The percentage of total steps at which the ControlNet starts applying.
+            control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
+                The percentage of total steps at which the ControlNet stops applying.
             original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
                 If `original_size` is not the same as `target_size` the image will appear to be down- or upsampled.
                 `original_size` defaults to `(width, height)` if not specified. Part of SDXL's micro-conditioning as
@@ -827,45 +982,62 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             ################### DemoFusion specific parameters ####################
             image_lr (`torch.FloatTensor`, *optional*, , defaults to None):
                 Low-resolution image input for upscaling. If provided, DemoFusion will encode it as the initial latent representation.
+            view_batch_size (`int`, defaults to 16):
+                The batch size for multiple denoising paths. Typically, a larger batch size can result in higher 
+                efficiency but comes with increased GPU memory requirements.
             multi_decoder (`bool`, defaults to True):
                 Determine whether to use a tiled decoder. Generally, when the resolution exceeds 3072x3072, 
                 a tiled decoder becomes necessary.
+            stride (`int`, defaults to 64):
+                The stride of moving local patches. A smaller stride is better for alleviating seam issues,
+                but it also introduces additional computational overhead and inference time.
+            cosine_scale_1 (`float`, defaults to 3):
+                Control the strength of skip-residual. For specific impacts, please refer to Appendix C
+                in the DemoFusion paper.
+            cosine_scale_2 (`float`, defaults to 1):
+                Control the strength of dilated sampling. For specific impacts, please refer to Appendix C
+                in the DemoFusion paper.
+            cosine_scale_3 (`float`, defaults to 1):
+                Control the strength of the gaussion filter. For specific impacts, please refer to Appendix C
+                in the DemoFusion paper.
+            sigma (`float`, defaults to 1):
+                The standard value of the gaussian filter.
             show_image (`bool`, defaults to False):
                 Determine whether to show intermediate results during generation.
             lowvram (`bool`, defaults to False):
                 Try to fit in 8 Gb of VRAM, with xformers installed.
-            encoder_limit_area (`int`, defaults to 4096^2):
-                Use `tilde_encoder` when exceeding this resolution.
-            decoder_limit_area (`int`, defaults to 2048^2):
-                Use `tilde_decoder` when exceeding this resolution.
-            models_to_cpu (`bool`, defaults to False):
-                Determines whether to transfer other model weights to the CPU during model encoding and decoding.
-            multi_encoder (`bool`, defaults to False):
-                Determine whether to use a tiled encoder.
-            num_resample_timesteps (`int`, defaults to 50):
-                Determines the number of diffusion steps during the upsampling stage.
-            init_rates (`list`, defaults to [0.8]):
-                Determines the number of upsampling steps and the extent of the diffusion-denoising process after each upsampling.
-            The parameters of Attentive Guidance:
-                    attn_type: str = 'vanilla',
-                    attn_guidance_scale: float = 0.001,
-                    attn_guidance_density: str = 'all',
-                    attn_guidance_decay: tuple = None,
-                    power_calibrate: int = 0,
-                    attn_guidance_filter: str = None,
-                For a detailed explanation of these parameters, please refer to the `attn_guidance.py` module.
-        
         Examples:
 
         Returns:
-            a `list` with the generated images at each phase.
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+                otherwise a `tuple` is returned containing the output images.
         """
-        
-        # 0. Default height and width to unet
-        height = height or self.default_sample_size * self.vae_scale_factor
-        width = width or self.default_sample_size * self.vae_scale_factor
+        controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
 
-        # x1_size = self.default_sample_size * self.vae_scale_factor
+        # align format for control guidance
+        if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
+            control_guidance_start = len(control_guidance_end) * [control_guidance_start]
+        elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
+            control_guidance_end = len(control_guidance_start) * [control_guidance_end]
+        elif not isinstance(control_guidance_start, list) and not isinstance(control_guidance_end, list):
+            mult = len(controlnet.nets) if isinstance(controlnet, MultiControlNetModel) else 1
+            control_guidance_start, control_guidance_end = mult * [control_guidance_start], mult * [
+                control_guidance_end
+            ]
+
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+        
+        aspect_ratio = height / width
+        w_resized = int(round(1024 / aspect_ratio ** 0.5, 0))
+        h_resized = int(round(1024 * aspect_ratio ** 0.5, 0))
+        
+        original_size = original_size or (h_resized, w_resized)
+        target_size = target_size or (h_resized, w_resized)
+
+        # x1_size = self.unet.config.sample_size * self.vae_scale_factor
 
         # height_scale = height / x1_size
         # width_scale = width / x1_size
@@ -874,13 +1046,12 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
 
         # original_size = original_size or (height, width)
         # target_size = target_size or (height, width)
-
+        
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt,
             prompt_2,
-            height,
-            width,
+            condition_image,
             callback_steps,
             negative_prompt,
             negative_prompt_2,
@@ -888,7 +1059,9 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             negative_prompt_embeds,
             pooled_prompt_embeds,
             negative_pooled_prompt_embeds,
-            num_images_per_prompt,
+            controlnet_conditioning_scale,
+            control_guidance_start,
+            control_guidance_end,
         )
 
         # 2. Define call parameters
@@ -906,12 +1079,22 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             self.unet.cpu()
             self.text_encoder.to(device)
             self.text_encoder_2.to(device)
-            image_lr.cpu()
-
+            if image_lr:
+                image_lr.cpu()
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
+
+        if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
+            controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet.nets)
+
+        global_pool_conditions = (
+            controlnet.config.global_pool_conditions
+            if isinstance(controlnet, ControlNetModel)
+            else controlnet.nets[0].config.global_pool_conditions
+        )
+        guess_mode = guess_mode or global_pool_conditions
 
         # 3. Encode input prompt
         text_encoder_lora_scale = (
@@ -923,13 +1106,13 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             pooled_prompt_embeds,
             negative_pooled_prompt_embeds,
         ) = self.encode_prompt(
-            prompt=prompt,
-            prompt_2=prompt_2,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt_2,
+            prompt,
+            prompt_2,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            negative_prompt_2,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
@@ -937,17 +1120,56 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             lora_scale=text_encoder_lora_scale,
         )
 
-        # 4. Prepare timesteps
+        # 4. Prepare image
+        if isinstance(controlnet, ControlNetModel):
+            condition_image = self.prepare_image(
+                image=condition_image,
+                width=w_resized,
+                height=h_resized,
+                # width=width // scale_num,
+                # height=height // scale_num,
+                batch_size=batch_size * num_images_per_prompt,
+                num_images_per_prompt=num_images_per_prompt,
+                device=device,
+                dtype=controlnet.dtype,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                guess_mode=guess_mode,
+            )
+            # height, width = condition_image.shape[-2:]
+            # condition_image.shape ([2, 3, 1024, 1024])
+        elif isinstance(controlnet, MultiControlNetModel):
+            condition_images = []
+
+            for image_ in condition_image:
+                image_ = self.prepare_image(
+                    image=image_,
+                    width=w_resized,
+                    height=h_resized,
+                    # width=width // scale_num,
+                    # height=height // scale_num,
+                    batch_size=batch_size * num_images_per_prompt,
+                    num_images_per_prompt=num_images_per_prompt,
+                    device=device,
+                    dtype=controlnet.dtype,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    guess_mode=guess_mode,
+                )
+
+                condition_images.append(image_)
+
+            condition_image = condition_images
+            del condition_images
+            # height, width = condition_image[0].shape[-2:]
+        else:
+            assert False
+
+        # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-
         timesteps = self.scheduler.timesteps
+        timesteps = timesteps.round().int()
 
-        # 5. Prepare latent variables
+        # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
-        aspect_rate = height / width
-        w_resized = int(1024 / aspect_rate ** 0.5)
-        h_resized = int(1024 * aspect_rate ** 0.5)
-        
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -961,16 +1183,30 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             latents,
         )
 
-        original_size = original_size or (h_resized, w_resized)
-        target_size = target_size or (h_resized, w_resized)
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7. Prepare added time ids & embeddings
+        # 7.1 Create tensor stating which controlnets to keep
+        controlnet_keep = []
+        for i in range(len(timesteps)):
+            keeps = [
+                1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
+                for s, e in zip(control_guidance_start, control_guidance_end)
+            ]
+            controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
+        
+        # 7.2 Prepare added time ids & embeddings
+        if isinstance(condition_image, list):
+            original_size = original_size or condition_image[0].shape[-2:]
+        else:
+            original_size = original_size or condition_image.shape[-2:]
+        target_size = target_size or (height, width)
+
         add_text_embeds = pooled_prompt_embeds
         add_time_ids = self._get_add_time_ids(
             original_size, crops_coords_top_left, target_size, dtype=prompt_embeds.dtype
         )
+
         if negative_original_size is not None and negative_target_size is not None:
             negative_add_time_ids = self._get_add_time_ids(
                 negative_original_size,
@@ -985,55 +1221,46 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
             add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
-        del negative_prompt_embeds, negative_pooled_prompt_embeds, negative_add_time_ids
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
 
         # 8. Denoising loop
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-
-        # 7.1 Apply denoising_end
-        if denoising_end is not None and isinstance(denoising_end, float) and denoising_end > 0 and denoising_end < 1:
-            discrete_timestep_cutoff = int(
-                round(
-                    self.scheduler.config.num_train_timesteps
-                    - (denoising_end * self.scheduler.config.num_train_timesteps)
-                )
-            )
-            num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
-            timesteps = timesteps[:num_inference_steps]
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         output_images = []
         
+        # prepaere the attn guidance
         alphas_cumprod_sample = self.scheduler.alphas_cumprod.to(device)[timesteps.type(torch.int) - 1]
         num_timesteps = len(timesteps)
-        attn_guidance = AttnGuidance(dtype=latents.dtype, device=latents.device, num_total_steps=num_timesteps,
-                                          h=h_resized, w=w_resized, attn_type=attn_type, guidance_scale=attn_guidance_scale,
-                                          guidance_density=attn_guidance_density,
-                                          guidance_scale_decay=attn_guidance_decay,
-                                          power_calibrate=power_calibrate,
-                                          guidance_filter=attn_guidance_filter)
+        attn_guidance = AttnGuidance(
+            dtype=latents.dtype, device=latents.device, num_total_steps=num_timesteps,
+            h=h_resized, w=w_resized, attn_type=attn_type, guidance_scale=attn_guidance_scale,
+            guidance_density=attn_guidance_density,
+            guidance_scale_decay=attn_guidance_decay,
+            power_calibrate=power_calibrate,
+            guidance_filter=attn_guidance_filter,
+        )
+        
+        time_cost = {}
+        
     ###################################################### Phase Initialization ########################################################
 
         if self.lowvram:
             self.text_encoder.cpu()
             self.text_encoder_2.cpu()
-
+        
         if image_lr == None:
             print("### Phase 1 Denoising ###")
+            time_start = time.time()
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
     
                     if self.lowvram:
                         self.vae.cpu()
                         self.unet.to(device)
-    
-                    add_time_ids = torch.tensor(
-                        [[h_resized, w_resized, 0, 0, h_resized, w_resized],
-                            [h_resized, w_resized, 0, 0, h_resized, w_resized]],
-                        device=latents.device, dtype=self.vae.dtype)
+                    
                     latents_for_view = latents
     
                     # expand the latents if we are doing classifier free guidance
@@ -1044,13 +1271,61 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
                     )
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
     
-                    # predict the noise residual
+                    
                     added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+    
+                    # controlnet(s) inference
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infer ControlNet only for the conditional batch.
+                        control_model_input = latents
+                        control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+                        controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                        controlnet_added_cond_kwargs = {
+                            "text_embeds": add_text_embeds.chunk(2)[1],
+                            "time_ids": add_time_ids.chunk(2)[1],
+                        }
+                    else:
+                        control_model_input = latent_model_input
+                        controlnet_prompt_embeds = prompt_embeds
+                        controlnet_added_cond_kwargs = added_cond_kwargs
+    
+                    if isinstance(controlnet_keep[i], list):
+                        cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                    else:
+                        controlnet_cond_scale = controlnet_conditioning_scale
+                        if isinstance(controlnet_cond_scale, list):
+                            controlnet_cond_scale = controlnet_cond_scale[0]
+                        cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                    
+                    # print(latent_model_input.shape, control_model_input.shape, condition_image.shape)
+                    # print(condition_image.shape, control_model_input.shape, controlnet_prompt_embeds.shape, t, cond_scale, guess_mode)
+                    # print(controlnet_added_cond_kwargs["text_embeds"].shape, controlnet_added_cond_kwargs["time_ids"].shape)
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=condition_image,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+    
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infered ControlNet only for the conditional batch.
+                        # To apply the output of ControlNet to both the unconditional and conditional batches,
+                        # add 0 to the unconditional batch to keep it unchanged.
+                        down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                        mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+    
+                    # predict the noise residual
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
                         encoder_hidden_states=prompt_embeds,
                         cross_attention_kwargs=cross_attention_kwargs,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
                         added_cond_kwargs=added_cond_kwargs,
                         return_dict=False,
                     )[0]
@@ -1060,14 +1335,10 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
                         noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
     
-                    if do_classifier_free_guidance and guidance_rescale > 0.0:
-                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                        noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
-    
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-
-                    # AttnFusion
+                    
+                    # Attention Guidance
                     if attn_guidance_scale > 0:
                         latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])
     
@@ -1077,26 +1348,26 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
                         if callback is not None and i % callback_steps == 0:
                             step_idx = i // getattr(self.scheduler, "order", 1)
                             callback(step_idx, t, latents)
-            del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond
+            del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond, down_block_res_samples, mid_block_res_sample
         else:
             print("### Encoding Real Image ###")
             latents = self.vae.encode(image_lr)
             latents = latents.latent_dist.sample() * self.vae.config.scaling_factor
-                        
+        
         anchor_mean = latents.mean()
         anchor_std = latents.std()
         if self.lowvram:
             latents = latents.cpu()
-            torch.cuda.empty_cache()
+            self.empty_cache()
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16
             needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
-            
+
             if self.lowvram:
                 needs_upcasting = False # use madebyollin/sdxl-vae-fp16-fix in lowvram mode!
                 self.unet.cpu()
                 self.vae.to(device)
-
+            
             if needs_upcasting:
                 self.upcast_vae()
                 latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
@@ -1108,7 +1379,9 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
-    
+        
+        time_cost['Initialization'] = time.time() - time_start
+        
         img = self.image_processor.postprocess(image, output_type=output_type)
         if show_image:
             plt.figure(figsize=(10, 10))
@@ -1116,178 +1389,277 @@ class APLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin,
             plt.axis('off')  # Turn off axis numbers and ticks
             plt.show()
         output_images.append(img[0])
-        # return output_images  # to be deleted
-    ###################################################### Resample ######################################################
-        # note: images are obtained by self.vae.decoder, thus -1 <= image <= 1.
-        if not height == width == 1024:
-            del img
-            num_resample_times = len(init_rates)
-            areas = torch.linspace(height * width, h_resized * w_resized, num_resample_times + 1).flip(dims=[0])[1:]
-            h_resized = (areas * aspect_rate) ** 0.5
-            w_resized = (areas / aspect_rate) ** 0.5
-            h_resized = (h_resized // self.vae_scale_factor * self.vae_scale_factor).type(torch.int)
-            w_resized = (w_resized // self.vae_scale_factor * self.vae_scale_factor).type(torch.int)
-            print(f'### total resample times: {num_resample_times} ###')
-            for resample_index in range(num_resample_times):
-                print(f'### resample times: {resample_index + 1} ###')
-                current_h, current_w, current_area, init_rate = (h_resized[resample_index].item(),
-                                                                 w_resized[resample_index].item(),
-                                                                 areas[resample_index].item(),
-                                                                 init_rates[resample_index])
-                del latents
-                dtype = self.vae.dtype
-                add_time_ids = torch.tensor([[current_h, current_w, 0, 0, current_h, current_w],
-                                            [current_h, current_w, 0, 0, current_h, current_w]],
-                                            device=device, dtype=dtype)
-                # upsample in RGB space
-                self.vae.type(torch.float32)
-                image = image.type(torch.float32)
-                image = F.interpolate(image, size=(current_h, current_w), mode='bicubic').clip(-1, 1)
-                # # display interpolated image
-                # if show_image:
-                #     img = self.image_processor.postprocess(image, output_type=output_type)
-                #     plt.figure(figsize=(10, 10))
-                #     plt.imshow(img[0])
-                #     plt.axis('off')  # Turn off axis numbers and ticks
-                #     plt.show()
-                #     output_images.append(img[0])
-                #     del img
-                # encode back to VAE space
-                if current_area >= encoder_limit_area:
-                    if models_to_cpu:
-                        self.unet.to('cpu')
-                        self.text_encoder.to('cpu')
-                        self.text_encoder_2.to('cpu')
-                        torch.cuda.empty_cache()
-                    if multi_encoder:
-                        latents = self.vae.tiled_encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
-                    else:
-                        latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
-                    del image
-                    latents = latents.type(dtype)
-                    self.vae.type(dtype)
-                    if models_to_cpu:
-                        self.unet.to(device)
-                        self.text_encoder.to(device)
-                        self.text_encoder_2.to(device)
+        
+    ####################################################### Progressive Resample Stage #####################################################
+        if height * width <= 1024:
+            del latents, condition_image, image, img
+            if test_timecost:
+                print(time_cost)
+            # Offload all models
+            self.maybe_free_model_hooks()
+            return output_images
+        
+        # note: images are obtained by self.vae.decoder, the value is approximately in [-1, 1]
+        self.text_encoder.cpu()
+        self.text_encoder_2.cpu()
+        del img
+        # calculate sub-stage sizes
+        num_resample_times = len(init_rates)
+        if num_resample_times == 0:  # in this case, only interpolation is performed.
+            h_resized, w_resized = height, width
+            h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
+            image = F.interpolate(image, (h_resized, w_resized), mode="bicubic", align_corners=False).clamp(-1, 1)
+        else:
+            h_resized = torch.linspace(h_resized, height, num_resample_times + 1)[1:]
+            w_resized = torch.linspace(w_resized, width, num_resample_times + 1)[1:]
+            h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
+            h_resized, w_resized = h_resized.int().tolist(), w_resized.int().tolist()
+            areas = [h * w for h, w in zip(h_resized, w_resized)]
+        # resampling arguments resetting
+        dtype = self.vae.dtype
+        # reset scheduler timesteps
+        self.scheduler.set_timesteps(num_resample_timesteps, device=device)
+        timesteps = self.scheduler.timesteps
+        # reset tensor stating which controlnets to keep
+        controlnet_keep = []
+        for i in range(len(timesteps)):
+            keeps = [
+                1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
+                for s, e in zip(control_guidance_start, control_guidance_end)
+            ]
+            controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
+        ####################################################### progressive resample loop #######################################################
+        print(f'### total resample times: {num_resample_times} ###')
+        for resample_index in range(num_resample_times):
+            print(f'### resample times: {resample_index + 1}/{num_resample_times} ###')
+            time_start = time.time()
+            current_h, current_w, current_area, init_rate = (h_resized[resample_index],
+                                                             w_resized[resample_index],
+                                                             areas[resample_index],
+                                                             init_rates[resample_index])
+            del latents
+            # reset original and target sizes
+            original_size = (current_h, current_w)
+            target_size = (current_h, current_w)
+            # reset add_time_ids
+            add_time_ids = self._get_add_time_ids(
+                original_size, crops_coords_top_left, target_size, dtype=prompt_embeds.dtype
+            )
+            if negative_original_size is not None and negative_target_size is not None:
+                negative_add_time_ids = self._get_add_time_ids(
+                    negative_original_size,
+                    negative_crops_coords_top_left,
+                    negative_target_size,
+                    dtype=prompt_embeds.dtype,
+                )
+            else:
+                negative_add_time_ids = add_time_ids
+            if do_classifier_free_guidance:
+                add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+            add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+            # reset warmup steps
+            num_warmup_steps = len(timesteps) - num_resample_timesteps * self.scheduler.order
+            num_warmup_steps = int(round(num_warmup_steps))
+            # get resampled_timesteps
+            resampled_timesteps = timesteps[int(num_resample_timesteps * init_rate):]
+            resampled_timesteps = resampled_timesteps.round().int()
+            # upsample in pixel space
+            self.empty_cache()
+            self.vae.type(torch.float32)
+            image = image.type(torch.float32)
+            image = F.interpolate(image, size=(current_h, current_w), mode='bicubic').clamp(-1, 1)
+            condition_image = F.interpolate(condition_image, size=(current_h, current_w), mode='bicubic')
+            # encode back to VAE latent space
+            if current_area >= encoder_limit_area:
+                if models_to_cpu:
+                    self.unet.to('cpu')
+                    self.controlnet.to('cpu')
+                    self.empty_cache()
+                if multi_encoder:
+                    print('using tiled encoder...')
+                    latents = self.vae.tiled_encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
                 else:
+                    print('using normal encoder...')
+                    latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
+                del image
+                latents = latents.type(dtype)
+                self.vae.type(dtype)
+                if models_to_cpu:
+                    self.unet.to(device)
+                    self.controlnet.to(device)
+                    self.vae.to("cpu")
+            else:
+                print('using normal encoder...')
+                if models_to_cpu:
+                    self.unet.to('cpu')
+                    self.controlnet.to('cpu')
+                    self.empty_cache()
+                latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
+                del image
+                latents = latents.type(dtype)
+                self.vae.type(dtype)
+                if models_to_cpu:
+                    self.unet.to(device)
+                    self.controlnet.to(device)
+                    self.vae.to("cpu")
+            # add noise
+            noise = torch.randn_like(latents)
+            latents = self.scheduler.add_noise(latents, noise, resampled_timesteps[0].unsqueeze(0))
+            del noise
+            self.empty_cache()
+            ######################################################## denoising loop ########################################################
+            with self.progress_bar(total=len(resampled_timesteps)) as progress_bar:
+                for i, t in enumerate(resampled_timesteps):
+                    i = i + num_resample_timesteps - len(resampled_timesteps)
+                    
+                    if self.lowvram:
+                        self.vae.cpu()
+                        self.unet.to(device)
+                    
+                    latents_for_view = latents
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = (
+                        latents.repeat_interleave(2, dim=0)
+                        if do_classifier_free_guidance
+                        else latents
+                    )
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    
+                    added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    
+                    # controlnet(s) inference
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infer ControlNet only for the conditional batch.
+                        control_model_input = latents
+                        control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+                        controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                        controlnet_added_cond_kwargs = {
+                            "text_embeds": add_text_embeds.chunk(2)[1],
+                            "time_ids": add_time_ids.chunk(2)[1],
+                        }
+                    else:
+                        control_model_input = latent_model_input
+                        controlnet_prompt_embeds = prompt_embeds
+                        controlnet_added_cond_kwargs = added_cond_kwargs
+                    
+                    if isinstance(controlnet_keep[i], list):
+                        cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                    else:
+                        controlnet_cond_scale = controlnet_conditioning_scale
+                        if isinstance(controlnet_cond_scale, list):
+                            controlnet_cond_scale = controlnet_cond_scale[0]
+                        cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                    
+                    # print(latent_model_input.shape, control_model_input.shape, condition_image.shape)
+                    # print(condition_image.shape, control_model_input.shape, controlnet_prompt_embeds.shape, t, cond_scale, guess_mode)
+                    # print(controlnet_added_cond_kwargs["text_embeds"].shape, controlnet_added_cond_kwargs["time_ids"].shape)
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=condition_image,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+                    
+                    if guess_mode and do_classifier_free_guidance:
+                        # Infered ControlNet only for the conditional batch.
+                        # To apply the output of ControlNet to both the unconditional and conditional batches,
+                        # add 0 to the unconditional batch to keep it unchanged.
+                        down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                        mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+                    
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
+                    
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    
+                    # compute the previous noisy sample x_t -> x_t-1
+                    if isinstance(self.scheduler, EulerDiscreteScheduler):
+                        self.scheduler._init_step_index(t)
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    
+                    # Attention Guidance
+                    # if attn_guidance_scale > 0:
+                    #     latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])
+                    
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and i % callback_steps == 0:
+                            step_idx = i // getattr(self.scheduler, "order", 1)
+                            callback(step_idx, t, latents)
+            del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond, down_block_res_samples, mid_block_res_sample
+            latents = (latents - latents.mean()) / latents.std() * anchor_std + anchor_mean
+            
+            if self.lowvram:
+                latents = latents.cpu()
+                self.empty_cache()
+            if not output_type == "latent":
+                # make sure the VAE is in float32 mode, as it overflows in float16
+                needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
+                if self.lowvram:
+                    needs_upcasting = False # use madebyollin/sdxl-vae-fp16-fix in lowvram mode!
+                    self.unet.cpu()
+                    self.vae.to(device)
+                if needs_upcasting:
+                    self.upcast_vae()
+                    latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
+                # if self.lowvram and multi_decoder:
+                #     current_width_height = self.unet.config.sample_size * self.vae_scale_factor
+                #     image = self.tiled_decode(latents, current_width_height, current_width_height)
+                # else:
+                #     image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                if current_area > decoder_limit_area and multi_decoder:
                     if models_to_cpu:
                         self.unet.to('cpu')
-                        self.text_encoder.to('cpu')
-                        self.text_encoder_2.to('cpu')
-                        torch.cuda.empty_cache()
-                    latents = self.vae.encode(image, return_dict=False)[0].mean * self.vae.config.scaling_factor
-                    del image
-                    latents = latents.type(dtype)
-                    self.vae.type(dtype)
+                        self.controlnet.to('cpu')
+                        self.vae.to(device)
+                        self.empty_cache()
+                    print('using tiled decoder...')
+                    image = self.tiled_decode(latents, current_h, current_w)
                     if models_to_cpu:
                         self.unet.to(device)
-                        self.text_encoder.to(device)
-                        self.text_encoder_2.to(device)
-                # resample timesteps & Prepare timesteps
-                self.scheduler.set_timesteps(num_resample_timesteps, device=device)
-                timesteps = self.scheduler.timesteps
-                # Denoising loop
-                num_warmup_steps = max(len(timesteps) - num_resample_timesteps * self.scheduler.order, 0)
-                # Apply denoising_end
-                if denoising_end is not None and isinstance(denoising_end, float) and denoising_end > 0 and denoising_end < 1:
-                    discrete_timestep_cutoff = int(
-                        round(
-                            self.scheduler.config.num_train_timesteps
-                            - (denoising_end * self.scheduler.config.num_train_timesteps)
-                        )
-                    )
-                    num_resample_timesteps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
-                    timesteps = timesteps[:num_resample_timesteps]
-                resampled_timesteps = timesteps[int(num_resample_timesteps * init_rate):]
-                # add noise
-                noise = torch.randn_like(latents)
-                latents = self.scheduler.add_noise(latents, noise, resampled_timesteps[0][None, ...])
-                del noise
-                # resample loop
-                # print("### Phase 2 Denoising ###")
-                with self.progress_bar(total=len(resampled_timesteps)) as progress_bar:
-                    for i, t in enumerate(resampled_timesteps):
-                        if self.lowvram:
-                            self.vae.cpu()
-                            self.unet.to(device)
-                        # expand the latents if we are doing classifier free guidance
-                        latent_model_input = (
-                            latents.repeat_interleave(2, dim=0)
-                            if do_classifier_free_guidance
-                            else latents
-                        )
-                        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                        # predict the noise residual
-                        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                        noise_pred = self.unet(
-                            latent_model_input,
-                            t,
-                            encoder_hidden_states=prompt_embeds,
-                            cross_attention_kwargs=cross_attention_kwargs,
-                            added_cond_kwargs=added_cond_kwargs,
-                            return_dict=False,
-                        )[0]
-                        # perform guidance
-                        if do_classifier_free_guidance:
-                            noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
-                            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                        if do_classifier_free_guidance and guidance_rescale > 0.0:
-                            # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                            noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
-                        # compute the previous noisy sample x_t -> x_t-1
-                        self.scheduler._init_step_index(t)
-                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                        # AttnFusion
-                        # latents = attn_guidance(num_denoising_steps - 1 - i, latents, alphas_cumprod_sample[i])
-                        # call the callback, if provided
-                        if i == len(resampled_timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                            progress_bar.update()
-                            if callback is not None and i % callback_steps == 0:
-                                step_idx = i // getattr(self.scheduler, "order", 1)
-                                callback(step_idx, t, latents)
-                del latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond
-                if self.lowvram:
-                    latents = latents.cpu()
-                    torch.cuda.empty_cache()
-                if not output_type == "latent":
-                    # make sure the VAE is in float32 mode, as it overflows in float16
-                    needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
-                    if self.lowvram:
-                        needs_upcasting = False # use madebyollin/sdxl-vae-fp16-fix in lowvram mode!
-                        self.unet.cpu()
-                        self.vae.to(device)
-                    if needs_upcasting:
-                        self.upcast_vae()
-                        latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
-                    # if self.lowvram and multi_decoder:
-                    #     current_width_height = self.unet.config.sample_size * self.vae_scale_factor
-                    #     image = self.tiled_decode(latents, current_width_height, current_width_height)
-                    if current_area > decoder_limit_area and multi_decoder:
-                        if models_to_cpu:
-                            self.unet.to('cpu')
-                            self.text_encoder.to('cpu')
-                            self.text_encoder_2.to('cpu')
-                            torch.cuda.empty_cache()
-                        image = self.tiled_decode(latents, current_h, current_w)
-                        if models_to_cpu:
-                            self.unet.to(device)
-                            self.text_encoder.to(device)
-                            self.text_encoder_2.to(device)
-                    else:
-                        image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                    # cast back to fp16 if needed
-                    if needs_upcasting:
-                        self.vae.to(dtype=torch.float16)
+                        self.controlnet.to(device)
+                else:
+                    print('using normal decoder...')
+                    self.empty_cache()
+                    image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                # cast back to fp16 if needed
+                if needs_upcasting:
+                    self.vae.to(dtype=torch.float16)
+            time_cost[f"sub-stage_{resample_index + 1}"] = time.time() - time_start
             image = self.image_processor.postprocess(image, output_type=output_type)
-            if show_image:
-                plt.figure(figsize=(10, 10))
-                plt.imshow(image[0])
-                plt.axis('off')  # Turn off axis numbers and ticks
-                plt.show()
+            # if show_image:
+            #     plt.figure(figsize=(10, 10))
+            #     plt.imshow(img[0])
+            #     plt.axis('off')  # Turn off axis numbers and ticks
+            #     plt.show()
             output_images.append(image[0])
-            del latents, image
-                        
+            del image
+        
+        del latents, condition_image
+        self.text_encoder.to(device)
+        self.text_encoder_2.to(device)
+        self.empty_cache()
+        
+        if test_timecost:
+            print(time_cost)
+        
         # Offload all models
         self.maybe_free_model_hooks()
 

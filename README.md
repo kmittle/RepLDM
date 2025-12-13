@@ -43,7 +43,7 @@
 ```
 conda create -n demofusion python=3.9
 conda activate demofusion
-pip install -r requirements.txt
+pip install -e .
 ```
 
 

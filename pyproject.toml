@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "AttentionGuidance"
+version = "0.1.0"
+description = "The naive implementation of Attention Guidance"
+requires-python = ">=3.9"
+dependencies = [
+    "diffusers~=0.21.4",
+    "torch~=2.1.0",
+    "scipy~=1.11.3",
+    "omegaconf~=2.3.0",
+    "accelerate~=0.23.0",
+    "transformers~=4.34.0",
+    "tqdm",
+    "einops",
+    "matplotlib",
+    "gradio",
+    "gradio_imageslider",
+]
+
+[tool.setuptools]
+packages = [
+    "AttentionGuidance",
+    "InferencePipelines",
+]
