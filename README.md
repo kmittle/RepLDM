@@ -41,8 +41,8 @@
 
 ### Install Environment
 ```
-conda create -n demofusion python=3.9
-conda activate demofusion
+conda create -n repldm python=3.9
+conda activate repldm
 pip install -e .
 ```
 
