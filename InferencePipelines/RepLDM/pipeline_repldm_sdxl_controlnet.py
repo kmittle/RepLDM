@@ -850,7 +850,7 @@ class RepLDMSDXLControlNetPipeline(
         show_image: bool = False,
         lowvram: bool = False,
         test_timecost: bool = False,
-        encoder_limit_area: int = 4096**2,
+        encoder_limit_area: int = 3072**2,
         decoder_limit_area: int = 2048**2,
         models_to_cpu: bool = False,
         multi_encoder: bool = False,
