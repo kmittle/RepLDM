@@ -126,9 +126,10 @@ The implementation in the `main branch` includes some modifications based on the
 
 ## 😉 Citation
 ```
-@inproceedings{caorepldm,
-  title={RepLDM: Reprogramming Pretrained Latent Diffusion Models for High-Quality, High-Efficiency, High-Resolution Image Generation},
+@article{cao2024ap,
+  title={Ap-ldm: Attentive and progressive latent diffusion model for training-free high-resolution image generation},
   author={Cao, Boyuan and Ye, Jiaxin and Wei, Yujie and Shan, Hongming},
-  booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems}
+  journal={arXiv preprint arXiv:2410.06055},
+  year={2024}
 }
 ```
