@@ -12,7 +12,7 @@
 <!-- here are urls -->
 <div align="center">
     <!-- arxiv -->
-    <a href="https://openreview.net/pdf?id=QwXpn5IPKk"><img src="https://img.shields.io/badge/arXiv-2410.06055-B31B1B.svg" alt="arXiv Paper"></a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <a href="https://arxiv.org/abs/2410.06055"><img src="https://img.shields.io/badge/arXiv-2410.06055-B31B1B.svg" alt="arXiv Paper"></a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
     <!-- project page -->
     <a href='https://kmittle.github.io/project_pages/RepLDM/'><img src='https://img.shields.io/badge/Project-Page-Green'></a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
     <!-- hugging face -->
