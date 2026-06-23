@@ -782,7 +782,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         attn_guidance_density: Union[str, tuple, list] = 'all',
         attn_guidance_decay: Optional[tuple] = None,
         power_calibrate: int = 0,
-        attn_guidance_filter=None,
+        attn_guidance_filter: Optional[Union[tuple, list]] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1215,7 +1215,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         num_resample_times = len(init_rates)
         if num_resample_times == 0:  # in this case, only interpolation is performed.
             h_resized, w_resized = height, width
-            h_resized, w_resized = (h_resized / 8).round() * 8, (w_resized / 8).round() * 8
+            h_resized, w_resized = round(h_resized / 8) * 8, round(w_resized / 8) * 8
             image = F.interpolate(image, (h_resized, w_resized), mode="bicubic", align_corners=False).clamp(-1, 1)
         else:
             h_resized = torch.linspace(h_resized, height, num_resample_times + 1)[1:]
