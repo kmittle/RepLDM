@@ -1391,7 +1391,7 @@ class RepLDMSDXLControlNetPipeline(
         output_images.append(img[0])
         
     ####################################################### Progressive Resample Stage #####################################################
-        if height * width <= 1024:
+        if height * width <= 1024**2:
             del latents, condition_image, image, img
             if test_timecost:
                 print(time_cost)
@@ -1646,11 +1646,6 @@ class RepLDMSDXLControlNetPipeline(
                     self.vae.to(dtype=torch.float16)
             time_cost[f"sub-stage_{resample_index + 1}"] = time.time() - time_start
             image = self.image_processor.postprocess(image, output_type=output_type)
-            # if show_image:
-            #     plt.figure(figsize=(10, 10))
-            #     plt.imshow(img[0])
-            #     plt.axis('off')  # Turn off axis numbers and ticks
-            #     plt.show()
             output_images.append(image[0])
             del image
         
