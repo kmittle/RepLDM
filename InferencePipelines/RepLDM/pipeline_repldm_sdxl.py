@@ -19,7 +19,6 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 import random
 import warnings
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
@@ -48,7 +47,6 @@ from diffusers.utils import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipelineOutput
 
 from AttentionGuidance import AttnGuidance
 import gc
