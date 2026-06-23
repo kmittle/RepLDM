@@ -1251,7 +1251,7 @@ class RepLDMSDXLControlNetPipeline(
             self.text_encoder.cpu()
             self.text_encoder_2.cpu()
         
-        if image_lr == None:
+        if image_lr is None:
             print("### Phase 1 Denoising ###")
             time_start = time.time()
             with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1348,7 +1348,9 @@ class RepLDMSDXLControlNetPipeline(
                         if callback is not None and i % callback_steps == 0:
                             step_idx = i // getattr(self.scheduler, "order", 1)
                             callback(step_idx, t, latents)
-            del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond, down_block_res_samples, mid_block_res_sample
+            del latents_for_view, latent_model_input, noise_pred, down_block_res_samples, mid_block_res_sample
+            if do_classifier_free_guidance:
+                del noise_pred_text, noise_pred_uncond
         else:
             print("### Encoding Real Image ###")
             latents = self.vae.encode(image_lr)
@@ -1603,7 +1605,9 @@ class RepLDMSDXLControlNetPipeline(
                         if callback is not None and i % callback_steps == 0:
                             step_idx = i // getattr(self.scheduler, "order", 1)
                             callback(step_idx, t, latents)
-            del latents_for_view, latent_model_input, noise_pred, noise_pred_text, noise_pred_uncond, down_block_res_samples, mid_block_res_sample
+            del latents_for_view, latent_model_input, noise_pred, down_block_res_samples, mid_block_res_sample
+            if do_classifier_free_guidance:
+                del noise_pred_text, noise_pred_uncond
             latents = (latents - latents.mean()) / latents.std() * anchor_std + anchor_mean
             
             if self.lowvram:
