@@ -15,7 +15,7 @@ from torch.multiprocessing import Pool
 from InferencePipelines import RepLDMSDXLPipeline
 
 
-@ torch.no_grad()
+@torch.no_grad()
 def worker_process(config, save_dir, data, generator_seeds, device, task_queue):
     # define model
     torch.cuda.set_device(device)
