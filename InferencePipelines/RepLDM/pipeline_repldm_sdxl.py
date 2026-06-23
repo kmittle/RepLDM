@@ -784,7 +784,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         attn_guidance_density: str = 'all',
         attn_guidance_decay: tuple = None,
         power_calibrate: int = 0,
-        attn_guidance_filter: str = None,
+        attn_guidance_filter=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -984,7 +984,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             self.unet.cpu()
             # self.text_encoder.to(device)
             # self.text_encoder_2.to(device)
-            image_lr.cpu()
+            if image_lr is not None:
+                image_lr.cpu()
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
