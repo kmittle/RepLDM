@@ -912,7 +912,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 Determine whether to show intermediate results during generation.
             lowvram (`bool`, defaults to False):
                 Try to fit in 8 Gb of VRAM, with xformers installed.
-            encoder_limit_area (`int`, defaults to 4096^2):
+            encoder_limit_area (`int`, defaults to 3072^2):
                 Use `tilde_encoder` when exceeding this resolution.
             decoder_limit_area (`int`, defaults to 2048^2):
                 Use `tilde_decoder` when exceeding this resolution.
