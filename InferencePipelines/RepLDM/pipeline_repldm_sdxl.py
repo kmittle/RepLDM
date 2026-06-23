@@ -781,8 +781,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         init_rates: list = [0.8],
         attn_type: str = 'vanilla',
         attn_guidance_scale: float = 0.001,
-        attn_guidance_density: str = 'all',
-        attn_guidance_decay: tuple = None,
+        attn_guidance_density: Union[str, tuple, list] = 'all',
+        attn_guidance_decay: Optional[tuple] = None,
         power_calibrate: int = 0,
         attn_guidance_filter=None,
     ):
@@ -927,10 +927,10 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             The parameters of Attentive Guidance:
                     attn_type: str = 'vanilla',
                     attn_guidance_scale: float = 0.001,
-                    attn_guidance_density: str = 'all',
-                    attn_guidance_decay: tuple = None,
+                    attn_guidance_density: Union[str, tuple, list] = 'all',
+                    attn_guidance_decay: Optional[tuple] = None,
                     power_calibrate: int = 0,
-                    attn_guidance_filter: str = None,
+                    attn_guidance_filter=None,
                 For a detailed explanation of these parameters, please refer to the `attn_guidance.py` module.
         
         Examples:
