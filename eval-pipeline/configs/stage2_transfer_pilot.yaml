@@ -1,0 +1,25 @@
+# Frozen before any 2048^2 scoring. This is a target-domain development audit,
+# not a prompt-disjoint confirmation set and not a new scale search.
+actions:
+  - id: no_ag
+    type: none
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+
+  - id: raw_0.001
+    type: scalar
+    scale: 0.001
+
+  - id: moment_tangent_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: moment_tangent
+
+  - id: trajectory_cone_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: trajectory_cone_tangent

@@ -1,14 +1,14 @@
-"""Stage-1 generation stage of the RepLDM eval pipeline (env: `repldm`).
+"""Generation stage of the RepLDM eval pipeline (env: `repldm`).
 
-Generates a Stage-1 (1024^2) image for every (prompt x seed x guidance action)
-combination and writes a lossless PNG + a per-image sidecar JSON manifest
-recording the *full* guidance config. Scoring is a separate stage (score.py,
-env `repldm_eval`) that reads these PNGs + manifests — see eval-pipeline/README.md.
+Generates an image for every (prompt x seed x guidance action) combination and
+writes a lossless PNG + a per-image sidecar JSON manifest recording the *full*
+guidance config. Scoring is a separate stage (score.py, env `repldm_eval`) that
+reads these PNGs + manifests — see eval-pipeline/README.md.
 
 Design notes (grounded in the actual pipeline, EXPERIMENT_PLAN §4/§13):
-  * Stage-1-only: height=width=1024 -> `height*width <= 1024**2` so Stage 2 is
-    skipped (the pipeline returns just the Stage-1 image). Guidance acts
-    only in Stage 1, so this is the regime we evaluate.
+  * Stage 1 remains the default. High-resolution Stage 2 requires the explicit
+    `--stage2` opt-in and uses task-seeded resampling noise for paired actions.
+    Attention Guidance acts only in Stage 1 in both regimes.
   * `--scales` preserves the constant-scalar sweep. `--actions` accepts a YAML
     grid containing no-AG, legacy schedule, scalar, and three-band actions.
   * Attention Guidance schedules are indexed by t_index and are reentrant, so
@@ -259,6 +259,36 @@ def validate_model_cache(model_name: str, cache_dir: str) -> None:
         )
 
 
+def generation_stage_settings(
+    stage2_enabled: bool,
+    resolution: int,
+    low_vram: bool,
+) -> dict:
+    """Validate the requested stage and return recorded pipeline settings."""
+    if resolution <= 0 or resolution % 8:
+        raise ValueError("resolution must be a positive multiple of 8")
+    if stage2_enabled and resolution <= 1024:
+        raise ValueError("--stage2 requires --resolution greater than 1024")
+    if not stage2_enabled and resolution > 1024:
+        raise ValueError("resolution above 1024 requires the explicit --stage2 opt-in")
+
+    init_rates = [0.8]
+    if stage2_enabled and resolution >= 4096:
+        init_rates = [0.9, 0.8]
+    return {
+        "stage2_enabled": stage2_enabled,
+        "stage_name": (
+            f"stage2_{resolution}" if stage2_enabled else f"stage1_{resolution}"
+        ),
+        "models_to_cpu": bool(low_vram or stage2_enabled),
+        "multi_encoder": bool(stage2_enabled),
+        "multi_decoder": bool(stage2_enabled and resolution > 2048),
+        "num_resample_timesteps": 50,
+        "init_rates": init_rates,
+        "stage2_noise_source": "task_generator" if stage2_enabled else None,
+    }
+
+
 def guidance_runtime(action: dict, num_inference_steps: int):
     """Translate a validated action record into pipeline guidance arguments."""
     action_type = action["type"]
@@ -326,8 +356,11 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 num_inference_steps=cfg["num_inference_steps"],
                 guidance_scale=cfg["guidance_scale"],
                 show_image=False,
-                multi_decoder=False, multi_encoder=False,
-                models_to_cpu=cfg["low_vram"],
+                multi_decoder=cfg["multi_decoder"],
+                multi_encoder=cfg["multi_encoder"],
+                models_to_cpu=cfg["models_to_cpu"],
+                num_resample_timesteps=cfg["num_resample_timesteps"],
+                init_rates=cfg["init_rates"],
                 attn_type="vanilla",
                 attn_guidance_scale=attn_scale,
                 attn_guidance_density=attn_density,
@@ -348,7 +381,14 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "attn_guidance_density": attn_density,
                 "attn_guidance_decay": attn_decay,
                 "frequency_band_cutoffs": cfg["frequency_band_cutoffs"],
-                "stage": "stage1_1024",
+                "stage": cfg["stage_name"],
+                "stage2_enabled": cfg["stage2_enabled"],
+                "models_to_cpu": cfg["models_to_cpu"],
+                "multi_encoder": cfg["multi_encoder"],
+                "multi_decoder": cfg["multi_decoder"],
+                "num_resample_timesteps": cfg["num_resample_timesteps"],
+                "init_rates": cfg["init_rates"],
+                "stage2_noise_source": cfg["stage2_noise_source"],
                 "model_name": cfg["model_name"],
                 "git_commit": commit,
                 "device": device,
@@ -394,6 +434,11 @@ def main():
                     help="YAML action grid; mutually exclusive with --scales")
     ap.add_argument("--seeds", default="0,42,123", help="comma-separated seeds")
     ap.add_argument("--resolution", type=int, default=1024)
+    ap.add_argument(
+        "--stage2",
+        action="store_true",
+        help="explicitly enable RepLDM high-resolution resampling for resolution > 1024",
+    )
     ap.add_argument("--num_inference_steps", type=int, default=50)
     ap.add_argument("--guidance_scale", type=float, default=7.5)
     ap.add_argument("--power_calibrate", type=int, default=0)
@@ -404,7 +449,12 @@ def main():
                     help="offload models to CPU between phases (models_to_cpu=True); use on busy GPUs")
     args = ap.parse_args()
 
-    assert args.resolution <= 1024, "eval is Stage-1-only; keep resolution <= 1024 so Stage 2 is skipped"
+    try:
+        stage_settings = generation_stage_settings(
+            args.stage2, args.resolution, args.low_vram
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
     seeds = [int(s) for s in args.seeds.split(",") if s != ""]
     if len(seeds) != len(set(seeds)):
         ap.error("--seeds must not contain duplicates")
@@ -438,6 +488,7 @@ def main():
         "cache_dir": args.cache_dir, "model_name": args.model_name, "low_vram": args.low_vram,
         "frequency_band_cutoffs": band_cutoffs,
         "git_commit": git_commit(),
+        **stage_settings,
     }
 
     tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)

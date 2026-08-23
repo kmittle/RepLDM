@@ -1,0 +1,14 @@
+# Correctness-only 2048^2 smoke. The two no-AG actions must be PNG-identical;
+# the expert action must be distinct. Do not use this run as efficacy evidence.
+actions:
+  - id: no_ag
+    type: none
+
+  - id: no_ag_repeat
+    type: none
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]

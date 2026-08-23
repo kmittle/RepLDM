@@ -9,9 +9,10 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 | S0 | Constant scalar TFSA residual | Invalidated | Scale increases saturation and degrades TOPIQ-NR; low scale converges to no-AG. |
 | S1 | Low/mid/high spectral residual gains | Invalidated | Best action, `mid_only_0.004`, is non-superior to no-AG; seed-CV finds no adaptive headroom. |
 | S2 | Moment-Tangent Attention Guidance (MTAG) | Invalidated | It removes moment drift but does not improve quality or preference. |
-| S3 | Trajectory-Cone Moment Guidance (TCMG) | Development grid frozen | Cone is active and non-catastrophic at low scales; no efficacy claim yet. |
+| S3 | Trajectory-Cone Moment Guidance (TCMG) | Invalidated | Cone geometry is active but does not improve quality, preference, or adaptive headroom. |
+| S4 | 2048² Stage-2 target-domain audit | Registered | Test whether the 1024² proxy masked high-resolution headroom before proposing another operator. |
 
-S0-S2 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
+S0-S3 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
 ## S2 Mechanistic Hypothesis
 
@@ -95,3 +96,31 @@ Run: `outputs/exp_trajectory_cone/smoke_2prompt_1seed_v1`, produced by commit `0
 Descriptive two-prompt means are uniformly negative on TOPIQ: TCMG `0.001/0.002/0.004` gives `-0.006597/-0.007909/-0.010637`; the energy-matched `0.001/0.002` gives `-0.010521/-0.008155`. TCMG `0.002` has HPSv2 `+0.005859`, but its two-prompt interval is uninformative and ImageReward is `-0.065652`. The fixed montage shows state-dependent composition changes without a consistent structural repair.
 
 TCMG `0.008` is removed because one prompt exceeds the `+0.01` clipping limit; energy-matched `0.004` is removed for the same reason. The contiguous non-catastrophic ranges are TCMG `0.001–0.004` and energy-matched TCMG `0.001–0.002`. These ranges, plus no-AG, expert, raw `0.001`, and plain tangent `0.002`, are frozen in `eval-pipeline/configs/trajectory_cone_development.yaml`. The smoke does not provide efficacy evidence.
+
+## S3 Development Outcome
+
+Run: `outputs/exp_trajectory_cone/development_12prompt_3seed_v1`, 12 prompts × 3 seeds × 9 actions, produced by commit `b0aa343`. All 324 PNG/JSON pairs are valid 1024² RGB images; every prompt/seed block contains all nine actions on one GPU, and each GPU produced 81 records. All 144 no-AG/expert/raw/plain-tangent controls exactly reproduce their S2 PNG hashes.
+
+No TCMG action passes the registered gate. Relative to no-AG:
+
+| Action | Δ TOPIQ-NR [95% CI] | Δ HPSv2 | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|
+| cone 0.001 | -0.002519 [-0.005576,-0.000152] | -0.000553 | -0.000175 | -0.000812 |
+| cone 0.002 | -0.001740 [-0.005274,+0.001283] | +0.000085 | +0.000050 | -0.000385 |
+| cone 0.004 | -0.004220 [-0.010200,+0.001771] | +0.000665 | +0.000600 | -0.000368 |
+| cone-rescaled 0.001 | -0.003178 [-0.005424,-0.000840] | +0.000173 | +0.000085 | -0.000642 |
+| cone-rescaled 0.002 | -0.005843 [-0.010720,-0.000922] | +0.000346 | +0.000998 | +0.000022 |
+
+At matched scale, cone `0.002` improves TOPIQ over plain tangent `0.002` by only `+0.000528`, CI `[-0.000412,+0.001596]`; HPSv2 changes by `+0.000031`. Thus the half-space projection can remove an opposing component, but the removed component does not explain S2's efficacy failure.
+
+TOPIQ-selected seed-CV chooses no-AG globally in all three folds. Its per-prompt result is `+0.001120` vs no-AG, CI `[-0.004272,+0.006516]`, while clipping rises `+0.001262` and saturation `+0.012097`. HPS-selected per-prompt actions lose `-0.001604` to the global expert, CI `[-0.003455,-0.000190]`, and substantially worsen both guards. The complete seed-0 montage at `outputs/exp_trajectory_cone/development_12prompt_3seed_v1/figs/all_actions_seed0.png` shows state-dependent composition changes but no stable structural or text repair. S3 is closed without another scale sweep and cannot seed RL.
+
+## S4 Registered Stage-2 Audit
+
+S0-S3 evaluated the 1024² Stage-1 image, while RepLDM's central product claim concerns the final high-resolution image after resampling. S4 is a target-domain diagnostic to test that mismatch; it is not permission to bypass the failed RL gates or treat reused development prompts as confirmation data. Attention Guidance remains Stage-1-only, so S4 measures whether Stage 2 amplifies or reverses its downstream effect.
+
+Before batch generation, Stage-2 correctness must pass on `prompts/stage2_smoke.csv`, seed `0`, one GPU, and `configs/stage2_engineering_smoke.yaml`. Stage-2 noise must use the task generator rather than global RNG; normal 2048² decode must place the VAE and latents on the execution device when phase offload is enabled. The two duplicate no-AG actions must have identical final PNG hashes, the expert must differ, all outputs must be 2048² RGB, metadata must record Stage-2 settings, and a repeated run must reproduce hashes. Failure blocks the pilot.
+
+The frozen pilot is 12 prompts × 3 seeds × 5 actions = 180 final 2048² images using `configs/stage2_transfer_pilot.yaml`: no-AG, conference expert, raw `0.001`, plain tangent `0.002`, and cone `0.002`. These form a mechanistic ladder fixed from prior evidence; no high-resolution scale search is allowed. Same prompt/seed actions must share a GPU and task-seeded Stage-2 noise.
+
+TOPIQ-NR is primary. A TCMG result can reopen the method only if its gain over no-AG is at least `+0.005`, the 95% CI excludes zero, the within-metric Holm-adjusted test is below `0.05`, and direct paired comparisons also beat expert, raw, and plain tangent. HPSv2 and CLIP cosine must have lower CI bounds above `-0.003` and `-0.005`; clipped fraction and saturation mean deltas must stay below `+0.001` and `+0.005`. Report ImageReward, patch-IR, aesthetic, contrast, colorfulness, sharpness, all failed actions, and a fixed montage. A pass still requires prompt-disjoint confirmation and blinded high-resolution preference/detail crops. If no action passes, close Stage-1 Attention Guidance for this target pipeline before inventing a learned controller.

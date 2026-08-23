@@ -59,3 +59,9 @@ TOPIQ-NR is the pilot primary endpoint, but it cannot establish semantics. Confi
 ## RL Entry Condition
 
 If G1-G3 pass, start with shared-state antithetic actions around the static spectral winner and estimate local terminal-reward differences. Compare against identical rollout branches without policy learning. Do not call this estimator novel unless the BranchGRPO/DRM/SGPO distinction survives full related-work review. Stop training when any held-out preference/alignment metric or clipping guard crosses its predeclared non-inferiority bound.
+
+## High-Resolution Target-Domain Exception
+
+S0-S3 use the 1024² Stage-1 image, but the repository's main product claim concerns the final image after high-resolution resampling. One diagnostic 2048² audit is therefore allowed even though G1-G3 failed. This audit may show that Stage 2 changes an already frozen action's ranking; it may not introduce new scales, optimize on high-resolution scores, authorize RL, or count reused prompts as confirmation data.
+
+Stage-2 actions must share both the Stage-1 seed and explicitly seeded resampling noise within each prompt/seed block. A duplicate no-guidance action must reproduce the final PNG exactly before formal generation. Report final-image quality, preference, alignment and pixel guards, plus the fact that Attention Guidance remains Stage-1-only. A positive pilot must still be confirmed on unseen prompts with randomized blinded high-resolution comparisons; a negative pilot closes this exception.

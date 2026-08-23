@@ -11,7 +11,7 @@ analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 
 ## Generate
 
-Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry.
+Stage 1 at up to 1024² is the default. A resolution above 1024 requires the explicit `--stage2` opt-in, which enables the repository's high-resolution resampling path and records all phase settings. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry.
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -21,6 +21,19 @@ Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` reta
   --actions eval-pipeline/configs/frequency_action_pilot.yaml \
   --seeds 0,42,123
 ```
+
+Run the registered Stage-2 engineering smoke before any 2048² batch:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1 \
+  --prompts eval-pipeline/prompts/stage2_smoke.csv \
+  --out_dir outputs/exp_stage2_transfer/engineering_smoke_v1 \
+  --actions eval-pipeline/configs/stage2_engineering_smoke.yaml \
+  --seeds 0 --resolution 2048 --stage2
+```
+
+Stage-2 resampling noise is drawn from the per-task generator, so paired actions share both Stage-1 and Stage-2 randomness. With phase offload enabled, normal decoding explicitly restores the VAE and latent to the execution device. The engineering smoke's `no_ag` and `no_ag_repeat` final PNGs must be identical; `conference_expert` must differ.
 
 All actions for one `(prompt, seed)` block run on the same GPU. Blocks use deterministic device placement and deterministic shuffled action order. On resume, an existing sidecar's device takes precedence; an already cross-device block is rejected. A task is complete only when both PNG and JSON exist. Worker and per-task failures make the command fail after preserving completed records.
 
@@ -35,6 +48,8 @@ Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count 
 `configs/trajectory_cone_smoke.yaml` is the registered S3 range check. Its hypothesis and action-removal rule are fixed in `MODEL_ITERATIONS.md`; do not add scales after viewing its scores.
 
 `configs/trajectory_cone_development.yaml` freezes the complete non-catastrophic S3 intervals. As with S2, its 12-prompt set is development-only.
+
+`configs/stage2_engineering_smoke.yaml` is correctness-only. `configs/stage2_transfer_pilot.yaml` freezes the five-action 2048² mechanistic ladder after S3; it reuses development prompts to audit target-domain mismatch and cannot support a confirmation claim.
 
 ## Prepare Scorers
 

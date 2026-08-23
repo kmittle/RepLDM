@@ -7,6 +7,7 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,6 +23,9 @@ def load_module(name, relative_path):
 
 compare_actions = load_module("compare_actions", "eval-pipeline/compare_actions.py")
 generate = load_module("generate", "eval-pipeline/generate.py")
+from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
+    _sample_resample_noise,
+)
 analyze_adaptivity = load_module(
     "analyze_adaptivity", "eval-pipeline/analyze_adaptivity.py"
 )
@@ -88,6 +92,48 @@ class EvalPipelineTest(unittest.TestCase):
             ROOT / "eval-pipeline/configs/trajectory_cone_development.yaml", 50
         )
         self.assertEqual(len(cone_development), 9)
+
+        stage2_smoke, _ = generate.load_actions(
+            ROOT / "eval-pipeline/configs/stage2_engineering_smoke.yaml", 50
+        )
+        self.assertEqual(len(stage2_smoke), 3)
+        self.assertEqual(
+            [action["type"] for action in stage2_smoke[:2]], ["none", "none"]
+        )
+        stage2_pilot, _ = generate.load_actions(
+            ROOT / "eval-pipeline/configs/stage2_transfer_pilot.yaml", 50
+        )
+        self.assertEqual(len(stage2_pilot), 5)
+
+    def test_stage2_requires_explicit_high_resolution_opt_in(self):
+        stage1 = generate.generation_stage_settings(False, 1024, False)
+        self.assertEqual(stage1["stage_name"], "stage1_1024")
+        self.assertFalse(stage1["models_to_cpu"])
+
+        stage2 = generate.generation_stage_settings(True, 2048, False)
+        self.assertEqual(stage2["stage_name"], "stage2_2048")
+        self.assertTrue(stage2["models_to_cpu"])
+        self.assertTrue(stage2["multi_encoder"])
+        self.assertFalse(stage2["multi_decoder"])
+        self.assertEqual(stage2["init_rates"], [0.8])
+        self.assertEqual(stage2["stage2_noise_source"], "task_generator")
+
+        with self.assertRaisesRegex(ValueError, "explicit --stage2"):
+            generate.generation_stage_settings(False, 2048, False)
+        with self.assertRaisesRegex(ValueError, "greater than 1024"):
+            generate.generation_stage_settings(True, 1024, False)
+        with self.assertRaisesRegex(ValueError, "multiple of 8"):
+            generate.generation_stage_settings(True, 2050, False)
+
+    def test_stage2_resample_noise_uses_the_task_generator(self):
+        latents = torch.empty(2, 4, 8, 8)
+        first_generator = torch.Generator("cpu").manual_seed(123)
+        second_generator = torch.Generator("cpu").manual_seed(123)
+        torch.manual_seed(1)
+        first = _sample_resample_noise(latents, first_generator)
+        torch.manual_seed(999)
+        second = _sample_resample_noise(latents, second_generator)
+        self.assertTrue(torch.equal(first, second))
 
     def test_invalid_action_config_is_rejected(self):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:

@@ -106,6 +106,19 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     return noise_cfg
 
 
+def _sample_resample_noise(
+    latents: torch.Tensor,
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+) -> torch.Tensor:
+    """Sample Stage-2 noise from the task generator used for paired inference."""
+    return randn_tensor(
+        latents.shape,
+        generator=generator,
+        device=latents.device,
+        dtype=latents.dtype,
+    )
+
+
 class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin):
     """
     Pipeline for text-to-image generation using Stable Diffusion XL.
@@ -1329,7 +1342,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 timesteps = timesteps[:num_resample_timesteps]
             resampled_timesteps = timesteps[int(num_resample_timesteps * init_rate):]
             # add noise
-            noise = torch.randn_like(latents)
+            noise = _sample_resample_noise(latents, generator)
             latents = self.scheduler.add_noise(latents, noise, resampled_timesteps[0][None, ...])
             del noise
             self.empty_cache()
@@ -1396,20 +1409,21 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 # if self.lowvram and multi_decoder:
                 #     current_width_height = self.unet.config.sample_size * self.vae_scale_factor
                 #     image = self.tiled_decode(latents, current_width_height, current_width_height)
+                if models_to_cpu:
+                    self.unet.to('cpu')
+                    self.vae.to(device)
+                    latents = latents.to(device)
+                    self.empty_cache()
                 if current_area > decoder_limit_area and multi_decoder:
-                    if models_to_cpu:
-                        self.unet.to('cpu')
-                        self.vae.to(device)
-                        self.empty_cache()
                     print('using tiled decoder...')
                     image = self.tiled_decode(latents, current_h, current_w)
                     # image = self.tiled_decode(latents)
-                    if models_to_cpu:
-                        self.unet.to(device)
                 else:
                     print('using normal decoder...')
                     self.empty_cache()
                     image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                if models_to_cpu:
+                    self.unet.to(device)
                 # cast back to fp16 if needed
                 if needs_upcasting:
                     self.vae.to(dtype=torch.float16)
