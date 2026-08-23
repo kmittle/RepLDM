@@ -4,11 +4,9 @@ import torch
 from torch import fft
 
 import math
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Tuple, Union
 
-
-Scale = Union[float, Tensor]
-BandScales = Union[Sequence[Scale], Tensor]
+from .types import BandScales, RESIDUAL_MODES, ResidualMode, Scale
 
 
 class AttnGuidance:
@@ -338,6 +336,99 @@ class AttnGuidance:
             ratio * reference_norm / (update_norm + 1e-12), max=1.0
         )
         return update * multiplier.reshape((-1,) + (1,) * (update.ndim - 1)).to(update.dtype)
+
+    @staticmethod
+    def _broadcast_scale(scale: Scale, reference: Tensor) -> Tensor:
+        """Convert a scalar or per-sample scale to NCHW broadcast shape."""
+        value = torch.as_tensor(scale, device=reference.device, dtype=reference.dtype)
+        if value.ndim == 0:
+            return value
+        if value.ndim != 1 or value.shape[0] not in (1, reference.shape[0]):
+            raise ValueError("scale must be scalar or have one value per batch item")
+        return value.reshape((-1,) + (1,) * (reference.ndim - 1))
+
+    @staticmethod
+    def mean_center_residual(residual: Tensor) -> Tensor:
+        """Remove each batch/channel residual mean over spatial positions."""
+        if residual.ndim != 4:
+            raise ValueError("Attention Guidance residuals must have shape (batch, channels, height, width)")
+        work_dtype = (
+            torch.float32
+            if residual.dtype in {torch.float16, torch.bfloat16}
+            else residual.dtype
+        )
+        work = residual.to(work_dtype)
+        centered = work - work.mean(dim=(-2, -1), keepdim=True)
+        return centered.to(residual.dtype)
+
+    def apply_moment_tangent_update(
+        self,
+        latents: Tensor,
+        residual: Tensor,
+        scale: Scale,
+        *,
+        match_raw_energy: bool = False,
+    ) -> Tensor:
+        """Move along the fixed-mean/fixed-variance manifold per channel.
+
+        The centered residual is projected orthogonally to the centered latent,
+        then mapped with the sphere exponential map. The rescaled ablation gives
+        the tangent the raw residual's per-channel norm before that map.
+        """
+        if latents.shape != residual.shape or latents.ndim != 4:
+            raise ValueError("latents and residual must have the same NCHW shape")
+        work_dtype = (
+            torch.float32
+            if latents.dtype in {torch.float16, torch.bfloat16}
+            else latents.dtype
+        )
+        z = latents.to(work_dtype)
+        raw = residual.to(work_dtype)
+        mean = z.mean(dim=(-2, -1), keepdim=True)
+        centered_latents = z - mean
+        centered_residual = raw - raw.mean(dim=(-2, -1), keepdim=True)
+
+        spatial_dims = (-2, -1)
+        latent_energy = centered_latents.square().sum(dim=spatial_dims, keepdim=True)
+        radial_inner_product = (centered_residual * centered_latents).sum(
+            dim=spatial_dims, keepdim=True
+        )
+        energy_epsilon = torch.finfo(work_dtype).eps
+        tangent = centered_residual - (
+            radial_inner_product / latent_energy.clamp_min(energy_epsilon)
+        ) * centered_latents
+        tangent = torch.where(latent_energy > energy_epsilon, tangent, torch.zeros_like(tangent))
+        tangent_energy = tangent.square().sum(dim=spatial_dims, keepdim=True)
+
+        if match_raw_energy:
+            raw_energy = raw.square().sum(dim=spatial_dims, keepdim=True)
+            multiplier = torch.sqrt(
+                raw_energy / tangent_energy.clamp_min(energy_epsilon)
+            )
+            tangent = torch.where(
+                tangent_energy > energy_epsilon,
+                tangent * multiplier,
+                torch.zeros_like(tangent),
+            )
+            tangent_energy = tangent.square().sum(dim=spatial_dims, keepdim=True)
+
+        radius = torch.sqrt(latent_energy.clamp_min(0.0))
+        speed = torch.sqrt(tangent_energy.clamp_min(0.0))
+        norm_epsilon = math.sqrt(energy_epsilon)
+        direction = tangent / speed.clamp_min(norm_epsilon)
+        scale_value = self._broadcast_scale(scale, z)
+        angle = scale_value * speed / radius.clamp_min(norm_epsilon)
+        moved = (
+            torch.cos(angle) * centered_latents
+            + torch.sin(angle) * radius * direction
+            + mean
+        )
+        active = (
+            (latent_energy > energy_epsilon)
+            & (tangent_energy > energy_epsilon)
+            & (scale_value != 0)
+        )
+        return torch.where(active, moved, z).to(latents.dtype)
     
     def vanilla_attn_guidance(self, latents: Tensor, alpha_t: Optional[Tensor] = None) -> Tensor:
         b, c, h, w = latents.shape
@@ -369,6 +460,7 @@ class AttnGuidance:
         band_scales: Optional[BandScales] = None,
         reference_update: Optional[Tensor] = None,
         max_update_ratio: Optional[Scale] = None,
+        residual_mode: ResidualMode = "raw",
     ) -> Tensor:
         """
         NOTE: Here, t_index is not the same as timestep because Diffusion Models typically use a skip-step sampling
@@ -387,10 +479,26 @@ class AttnGuidance:
             of the TFSA residual. Equal gains recover scalar guidance.
         max_update_ratio: optional trust-region cap on guidance-update norm relative
             to `reference_update`, normally the scheduler's update at this step.
+        residual_mode: geometry applied to a scalar TFSA residual. `raw` is the
+            legacy additive update; `mean_centered` removes per-channel spatial
+            drift; moment-tangent modes use a fixed-moment geodesic update.
         """
+        if residual_mode not in RESIDUAL_MODES:
+            raise ValueError(f"unsupported residual_mode {residual_mode!r}")
         if scale is not None and band_scales is not None:
             raise ValueError("provide either scale or band_scales, not both")
+        if band_scales is not None and residual_mode != "raw":
+            raise ValueError("frequency-band guidance only supports residual_mode='raw'")
+        if (
+            max_update_ratio is not None
+            and residual_mode in {"moment_tangent", "moment_tangent_rescaled"}
+        ):
+            raise ValueError(
+                "max_update_ratio is not defined for moment-tangent geodesic updates"
+            )
         controlled = scale is not None or band_scales is not None
+        if not controlled and residual_mode != "raw":
+            raise ValueError("non-raw residual modes require an explicit scalar scale")
         if not controlled:
             with torch.no_grad():
                 if t_index in self.guidance_step_index:
@@ -408,11 +516,22 @@ class AttnGuidance:
                 self.filter(latents, t_index, controlled=True), alpha_t
             )
             residual = guided - latents
-            update = (
-                scale * residual
-                if band_scales is None
-                else self.apply_frequency_band_scales(residual, band_scales)
-            )
+            if residual_mode in {"moment_tangent", "moment_tangent_rescaled"}:
+                return self.apply_moment_tangent_update(
+                    latents,
+                    residual,
+                    scale,
+                    match_raw_energy=residual_mode == "moment_tangent_rescaled",
+                )
+            if residual_mode == "mean_centered":
+                centered_residual = self.mean_center_residual(residual)
+                update = self._broadcast_scale(scale, centered_residual) * centered_residual
+            else:
+                update = (
+                    scale * residual
+                    if band_scales is None
+                    else self.apply_frequency_band_scales(residual, band_scales)
+                )
             if max_update_ratio is not None:
                 if reference_update is None:
                     raise ValueError("reference_update is required with max_update_ratio")

@@ -46,7 +46,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from AttentionGuidance import ConstantGuidanceController
+from AttentionGuidance import ConstantGuidanceController, RESIDUAL_MODES
 from InferencePipelines import RepLDMSDXLPipeline
 
 DEFAULT_CACHE_DIR = "/mnt/miah204/bycao/RepLDM/pretrained_ckpts"
@@ -80,6 +80,7 @@ def build_tasks(prompts: pd.DataFrame, seeds, actions, legacy_scale_ids: bool = 
                     task["scale"] = float(action["scale"])
                 if "band_scales" in action:
                     task["band_scales"] = list(action["band_scales"])
+                task["residual_mode"] = action.get("residual_mode", "raw")
                 tasks.append(task)
     return tasks
 
@@ -199,6 +200,13 @@ def load_actions(path: str, num_inference_steps: int):
             if len(action["band_scales"]) != 3 or min(action["band_scales"]) < 0:
                 raise ValueError(f"{action_id}: band_scales must be three non-negative values")
 
+        residual_mode = str(action.get("residual_mode", "raw"))
+        if residual_mode not in RESIDUAL_MODES:
+            raise ValueError(f"{action_id}: unsupported residual_mode {residual_mode!r}")
+        if action_type != "scalar" and residual_mode != "raw":
+            raise ValueError(f"{action_id}: only scalar actions support non-raw residual modes")
+        action["residual_mode"] = residual_mode
+
         delay_steps = int(action.get("delay_steps", 0))
         if not 0 <= delay_steps < num_inference_steps:
             raise ValueError(f"{action_id}: delay_steps must be in [0, {num_inference_steps})")
@@ -211,6 +219,10 @@ def load_actions(path: str, num_inference_steps: int):
             action["max_update_ratio"] = float(action["max_update_ratio"])
             if action["max_update_ratio"] < 0:
                 raise ValueError(f"{action_id}: max_update_ratio must be non-negative")
+            if residual_mode in {"moment_tangent", "moment_tangent_rescaled"}:
+                raise ValueError(
+                    f"{action_id}: max_update_ratio is not defined for moment-tangent updates"
+                )
         normalized.append(action)
 
     cutoffs = [float(value) for value in config.get("frequency_band_cutoffs", [0.08, 0.25])]
@@ -243,6 +255,37 @@ def validate_model_cache(model_name: str, cache_dir: str) -> None:
         )
 
 
+def guidance_runtime(action: dict, num_inference_steps: int):
+    """Translate a validated action record into pipeline guidance arguments."""
+    action_type = action["type"]
+    residual_mode = action.get("residual_mode", "raw")
+    controller = None
+    attn_scale = float(action.get("scale", 0.0))
+    attn_density = "all"
+    attn_decay = None
+    if action_type == "legacy":
+        delay_steps = action.get("delay_steps", 0)
+        attn_density = tuple(
+            [1] * (num_inference_steps - delay_steps) + [0] * delay_steps
+        )
+        attn_decay = tuple(action["decay"]) if action.get("decay") else None
+    elif action_type == "frequency_bands":
+        controller = ConstantGuidanceController(
+            band_scales=tuple(action["band_scales"]),
+            max_update_ratio=action.get("max_update_ratio"),
+        )
+    elif action_type == "scalar" and (
+        residual_mode != "raw" or action.get("max_update_ratio") is not None
+    ):
+        controller = ConstantGuidanceController(
+            scale=attn_scale,
+            max_update_ratio=action.get("max_update_ratio"),
+            residual_mode=residual_mode,
+        )
+        attn_scale = 0.0
+    return controller, attn_scale, attn_density, attn_decay
+
+
 def worker_process(cfg: dict, device: str, task_queue, error_queue):
     torch.cuda.set_device(device)
     pipe = RepLDMSDXLPipeline.from_pretrained(
@@ -268,22 +311,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
         try:
             generator = torch.Generator(device).manual_seed(task["seed"])
             action = task["action"]
-            action_type = action["type"]
-            controller = None
-            attn_scale = float(action.get("scale", 0.0))
-            attn_density = "all"
-            attn_decay = None
-            if action_type == "legacy":
-                delay_steps = action.get("delay_steps", 0)
-                attn_density = tuple(
-                    [1] * (cfg["num_inference_steps"] - delay_steps) + [0] * delay_steps
-                )
-                attn_decay = tuple(action["decay"]) if action.get("decay") else None
-            elif action_type == "frequency_bands":
-                controller = ConstantGuidanceController(
-                    band_scales=tuple(action["band_scales"]),
-                    max_update_ratio=action.get("max_update_ratio"),
-                )
+            controller, attn_scale, attn_density, attn_decay = guidance_runtime(
+                action, cfg["num_inference_steps"]
+            )
             images = pipe(
                 task["prompt"],
                 negative_prompt=cfg["negative_prompt"],

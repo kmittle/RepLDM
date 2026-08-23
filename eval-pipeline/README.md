@@ -11,7 +11,7 @@ analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 
 ## Generate
 
-Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML.
+Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, or `moment_tangent_rescaled`; omitted mode means byte-compatible `raw`. Moment-tangent modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate the fixed-moment geometry.
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -27,6 +27,8 @@ All actions for one `(prompt, seed)` block run on the same GPU. Blocks use deter
 Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count fixed within a run. Use a new output directory whenever any of these or the action definitions change.
 
 `configs/frequency_amplitude_followup.yaml` is explicitly post-hoc: it checks whether the 0.004 pilot simply used too much scalar or mid-band guidance. Treat it as search data and validate any selected amplitude on new prompts.
+
+`configs/moment_tangent_smoke.yaml` is registered in `MODEL_ITERATIONS.md`. Run it on `prompts/smoke.csv` with seed `0` before freezing a larger development grid; its two prompts may reject broken or catastrophic actions but cannot support an efficacy claim.
 
 ## Prepare Scorers
 

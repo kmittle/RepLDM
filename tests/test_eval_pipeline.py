@@ -43,9 +43,45 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual([task["action_id"] for task in groups[0]], ["no_ag", "conference_expert"])
 
+    def test_moment_tangent_config_and_runtime_wiring(self):
+        actions, _ = generate.load_actions(
+            ROOT / "eval-pipeline/configs/moment_tangent_smoke.yaml", 50
+        )
+        self.assertEqual(len(actions), 16)
+        by_id = {action["id"]: action for action in actions}
+        action = by_id["moment_tangent_rescaled_0.004"]
+        self.assertEqual(action["residual_mode"], "moment_tangent_rescaled")
+
+        controller, scale, density, decay = generate.guidance_runtime(action, 50)
+        self.assertEqual(scale, 0.0)
+        self.assertEqual(density, "all")
+        self.assertIsNone(decay)
+        self.assertEqual(controller(None).scale, 0.004)
+        self.assertEqual(
+            controller(None).residual_mode, "moment_tangent_rescaled"
+        )
+
+        raw_controller, raw_scale, _, _ = generate.guidance_runtime(
+            by_id["raw_0.004"], 50
+        )
+        self.assertIsNone(raw_controller)
+        self.assertEqual(raw_scale, 0.004)
+
     def test_invalid_action_config_is_rejected(self):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:
             handle.write("actions:\n  - id: bad/action\n    type: none\n")
+            handle.flush()
+            with self.assertRaises(ValueError):
+                generate.load_actions(handle.name, 50)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:
+            handle.write(
+                "actions:\n"
+                "  - id: invalid_geometry\n"
+                "    type: legacy\n"
+                "    scale: 0.004\n"
+                "    residual_mode: moment_tangent\n"
+            )
             handle.flush()
             with self.assertRaises(ValueError):
                 generate.load_actions(handle.name, 50)

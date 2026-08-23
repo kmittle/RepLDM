@@ -1178,6 +1178,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                                 band_scales=action.band_scales,
                                 reference_update=denoising_update,
                                 max_update_ratio=action.max_update_ratio,
+                                residual_mode=action.residual_mode,
                             )
                     elif attn_guidance_scale > 0:
                         latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])

@@ -1,0 +1,68 @@
+# Registered in MODEL_ITERATIONS.md before generation. This smoke checks the
+# mechanism and scale range; it is not a confirmatory benchmark.
+actions:
+  - id: no_ag
+    type: none
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+
+  - id: raw_0.001
+    type: scalar
+    scale: 0.001
+  - id: raw_0.002
+    type: scalar
+    scale: 0.002
+  - id: raw_0.004
+    type: scalar
+    scale: 0.004
+
+  - id: mean_centered_0.001
+    type: scalar
+    scale: 0.001
+    residual_mode: mean_centered
+  - id: mean_centered_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: mean_centered
+  - id: mean_centered_0.004
+    type: scalar
+    scale: 0.004
+    residual_mode: mean_centered
+
+  - id: moment_tangent_0.001
+    type: scalar
+    scale: 0.001
+    residual_mode: moment_tangent
+  - id: moment_tangent_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: moment_tangent
+  - id: moment_tangent_0.004
+    type: scalar
+    scale: 0.004
+    residual_mode: moment_tangent
+  - id: moment_tangent_0.008
+    type: scalar
+    scale: 0.008
+    residual_mode: moment_tangent
+
+  - id: moment_tangent_rescaled_0.001
+    type: scalar
+    scale: 0.001
+    residual_mode: moment_tangent_rescaled
+  - id: moment_tangent_rescaled_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: moment_tangent_rescaled
+  - id: moment_tangent_rescaled_0.004
+    type: scalar
+    scale: 0.004
+    residual_mode: moment_tangent_rescaled
+  - id: moment_tangent_rescaled_0.008
+    type: scalar
+    scale: 0.008
+    residual_mode: moment_tangent_rescaled
