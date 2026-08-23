@@ -4,10 +4,11 @@
 
 metrics:
   - imagereward     # global-IR (224) + patch-IR (native 224 crops, §13.2)
-  - pixel           # weightless decorrelated witnesses (§13.5): colorfulness/sharpness/saturation/clip/contrast
+  - pixel           # weightless low-level witnesses (§13.5): colorfulness/sharpness/saturation/clip/contrast
   - clip            # CLIP-Score (canonical 2.5*max(cos,0) @ ViT-B/32) + raw cosine — alignment witness
   - hps             # HPSv2 (v2.1, ViT-H-14) — human preference
   - aesthetic       # LAION aesthetic predictor (CLIP ViT-L/14 + MLP)
+  - iqa             # TOPIQ-NR on the complete native-resolution image
 
 # per-scorer params (passed to every Scorer.__init__ / weights_status)
 params:
@@ -24,6 +25,7 @@ metric_meta:
   clipscore:     higher
   hpsv2:         higher
   aesthetic:     higher
+  topiq_nr:      higher
 
 # fixed sampling recipe used by generate.py — recorded here for reproducibility
 # (cross-run control variables; do not vary per metric).

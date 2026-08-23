@@ -1,6 +1,6 @@
 """Weightless pixel witnesses (no model / no weights). Wraps metrics.py.
 
-These are RepLDM-unique decorrelated reward-hacking witnesses (§13.5) — colorfulness,
+These are low-level reward-hacking witnesses (§13.5) — colorfulness,
 Laplacian sharpness, mean saturation, clipped fraction, contrast std. Sana has no
 low-level pixel metrics; these stay our own.
 """

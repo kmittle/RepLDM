@@ -1,104 +1,80 @@
-# RepLDM eval-pipeline (quantitative measurement instrument)
+# RepLDM Evaluation Pipeline
 
-Decoupled two-stage harness that feeds all Phase-1 experiments (constant-scale
-sweep / CMA-ES static baseline / per-prompt oracle gap) and, later, the DRaFT
-reward. Generation and scoring live in **different conda envs** and communicate
-through PNGs + a JSON manifest on disk, so scoring is re-runnable and extensible
-without regenerating images.
+The harness separates generation from scoring through lossless PNG files and JSON sidecars. This lets expensive generations be scored repeatedly without coupling SDXL dependencies to reward-model dependencies.
 
-```
-generate.py  [env repldm]   prompt x seed x scale  ->  images/*.png + images/*.json
-                                                         -> manifest.jsonl
-score.py     [env sana_cby]  manifest + PNGs         ->  scores.jsonl
-aggregate.py [env repldm]    manifest + scores       ->  eval_results.csv + analysis
+```text
+generate.py       [diff_attn]    prompt x seed x action -> PNG + sidecar -> manifest.jsonl
+score.py          [repldm_eval]  manifest + PNG          -> scores.jsonl
+compare_actions.py[repldm_eval]  manifest + scores       -> action_comparisons.csv
 ```
 
-Why decoupled: ImageReward / HPSv2 / CLIP live only in `sana_cby` (py3.11);
-the SDXL pipeline needs `repldm` (py3.9, diffusers 0.21.4). See the project-env memory.
+## Generate
 
-## 1. Generate (env `repldm`)
-
-Stage-1-only (1024², so Stage 2 is skipped), constant per-step guidance scale.
-`scale=0` is the exact no-guidance baseline.
+Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML.
 
 ```bash
-conda run -n repldm python eval-pipeline/generate.py \
-  --devices 6,7 \
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1,2,3,4 \
   --prompts eval-pipeline/prompts/eval_v1.csv \
-  --out_dir outputs/exp1.1_scale_sweep/pilot \
-  --scales 0,0.001,0.002,0.003,0.005 \
-  --seeds 0,42,123 \
-  --low_vram          # offload to CPU between phases; use when GPUs are busy
+  --out_dir outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1 \
+  --actions eval-pipeline/configs/frequency_action_pilot.yaml \
+  --seeds 0,42,123
 ```
-- One worker per `--device`, shared task queue, resume-safe (existing PNGs skipped).
-- `--guidance_scale` (CFG, default 7.5) and `--power_calibrate` (0) are held fixed
-  across the sweep — they are confounds, keep them constant.
-- Pick currently-free GPUs (`nvidia-smi`); the box is shared/saturated.
 
-## 2. Score (env `sana_cby`) — config-driven, call the env python directly
+All actions for one `(prompt, seed)` block run on the same GPU. Blocks use deterministic device placement and deterministic shuffled action order. On resume, an existing sidecar's device takes precedence; an already cross-device block is rejected. A task is complete only when both PNG and JSON exist. Worker and per-task failures make the command fail after preserving completed records.
 
-One-time weight pre-stage (downloads CLIP/HPSv2/aesthetic to **shared caches**, ~7GB;
-decoupled from Sana — same upstream packages, weights in `~/.cache/{clip,hpsv2,aesthetic}`):
-```bash
-/home/bycao/miniforge3/envs/sana_cby/bin/python eval-pipeline/prestage_weights.py
-```
+Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count fixed within a run. Use a new output directory whenever any of these or the action definitions change.
+
+## Prepare Scorers
+
+The scoring environment is a clone of `diff_attn` with independent evaluation packages:
 
 ```bash
-/home/bycao/miniforge3/envs/sana_cby/bin/python eval-pipeline/score.py \
-  --run_dir outputs/exp1.1_scale_sweep/pilot --device cuda:0
-```
-`configs/eval_common.yaml` lists which metrics run; each is a self-contained module under
-`scorers/` (DECOUPLED — upstream pip packages, **never Sana imports/copies**). Weights are
-validated up front, so a missing metric is skipped (not a crash). Resume is **additive**:
-re-running adds new metric columns to existing rows without redoing old ones. `scores.jsonl`
-columns:
-- `imagereward` — full-image IR (224 downsample → color/layout, not detail).
-- `patch_ir_mean/std/n` — IR over native-res 224 crops (detail-sensitive; §13.2). **[RepLDM-unique]**
-- `clip_cosine`, `clipscore` — CLIP-Score, canonical `2.5·max(cos,0)` @ ViT-B/32 + raw cosine — alignment witness.
-- `hpsv2` — HPSv2 v2.1 (ViT-H-14) human preference.
-- `aesthetic` — LAION aesthetic (CLIP ViT-L/14 + MLP), ~[1,10].
-- `colorfulness, laplacian_sharpness, mean_saturation, clipped_fraction, contrast_std`
-  — weightless decorrelated reward-hacking witnesses (§13.5). **[RepLDM-unique]**
-> §13.5 caveat: clip/hpsv2/aesthetic are all CLIP-family@224 → mutually correlated, **NOT**
-> independent detail witnesses; pair them with patch-IR + pixel sharpness.
-Add `geneval`/`dpg`/`fid` later by dropping a module in `scorers/` + listing it in the config.
+/home/bycao/miniforge3/envs/repldm_eval/bin/python -m pip install \
+  pyiqa==0.1.15.post2 hpsv2==1.2.0 openai-clip==1.0.1 fairscale==0.4.13
 
-## 3. Analyze (env `repldm`)
+HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 \
+  /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/prestage_weights.py
+```
+
+ImageReward additionally uses the source checkout at `/mnt/miah204/bycao/ImageReward`. The pre-stage command caches its checkpoint, media config, and BERT tokenizer. Generation and formal scoring run offline after weights are staged.
+
+## Score
 
 ```bash
-conda run -n repldm python eval-pipeline/aggregate.py --run_dir outputs/exp1.1_scale_sweep/pilot
+CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/score.py \
+  --run_dir outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1 \
+  --device cuda:0 --strict
 ```
-Prints the sharpened Exp-1.1 go/no-go (§13.4): mean-IR-vs-scale spread vs seed
-noise; per-prompt **interior-optimum** test (monotone-in-scale ⇒ "tune the clamp",
-not "learn guidance"); argmax-scale heterogeneity (content-adaptivity); global-IR
-vs patch-IR argmax; corr(IR, colorfulness/sharpness). Saves `eval_results.csv` +
-`analysis.png`.
 
-## 4. Visualize (env with numpy + Pillow + matplotlib)
+`--strict` is required for reported experiments: it fails if any configured scorer cannot initialize or score an image. Scoring is additive; complete existing scorer outputs are not recomputed.
+
+Configured outputs are ImageReward and native crops, pixel witnesses, CLIPScore, HPSv2, LAION aesthetic, and TOPIQ-NR. CLIP, HPSv2, and aesthetic are correlated 224px model families, not independent confirmations. Patch-IR and Laplacian variance can reward local texture or noise; use them only as diagnostics.
+
+## Compare Actions
 
 ```bash
-python eval-pipeline/visualize.py --run_dir outputs/exp1.1_scale_sweep/pilot --seed 0
+/home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/compare_actions.py \
+  --run_dir outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1 \
+  --baseline no_ag \
+  --metrics topiq_nr,hpsv2,imagereward,patch_ir_mean,clip_cosine,aesthetic,clipped_fraction
 ```
-Saves `figs/scale_sweep_montage.png` (one prompt/bucket × all scales, IR-annotated,
-green box = per-row IR argmax, red IR = >10% clipped) and `figs/action_visibility.png`
-(normalized witnesses-vs-IR + raw IR vs seed-noise band). These are the figures embedded
-in `EXPERIMENT_RESULTS.md`.
+
+The comparison rejects missing or cross-device pairing metadata. It reports paired deltas, crossed prompt/seed bootstrap 95% intervals, prompt-level sign-flip tests, and both within-metric and global Holm corrections. Missing prompt×seed cells are rejected rather than silently converted into an unbalanced comparison.
+
+`aggregate.py` and `visualize.py` remain available for the legacy scalar sweep. Their plots are descriptive and must not be used for the invalidated cross-device pilot in `EXPERIMENT_RESULTS.md`.
 
 ## Layout
-```
-configs/eval_common.yaml   which metrics + params + fixed sampling recipe
-scorers/                   one self-contained Scorer per metric (register via @register_metric)
-  base.py                  REGISTRY + Scorer base + weights_status()
-  imagereward_scorer.py    global-IR + patch-IR        pixel_scorer.py   weightless witnesses
-  clip_scorer.py           CLIP-Score                  hps_scorer.py     HPSv2
-  aesthetic_scorer.py      LAION aesthetic
-generate.py  score.py  aggregate.py  metrics.py  prestage_weights.py  prompts/
-```
 
-## Notes / not-yet
-- `geneval` / `dpg` / `fid` are pluggable but not yet implemented (heavy: detection/VQA
-  models + benchmark prompt sets + large samples; lower priority for a guidance-scale study).
-- The differentiable reward path for DRaFT is `ImageReward.score_gard` (this harness
-  uses the non-diff `score()` — fine for measurement).
-- `prompts/eval_v1.csv` is a 12-prompt × 6-bucket starter set; expand to ~50 for full Exp-1.1.
+```text
+configs/                 scorer and action YAML
+prompts/                 prompt CSV files
+scorers/                 independent metric plugins
+generate.py              grouped multi-GPU generation
+score.py                 additive scoring runner
+compare_actions.py       paired inference and multiplicity correction
+aggregate.py             legacy scalar-sweep diagnostics
+visualize.py             legacy montage and witness plots
+prestage_weights.py      one-time scorer weight setup
 ```

@@ -48,7 +48,7 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from AttentionGuidance import AttnGuidance
+from AttentionGuidance import AttnGuidance, GuidanceAction, GuidanceController, GuidanceObservation
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -783,6 +783,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         attn_guidance_decay: Optional[tuple] = None,
         power_calibrate: int = 0,
         attn_guidance_filter: Optional[Union[tuple, list]] = None,
+        attn_guidance_controller: Optional[GuidanceController] = None,
+        attn_guidance_band_cutoffs: Tuple[float, float] = (0.08, 0.25),
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -929,6 +931,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     attn_guidance_decay: Optional[tuple] = None,
                     power_calibrate: int = 0,
                     attn_guidance_filter=None,
+                    attn_guidance_controller=None,
+                    attn_guidance_band_cutoffs=(0.08, 0.25),
                 For a detailed explanation of these parameters, please refer to the `attn_guidance.py` module.
         
         Examples:
@@ -1093,6 +1097,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             guidance_scale_decay=attn_guidance_decay,
             power_calibrate=power_calibrate,
             guidance_filter=attn_guidance_filter,
+            frequency_band_cutoffs=attn_guidance_band_cutoffs,
         )
     ###################################################### Phase Initialization ########################################################
 
@@ -1144,10 +1149,37 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
     
                     # compute the previous noisy sample x_t -> x_t-1
+                    latents_before_step = latents
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    denoising_update = latents - latents_before_step
 
                     # AttnFusion
-                    if attn_guidance_scale > 0:
+                    t_index = num_timesteps - 1 - i
+                    if attn_guidance_controller is not None:
+                        action = attn_guidance_controller(
+                            GuidanceObservation(
+                                step_index=i,
+                                t_index=t_index,
+                                timestep=t,
+                                alpha_t=alphas_cumprod_sample[i],
+                                latents=latents,
+                                denoising_update=denoising_update,
+                                pooled_prompt_embeds=pooled_prompt_embeds,
+                            )
+                        )
+                        if action is not None:
+                            if not isinstance(action, GuidanceAction):
+                                raise TypeError("attn_guidance_controller must return GuidanceAction or None")
+                            latents = attn_guidance(
+                                t_index,
+                                latents,
+                                alphas_cumprod_sample[i],
+                                scale=action.scale,
+                                band_scales=action.band_scales,
+                                reference_update=denoising_update,
+                                max_update_ratio=action.max_update_ratio,
+                            )
+                    elif attn_guidance_scale > 0:
                         latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])
     
                     # call the callback, if provided

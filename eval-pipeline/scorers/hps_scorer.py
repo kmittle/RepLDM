@@ -4,6 +4,8 @@ call — a perf bug we avoid). Score = diagonal of image@text features (raw cosi
 do NOT divide by logit_scale). §13.5: ViT-H-14@224, correlated with the other
 CLIP-family metrics; not an independent detail witness.
 """
+import os
+
 import torch
 
 from .base import Scorer, register_metric
@@ -31,6 +33,18 @@ class HPSScorer(Scorer):
         try:
             from huggingface_hub import hf_hub_download
             hf_hub_download("xswu/HPSv2", "HPS_v2.1_compressed.pt", local_files_only=True)
+            hf_hub_download(
+                "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+                "open_clip_pytorch_model.bin",
+                local_files_only=True,
+            )
+            import hpsv2
+            vocab = os.path.join(
+                os.path.dirname(hpsv2.__file__), "src", "open_clip",
+                "bpe_simple_vocab_16e6.txt.gz",
+            )
+            if not os.path.exists(vocab):
+                return False, f"HPSv2 tokenizer vocabulary is missing ({vocab})"
             return True, ""
         except Exception as e:
             return False, f"HPS_v2.1 / ViT-H-14 not cached ({e})"

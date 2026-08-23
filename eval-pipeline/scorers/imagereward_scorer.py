@@ -2,8 +2,8 @@
 
 Decoupled: imports ImageReward from the SOURCE checkout via the documented shim
 (datasets stub + transformers symbol shim) — NOT the broken pip `image-reward`, and
-NOT from Sana. patch-IR (native-res crops) is RepLDM's detail-sensitive twist (§13.2)
-that Sana's ImageReward (full image only) lacks.
+NOT from Sana. patch-IR preserves native-resolution local crops as a diagnostic;
+it is not treated as an independently validated perceptual-detail metric.
 """
 import importlib.machinery
 import os
@@ -67,8 +67,25 @@ class ImageRewardScorer(Scorer):
 
     @classmethod
     def weights_status(cls, **p):
-        ok = os.path.exists(os.path.join(IR_CACHE, "ImageReward.pt"))
-        return ok, ("" if ok else f"missing {IR_CACHE}/ImageReward.pt")
+        required = [
+            os.path.join(IR_CACHE, "ImageReward.pt"),
+            os.path.join(IR_CACHE, "med_config.json"),
+        ]
+        missing = [path for path in required if not os.path.exists(path)]
+        if missing:
+            return False, f"missing {missing}"
+        try:
+            import fairscale  # noqa: F401
+        except ImportError:
+            return False, "fairscale is not installed"
+        try:
+            from transformers import BertTokenizer
+            BertTokenizer.from_pretrained("bert-base-uncased", local_files_only=True)
+        except Exception as exc:
+            return False, f"bert-base-uncased tokenizer is not cached ({exc})"
+        if not os.path.isdir(IMAGEREWARD_SRC):
+            return False, f"ImageReward source checkout is missing: {IMAGEREWARD_SRC}"
+        return True, ""
 
     def score_image(self, image, prompt):
         rec = {"imagereward": float(self.model.score(prompt, image))}

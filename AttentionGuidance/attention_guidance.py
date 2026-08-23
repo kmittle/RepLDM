@@ -4,7 +4,11 @@ import torch
 from torch import fft
 
 import math
-from typing import Optional, Union
+from typing import Optional, Sequence, Tuple, Union
+
+
+Scale = Union[float, Tensor]
+BandScales = Union[Sequence[Scale], Tensor]
 
 
 class AttnGuidance:
@@ -58,6 +62,7 @@ class AttnGuidance:
         power_calibrate: Union[None, int] = None,
         guidance_filter: Union[None, tuple, list] = None,
         attn_scaling: Optional[float] = None,
+        frequency_band_cutoffs: Tuple[float, float] = (0.08, 0.25),
     ) -> None:
         assert num_total_steps > 0
         assert attn_type in {"vanilla"}, "attn_type should be 'vanilla' currently."
@@ -93,6 +98,8 @@ class AttnGuidance:
             assert guidance_filter[0] in {'linear', 'cosine', 'exp'}
             assert 0 <= guidance_filter[1] <= 1
         if attn_scaling is not None: assert attn_scaling > 0
+        assert len(frequency_band_cutoffs) == 2
+        assert 0 < frequency_band_cutoffs[0] < frequency_band_cutoffs[1] < 0.5
         
         self.dtype = dtype
         self.device = device
@@ -106,10 +113,17 @@ class AttnGuidance:
         self.power_calibrate = power_calibrate
         self.guidance_filter = guidance_filter
         self.attn_scaling = attn_scaling
+        self.frequency_band_cutoffs = frequency_band_cutoffs
+        self._frequency_mask_cache = {}
         
         self.guidance_step_index = self.determine_guidance_step_index()
-        self.guidance_step_scale = iter(self.determine_guidance_step_scale())
+        self._guided_t_indices = tuple(sorted(self.guidance_step_index, reverse=True))
+        self._guidance_rank_by_t_index = {
+            t_index: rank for rank, t_index in enumerate(self._guided_t_indices)
+        }
+        self.guidance_step_scale = self.determine_guidance_step_scale()
         self.filter_range = self.determine_filter_range()
+        self._controlled_filter_range = self.determine_filter_range(self.num_total_steps)
     
     @torch.no_grad()
     def determine_guidance_step_index(self):
@@ -161,12 +175,12 @@ class AttnGuidance:
         return step_scale
     
     @torch.no_grad()
-    def determine_filter_range(self):
+    def determine_filter_range(self, num_steps: Optional[int] = None):
         guidance_filter = self.guidance_filter
         if guidance_filter is None:
             filter_range = 'full'
         else:
-            num_guidance_steps = len(self.guidance_step_index)
+            num_guidance_steps = num_steps or len(self.guidance_step_index)
             device = self.device
             filter_strategy = guidance_filter[0]
             h = self.h // 2
@@ -193,21 +207,38 @@ class AttnGuidance:
                 w_filter_range = torch.logspace(torch.log(torch.tensor(filter_start_w)), torch.log(torch.tensor(w)),
                                                 num_guidance_steps, torch.exp(torch.tensor(1)),
                                                 dtype=torch.int, device=device)
-            filter_range = tuple(zip(h_filter_range, w_filter_range))
-            filter_range = iter(filter_range)
+            filter_range = tuple(
+                (int(h_threshold), int(w_threshold))
+                for h_threshold, w_threshold in zip(h_filter_range, w_filter_range)
+            )
         return filter_range
     
-    def filter(self, x):
+    def filter(self, x: Tensor, t_index: int, controlled: bool = False) -> Tensor:
         if self.guidance_filter is not None:
-            h_threshold, w_threshold = next(self.filter_range)
+            if not 0 <= t_index < self.num_total_steps:
+                raise IndexError(
+                    f"t_index must be in [0, {self.num_total_steps}), got {t_index}"
+                )
+            if controlled:
+                filter_rank = self.num_total_steps - 1 - t_index
+                ranges = self._controlled_filter_range
+            else:
+                try:
+                    filter_rank = self._guidance_rank_by_t_index[t_index]
+                except KeyError as exc:
+                    raise ValueError(
+                        f"legacy filtering is undefined for unguided t_index={t_index}"
+                    ) from exc
+                ranges = self.filter_range
+            h_threshold, w_threshold = ranges[filter_rank]
             # fft
             dtype = x.dtype
             x = x.type(torch.float32)
             x = fft.fftn(x, dim=(-2, -1))
             x = fft.fftshift(x, dim=(-2, -1))
             # filter
-            B, C, H, W = x.shape
-            mask = torch.zeros((B, C, H, W), device=self.device)
+            _, _, H, W = x.shape
+            mask = torch.zeros((1, 1, H, W), device=x.device)
             crow, ccol = H // 2, W // 2
             mask[..., crow - h_threshold:crow + h_threshold, ccol - w_threshold:ccol + w_threshold] = 1
             x = x * mask
@@ -216,6 +247,97 @@ class AttnGuidance:
             x = fft.ifftn(x, dim=(-2, -1)).real
             x = x.type(dtype)
         return x
+
+    def _frequency_masks(self, height: int, width: int, device: torch.device) -> Tensor:
+        """Return smooth low/mid/high masks forming a partition of unity."""
+        key = (height, width, str(device))
+        cached = self._frequency_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        fy = torch.fft.fftfreq(height, device=device, dtype=torch.float32)
+        fx = torch.fft.rfftfreq(width, device=device, dtype=torch.float32)
+        radius = torch.sqrt(fy[:, None].square() + fx[None, :].square())
+        low_cutoff, mid_cutoff = self.frequency_band_cutoffs
+        low_pass = torch.exp(-0.5 * (radius / low_cutoff).pow(4))
+        mid_pass = torch.exp(-0.5 * (radius / mid_cutoff).pow(4))
+        masks = torch.stack((low_pass, mid_pass - low_pass, 1.0 - mid_pass))
+        self._frequency_mask_cache[key] = masks
+        return masks
+
+    @staticmethod
+    def _coerce_band_scales(band_scales: BandScales, reference: Tensor) -> Tensor:
+        if isinstance(band_scales, Tensor):
+            scales = band_scales.to(device=reference.device, dtype=torch.float32)
+        else:
+            values = [
+                value.to(device=reference.device, dtype=torch.float32)
+                if isinstance(value, Tensor)
+                else torch.tensor(value, device=reference.device, dtype=torch.float32)
+                for value in band_scales
+            ]
+            scales = torch.stack(values)
+        if scales.ndim not in (1, 2) or scales.shape[-1] != 3:
+            raise ValueError(
+                "band_scales must have shape (3,) or (batch, 3) for low/mid/high gains"
+            )
+        if scales.ndim == 2 and scales.shape[0] != reference.shape[0]:
+            raise ValueError(
+                f"batched band_scales has batch {scales.shape[0]}, expected {reference.shape[0]}"
+            )
+        return scales
+
+    def apply_frequency_band_scales(self, residual: Tensor, band_scales: BandScales) -> Tensor:
+        """Apply low/mid/high gains to a TFSA residual with one inverse FFT."""
+        if not isinstance(band_scales, Tensor):
+            scalar_values = [value for value in band_scales if not isinstance(value, Tensor)]
+            if len(scalar_values) == 3 and scalar_values[0] == scalar_values[1] == scalar_values[2]:
+                legacy_scale = torch.tensor(
+                    scalar_values[0], device=residual.device, dtype=residual.dtype
+                )
+                return legacy_scale * residual
+        scales = self._coerce_band_scales(band_scales, residual)
+        height, width = residual.shape[-2:]
+        masks = self._frequency_masks(height, width, residual.device)
+        spectrum = fft.rfft2(residual.float(), dim=(-2, -1), norm="ortho")
+        if scales.ndim == 1:
+            combined_mask = torch.sum(scales[:, None, None] * masks, dim=0)
+        else:
+            combined_mask = torch.sum(
+                scales[:, :, None, None] * masks[None, ...], dim=1
+            )[:, None, ...]
+        update = fft.irfft2(
+            spectrum * combined_mask,
+            s=(height, width),
+            dim=(-2, -1),
+            norm="ortho",
+        )
+        return update.to(residual.dtype)
+
+    @staticmethod
+    def limit_update_ratio(
+        update: Tensor,
+        reference_update: Tensor,
+        max_update_ratio: Scale,
+    ) -> Tensor:
+        """Cap guidance energy relative to the scheduler update, per sample."""
+        if update.shape != reference_update.shape:
+            raise ValueError("reference_update must have the same shape as the guidance update")
+        ratio = torch.as_tensor(max_update_ratio, device=update.device, dtype=torch.float32)
+        if torch.any(ratio < 0):
+            raise ValueError("max_update_ratio must be non-negative")
+        if ratio.ndim > 1 or (ratio.ndim == 1 and ratio.shape[0] not in (1, update.shape[0])):
+            raise ValueError("max_update_ratio must be scalar or have one value per batch item")
+        dims = tuple(range(1, update.ndim))
+        update_norm = torch.linalg.vector_norm(update.float(), dim=dims)
+        reference_norm = torch.linalg.vector_norm(reference_update.float(), dim=dims)
+        ratio = ratio.reshape(-1)
+        if ratio.numel() == 1:
+            ratio = ratio.expand_as(update_norm)
+        multiplier = torch.clamp(
+            ratio * reference_norm / (update_norm + 1e-12), max=1.0
+        )
+        return update * multiplier.reshape((-1,) + (1,) * (update.ndim - 1)).to(update.dtype)
     
     def vanilla_attn_guidance(self, latents: Tensor, alpha_t: Optional[Tensor] = None) -> Tensor:
         b, c, h, w = latents.shape
@@ -238,14 +360,22 @@ class AttnGuidance:
         latents_ = latents_.transpose(-1, -2).reshape(b, c, h, w)
         return latents_
     
-    def __call__(self, t_index: int, latents: Tensor, alpha_t: Optional[Tensor] = None,
-                 scale: Optional[Union[float, Tensor]] = None) -> Tensor:
+    def __call__(
+        self,
+        t_index: int,
+        latents: Tensor,
+        alpha_t: Optional[Tensor] = None,
+        scale: Optional[Scale] = None,
+        band_scales: Optional[BandScales] = None,
+        reference_update: Optional[Tensor] = None,
+        max_update_ratio: Optional[Scale] = None,
+    ) -> Tensor:
         """
         NOTE: Here, t_index is not the same as timestep because Diffusion Models typically use a skip-step sampling
         strategy. t_index represents the index of the timestep. For a sampling with T=50, t=50, ..., 1 corresponds
         to t_index=49, ..., 0.
 
-        scale: per-step guidance strength.
+        scale: per-step scalar guidance strength.
             - None (default): use the precomputed hand-tuned schedule (gated by guidance_step_index / decayed by
               guidance_scale_decay). The whole op runs under torch.no_grad() -- byte-for-byte the original
               training-free path.
@@ -253,16 +383,41 @@ class AttnGuidance:
               step, leaving the op grad-enabled so gradients can flow through `scale` (and, if `latents` requires
               grad, through the attention nudge) for differentiable reward fine-tuning. scale == 0 reproduces the
               no-guidance latent, so a learned controller subsumes guidance_density (0 == OFF) AND guidance_scale_decay.
+        band_scales: low/mid/high gains applied to a smooth spectral decomposition
+            of the TFSA residual. Equal gains recover scalar guidance.
+        max_update_ratio: optional trust-region cap on guidance-update norm relative
+            to `reference_update`, normally the scheduler's update at this step.
         """
-        if scale is None:
+        if scale is not None and band_scales is not None:
+            raise ValueError("provide either scale or band_scales, not both")
+        controlled = scale is not None or band_scales is not None
+        if not controlled:
             with torch.no_grad():
                 if t_index in self.guidance_step_index:
-                    s = next(self.guidance_step_scale)
+                    rank = self._guidance_rank_by_t_index[t_index]
+                    s = self.guidance_step_scale[rank]
                     if self.attn_type == 'vanilla':
-                        latents = latents + s * (self.vanilla_attn_guidance(self.filter(latents), alpha_t) - latents)
+                        guided = self.vanilla_attn_guidance(
+                            self.filter(latents, t_index, controlled=False), alpha_t
+                        )
+                        latents = latents + s * (guided - latents)
             return latents
+
         if self.attn_type == 'vanilla':
-            latents = latents + scale * (self.vanilla_attn_guidance(self.filter(latents), alpha_t) - latents)
+            guided = self.vanilla_attn_guidance(
+                self.filter(latents, t_index, controlled=True), alpha_t
+            )
+            residual = guided - latents
+            update = (
+                scale * residual
+                if band_scales is None
+                else self.apply_frequency_band_scales(residual, band_scales)
+            )
+            if max_update_ratio is not None:
+                if reference_update is None:
+                    raise ValueError("reference_update is required with max_update_ratio")
+                update = self.limit_update_ratio(update, reference_update, max_update_ratio)
+            latents = latents + update
         return latents
 
 
@@ -275,6 +430,5 @@ if __name__ == '__main__':
                                       guidance_filter=None,)
     print(attn_guidance.guidance_step_index)
     print(len(attn_guidance.guidance_step_index))
-    print([round(next(attn_guidance.guidance_step_scale).item(), 4) for _ in range(len(attn_guidance.guidance_step_index))])
+    print([round(value.item(), 4) for value in attn_guidance.guidance_step_scale])
     print(attn_guidance.filter_range)
-

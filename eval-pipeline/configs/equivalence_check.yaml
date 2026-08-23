@@ -1,0 +1,10 @@
+frequency_band_cutoffs: [0.08, 0.25]
+
+actions:
+  - id: scalar_0.004
+    type: scalar
+    scale: 0.004
+
+  - id: bands_equal_0.004
+    type: frequency_bands
+    band_scales: [0.004, 0.004, 0.004]

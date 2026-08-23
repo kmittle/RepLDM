@@ -1,4 +1,4 @@
-"""Config-driven scoring runner for the RepLDM eval-pipeline (env: `sana_cby`).
+"""Config-driven scoring runner for the RepLDM eval-pipeline (env: `repldm_eval`).
 
 Reads a run's manifest, runs the configured Scorers (self-contained metric modules
 under scorers/, each decoupled from Sana), and writes scores.jsonl. Each metric is
@@ -9,8 +9,8 @@ Resume is ADDITIVE: a row is recomputed only if it lacks an enabled metric's col
 and existing columns are preserved — so you can add CLIP/HPSv2/aesthetic to an already-
 scored run without redoing ImageReward. Output is rewritten atomically every 50 images.
 
-  /home/bycao/miniforge3/envs/sana_cby/bin/python eval-pipeline/score.py \
-      --run_dir outputs/exp1.1_scale_sweep/pilot --device cuda:0
+  /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/score.py \
+      --run_dir outputs/exp_spectral_headroom/pilot --device cuda:0 --strict
 """
 import argparse
 import json
@@ -38,6 +38,10 @@ def main():
     ap.add_argument("--config", default=os.path.join(THIS, "configs", "eval_common.yaml"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--metrics", default=None, help="comma-separated override of config 'metrics'")
+    ap.add_argument(
+        "--strict", action="store_true",
+        help="fail if any requested scorer cannot load or score an image",
+    )
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -52,20 +56,32 @@ def main():
 
     # instantiate scorers (validate weights first; skip cleanly if missing/broken)
     active = []
+    unavailable = []
     for name in metric_names:
         if name not in REGISTRY:
-            print(f"[warn] unknown metric '{name}', skipping", flush=True); continue
+            message = f"unknown metric '{name}'"
+            print(f"[warn] {message}, skipping", flush=True)
+            unavailable.append(message)
+            continue
         cls = REGISTRY[name]
         ready, msg = cls.weights_status(**params)
         if not ready:
-            print(f"[skip] '{name}' weights missing -> {msg}", flush=True); continue
+            message = f"'{name}' weights missing -> {msg}"
+            print(f"[skip] {message}", flush=True)
+            unavailable.append(message)
+            continue
         try:
             active.append((name, cls(device=device, **params)))
             print(f"[ok] loaded scorer '{name}' on {device}", flush=True)
         except Exception as e:
-            print(f"[skip] '{name}' failed to init -> {e}", flush=True)
+            message = f"'{name}' failed to init -> {e}"
+            print(f"[skip] {message}", flush=True)
+            unavailable.append(message)
+    if args.strict and unavailable:
+        raise RuntimeError("requested scorers unavailable: " + "; ".join(unavailable))
     if not active:
-        print("no active scorers; nothing to do", flush=True); return
+        print("no active scorers; nothing to do", flush=True)
+        return
 
     need_keys = {k for _, sc in active for k, _ in sc.OUTPUT_KEYS}
     todo = [r for r in manifest
@@ -83,14 +99,25 @@ def main():
     from PIL import Image
     for i, r in enumerate(todo):
         img = Image.open(os.path.join(args.run_dir, r["image_path"])).convert("RGB")
-        rec = existing.get(r["id"], {
-            "id": r["id"], "prompt_index": r["prompt_index"], "bucket": r.get("bucket", ""),
-            "seed": r["seed"], "scale": r["scale"], "image_path": r["image_path"]})
+        metadata_keys = (
+            "id", "prompt_index", "bucket", "seed", "scale", "action_id",
+            "action_type", "band_scales", "image_path",
+        )
+        rec = existing.get(
+            r["id"], {key: r[key] for key in metadata_keys if key in r}
+        )
         for name, sc in active:
+            scorer_keys = {key for key, _ in sc.OUTPUT_KEYS}
+            if scorer_keys.issubset(rec):
+                continue
             try:
                 rec.update(sc.score_image(img, r["prompt"]))
             except Exception as e:
                 print(f"[warn] {name} failed on {r['id']}: {e}", flush=True)
+                if args.strict:
+                    existing[r["id"]] = rec
+                    flush()
+                    raise RuntimeError(f"{name} failed on {r['id']}") from e
         existing[r["id"]] = rec
         if (i + 1) % 50 == 0 or i == len(todo) - 1:
             flush()

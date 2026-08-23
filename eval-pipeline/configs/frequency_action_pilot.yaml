@@ -1,0 +1,47 @@
+frequency_band_cutoffs: [0.08, 0.25]
+
+actions:
+  - id: no_ag
+    type: none
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+
+  - id: scalar_0.004
+    type: scalar
+    scale: 0.004
+
+  - id: bands_equal_0.004
+    type: frequency_bands
+    band_scales: [0.004, 0.004, 0.004]
+
+  - id: low_only_0.004
+    type: frequency_bands
+    band_scales: [0.004, 0.0, 0.0]
+
+  - id: mid_only_0.004
+    type: frequency_bands
+    band_scales: [0.0, 0.004, 0.0]
+
+  - id: high_only_0.004
+    type: frequency_bands
+    band_scales: [0.0, 0.0, 0.004]
+
+  - id: protect_low_0.002_0.004
+    type: frequency_bands
+    band_scales: [0.0, 0.002, 0.004]
+
+  - id: protect_low_0.004_0.004
+    type: frequency_bands
+    band_scales: [0.0, 0.004, 0.004]
+
+  - id: tilted_0.001_0.003_0.005
+    type: frequency_bands
+    band_scales: [0.001, 0.003, 0.005]
+
+  - id: tilted_0.002_0.004_0.006
+    type: frequency_bands
+    band_scales: [0.002, 0.004, 0.006]
