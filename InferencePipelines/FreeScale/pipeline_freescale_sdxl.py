@@ -20,20 +20,15 @@ from diffusers.utils import (
     is_accelerate_version,
     is_invisible_watermark_available,
     logging,
-    randn_tensor,
     replace_example_docstring,
 )
+from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipelineOutput
 
 if is_invisible_watermark_available():
-    from .watermark import StableDiffusionXLWatermarker
+    from diffusers.pipelines.stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
 
-from inspect import isfunction
-from functools import partial
-import numpy as np
-
-import torch.nn.functional as F
 from diffusers.models.attention import BasicTransformerBlock
 from .scale_attention import ori_forward, scale_forward
 
@@ -74,7 +69,7 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     return noise_cfg
 
 
-class FreeScaleSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin):
+class FreeScaleSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion XL.
 
@@ -846,6 +841,7 @@ class FreeScaleSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMi
                 guidance_filter=guidance_filter,
             )
         attn_guidance = create_attn_guidance_module()
+        alphas_cumprod_sample = self.scheduler.alphas_cumprod.to(device)[timesteps.type(torch.int) - 1]
 
         # denoising loop begin
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -880,7 +876,7 @@ class FreeScaleSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMi
                 
                 # apply attention guidance
                 if attn_guidance_scale > 0:
-                    latents = attn_guidance(num_inference_steps - 1 - i, latents)
+                    latents = attn_guidance(num_inference_steps - 1 - i, latents, alphas_cumprod_sample[i])
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -1051,7 +1047,7 @@ class FreeScaleSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMi
             image = self.image_processor.postprocess(image, output_type=output_type)
 
             if not return_dict:
-                final_results += [(image,)]
+                final_results += [image[0]]
             else:
                 final_results += [StableDiffusionXLPipelineOutput(images=image)]
 

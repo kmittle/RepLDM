@@ -4,17 +4,17 @@ import torch
 from torch import fft
 
 import math
-from typing import Union
+from typing import Optional, Union
 
 
 class AttnGuidance:
     """
     Args:
         num_total_steps: total sampling steps.
-        attn_type: choose from {"vanilla", "linear", "swin", "skipwin"}.
+        attn_type: only "vanilla" is implemented.
             Default: "vanilla"
-        guidance_scale: choose from [0, 1].
-            Defualt: 0.001
+        guidance_scale: non-negative float, typically in [0, 1].
+            Default: 0.001
         guidance_density: This divides the sampling into several stages. You can give positive decimals in the form of 
             tuples that represent the proportion of guidance steps in each of the stages. The length of the tuple should 
             not exceed the number of sampling steps, and the number of sampling steps can be evenly divided. You can also 
@@ -34,7 +34,7 @@ class AttnGuidance:
             0: no calibration
             1: take both signal's mean and variance into consideration.
             2: only take signal's variance into consideration.
-            Default: 0/None
+            Default: None
         guidance_filter: Apply filtering to Training-Free-Self-Attention(latents) so that the part used for guidance gradually includes
             more high-frequency signals. Ensure the input is either None or a tuple containing two elements. When set to
             None, no filtering is applied. When set to a tuple, the first parameter is the method of expanding the filter
@@ -50,14 +50,14 @@ class AttnGuidance:
         device,
         num_total_steps: int,
         h: int,
-        w:int,
+        w: int,
         attn_type: str = "vanilla",
         guidance_scale: float = 0.001,
         guidance_density: Union[str, tuple, list] = "all",
         guidance_scale_decay: Union[None, tuple, list] = None,
-        power_calibrate: float = None,
+        power_calibrate: Union[None, int] = None,
         guidance_filter: Union[None, tuple, list] = None,
-        attn_scaling: float = None,
+        attn_scaling: Optional[float] = None,
     ) -> None:
         assert num_total_steps > 0
         assert attn_type in {"vanilla"}, "attn_type should be 'vanilla' currently."
@@ -111,7 +111,7 @@ class AttnGuidance:
         self.guidance_step_scale = iter(self.determine_guidance_step_scale())
         self.filter_range = self.determine_filter_range()
     
-    @ torch.no_grad()
+    @torch.no_grad()
     def determine_guidance_step_index(self):
         if self.guidance_density == "all":
             guidance_step_index = {i.item() for i in torch.arange(self.num_total_steps)}
@@ -132,7 +132,7 @@ class AttnGuidance:
         assert len(guidance_step_index) > 0
         return guidance_step_index
     
-    @ torch.no_grad()
+    @torch.no_grad()
     def determine_guidance_step_scale(self):
         num_guidance_steps = len(self.guidance_step_index)
         max_scale = self.guidance_scale
@@ -150,21 +150,17 @@ class AttnGuidance:
             step_scale = max_scale * torch.linspace(1, 0, num_guidance_steps, dtype=dtype, device=device) ** factor
             step_scale[step_scale < min_scale] = min_scale
         elif decay_type == 'cosine':
-            omega = torch.linspace(0, torch.pi, num_guidance_steps)
+            omega = torch.linspace(0, torch.pi, num_guidance_steps, dtype=dtype, device=device)
             cos_value = ((torch.cos(omega) + 1) / 2) ** factor
             step_scale = max_scale * cos_value
             step_scale[step_scale < min_scale] = min_scale
-            step_scale = step_scale.type(dtype)
-            step_scale = step_scale.to(device)
         elif decay_type == 'exp':
-            rate = torch.tensor([factor ** i for i in range(num_guidance_steps)])
+            rate = torch.tensor([factor ** i for i in range(num_guidance_steps)], dtype=dtype, device=device)
             step_scale = max_scale * rate
             step_scale[step_scale < min_scale] = min_scale
-            step_scale = step_scale.type(dtype)
-            step_scale = step_scale.to(device)
         return step_scale
     
-    @ torch.no_grad()
+    @torch.no_grad()
     def determine_filter_range(self):
         guidance_filter = self.guidance_filter
         if guidance_filter is None:
@@ -181,7 +177,7 @@ class AttnGuidance:
                 h_filter_range = torch.linspace(filter_start_h, h, num_guidance_steps, dtype=torch.int, device=device)
                 w_filter_range = torch.linspace(filter_start_w, w, num_guidance_steps, dtype=torch.int, device=device)
             elif filter_strategy == 'cosine':
-                omega = torch.linspace(-torch.pi, 0, num_guidance_steps)
+                omega = torch.linspace(-torch.pi, 0, num_guidance_steps, device=device)
                 h_filter_range = (torch.cos(omega) + 1) / 2
                 w_filter_range = h_filter_range
                 h_filter_range = h * h_filter_range
@@ -190,8 +186,6 @@ class AttnGuidance:
                 w_filter_range = w_filter_range.type(torch.int)
                 h_filter_range[h_filter_range < filter_start_h] = filter_start_h
                 w_filter_range[w_filter_range < filter_start_w] = filter_start_w
-                h_filter_range = h_filter_range.to(device)
-                w_filter_range = w_filter_range.to(device)
             elif filter_strategy == 'exp':
                 h_filter_range = torch.logspace(torch.log(torch.tensor(filter_start_h)), torch.log(torch.tensor(h)),
                                                 num_guidance_steps, torch.exp(torch.tensor(1)),
@@ -203,7 +197,6 @@ class AttnGuidance:
             filter_range = iter(filter_range)
         return filter_range
     
-    @ torch.no_grad()
     def filter(self, x):
         if self.guidance_filter is not None:
             h_threshold, w_threshold = next(self.filter_range)
@@ -215,7 +208,7 @@ class AttnGuidance:
             # filter
             B, C, H, W = x.shape
             mask = torch.zeros((B, C, H, W), device=self.device)
-            crow, ccol = H // 2, W //2
+            crow, ccol = H // 2, W // 2
             mask[..., crow - h_threshold:crow + h_threshold, ccol - w_threshold:ccol + w_threshold] = 1
             x = x * mask
             # ifft
@@ -224,8 +217,7 @@ class AttnGuidance:
             x = x.type(dtype)
         return x
     
-    @ torch.no_grad()
-    def vanilla_attn_guidance(self, latents: Tensor, alpha_t: Tensor = None) -> Tensor:
+    def vanilla_attn_guidance(self, latents: Tensor, alpha_t: Optional[Tensor] = None) -> Tensor:
         b, c, h, w = latents.shape
         scaling = c ** 0.5 if self.attn_scaling is None else self.attn_scaling
         latents = latents.reshape(b, c, -1)
@@ -235,6 +227,8 @@ class AttnGuidance:
         attn = torch.matmul(q, k)
         attn = F.softmax(attn, dim=-1)
         latents_ = torch.matmul(attn, latents)
+        if self.power_calibrate and alpha_t is None:
+            raise ValueError("alpha_t is required when power_calibrate is set")
         if self.power_calibrate:
             if self.power_calibrate == 1:
                 power = (alpha_t * (latents_ / (latents + 1e-6)) ** 2 + (1 - alpha_t) * (attn ** 2).sum(dim=-1, keepdim=True)) ** 0.5
@@ -244,17 +238,31 @@ class AttnGuidance:
         latents_ = latents_.transpose(-1, -2).reshape(b, c, h, w)
         return latents_
     
-    @ torch.no_grad()
-    def __call__(self, t_index: int, latents: Tensor, alpha_t: Tensor = None) -> Tensor:
+    def __call__(self, t_index: int, latents: Tensor, alpha_t: Optional[Tensor] = None,
+                 scale: Optional[Union[float, Tensor]] = None) -> Tensor:
         """
         NOTE: Here, t_index is not the same as timestep because Diffusion Models typically use a skip-step sampling
         strategy. t_index represents the index of the timestep. For a sampling with T=50, t=50, ..., 1 corresponds
         to t_index=49, ..., 0.
+
+        scale: per-step guidance strength.
+            - None (default): use the precomputed hand-tuned schedule (gated by guidance_step_index / decayed by
+              guidance_scale_decay). The whole op runs under torch.no_grad() -- byte-for-byte the original
+              training-free path.
+            - float | Tensor (e.g. emitted by a learned controller): overrides the schedule and is applied at EVERY
+              step, leaving the op grad-enabled so gradients can flow through `scale` (and, if `latents` requires
+              grad, through the attention nudge) for differentiable reward fine-tuning. scale == 0 reproduces the
+              no-guidance latent, so a learned controller subsumes guidance_density (0 == OFF) AND guidance_scale_decay.
         """
-        if t_index in self.guidance_step_index:
-            scale = next(self.guidance_step_scale)
-            if self.attn_type == 'vanilla':
-                latents = latents + scale * (self.vanilla_attn_guidance(self.filter(latents), alpha_t) - latents)
+        if scale is None:
+            with torch.no_grad():
+                if t_index in self.guidance_step_index:
+                    s = next(self.guidance_step_scale)
+                    if self.attn_type == 'vanilla':
+                        latents = latents + s * (self.vanilla_attn_guidance(self.filter(latents), alpha_t) - latents)
+            return latents
+        if self.attn_type == 'vanilla':
+            latents = latents + scale * (self.vanilla_attn_guidance(self.filter(latents), alpha_t) - latents)
         return latents
 
 
