@@ -1,0 +1,6 @@
+interface:
+  display_name: "Inspect RepLDM"
+  short_description: "Audit and fix RepLDM until independently clean"
+  default_prompt: "Use $inspect to audit and fix RepLDM until three independent review rounds are clean."
+policy:
+  allow_implicit_invocation: false

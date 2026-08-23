@@ -1,0 +1,6 @@
+interface:
+  display_name: "Check RepLDM Dual Review"
+  short_description: "Verify RepLDM changes with two engines"
+  default_prompt: "Use $check-cc to verify pending RepLDM changes with Codex and Claude."
+policy:
+  allow_implicit_invocation: false

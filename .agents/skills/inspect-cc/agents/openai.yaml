@@ -1,0 +1,6 @@
+interface:
+  display_name: "Inspect RepLDM Dual Review"
+  short_description: "Audit RepLDM with Codex and Claude"
+  default_prompt: "Use $inspect-cc to audit RepLDM with independent Codex and Claude reviewers."
+policy:
+  allow_implicit_invocation: false

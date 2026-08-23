@@ -1,0 +1,6 @@
+interface:
+  display_name: "Check RepLDM Changes"
+  short_description: "Verify and harden pending RepLDM changes"
+  default_prompt: "Use $check to verify, harden, and commit the current RepLDM changes."
+policy:
+  allow_implicit_invocation: false
