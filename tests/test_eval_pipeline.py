@@ -84,6 +84,10 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual(
             cone_controller(None).residual_mode, "trajectory_cone_tangent"
         )
+        cone_development, _ = generate.load_actions(
+            ROOT / "eval-pipeline/configs/trajectory_cone_development.yaml", 50
+        )
+        self.assertEqual(len(cone_development), 9)
 
     def test_invalid_action_config_is_rejected(self):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:

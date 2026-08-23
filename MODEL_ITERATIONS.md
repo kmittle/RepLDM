@@ -9,7 +9,7 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 | S0 | Constant scalar TFSA residual | Invalidated | Scale increases saturation and degrades TOPIQ-NR; low scale converges to no-AG. |
 | S1 | Low/mid/high spectral residual gains | Invalidated | Best action, `mid_only_0.004`, is non-superior to no-AG; seed-CV finds no adaptive headroom. |
 | S2 | Moment-Tangent Attention Guidance (MTAG) | Invalidated | It removes moment drift but does not improve quality or preference. |
-| S3 | Trajectory-Cone Moment Guidance (TCMG) | Registered | Remove tangent components opposing the frozen scheduler transition. |
+| S3 | Trajectory-Cone Moment Guidance (TCMG) | Development grid frozen | Cone is active and non-catastrophic at low scales; no efficacy claim yet. |
 
 S0-S2 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
@@ -87,3 +87,11 @@ Both `v` and `q` lie in the same tangent space, so the half-space projection kee
 GAG's parallel/orthogonal decomposition concerns sparse-versus-dense cross-attention guidance. TCMG instead constrains an external self-attention latent update against the scheduler's realized transition on a fixed-moment manifold. The decomposition alone is not claimed as generic novelty; the journal claim requires the combined operator and subsequent learned policy to survive baselines.
 
 Registered smoke: `eval-pipeline/configs/trajectory_cone_smoke.yaml`, two prompts, seed `0`, GPU 1. It includes no-AG, expert, raw `0.001`, plain tangent `0.002`, TCMG `0.001/0.002/0.004/0.008`, and energy-matched TCMG `0.001/0.002/0.004`. Apply the same non-finite/no-op, TOPIQ `-0.05`, and clipping `+0.01` rejection rules as S2. Smoke only fixes a contiguous scale range. A 12×3 development run is allowed only if at least one TCMG interval survives; the S2 gate thresholds remain unchanged.
+
+## S3 Smoke Outcome
+
+Run: `outputs/exp_trajectory_cone/smoke_2prompt_1seed_v1`, produced by commit `0e00fe6` on GPU 1. All 22 records are complete, finite, and pixel-distinct. Eight no-AG/expert/raw/plain-tangent controls exactly reproduce S2 hashes, so the tangent refactor has no integration regression. TCMG differs from plain tangent at the PNG level, showing that the cone is active on real scheduler trajectories.
+
+Descriptive two-prompt means are uniformly negative on TOPIQ: TCMG `0.001/0.002/0.004` gives `-0.006597/-0.007909/-0.010637`; the energy-matched `0.001/0.002` gives `-0.010521/-0.008155`. TCMG `0.002` has HPSv2 `+0.005859`, but its two-prompt interval is uninformative and ImageReward is `-0.065652`. The fixed montage shows state-dependent composition changes without a consistent structural repair.
+
+TCMG `0.008` is removed because one prompt exceeds the `+0.01` clipping limit; energy-matched `0.004` is removed for the same reason. The contiguous non-catastrophic ranges are TCMG `0.001–0.004` and energy-matched TCMG `0.001–0.002`. These ranges, plus no-AG, expert, raw `0.001`, and plain tangent `0.002`, are frozen in `eval-pipeline/configs/trajectory_cone_development.yaml`. The smoke does not provide efficacy evidence.

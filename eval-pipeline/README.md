@@ -34,6 +34,8 @@ Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count 
 
 `configs/trajectory_cone_smoke.yaml` is the registered S3 range check. Its hypothesis and action-removal rule are fixed in `MODEL_ITERATIONS.md`; do not add scales after viewing its scores.
 
+`configs/trajectory_cone_development.yaml` freezes the complete non-catastrophic S3 intervals. As with S2, its 12-prompt set is development-only.
+
 ## Prepare Scorers
 
 The scoring environment is a clone of `diff_attn` with independent evaluation packages:
