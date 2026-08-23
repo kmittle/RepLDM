@@ -30,6 +30,8 @@ Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count 
 
 `configs/moment_tangent_smoke.yaml` is registered in `MODEL_ITERATIONS.md`. Run it on `prompts/smoke.csv` with seed `0` before freezing a larger development grid; its two prompts may reject broken or catastrophic actions but cannot support an efficacy claim.
 
+`configs/moment_tangent_development.yaml` is the action grid frozen from that range check. Its 12-prompt, 3-seed output is development evidence; do not reuse those prompts for confirmation if an action passes the registered gate.
+
 ## Prepare Scorers
 
 The scoring environment is a clone of `diff_attn` with independent evaluation packages:

@@ -67,6 +67,11 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertIsNone(raw_controller)
         self.assertEqual(raw_scale, 0.004)
 
+        development_actions, _ = generate.load_actions(
+            ROOT / "eval-pipeline/configs/moment_tangent_development.yaml", 50
+        )
+        self.assertEqual(len(development_actions), 10)
+
     def test_invalid_action_config_is_rejected(self):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:
             handle.write("actions:\n  - id: bad/action\n    type: none\n")

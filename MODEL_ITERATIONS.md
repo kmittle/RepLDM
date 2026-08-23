@@ -8,7 +8,7 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 |---|---|---|---|
 | S0 | Constant scalar TFSA residual | Invalidated | Scale increases saturation and degrades TOPIQ-NR; low scale converges to no-AG. |
 | S1 | Low/mid/high spectral residual gains | Invalidated | Best action, `mid_only_0.004`, is non-superior to no-AG; seed-CV finds no adaptive headroom. |
-| S2 | Moment-Tangent Attention Guidance (MTAG) | Registered | Test whether spatial rearrangement can be retained without per-channel moment drift. |
+| S2 | Moment-Tangent Attention Guidance (MTAG) | Development grid frozen | Smoke passed implementation/range checks; no efficacy claim yet. |
 
 S0 and S1 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
@@ -47,3 +47,18 @@ A candidate enters RL work only if it meets all of the following on the frozen d
 4. A fixed montage shows a plausible structural/detail change rather than global color or contrast manipulation.
 
 Passing this gate licenses a new prompt-disjoint confirmation set and high-resolution Stage-2 transfer test. It does not itself establish a journal claim. Failure kills S2 and triggers a new operator hypothesis rather than reward tuning or controller complexity.
+
+## S2 Smoke Outcome
+
+Run: `outputs/exp_moment_tangent/smoke_2prompt_1seed_v1`, produced by commit `b9f3fbc` on GPU 1. All 32 expected PNG/JSON pairs are valid 1024² RGB images, contain complete action metadata, and have distinct PNG hashes. No-AG, conference expert, and raw scales `0.001/0.002/0.004` exactly reproduce the corresponding historical PNG SHA-256 hashes on the same GPU.
+
+The two-prompt means below are descriptive only:
+
+| Action | Δ TOPIQ | Δ HPSv2 | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|
+| raw 0.001 | +0.001310 | +0.000366 | +0.001281 | +0.008493 |
+| mean-centered 0.001 | -0.000746 | +0.001953 | -0.002757 | +0.005103 |
+| tangent 0.002 | -0.007128 | +0.005005 | -0.004189 | -0.000084 |
+| tangent-rescaled 0.002 | -0.006053 | +0.001465 | +0.003750 | +0.003801 |
+
+The fixed montage shows no consistent structural winner. Moment tangent suppresses the raw update's contrast/saturation route, but the energy-matched variant introduces a flat-design wall-object artifact. Per the registered catastrophic thresholds, tangent `0.008`, tangent-rescaled `0.004/0.008`, and mean-centered `0.004` are removed. The development grid is frozen in `eval-pipeline/configs/moment_tangent_development.yaml`; retained intervals are mean-centered `0.001–0.002`, tangent `0.001–0.004`, and tangent-rescaled `0.001–0.002`. Raw `0.001` is the previously established best scalar control. The 12-prompt set remains development data because it informed S2; any passing action still requires prompt-disjoint confirmation.
