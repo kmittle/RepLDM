@@ -6,6 +6,7 @@ The harness separates generation from scoring through lossless PNG files and JSO
 generate.py       [diff_attn]    prompt x seed x action -> PNG + sidecar -> manifest.jsonl
 score.py          [repldm_eval]  manifest + PNG          -> scores.jsonl
 compare_actions.py[repldm_eval]  manifest + scores       -> action_comparisons.csv
+analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 ```
 
 ## Generate
@@ -65,6 +66,18 @@ Configured outputs are ImageReward and native crops, pixel witnesses, CLIPScore,
 
 The comparison rejects missing or cross-device pairing metadata. It reports paired deltas, crossed prompt/seed bootstrap 95% intervals, prompt-level sign-flip tests, and both within-metric and global Holm corrections. Missing prompt×seed cells are rejected rather than silently converted into an unbalanced comparison.
 
+## Analyze Adaptivity Headroom
+
+Use leave-one-seed-out selection to test whether per-prompt action choices are stable beyond the seeds used to choose them:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/analyze_adaptivity.py \
+  --run_dir outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1 \
+  --selection_metric topiq_nr
+```
+
+For each fold, the script selects a global action and one action per prompt on the other seeds, then evaluates both on the held-out seed. `no_ag` is always a candidate, so the analysis cannot create a gain by forcing guidance. It writes `adaptivity_comparisons.csv` and `adaptivity_selections.csv`, including the candidate set, objective direction, inference seed, and resampling counts. It rejects incomplete or cross-device blocks and reports the per-prompt-minus-global headroom with the same paired inference used above. This is a cross-seed consistency test on known prompts, not evidence of generalization to unseen prompts.
+
 `aggregate.py` and `visualize.py` remain available for the legacy scalar sweep. Their plots are descriptive and must not be used for the invalidated cross-device pilot in `EXPERIMENT_RESULTS.md`.
 
 ## Layout
@@ -76,6 +89,7 @@ scorers/                 independent metric plugins
 generate.py              grouped multi-GPU generation
 score.py                 additive scoring runner
 compare_actions.py       paired inference and multiplicity correction
+analyze_adaptivity.py    leave-one-seed-out action-selection headroom
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

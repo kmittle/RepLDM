@@ -1,6 +1,7 @@
 import json
 import importlib.util
 import pathlib
+import sys
 import tempfile
 import unittest
 
@@ -9,6 +10,7 @@ import pandas as pd
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "eval-pipeline"))
 
 
 def load_module(name, relative_path):
@@ -20,6 +22,9 @@ def load_module(name, relative_path):
 
 compare_actions = load_module("compare_actions", "eval-pipeline/compare_actions.py")
 generate = load_module("generate", "eval-pipeline/generate.py")
+analyze_adaptivity = load_module(
+    "analyze_adaptivity", "eval-pipeline/analyze_adaptivity.py"
+)
 
 
 class EvalPipelineTest(unittest.TestCase):
@@ -150,6 +155,100 @@ class EvalPipelineTest(unittest.TestCase):
             [task["execution_rank"] for task in first["cuda:1"]], list(range(4))
         )
         self.assertNotEqual(first_ids, [task["id"] for task in first_tasks])
+
+    def test_seed_cv_reports_per_prompt_headroom(self):
+        rows = []
+        for prompt_index in [0, 1]:
+            for seed in [0, 1, 2]:
+                values = {
+                    "no_ag": 0.0,
+                    "action_a": 1.0 if prompt_index == 0 else -1.0,
+                    "action_b": -1.0 if prompt_index == 0 else 1.0,
+                }
+                for action, score in values.items():
+                    rows.append(
+                        {
+                            "prompt_index": prompt_index,
+                            "seed": seed,
+                            "device": "cuda:0",
+                            "action_id": action,
+                            "topiq_nr": score,
+                        }
+                    )
+        result, selections = analyze_adaptivity.seed_cv_headroom(
+            pd.DataFrame(rows),
+            baseline="no_ag",
+            selection_metric="topiq_nr",
+            metrics=["topiq_nr"],
+            n_boot=100,
+            n_random=100,
+        )
+
+        means = result.set_index("comparison")["mean_delta"]
+        self.assertAlmostEqual(means["global_static_vs_baseline"], 0.0)
+        self.assertAlmostEqual(means["per_prompt_vs_baseline"], 1.0)
+        self.assertAlmostEqual(means["per_prompt_vs_global"], 1.0)
+        self.assertEqual(
+            set(selections["per_prompt_action"]), {"action_a", "action_b"}
+        )
+
+    def test_seed_cv_does_not_use_held_out_seed_for_selection(self):
+        rows = []
+        scores = {
+            "no_ag": [0.0, 0.0, 0.0],
+            "action_a": [2.0, 2.0, -10.0],
+            "action_b": [-1.0, -1.0, 10.0],
+        }
+        for prompt_index in [0, 1]:
+            for seed in [0, 1, 2]:
+                for action, values in scores.items():
+                    rows.append(
+                        {
+                            "prompt_index": prompt_index,
+                            "seed": seed,
+                            "device": "cuda:0",
+                            "action_id": action,
+                            "topiq_nr": values[seed],
+                        }
+                    )
+        _, selections = analyze_adaptivity.seed_cv_headroom(
+            pd.DataFrame(rows),
+            baseline="no_ag",
+            selection_metric="topiq_nr",
+            metrics=["topiq_nr"],
+            n_boot=100,
+            n_random=100,
+        )
+
+        held_out_two = selections[selections["held_out_seed"] == 2]
+        self.assertEqual(set(held_out_two["per_prompt_action"]), {"action_a"})
+        self.assertEqual(set(held_out_two["global_action"]), {"action_a"})
+
+    def test_seed_cv_rejects_an_incomplete_action_block(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "prompt_index": prompt_index,
+                    "seed": seed,
+                    "device": "cuda:0",
+                    "action_id": action,
+                    "topiq_nr": 0.0,
+                }
+                for prompt_index in [0, 1]
+                for seed in [0, 1]
+                for action in ["no_ag", "candidate"]
+                if not (prompt_index == 1 and seed == 1 and action == "candidate")
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "complete prompt x seed x action"):
+            analyze_adaptivity.seed_cv_headroom(
+                frame,
+                baseline="no_ag",
+                selection_metric="topiq_nr",
+                metrics=["topiq_nr"],
+                n_boot=10,
+                n_random=10,
+            )
 
 
 if __name__ == "__main__":
