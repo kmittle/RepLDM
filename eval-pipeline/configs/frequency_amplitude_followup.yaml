@@ -1,0 +1,45 @@
+# Post-hoc diagnostic prompted by the 0.004 spectral pilot. This is an action
+# search set, not a confirmatory benchmark.
+frequency_band_cutoffs: [0.08, 0.25]
+
+actions:
+  - id: no_ag
+    type: none
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+
+  - id: scalar_0.001
+    type: scalar
+    scale: 0.001
+
+  - id: scalar_0.002
+    type: scalar
+    scale: 0.002
+
+  - id: scalar_0.003
+    type: scalar
+    scale: 0.003
+
+  - id: scalar_0.004
+    type: scalar
+    scale: 0.004
+
+  - id: mid_only_0.001
+    type: frequency_bands
+    band_scales: [0.0, 0.001, 0.0]
+
+  - id: mid_only_0.002
+    type: frequency_bands
+    band_scales: [0.0, 0.002, 0.0]
+
+  - id: mid_only_0.003
+    type: frequency_bands
+    band_scales: [0.0, 0.003, 0.0]
+
+  - id: mid_only_0.004
+    type: frequency_bands
+    band_scales: [0.0, 0.004, 0.0]

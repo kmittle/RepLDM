@@ -25,6 +25,8 @@ All actions for one `(prompt, seed)` block run on the same GPU. Blocks use deter
 
 Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count fixed within a run. Use a new output directory whenever any of these or the action definitions change.
 
+`configs/frequency_amplitude_followup.yaml` is explicitly post-hoc: it checks whether the 0.004 pilot simply used too much scalar or mid-band guidance. Treat it as search data and validate any selected amplitude on new prompts.
+
 ## Prepare Scorers
 
 The scoring environment is a clone of `diff_attn` with independent evaluation packages:
