@@ -46,7 +46,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from AttentionGuidance import ConstantGuidanceController, RESIDUAL_MODES
+from AttentionGuidance import (
+    ConstantGuidanceController,
+    MOMENT_TANGENT_MODES,
+    RESIDUAL_MODES,
+)
 from InferencePipelines import RepLDMSDXLPipeline
 
 DEFAULT_CACHE_DIR = "/mnt/miah204/bycao/RepLDM/pretrained_ckpts"
@@ -219,7 +223,7 @@ def load_actions(path: str, num_inference_steps: int):
             action["max_update_ratio"] = float(action["max_update_ratio"])
             if action["max_update_ratio"] < 0:
                 raise ValueError(f"{action_id}: max_update_ratio must be non-negative")
-            if residual_mode in {"moment_tangent", "moment_tangent_rescaled"}:
+            if residual_mode in MOMENT_TANGENT_MODES:
                 raise ValueError(
                     f"{action_id}: max_update_ratio is not defined for moment-tangent updates"
                 )

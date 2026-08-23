@@ -11,7 +11,7 @@ analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 
 ## Generate
 
-Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, or `moment_tangent_rescaled`; omitted mode means byte-compatible `raw`. Moment-tangent modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate the fixed-moment geometry.
+Stage-1 experiments are limited to 1024² so Stage 2 is skipped. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry.
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -31,6 +31,8 @@ Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count 
 `configs/moment_tangent_smoke.yaml` is registered in `MODEL_ITERATIONS.md`. Run it on `prompts/smoke.csv` with seed `0` before freezing a larger development grid; its two prompts may reject broken or catastrophic actions but cannot support an efficacy claim.
 
 `configs/moment_tangent_development.yaml` is the action grid frozen from that range check. Its 12-prompt, 3-seed output is development evidence; do not reuse those prompts for confirmation if an action passes the registered gate.
+
+`configs/trajectory_cone_smoke.yaml` is the registered S3 range check. Its hypothesis and action-removal rule are fixed in `MODEL_ITERATIONS.md`; do not add scales after viewing its scores.
 
 ## Prepare Scorers
 

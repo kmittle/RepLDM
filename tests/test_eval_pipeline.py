@@ -72,6 +72,19 @@ class EvalPipelineTest(unittest.TestCase):
         )
         self.assertEqual(len(development_actions), 10)
 
+        cone_actions, _ = generate.load_actions(
+            ROOT / "eval-pipeline/configs/trajectory_cone_smoke.yaml", 50
+        )
+        self.assertEqual(len(cone_actions), 11)
+        cone = {action["id"]: action for action in cone_actions}[
+            "trajectory_cone_0.002"
+        ]
+        cone_controller, cone_scale, _, _ = generate.guidance_runtime(cone, 50)
+        self.assertEqual(cone_scale, 0.0)
+        self.assertEqual(
+            cone_controller(None).residual_mode, "trajectory_cone_tangent"
+        )
+
     def test_invalid_action_config_is_rejected(self):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:
             handle.write("actions:\n  - id: bad/action\n    type: none\n")

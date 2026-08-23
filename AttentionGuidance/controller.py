@@ -4,7 +4,13 @@ from typing import Optional, Protocol, Sequence
 
 from torch import Tensor
 
-from .types import BandScales, RESIDUAL_MODES, ResidualMode, Scale
+from .types import (
+    BandScales,
+    MOMENT_TANGENT_MODES,
+    RESIDUAL_MODES,
+    ResidualMode,
+    Scale,
+)
 
 
 @dataclass(frozen=True)
@@ -38,7 +44,7 @@ class GuidanceAction:
             raise ValueError("frequency-band actions only support residual_mode='raw'")
         if (
             self.max_update_ratio is not None
-            and self.residual_mode in {"moment_tangent", "moment_tangent_rescaled"}
+            and self.residual_mode in MOMENT_TANGENT_MODES
         ):
             raise ValueError(
                 "max_update_ratio is not defined for moment-tangent geodesic updates"
@@ -95,7 +101,7 @@ class ScheduleGuidanceController:
             raise ValueError("frequency-band schedules only support residual_mode='raw'")
         if (
             max_update_ratio is not None
-            and residual_mode in {"moment_tangent", "moment_tangent_rescaled"}
+            and residual_mode in MOMENT_TANGENT_MODES
         ):
             raise ValueError(
                 "max_update_ratio is not defined for moment-tangent geodesic updates"

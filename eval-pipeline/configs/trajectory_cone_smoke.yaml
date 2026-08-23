@@ -1,0 +1,50 @@
+# S3 registered range smoke. The trajectory-cone modes use the scheduler update
+# already recorded by the controller observation; no extra UNet call is needed.
+actions:
+  - id: no_ag
+    type: none
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+
+  - id: raw_0.001
+    type: scalar
+    scale: 0.001
+
+  - id: moment_tangent_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: moment_tangent
+
+  - id: trajectory_cone_0.001
+    type: scalar
+    scale: 0.001
+    residual_mode: trajectory_cone_tangent
+  - id: trajectory_cone_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: trajectory_cone_tangent
+  - id: trajectory_cone_0.004
+    type: scalar
+    scale: 0.004
+    residual_mode: trajectory_cone_tangent
+  - id: trajectory_cone_0.008
+    type: scalar
+    scale: 0.008
+    residual_mode: trajectory_cone_tangent
+
+  - id: trajectory_cone_rescaled_0.001
+    type: scalar
+    scale: 0.001
+    residual_mode: trajectory_cone_tangent_rescaled
+  - id: trajectory_cone_rescaled_0.002
+    type: scalar
+    scale: 0.002
+    residual_mode: trajectory_cone_tangent_rescaled
+  - id: trajectory_cone_rescaled_0.004
+    type: scalar
+    scale: 0.004
+    residual_mode: trajectory_cone_tangent_rescaled

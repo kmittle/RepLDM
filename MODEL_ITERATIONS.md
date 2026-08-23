@@ -8,9 +8,10 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 |---|---|---|---|
 | S0 | Constant scalar TFSA residual | Invalidated | Scale increases saturation and degrades TOPIQ-NR; low scale converges to no-AG. |
 | S1 | Low/mid/high spectral residual gains | Invalidated | Best action, `mid_only_0.004`, is non-superior to no-AG; seed-CV finds no adaptive headroom. |
-| S2 | Moment-Tangent Attention Guidance (MTAG) | Development grid frozen | Smoke passed implementation/range checks; no efficacy claim yet. |
+| S2 | Moment-Tangent Attention Guidance (MTAG) | Invalidated | It removes moment drift but does not improve quality or preference. |
+| S3 | Trajectory-Cone Moment Guidance (TCMG) | Registered | Remove tangent components opposing the frozen scheduler transition. |
 
-S0 and S1 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
+S0-S2 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
 ## S2 Mechanistic Hypothesis
 
@@ -62,3 +63,27 @@ The two-prompt means below are descriptive only:
 | tangent-rescaled 0.002 | -0.006053 | +0.001465 | +0.003750 | +0.003801 |
 
 The fixed montage shows no consistent structural winner. Moment tangent suppresses the raw update's contrast/saturation route, but the energy-matched variant introduces a flat-design wall-object artifact. Per the registered catastrophic thresholds, tangent `0.008`, tangent-rescaled `0.004/0.008`, and mean-centered `0.004` are removed. The development grid is frozen in `eval-pipeline/configs/moment_tangent_development.yaml`; retained intervals are mean-centered `0.001–0.002`, tangent `0.001–0.004`, and tangent-rescaled `0.001–0.002`. Raw `0.001` is the previously established best scalar control. The 12-prompt set remains development data because it informed S2; any passing action still requires prompt-disjoint confirmation.
+
+## S2 Development Outcome
+
+Run: `outputs/exp_moment_tangent/development_12prompt_3seed_v1`, 12 prompts × 3 seeds × 10 actions, produced by commit `65ba734`. All 360 records are complete and paired; 108 no-AG/expert/raw control PNGs exactly reproduce prior same-GPU hashes.
+
+No action passes the registered gate. The least-negative TOPIQ result is mean-centered `0.001`: `-0.000946`, 95% CI `[-0.005246,+0.003537]`. Moment tangent `0.001/0.002/0.004` gives `-0.002316/-0.002268/-0.004424`; energy-matched `0.001` is significantly worse after within-metric Holm correction (`-0.003763`, CI `[-0.005925,-0.001483]`, adjusted `p=0.025920`). HPSv2 changes for every S2 action are within `±0.001`; CLIP does not improve.
+
+The mechanism itself is supported: raw `0.001` increases saturation by `+0.013449`, whereas the three unscaled tangent actions change it by `-0.000862/-0.000997/-0.001767`, with clipped fraction within `±0.001`. Thus the fixed-moment constraint removes the color/contrast route, but the remaining spatial TFSA direction has no measurable benefit. TOPIQ-selected per-prompt seed-CV is `+0.001791` vs no-AG, CI `[-0.004392,+0.007529]`, while increasing clipping and saturation. HPS-selected per-prompt actions underperform the global expert by `-0.002082`, CI `[-0.003872,-0.000434]`. The fixed montage shows composition changes but no stable structural repair. S2 is closed; its scales must not be tuned further and it cannot seed RL training.
+
+## S3 Registered Hypothesis
+
+S2 shows that moment drift is harmful but also that unconditional TFSA spatial transport is not reliably useful. S3 tests whether the harmful part is the component that opposes the frozen model's own denoising transition. Let `P_T` be the S2 fixed-moment tangent projection, `d = TFSA(z)-z`, and `g` the scheduler update that produced `z`. Per sample and latent channel:
+
+```text
+v = P_T(d),  q = P_T(g)
+c = v - min(<v,q>, 0) q / ||q||^2
+z' = Exp_z(scale c).
+```
+
+Both `v` and `q` lie in the same tangent space, so the half-space projection keeps the fixed-moment guarantee and enforces `<c,q> >= 0`. It is parameter-free, state-dependent, uses no additional UNet call, and has a falsifiable role: if opposing components caused S2's loss, TCMG should beat plain moment tangent at matched scale. An energy-matched variant separates cone geometry from attenuation.
+
+GAG's parallel/orthogonal decomposition concerns sparse-versus-dense cross-attention guidance. TCMG instead constrains an external self-attention latent update against the scheduler's realized transition on a fixed-moment manifold. The decomposition alone is not claimed as generic novelty; the journal claim requires the combined operator and subsequent learned policy to survive baselines.
+
+Registered smoke: `eval-pipeline/configs/trajectory_cone_smoke.yaml`, two prompts, seed `0`, GPU 1. It includes no-AG, expert, raw `0.001`, plain tangent `0.002`, TCMG `0.001/0.002/0.004/0.008`, and energy-matched TCMG `0.001/0.002/0.004`. Apply the same non-finite/no-op, TOPIQ `-0.05`, and clipping `+0.01` rejection rules as S2. Smoke only fixes a contiguous scale range. A 12×3 development run is allowed only if at least one TCMG interval survives; the S2 gate thresholds remain unchanged.

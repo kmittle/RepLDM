@@ -6,7 +6,7 @@ from .controller import (
     GuidanceObservation,
     ScheduleGuidanceController,
 )
-from .types import RESIDUAL_MODES, ResidualMode
+from .types import MOMENT_TANGENT_MODES, RESIDUAL_MODES, ResidualMode
 
 __all__ = [
     "AttnGuidance",
@@ -14,6 +14,7 @@ __all__ = [
     "GuidanceAction",
     "GuidanceController",
     "GuidanceObservation",
+    "MOMENT_TANGENT_MODES",
     "RESIDUAL_MODES",
     "ResidualMode",
     "ScheduleGuidanceController",

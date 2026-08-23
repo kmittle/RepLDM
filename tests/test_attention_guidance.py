@@ -147,6 +147,97 @@ class AttentionGuidanceTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(value.grad).all())
         self.assertGreater(float(scale.grad.abs()), 0.0)
 
+    def test_trajectory_cone_removes_opposing_tangent_component(self):
+        guidance = self.make_guidance()
+        latents = torch.randn(2, 4, 8, 8, dtype=torch.float64)
+        residual = torch.randn_like(latents)
+        centered = latents - latents.mean(dim=(-2, -1), keepdim=True)
+        epsilon = torch.finfo(latents.dtype).eps
+        tangent, _ = guidance._project_fixed_moment_tangent(
+            centered, residual, epsilon
+        )
+        projected = guidance._project_trajectory_cone(
+            tangent, -tangent, epsilon
+        )
+        torch.testing.assert_close(
+            projected, torch.zeros_like(projected), rtol=0.0, atol=1e-12
+        )
+        supported = guidance._project_trajectory_cone(
+            tangent, tangent, epsilon
+        )
+        self.assertTrue(torch.equal(supported, tangent))
+
+    def test_trajectory_cone_is_non_opposing_and_preserves_moments(self):
+        guidance = self.make_guidance()
+        latents = torch.randn(2, 4, 8, 8, dtype=torch.float64)
+        residual = torch.randn_like(latents)
+        reference = torch.randn_like(latents)
+        centered = latents - latents.mean(dim=(-2, -1), keepdim=True)
+        epsilon = torch.finfo(latents.dtype).eps
+        tangent, _ = guidance._project_fixed_moment_tangent(
+            centered, residual, epsilon
+        )
+        reference_tangent, _ = guidance._project_fixed_moment_tangent(
+            centered, reference, epsilon
+        )
+        cone = guidance._project_trajectory_cone(
+            tangent, reference_tangent, epsilon
+        )
+        agreement = (cone * reference_tangent).sum(dim=(-2, -1))
+        self.assertTrue(torch.all(agreement >= -1e-12))
+
+        updated = guidance.apply_moment_tangent_update(
+            latents,
+            residual,
+            0.2,
+            reference_update=reference,
+            trajectory_cone=True,
+        )
+        torch.testing.assert_close(
+            updated.mean(dim=(-2, -1)),
+            latents.mean(dim=(-2, -1)),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        torch.testing.assert_close(
+            updated.var(dim=(-2, -1), correction=0),
+            latents.var(dim=(-2, -1), correction=0),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_trajectory_cone_requires_reference_update(self):
+        guidance = self.make_guidance()
+        with self.assertRaisesRegex(ValueError, "reference_update"):
+            guidance(
+                3,
+                torch.randn(1, 4, 8, 8),
+                scale=0.002,
+                residual_mode="trajectory_cone_tangent",
+            )
+
+    def test_trajectory_cone_has_finite_gradients(self):
+        guidance = self.make_guidance()
+        latents = torch.randn(1, 4, 8, 8, dtype=torch.float64, requires_grad=True)
+        residual = torch.randn_like(latents, requires_grad=True)
+        reference = torch.randn_like(latents, requires_grad=True)
+        scale = torch.tensor(0.02, dtype=torch.float64, requires_grad=True)
+        weights = torch.linspace(
+            0.1, 1.0, latents.numel(), dtype=torch.float64
+        ).reshape_as(latents)
+        updated = guidance.apply_moment_tangent_update(
+            latents,
+            residual,
+            scale,
+            match_raw_energy=True,
+            reference_update=reference,
+            trajectory_cone=True,
+        )
+        (updated * weights).sum().backward()
+        for value in (latents, residual, reference, scale):
+            self.assertIsNotNone(value.grad)
+            self.assertTrue(torch.isfinite(value.grad).all())
+
     def test_moment_tangent_rejects_incompatible_action_constraints(self):
         with self.assertRaises(ValueError):
             GuidanceAction(
@@ -216,6 +307,13 @@ class AttentionGuidanceTest(unittest.TestCase):
             residual_mode="moment_tangent",
         )
         self.assertEqual(tangent_schedule(observation).residual_mode, "moment_tangent")
+        cone_schedule = ScheduleGuidanceController(
+            scale_schedule=(0.004, 0.003, 0.002, 0.001),
+            residual_mode="trajectory_cone_tangent",
+        )
+        self.assertEqual(
+            cone_schedule(observation).residual_mode, "trajectory_cone_tangent"
+        )
         with self.assertRaises(ValueError):
             GuidanceAction(scale=0.001, band_scales=(0.001, 0.001, 0.001))
 

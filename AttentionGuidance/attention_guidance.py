@@ -6,7 +6,14 @@ from torch import fft
 import math
 from typing import Optional, Tuple, Union
 
-from .types import BandScales, RESIDUAL_MODES, ResidualMode, Scale
+from .types import (
+    BandScales,
+    MOMENT_TANGENT_MODES,
+    RESIDUAL_MODES,
+    TRAJECTORY_CONE_MODES,
+    ResidualMode,
+    Scale,
+)
 
 
 class AttnGuidance:
@@ -361,6 +368,53 @@ class AttnGuidance:
         centered = work - work.mean(dim=(-2, -1), keepdim=True)
         return centered.to(residual.dtype)
 
+    @staticmethod
+    def _project_fixed_moment_tangent(
+        centered_latents: Tensor,
+        residual: Tensor,
+        energy_epsilon: float,
+    ) -> Tuple[Tensor, Tensor]:
+        """Project a residual into each channel's fixed-mean/norm tangent space."""
+        spatial_dims = (-2, -1)
+        centered_residual = residual - residual.mean(
+            dim=spatial_dims, keepdim=True
+        )
+        latent_energy = centered_latents.square().sum(
+            dim=spatial_dims, keepdim=True
+        )
+        radial_inner_product = (centered_residual * centered_latents).sum(
+            dim=spatial_dims, keepdim=True
+        )
+        tangent = centered_residual - (
+            radial_inner_product / latent_energy.clamp_min(energy_epsilon)
+        ) * centered_latents
+        tangent = torch.where(
+            latent_energy > energy_epsilon, tangent, torch.zeros_like(tangent)
+        )
+        return tangent, latent_energy
+
+    @staticmethod
+    def _project_trajectory_cone(
+        tangent: Tensor,
+        reference_tangent: Tensor,
+        energy_epsilon: float,
+    ) -> Tensor:
+        """Remove each channel's component opposing the scheduler trajectory."""
+        spatial_dims = (-2, -1)
+        reference_energy = reference_tangent.square().sum(
+            dim=spatial_dims, keepdim=True
+        )
+        agreement = (tangent * reference_tangent).sum(
+            dim=spatial_dims, keepdim=True
+        )
+        opposing_coefficient = torch.minimum(
+            agreement, torch.zeros_like(agreement)
+        ) / reference_energy.clamp_min(energy_epsilon)
+        projected = tangent - opposing_coefficient * reference_tangent
+        return torch.where(
+            reference_energy > energy_epsilon, projected, tangent
+        )
+
     def apply_moment_tangent_update(
         self,
         latents: Tensor,
@@ -368,15 +422,22 @@ class AttnGuidance:
         scale: Scale,
         *,
         match_raw_energy: bool = False,
+        reference_update: Optional[Tensor] = None,
+        trajectory_cone: bool = False,
     ) -> Tensor:
         """Move along the fixed-mean/fixed-variance manifold per channel.
 
         The centered residual is projected orthogonally to the centered latent,
-        then mapped with the sphere exponential map. The rescaled ablation gives
-        the tangent the raw residual's per-channel norm before that map.
+        then mapped with the sphere exponential map. A trajectory-cone update
+        additionally removes any per-channel tangent component opposing the
+        scheduler update. The rescaled ablation restores the raw residual norm.
         """
         if latents.shape != residual.shape or latents.ndim != 4:
             raise ValueError("latents and residual must have the same NCHW shape")
+        if trajectory_cone and reference_update is None:
+            raise ValueError("reference_update is required for trajectory-cone guidance")
+        if reference_update is not None and reference_update.shape != latents.shape:
+            raise ValueError("reference_update must have the same shape as latents")
         work_dtype = (
             torch.float32
             if latents.dtype in {torch.float16, torch.bfloat16}
@@ -386,18 +447,21 @@ class AttnGuidance:
         raw = residual.to(work_dtype)
         mean = z.mean(dim=(-2, -1), keepdim=True)
         centered_latents = z - mean
-        centered_residual = raw - raw.mean(dim=(-2, -1), keepdim=True)
+        energy_epsilon = torch.finfo(work_dtype).eps
+        tangent, latent_energy = self._project_fixed_moment_tangent(
+            centered_latents, raw, energy_epsilon
+        )
+        if trajectory_cone:
+            reference_tangent, _ = self._project_fixed_moment_tangent(
+                centered_latents,
+                reference_update.to(device=z.device, dtype=work_dtype),
+                energy_epsilon,
+            )
+            tangent = self._project_trajectory_cone(
+                tangent, reference_tangent, energy_epsilon
+            )
 
         spatial_dims = (-2, -1)
-        latent_energy = centered_latents.square().sum(dim=spatial_dims, keepdim=True)
-        radial_inner_product = (centered_residual * centered_latents).sum(
-            dim=spatial_dims, keepdim=True
-        )
-        energy_epsilon = torch.finfo(work_dtype).eps
-        tangent = centered_residual - (
-            radial_inner_product / latent_energy.clamp_min(energy_epsilon)
-        ) * centered_latents
-        tangent = torch.where(latent_energy > energy_epsilon, tangent, torch.zeros_like(tangent))
         tangent_energy = tangent.square().sum(dim=spatial_dims, keepdim=True)
 
         if match_raw_energy:
@@ -481,7 +545,9 @@ class AttnGuidance:
             to `reference_update`, normally the scheduler's update at this step.
         residual_mode: geometry applied to a scalar TFSA residual. `raw` is the
             legacy additive update; `mean_centered` removes per-channel spatial
-            drift; moment-tangent modes use a fixed-moment geodesic update.
+            drift; moment-tangent modes use a fixed-moment geodesic update;
+            trajectory-cone modes also remove components opposing the scheduler
+            update and therefore require `reference_update`.
         """
         if residual_mode not in RESIDUAL_MODES:
             raise ValueError(f"unsupported residual_mode {residual_mode!r}")
@@ -491,7 +557,7 @@ class AttnGuidance:
             raise ValueError("frequency-band guidance only supports residual_mode='raw'")
         if (
             max_update_ratio is not None
-            and residual_mode in {"moment_tangent", "moment_tangent_rescaled"}
+            and residual_mode in MOMENT_TANGENT_MODES
         ):
             raise ValueError(
                 "max_update_ratio is not defined for moment-tangent geodesic updates"
@@ -499,6 +565,8 @@ class AttnGuidance:
         controlled = scale is not None or band_scales is not None
         if not controlled and residual_mode != "raw":
             raise ValueError("non-raw residual modes require an explicit scalar scale")
+        if residual_mode in TRAJECTORY_CONE_MODES and reference_update is None:
+            raise ValueError("reference_update is required for trajectory-cone guidance")
         if not controlled:
             with torch.no_grad():
                 if t_index in self.guidance_step_index:
@@ -516,12 +584,14 @@ class AttnGuidance:
                 self.filter(latents, t_index, controlled=True), alpha_t
             )
             residual = guided - latents
-            if residual_mode in {"moment_tangent", "moment_tangent_rescaled"}:
+            if residual_mode in MOMENT_TANGENT_MODES:
                 return self.apply_moment_tangent_update(
                     latents,
                     residual,
                     scale,
-                    match_raw_energy=residual_mode == "moment_tangent_rescaled",
+                    match_raw_energy=residual_mode.endswith("_rescaled"),
+                    reference_update=reference_update,
+                    trajectory_cone=residual_mode in TRAJECTORY_CONE_MODES,
                 )
             if residual_mode == "mean_centered":
                 centered_residual = self.mean_center_residual(residual)
