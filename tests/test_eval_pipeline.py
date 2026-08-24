@@ -95,6 +95,23 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual(feature_source, "backbone")
         self.assertEqual(config.to_record(), frla_action["frla_config"])
 
+        authorized = {
+            "schema": "frla_relational_validation_v1",
+            "actions": [
+                {
+                    "id": "frla_authorized",
+                    "type": "frla_relational",
+                    "selection_eligible": True,
+                    "frla_config": frla_action["frla_config"],
+                }
+            ],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:
+            yaml.safe_dump(authorized, handle)
+            handle.flush()
+            authorized_actions, _ = generate.load_actions(handle.name, 5)
+        self.assertTrue(authorized_actions[0]["selection_eligible"])
+
     def test_frla_diagnostics_reset_and_sidecar_provenance(self):
         state = type("PipelineState", (), {})()
         config = FRLAConfig(grid_size=8, lags=((1, 0),))

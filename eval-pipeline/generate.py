@@ -69,6 +69,10 @@ from InferencePipelines import RepLDMSDXLPipeline
 DEFAULT_CACHE_DIR = "/mnt/miah204/bycao/RepLDM/pretrained_ckpts"
 DEFAULT_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_NEG = "blurry, ugly, duplicate, poorly drawn, deformed, mosaic"
+FRLA_SELECTION_SCHEMAS = {
+    "frla_relational_actions_v1",
+    "frla_relational_validation_v1",
+}
 
 
 def task_id(prompt_index: int, seed: int, action: dict, legacy_scale_id: bool = False) -> str:
@@ -417,9 +421,9 @@ def load_actions(path: str, num_inference_steps: int):
             selection_eligible = action.get("selection_eligible", False)
             if not isinstance(selection_eligible, bool):
                 raise ValueError(f"{action_id}: selection_eligible must be boolean")
-            if selection_eligible and config.get("schema") != "frla_relational_actions_v1":
+            if selection_eligible and config.get("schema") not in FRLA_SELECTION_SCHEMAS:
                 raise ValueError(
-                    f"{action_id}: FRLA selection requires frla_relational_actions_v1"
+                    f"{action_id}: FRLA selection requires an authorized relational schema"
                 )
             # The dormant probe remains ineligible by default. A future
             # registered FRLA action must opt into its own selection protocol.
