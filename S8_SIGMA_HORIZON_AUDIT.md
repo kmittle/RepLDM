@@ -33,9 +33,11 @@ This horizon is a design choice, not a consequence of CFG-OEC. The paper's
 proxy is `2*p_i-p_(i-1)`, i.e. `r=1`, and uses the difference as an error
 surrogate at the current step. A next-point sigma horizon therefore defines a
 new `CFG-EC-sigma` variant. It must be compared with the registered `r=1`
-proxy, and cannot be described as an exact CFG-OEC reproduction. At the final
-point (`sigma_(i+1)=0`) this definition gives `r_sigma=0` and no proxy error;
-that endpoint behavior must be reported or disabled by a frozen rule.
+proxy, and cannot be described as an exact CFG-OEC reproduction. At the
+penultimate point, `sigma_(i+1)=0` is a valid endpoint and gives
+`r_sigma=sigma_i/h_prev`, generally nonzero. At the actual final point
+(`sigma_i=0`) there is no next scheduler point, so the correction must be
+skipped by a frozen rule rather than inventing a ratio.
 
 If the intended target is one *previous-sized* local interval rather than the
 next scheduler point, the ratio is deliberately `r=1`; there is no principled
