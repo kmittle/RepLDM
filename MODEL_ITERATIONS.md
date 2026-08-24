@@ -463,8 +463,9 @@ epsilon-prediction 的 Euler step，先计算 ordinary predictor 的 `euler_prev
 张量。该接口位于 `AttentionGuidance/ancestral_correction.py`，pipeline 只在
 Stage-1、standalone action 中启用，并把每步 correction/update ratio 写入 sidecar。
 
-动机参考 LC-GRPO（2608.05600）的 predictor-corrector、CreFlow（2605.14274）的
-trajectory correction，以及 path-space 统一视角（2608.14430）。这些工作意味着
+动机参考 LC-GRPO（2608.05600）的 predictor-corrector、CreFlow（2605.14274）中
+关于 corrective direction/credit assignment 的视角，以及 path-space 统一视角
+（2608.14430）。这些工作意味着
 不能把 correction 或 RL estimator 宣称为新颖贡献；本轮只检验 fixed action 是否有
 质量 headroom。
 

@@ -11,12 +11,15 @@ Euler transition using the analytical ancestral transition already implied by
 the scheduler.
 
 This is motivated by the predictor-corrector pattern in LC-GRPO
-([2608.05600](https://arxiv.org/abs/2608.05600)), trajectory correction in
-CreFlow ([2605.14274](https://arxiv.org/abs/2605.14274)), and the path-space view
-of diffusion policies ([2608.14430](https://arxiv.org/abs/2608.14430)). Those
+([2608.05600](https://arxiv.org/abs/2608.05600)), the corrective-direction and
+credit-assignment perspective in CreFlow
+([2605.14274](https://arxiv.org/abs/2605.14274)), and the path-space view of
+diffusion policies ([2608.14430](https://arxiv.org/abs/2608.14430)). Those
 papers mean this implementation must not claim a new RL estimator.  The narrow
-question here is whether a scheduler-consistent, bounded correction is a useful
-fixed action before any renderer or RL is considered.
+question here is whether a bounded Euler-to-ancestral ablation is a useful
+fixed action before any renderer or RL is considered.  Only the Euler and
+Euler-Ancestral endpoints are scheduler-consistent; intermediate mixes are
+explicitly interpolation controls, not a new SDE.
 
 ## Method
 

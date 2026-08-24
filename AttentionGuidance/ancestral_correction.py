@@ -1,10 +1,12 @@
-"""Scheduler-consistent latent corrections for Euler sampling.
+"""Bounded Euler-to-ancestral ablations for Euler sampling.
 
 The correction is deliberately kept outside the denoiser.  Given the Euler
 predictor output and the scheduler's current noise levels, it interpolates
 between the deterministic Euler transition and the corresponding
-Euler-Ancestral transition.  This makes the intervention auditable and keeps
-the frozen U-Net, CFG, timestep sequence, and initial noise unchanged.
+Euler-Ancestral transition.  Only the endpoints have exact scheduler
+semantics; intermediate ``mix`` values are a registered bounded ablation.
+This keeps the frozen U-Net, CFG, timestep sequence, and initial noise
+unchanged.
 """
 
 from __future__ import annotations
@@ -21,12 +23,14 @@ _NOISE_MODES = frozenset(("sqrt", "linear", "none"))
 
 @dataclass(frozen=True)
 class TrajectoryCorrectionConfig:
-    """Configuration for an Euler-compatible ancestral correction.
+    """Configuration for an Euler-compatible ancestral ablation.
 
     ``mix=0`` is an exact no-op.  With no trust cap, ``mix=1`` and
     ``noise_mode='sqrt'`` gives the Euler-Ancestral transition for an
-    epsilon-prediction scheduler.  ``max_correction_ratio`` bounds the
-    correction norm relative to the ordinary Euler update on each sample.
+    epsilon-prediction scheduler.  Intermediate values are bounded
+    interpolation controls rather than a new SDE. ``max_correction_ratio``
+    bounds the correction norm relative to the ordinary Euler update on each
+    sample.
     """
 
     mix: float

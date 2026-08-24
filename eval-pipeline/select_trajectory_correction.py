@@ -65,7 +65,9 @@ def _diagnostics_are_valid(frame: pd.DataFrame, action: str) -> bool:
             return False
         expected_steps = None
         if "num_inference_steps" in rows:
-            expected_steps = int(rows.loc[rows.index[0], "num_inference_steps"])
+            if rows["num_inference_steps"].isna().any() or rows["num_inference_steps"].nunique() != 1:
+                return False
+            expected_steps = int(rows["num_inference_steps"].iloc[0])
             if expected_steps <= 0 or len(value) != expected_steps:
                 return False
         previous_sigma_from = None
