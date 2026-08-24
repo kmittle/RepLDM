@@ -324,3 +324,25 @@ not search another angle, top-k, layer, schedule, reward, or controller, and do
 not start RL on this failed static family. The separately documented
 low-capacity latent-renderer proposal may be registered as a new project, but
 it must compete directly with no-AG and cannot be presented as a rescue of S5.
+
+## LR-0：独立 latent renderer 的工程注册与真实模型接线检查
+
+S5 关闭后，按 `LATENT_RENDERER_PROTOCOL.md` 注册了全新的 LR-0 假设。实现
+位于 `AttentionGuidance/latent_renderer.py`，包含六个可解释基底、固定矩
+几何、scheduler-update trust region，以及可选的 D4 对称 depthwise spatial
+head。系数-only 版本是匹配容量的对照，不是最终方法主张；没有任何 RL 或
+checkpoint 在这一阶段训练。
+
+在 commit `fee18b3` 上，用本地 SDXL checkpoint、GPU 1、1024²、50 NFE、同一
+prompt/seed 运行了 `outputs/latent_renderer/wiring_smoke_50_fee18b3`。no-renderer
+与 zero-renderer 的 PNG SHA-256 都是
+`525f641939fd2755b8e9df9801420104dbc0255bbcbedaec5faa856cf5dafb49`；固定的
+非零 probe 为
+`fd52f112a0925a59b4692208f4ac9dc37a4d180f7a75befb4f6226375b1470ff`。三张图都
+是有效的 1024² RGB PNG，最后一步 renderer/scheduler update ratio 为
+`0.0010653`，通道均值和方差误差分别约为 `7.5e-9` 和 `3.0e-8`。
+
+这只证明普通 UNet forward、`pred_original_sample`、provider、renderer 和
+scheduler 注入的接线正确，不能证明质量增益，也不能用于挑选 probe。下一步
+仍必须先冻结全新的 train/validation/test prompts，比较固定基底动作与
+no-AG、随机匹配容量和 search-then-distill；LR-1 未通过前禁止 RL。
