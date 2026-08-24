@@ -66,6 +66,7 @@ from AttentionGuidance import (
     TrajectoryCorrectionConfig,
     apply_ancestral_correction,
 )
+from InferencePipelines.cfg_batch import expand_cfg_latents, split_cfg_noise_pred
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -1302,10 +1303,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     latents_for_view = latents
     
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = (
-                        latents.repeat_interleave(2, dim=0)
-                        if do_classifier_free_guidance
-                        else latents
+                    latent_model_input = expand_cfg_latents(
+                        latents, do_classifier_free_guidance
                     )
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
     
@@ -1341,7 +1340,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
     
                     # perform guidance
                     if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
+                        noise_pred_uncond, noise_pred_text = split_cfg_noise_pred(noise_pred)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
     
                     if do_classifier_free_guidance and guidance_rescale > 0.0:
@@ -1625,10 +1624,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         self.vae.cpu()
                         self.unet.to(device)
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = (
-                        latents.repeat_interleave(2, dim=0)
-                        if do_classifier_free_guidance
-                        else latents
+                    latent_model_input = expand_cfg_latents(
+                        latents, do_classifier_free_guidance
                     )
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                     # predict the noise residual
@@ -1643,7 +1640,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     )[0]
                     # perform guidance
                     if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
+                        noise_pred_uncond, noise_pred_text = split_cfg_noise_pred(noise_pred)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                     if do_classifier_free_guidance and guidance_rescale > 0.0:
                         # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
