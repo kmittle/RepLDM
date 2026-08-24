@@ -56,6 +56,7 @@ from AttentionGuidance import (
     SEMANTIC_TRANSPORT_MODES,
     StructuralUNetBasisProvider,
     build_fixed_coefficient_renderer,
+    FreeUSchedule,
 )
 from AttentionGuidance.attention_baselines import installed_attention_baseline
 from InferencePipelines import RepLDMSDXLPipeline
@@ -222,6 +223,7 @@ def load_actions(path: str, num_inference_steps: int):
             "clean_transport",
             "attention_baseline",
             "latent_renderer_fixed",
+            "freeu",
         }:
             raise ValueError(f"unsupported action type {action_type!r} for {action_id}")
 
@@ -331,6 +333,31 @@ def load_actions(path: str, num_inference_steps: int):
                 "prompt_dim": prompt_dim,
                 "state_dim": state_dim,
             }
+            action["scale"] = 0.0
+        elif action_type == "freeu":
+            if "parameters" in action and "knots" in action:
+                raise ValueError(f"{action_id}: provide either parameters or knots, not both")
+            if "parameters" in action:
+                knots = ((0.0, action["parameters"]), (1.0, action["parameters"]))
+            else:
+                raw_knots = action.get("knots")
+                if raw_knots is None and isinstance(action.get("schedule"), dict):
+                    raw_knots = action["schedule"].get("knots")
+                if not isinstance(raw_knots, list):
+                    raise ValueError(f"{action_id}: freeu requires parameters or a knots list")
+                knots = []
+                for raw_knot in raw_knots:
+                    if not isinstance(raw_knot, dict):
+                        raise ValueError(f"{action_id}: each FreeU knot must be a mapping")
+                    knots.append((raw_knot.get("position"), raw_knot.get("parameters")))
+            try:
+                schedule = FreeUSchedule(knots)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{action_id}: invalid FreeU schedule: {exc}") from exc
+            action["freeu_schedule"] = schedule.to_record()
+            action.pop("parameters", None)
+            action.pop("knots", None)
+            action.pop("schedule", None)
             action["scale"] = 0.0
 
         residual_mode = str(action.get("residual_mode", "raw"))
@@ -538,6 +565,18 @@ def attention_baseline_runtime(action: dict):
     }
 
 
+def freeu_runtime(action: dict):
+    """Translate a normalized FreeU action into a re-entrant schedule."""
+    if action["type"] != "freeu":
+        return None
+    record = action.get("freeu_schedule")
+    if not isinstance(record, dict) or not isinstance(record.get("knots"), list):
+        raise ValueError("normalized FreeU action lacks a knots record")
+    return FreeUSchedule(
+        (item["position"], item["parameters"]) for item in record["knots"]
+    )
+
+
 def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: float):
     """Construct one fixed LR-1 renderer/provider pair for a worker device."""
     if action["type"] != "latent_renderer_fixed":
@@ -600,6 +639,11 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             )
             clean_config = clean_transport_runtime(action)
             baseline_config = attention_baseline_runtime(action)
+            freeu_schedule = freeu_runtime(action)
+            # The diffusers FreeU implementation stores mutable attributes on
+            # every up block.  Clear them before every action to preserve exact
+            # paired comparisons, including after a failed task.
+            pipe.unet.disable_freeu()
             if cfg["stage2_enabled"] and action["type"] == "latent_renderer_fixed":
                 raise ValueError("latent renderer is registered for Stage 1 only")
             if action["type"] == "latent_renderer_fixed":
@@ -648,6 +692,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     semantic_transport_config=clean_config,
                     latent_renderer=latent_renderer,
                     latent_renderer_basis_provider=latent_provider,
+                    freeu_schedule=freeu_schedule,
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
@@ -693,6 +738,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     else None
                 ),
                 "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
+                "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
             }
             if diagnostics:
                 record.update(diagnostics)

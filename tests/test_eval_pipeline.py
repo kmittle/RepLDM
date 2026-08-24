@@ -59,6 +59,30 @@ finalize_renderer_validation = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_freeu_action_is_normalized_and_reentrant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "freeu.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "actions": [
+                            {
+                                "id": "freeu_dynamic",
+                                "type": "freeu",
+                                "knots": [
+                                    {"position": 0.0, "parameters": [1, 1, 1, 1]},
+                                    {"position": 1.0, "parameters": [0.6, 0.4, 1.1, 1.2]},
+                                ],
+                            }
+                        ]
+                    }
+                )
+            )
+            actions, _ = generate.load_actions(str(path), 4)
+            self.assertEqual(actions[0]["type"], "freeu")
+            schedule = generate.freeu_runtime(actions[0])
+            self.assertEqual(schedule.at(1.0).as_tuple(), (0.6, 0.4, 1.1, 1.2))
+
     @staticmethod
     def _registered_validation_inputs():
         with open(ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml") as handle:

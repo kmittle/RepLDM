@@ -1,0 +1,65 @@
+# Development-only amplitude/window search following freeu_structural_pilot_v1.
+# The search is intentionally limited to a fresh prompt split and is not a
+# confirmation manifest.
+schema: freeu_actions_v1
+experiment_id: freeu_conservative_search_v1
+parent_experiment: freeu_structural_pilot_v1
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  resolution: 1024
+  num_inference_steps: 30
+  cfg_scale: 7.5
+  stage2: false
+split:
+  prompts: eval-pipeline/prompts/latent_renderer_validation.csv
+  seeds: [7, 19]
+  role: development_search
+
+actions:
+  - id: no_freeu
+    type: none
+  - id: freeu_tiny_constant
+    type: freeu
+    parameters: [0.95, 0.95, 1.02, 1.03]
+  - id: freeu_tiny_window
+    type: freeu
+    knots:
+      - position: 0.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 0.25
+        parameters: [0.95, 0.95, 1.02, 1.03]
+      - position: 0.55
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 1.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+  - id: freeu_low_constant
+    type: freeu
+    parameters: [0.90, 0.88, 1.04, 1.06]
+  - id: freeu_low_window
+    type: freeu
+    knots:
+      - position: 0.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 0.30
+        parameters: [0.90, 0.88, 1.04, 1.06]
+      - position: 0.60
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 1.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+  - id: freeu_skip_only
+    type: freeu
+    parameters: [0.90, 0.88, 1.0, 1.0]
+  - id: freeu_backbone_only
+    type: freeu
+    parameters: [1.0, 1.0, 1.04, 1.06]
+  - id: freeu_medium_window
+    type: freeu
+    knots:
+      - position: 0.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 0.20
+        parameters: [0.80, 0.75, 1.08, 1.10]
+      - position: 0.45
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 1.0
+        parameters: [1.0, 1.0, 1.0, 1.0]

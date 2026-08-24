@@ -36,6 +36,7 @@ from .latent_renderer import (
     cap_update_norm,
     inject_rendered_clean_update,
 )
+from .freeu import FreeUKnot, FreeUParameters, FreeUSchedule
 
 __all__ = [
     "AttnGuidance",
@@ -72,4 +73,7 @@ __all__ = [
     "build_spectral_bases",
     "cap_update_norm",
     "inject_rendered_clean_update",
+    "FreeUKnot",
+    "FreeUParameters",
+    "FreeUSchedule",
 ]

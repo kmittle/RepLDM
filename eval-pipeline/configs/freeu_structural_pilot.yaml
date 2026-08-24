@@ -1,0 +1,55 @@
+# Development pilot for a scheduler-stage structural intervention.
+# FreeU is an established baseline; the knot schedules are the exploratory
+# journal-extension candidates and must be validated on a fresh split if they
+# show a stable signal.
+schema: freeu_actions_v1
+experiment_id: freeu_structural_pilot_v1
+parent_principle: model_native_structure
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  resolution: 1024
+  num_inference_steps: 30
+  cfg_scale: 7.5
+  stage2: false
+  extra_unet_calls: 0
+split:
+  prompts: eval-pipeline/prompts/latent_renderer_validation.csv
+  seeds: [7, 19, 73]
+  role: development_only
+
+actions:
+  - id: no_freeu
+    type: none
+  - id: freeu_official_sdxl
+    type: freeu
+    parameters: [0.6, 0.4, 1.1, 1.2]
+  - id: freeu_balanced
+    type: freeu
+    parameters: [0.8, 0.8, 1.1, 1.1]
+  - id: freeu_early_structure
+    type: freeu
+    knots:
+      - position: 0.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+      - position: 0.35
+        parameters: [0.75, 0.65, 1.15, 1.2]
+      - position: 1.0
+        parameters: [0.6, 0.4, 1.1, 1.2]
+  - id: freeu_late_detail
+    type: freeu
+    knots:
+      - position: 0.0
+        parameters: [0.6, 0.4, 1.1, 1.2]
+      - position: 0.65
+        parameters: [0.75, 0.65, 1.15, 1.2]
+      - position: 1.0
+        parameters: [1.0, 1.0, 1.0, 1.0]
+  - id: freeu_structure_strong
+    type: freeu
+    knots:
+      - position: 0.0
+        parameters: [0.9, 0.8, 1.2, 1.3]
+      - position: 0.5
+        parameters: [0.65, 0.5, 1.2, 1.3]
+      - position: 1.0
+        parameters: [0.55, 0.35, 1.1, 1.2]
