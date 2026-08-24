@@ -1,0 +1,26 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,split
+0,"A raccoon wearing formal clothes, wearing a tophat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of Madhubani art.",complex,292,Arts,Complex,test
+1,a white bird in front of a dinosaur standing by some trees,complex,361,Outdoor Scenes,Complex,test
+2,a pickup truck with a horse on its left and two dogs on its right,complex,370,Vehicles,Complex,test
+3,a propaganda poster depicting a cat dressed as french emperor napoleon holding a piece of cheese,complex,360,Artifacts,Complex,test
+4,an airplane flying into a cloud that looks like monster,fine-grained-detail,576,Vehicles,Fine-grained Detail,test
+5,a car's wheel crushing a pair of headphones,fine-grained-detail,619,Vehicles,Fine-grained Detail,test
+6,A map of the United States with a pin on San Francisco,fine-grained-detail,417,World Knowledge,Fine-grained Detail,test
+7,people packed on a double-decker bus,fine-grained-detail,687,People,Fine-grained Detail,test
+8,a metallic blue sphere to the left of a yellow box made of felt,properties-positioning,982,Illustrations,Properties & Positioning,test
+9,a red box next to a blue box,properties-positioning,991,Illustrations,Properties & Positioning,test
+10,a red box to the right of a green sphere,properties-positioning,990,Illustrations,Properties & Positioning,test
+11,a pen-and-ink crosshatched drawing of a sphere with dark square on it,properties-positioning,981,Illustrations,Properties & Positioning,test
+12,7 dogs sitting around a poker table,quantity,1024,Animals,Quantity,test
+13,three pickup trucks piled on top of each other,quantity,1074,Vehicles,Quantity,test
+14,two baseballs next to three tennis balls,quantity,1023,Artifacts,Quantity,test
+15,five chairs,quantity,1030,Artifacts,Quantity,test
+16,a bowl with a cartoon dinosaur on it,writing-symbols,1586,Artifacts,Writing & Symbols,test
+17,"a flag with three vertical stripes that are blue, white and red",writing-symbols,1590,Illustrations,Writing & Symbols,test
+18,A portrait photo of a kangaroo wearing an orange hoodie and blue sunglasses standing on the grassin front of the Sydney Opera House holding a sign on the chest that says Welcome Friends!,writing-symbols,1571,World Knowledge,Writing & Symbols,test
+19,"Two cups of coffee, one with latte art of the Eiffel tower. The other has latte art of the Statue of Liberty.",writing-symbols,1555,Food & Beverage,Writing & Symbols,test
+20,a close up of a handpalm with leaves growing from it,perspective,939,People,Perspective,test
+21,"Aerial view of downtown Manhattan, but with Millennium Wheel next to the Statue of Liberty. The Great Pyramid is on a sandy island near the buildings.",perspective,928,World Knowledge,Perspective,test
+22,a pig face,perspective,946,Animals,Perspective,test
+23,"A close-up of two beetles wearing karate uniforms and fighting, jumping over a waterfall.",perspective,923,Animals,Perspective,test
+

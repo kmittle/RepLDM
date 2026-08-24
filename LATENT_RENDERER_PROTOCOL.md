@@ -71,14 +71,27 @@ simpler method and stop.
 
 ## Data, Evaluation, and Stop Rules
 
-Prompt train/validation/test files must be selected and hashed before any
-image is generated. All prompts used by S0--S5 and their derivative outputs
-are excluded. Seeds `0,42,123` are reserved for final evaluation and cannot be
-used to choose coefficients. TOPIQ-NR is held out from training; report it
-with HPSv2, CLIP alignment, ImageReward, patch/detail witnesses, OCR/counting
-checks, DCT statistics, LPIPS/diversity, pixel guards, and a blinded human
-pairwise test before making a TPAMI claim. Use prompt/seed crossed bootstrap
-intervals, prompt sign-flip tests, and within-family Holm correction.
+The frozen prompt manifest is
+`eval-pipeline/prompts/latent_renderer_manifest.json`. It records the source
+revision/hash, selection key, excluded rows, and exact hashes for these
+disjoint files:
+
+```text
+train      eval-pipeline/prompts/latent_renderer_train.csv       (48 rows)
+validation eval-pipeline/prompts/latent_renderer_validation.csv  (24 rows)
+test       eval-pipeline/prompts/latent_renderer_test.csv        (24 rows)
+```
+
+Each split has 8/4/4 prompts per challenge across six PartiPrompts challenges.
+The manifest and split files must be committed before any image is generated;
+the test file is never used for coefficient or architecture selection. All
+prompts used by S0--S5 and their derivative outputs are excluded. Seeds
+`0,42,123` are reserved for final evaluation and cannot be used to choose
+coefficients. TOPIQ-NR is held out from training; report it with HPSv2, CLIP
+alignment, ImageReward, patch/detail witnesses, OCR/counting checks, DCT
+statistics, LPIPS/diversity, pixel guards, and a blinded human pairwise test
+before making a TPAMI claim. Use prompt/seed crossed bootstrap intervals,
+prompt sign-flip tests, and within-family Holm correction.
 
 Any non-finite output, violated moment or trust bound, missing paired record,
 or failure of LR-1 closes the learned/RL path. No angle, top-k, reward, or

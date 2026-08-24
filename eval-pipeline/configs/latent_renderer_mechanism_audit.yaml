@@ -71,7 +71,12 @@ baselines:
   - extra_unet_call
 
 data:
-  prompt_source: pending_frozen_prompt_manifest
+  prompt_manifest: eval-pipeline/prompts/latent_renderer_manifest.json
+  train_prompts: eval-pipeline/prompts/latent_renderer_train.csv
+  validation_prompts: eval-pipeline/prompts/latent_renderer_validation.csv
+  test_prompts: eval-pipeline/prompts/latent_renderer_test.csv
+  prompt_source_revision: 944b156abfdad7627c3221b5ec4f6a6fb060a1975
+  prompt_source_sha256: fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb
   excluded_prompt_manifests:
     - eval-pipeline/prompts/eval_v1.csv
     - eval-pipeline/prompts/s5_development.csv

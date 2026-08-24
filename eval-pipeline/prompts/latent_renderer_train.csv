@@ -1,0 +1,50 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,split
+0,a grandmother reading a book to her grandson and granddaughter,complex,378,People,Complex,train
+1,"A raccoon wearing formal clothes, wearing a tophat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of pixel art.",complex,293,Arts,Complex,train
+2,"a painting of an ornate treasure chest with a broad sword propped up against it, glowing in a dark cave",complex,356,Arts,Complex,train
+3,A photograph of the inside of a subway train. There are lobsters sitting on the seats. One of them is reading a newspaper. The window shows the ocean in the background.,complex,286,Vehicles,Complex,train
+4,a boy sitting on the shoulders of a woman who is wearing an elegant dress,complex,376,People,Complex,train
+5,"Renaissance portrayals of the Virgin Mary, seated in a loggia. Behind her is a hazy and seemingly isolated landscape imagined by the artist and painted using sfumato.",complex,357,People,Complex,train
+6,"A raccoon wearing formal clothes, wearing a tophat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of Vincent Van Gogh.",complex,297,Arts,Complex,train
+7,"A set of 2x2 emoji icons with happy, angry, surprised and sobbing faces. The emoji icons look like colorful macarons. All of the macarons are wearing cowboy hats.",complex,280,Illustrations,Complex,train
+8,A teddy bear wearing a motorcycle helmet and cape is riding a motorcycle in Rio de Janeiro with Dois Irmãos in the background,fine-grained-detail,388,World Knowledge,Fine-grained Detail,train
+9,a politician giving a speech at a podium,fine-grained-detail,677,People,Fine-grained Detail,train
+10,the Taj Mahal at sunrise,fine-grained-detail,555,World Knowledge,Fine-grained Detail,train
+11,an inflatable rabbit held up in the air by the geyser Old Faithful,fine-grained-detail,637,World Knowledge,Fine-grained Detail,train
+12,a sunken submarine at the bottom of the ocean,fine-grained-detail,495,Vehicles,Fine-grained Detail,train
+13,a marina with a herd of dolphins playing in it,fine-grained-detail,648,Outdoor Scenes,Fine-grained Detail,train
+14,A smiling sloth wearing a bowtie and holding a quarterstaff and a big book.,fine-grained-detail,408,Animals,Fine-grained Detail,train
+15,a bottle of light beer with a lemon slice wedged in the rim,fine-grained-detail,589,Food & Beverage,Fine-grained Detail,train
+16,a stack of three red cubes with a blue sphere on the right and two green cones on the left,properties-positioning,978,Illustrations,Properties & Positioning,train
+17,a yellow box to the right of a blue sphere,properties-positioning,989,Illustrations,Properties & Positioning,train
+18,a metallic blue sphere to the left of a brown cardboard box,properties-positioning,1007,Illustrations,Properties & Positioning,train
+19,concentric squares fading from yellow on the outside to deep orange on the inside,properties-positioning,984,Illustrations,Properties & Positioning,train
+20,a circular brown trash bin in front of a brick wall,properties-positioning,1012,Artifacts,Properties & Positioning,train
+21,a white flag with a red circle next to a solid blue flag,properties-positioning,987,Artifacts,Properties & Positioning,train
+22,a white background with a large blue circle and a small green square,properties-positioning,1002,Illustrations,Properties & Positioning,train
+23,several red lego blocks and one blue one,properties-positioning,994,Artifacts,Properties & Positioning,train
+24,two red balls,quantity,1060,Artifacts,Quantity,train
+25,four wine bottles,quantity,1054,Artifacts,Quantity,train
+26,a tennis court with three yellow cones on it,quantity,1079,Outdoor Scenes,Quantity,train
+27,four green glass bottles,quantity,1051,Artifacts,Quantity,train
+28,two beat-up baseballs on either side of a yellow basketball,quantity,1022,Artifacts,Quantity,train
+29,two pianos next to each other,quantity,1083,Indoor Scenes,Quantity,train
+30,two violins standing up,quantity,1041,Artifacts,Quantity,train
+31,a jungle gym with three kids on it,quantity,1098,People,Quantity,train
+32,Portrait of a tiger wearing a train conductor's hat and holding a skateboard that has a yin-yang symbol on it. comic book illustration,writing-symbols,1547,Animals,Writing & Symbols,train
+33,"The saying ""BE EXCELLENT TO EACH OTHER"" written in faded paint on the hull of an old wooden boat and reflected in the water. Wide-angle lens.",writing-symbols,1567,Illustrations,Writing & Symbols,train
+34,"A burger patty, with the bottom bun and lettuce and tomatoes. ""COFFEE"" written on it in mustard",writing-symbols,1564,Food & Beverage,Writing & Symbols,train
+35,a black towel with a cartoon of a dog on it,writing-symbols,1592,Artifacts,Writing & Symbols,train
+36,a sticker stuck in the middle of a stop sign,writing-symbols,1597,Artifacts,Writing & Symbols,train
+37,"A high contrast portrait photo of a fluffy hamster wearing an orange beanie and sunglasses holding a sign that says ""Let's PAINT!""",writing-symbols,1574,Animals,Writing & Symbols,train
+38,Portrait of a tiger wearing a train conductor's hat and holding a skateboard that has a yin-yang symbol on it. Chinese ink and wash painting,writing-symbols,1545,Animals,Writing & Symbols,train
+39,the word 'START' written above the word 'SMILING',writing-symbols,1625,Illustrations,Writing & Symbols,train
+40,view of a clock tower from above,perspective,952,Artifacts,Perspective,train
+41,an aerial photo of a baseball stadium,perspective,955,Outdoor Scenes,Perspective,train
+42,a cross-section view of a walnut,perspective,943,Produce & Plants,Perspective,train
+43,Three-quarters front view of a red 1997 Ford F-150 coming around a curve in a mountain road and looking over a green valley on a cloudy day.,perspective,913,Vehicles,Perspective,train
+44,view from below of a tall white ladder with just one rung leaning up against a yellow brick wall,perspective,937,Artifacts,Perspective,train
+45,Three-quarters front view of a blue 1977 Ford F-150 coming around a curve in a mountain road and looking over a green valley on a cloudy day.,perspective,910,Vehicles,Perspective,train
+46,"A close-up of two chameleons wearing karate uniforms and fighting, jumping over a waterfall.",perspective,921,Animals,Perspective,train
+47,a view of the Milllenium Wheel from the Thames,perspective,973,World Knowledge,Perspective,train
+

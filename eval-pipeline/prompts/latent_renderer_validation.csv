@@ -1,0 +1,26 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,split
+0,A photo of the Space Shuttle Endeavor painted yellow and flying over the Earth. The continent of South America is visible.,complex,310,World Knowledge,Complex,validation
+1,a real flamingo reading a large open book. a big stack of books is piled up next to it. dslr photograph.,complex,331,Animals,Complex,validation
+2,"A raccoon wearing formal clothes, wearing a tophat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of Rembrandt.",complex,295,Arts,Complex,validation
+3,"An anime illustration of Sydney Opera House sitting next to Eiffel tower, under a blue night sky of roiling energy, exploding yellow stars, and radiating swirls of blu",complex,325,World Knowledge,Complex,validation
+4,the silhouette of an elephant on the full moon,fine-grained-detail,549,Animals,Fine-grained Detail,validation
+5,a volcano exploding next to a marina,fine-grained-detail,649,Outdoor Scenes,Fine-grained Detail,validation
+6,a large present with a red ribbon,fine-grained-detail,510,Artifacts,Fine-grained Detail,validation
+7,a woman with long black hair and dark skin in a long white dress,fine-grained-detail,656,People,Fine-grained Detail,validation
+8,a large yellow triangle above a green square and red rectangle,properties-positioning,1003,Illustrations,Properties & Positioning,validation
+9,a large blue box with three small yellow boxes on it,properties-positioning,993,Illustrations,Properties & Positioning,validation
+10,A photo of a Japanese Porcelain Imari vase on the ground below a wooden chair.,properties-positioning,980,World Knowledge,Properties & Positioning,validation
+11,a black background with a large yellow square,properties-positioning,999,Illustrations,Properties & Positioning,validation
+12,a series of musical notes,quantity,1084,Illustrations,Quantity,validation
+13,two red flowers and three white flowers,quantity,1076,Produce & Plants,Quantity,validation
+14,four people riding in a convertible car,quantity,1099,People,Quantity,validation
+15,a comic about an owl family in the forest,quantity,1036,Artifacts,Quantity,validation
+16,"The saying ""BE EXCELLENT TO EACH OTHER"" written in a stained glass window.",writing-symbols,1566,Illustrations,Writing & Symbols,validation
+17,"a yellow wall with 'Hello, world.' written on it",writing-symbols,1605,Indoor Scenes,Writing & Symbols,validation
+18,a laptop screen showing a document being edited,writing-symbols,1616,Artifacts,Writing & Symbols,validation
+19,a large open book showing text and an illustration of a cat,writing-symbols,1604,Artifacts,Writing & Symbols,validation
+20,an ostrich's face,perspective,957,Animals,Perspective,validation
+21,a close-up of the eye of the planet Jupiter,perspective,967,Outdoor Scenes,Perspective,validation
+22,a close-up of the keys of a piano,perspective,971,Artifacts,Perspective,validation
+23,a close-up of a long-island ice tea cocktail,perspective,949,Food & Beverage,Perspective,validation
+
