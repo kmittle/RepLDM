@@ -117,6 +117,12 @@ def validate_registered_train_run(
         generated_coefficients = [float(value) for value in generated.get("coefficients", [])]
         if generated_coefficients != registered_coefficients:
             raise ValueError(f"{action_id}: generated coefficients differ from registration")
+        expected_cap = bool(registered.get("enforce_post_cast_cap", False))
+        generated_cap = generated.get("enforce_post_cast_cap", False)
+        if not isinstance(generated_cap, bool) or generated_cap != expected_cap:
+            raise ValueError(
+                f"{action_id}: generated enforce_post_cast_cap differs from registration"
+            )
         expected_provider = dict(provider_defaults)
         expected_provider.update(registered.get("provider", {}) or {})
         generated_provider = generated.get("latent_renderer_provider", {}) or {}
@@ -200,6 +206,62 @@ def _finite_renderer_diagnostics(frame: pd.DataFrame, action: str) -> bool:
                 for value in diagnostics["update_ratio"]
             ):
                 return False
+            if bool(action_record.get("enforce_post_cast_cap", False)):
+                strict_overrun = diagnostics.get("postcast_overrun")
+                postcast_ratio = diagnostics.get("postcast_update_ratio")
+                if (
+                    not isinstance(strict_overrun, list)
+                    or not isinstance(postcast_ratio, list)
+                    or len(strict_overrun) != len(diagnostics["update_ratio"])
+                    or len(postcast_ratio) != len(diagnostics["update_ratio"])
+                    or any(float(value) > 1e-7 for value in strict_overrun)
+                ):
+                    return False
+                trajectory = row.get("latent_renderer_injection_diagnostics")
+                if not isinstance(trajectory, list) or not trajectory:
+                    return False
+                bound = float(action_record.get("max_update_ratio", 0.05))
+                for expected_step, step in enumerate(trajectory):
+                    if not isinstance(step, dict):
+                        return False
+                    step_index = step.get("step_index")
+                    if (
+                        isinstance(step_index, bool)
+                        or not isinstance(step_index, int)
+                        or step_index != expected_step
+                    ):
+                        return False
+                    ratio = step.get("postcast_update_ratio")
+                    overrun = step.get("postcast_overrun")
+                    if (
+                        not isinstance(ratio, list)
+                        or not ratio
+                        or not isinstance(overrun, list)
+                        or len(overrun) != len(ratio)
+                    ):
+                        return False
+                    if any(
+                        not math.isfinite(float(value))
+                        or float(value) < 0
+                        or float(value) > bound + 1e-6
+                        for value in ratio
+                    ):
+                        return False
+                    if any(
+                        not math.isfinite(float(value))
+                        or float(value) < 0
+                        or float(value) > 1e-7
+                        for value in overrun
+                    ):
+                        return False
+                    for key in ("postcast_cap_applied", "postcast_noop_fallback"):
+                        flags = step.get(key)
+                        if (
+                            not isinstance(flags, list)
+                            or len(flags) != len(ratio)
+                            or not all(isinstance(value, bool) for value in flags)
+                        ):
+                            return False
     return True
 
 

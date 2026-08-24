@@ -349,6 +349,14 @@ def load_actions(path: str, num_inference_steps: int):
                 or action["max_update_ratio"] < 0
             ):
                 raise ValueError(f"{action_id}: max_update_ratio must be non-negative")
+            enforce_post_cast_cap = action.get("enforce_post_cast_cap", False)
+            if not isinstance(enforce_post_cast_cap, bool):
+                raise ValueError(
+                    f"{action_id}: enforce_post_cast_cap must be a boolean"
+                )
+            # Keep the dtype hard-bound choice in the normalized action so it
+            # is included in config.json, each task sidecar, and provenance.
+            action["enforce_post_cast_cap"] = enforce_post_cast_cap
             action["latent_renderer_provider"] = {
                 "feature_block": feature_block,
                 "semantic_layer": None if semantic_layer is None else str(semantic_layer),
@@ -727,6 +735,25 @@ def trajectory_correction_runtime(action: dict):
     )
 
 
+def renderer_diagnostics_sidecar(pipe) -> dict:
+    """Collect renderer summaries without retaining live tensor objects."""
+    renderer_diagnostics = getattr(pipe, "_last_latent_renderer_diagnostics", None)
+    return {
+        "latent_renderer_diagnostics": (
+            renderer_diagnostics.to_record()
+            if renderer_diagnostics is not None
+            and hasattr(renderer_diagnostics, "to_record")
+            else None
+        ),
+        "latent_renderer_provider_diagnostics": getattr(
+            pipe, "_last_latent_renderer_provider_diagnostics", None
+        ),
+        "latent_renderer_injection_diagnostics": getattr(
+            pipe, "_last_latent_renderer_injection_diagnostics", None
+        ),
+    }
+
+
 def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: float):
     """Construct one fixed LR-1 renderer/provider pair for a worker device."""
     if action["type"] != "latent_renderer_fixed":
@@ -737,6 +764,7 @@ def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: flo
         coefficient_bound=action["coefficient_bound"],
         max_update_ratio=action["max_update_ratio"],
         preserve_moments=True,
+        enforce_post_cast_cap=bool(action.get("enforce_post_cast_cap", False)),
     ).to(device)
     provider_config = action["latent_renderer_provider"]
     provider = StructuralUNetBasisProvider(
@@ -875,12 +903,6 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 peak_memory = None
             elapsed = time.perf_counter() - start_time
             diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
-            renderer_diagnostics = getattr(
-                pipe, "_last_latent_renderer_diagnostics", None
-            )
-            renderer_provider_diagnostics = getattr(
-                pipe, "_last_latent_renderer_provider_diagnostics", None
-            )
             images[-1].save(png_path)  # lossless PNG
             record = {
                 **task,
@@ -911,13 +933,6 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "git_commit": commit,
                 **cfg["runtime_provenance"],
                 "device": device,
-                "latent_renderer_diagnostics": (
-                    renderer_diagnostics.to_record()
-                    if renderer_diagnostics is not None
-                    and hasattr(renderer_diagnostics, "to_record")
-                    else None
-                ),
-                "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
                 "freeu_preserve_moments": getattr(pipe, "_last_freeu_preserve_moments", False),
                 "trajectory_correction": getattr(
@@ -927,6 +942,10 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     pipe, "_last_trajectory_correction_diagnostics", None
                 ),
             }
+            # Unlike ``latent_renderer_diagnostics`` (which retains the
+            # final-step summary for compatibility), this list preserves the
+            # complete scheduler-injection trajectory.
+            record.update(renderer_diagnostics_sidecar(pipe))
             if diagnostics:
                 record.update(diagnostics)
             else:
