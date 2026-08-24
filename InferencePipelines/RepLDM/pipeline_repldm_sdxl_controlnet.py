@@ -54,7 +54,11 @@ if is_invisible_watermark_available():
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 
 from AttentionGuidance import AttnGuidance
-from InferencePipelines.cfg_batch import expand_cfg_latents, split_cfg_noise_pred
+from InferencePipelines.cfg_batch import (
+    expand_cfg_latents,
+    expand_cfg_time_ids,
+    split_cfg_noise_pred,
+)
 import time
 from diffusers import EulerDiscreteScheduler
 import gc
@@ -1223,7 +1227,11 @@ class RepLDMSDXLControlNetPipeline(
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+        add_time_ids = expand_cfg_time_ids(
+            add_time_ids.to(device),
+            batch_size * num_images_per_prompt,
+            do_classifier_free_guidance,
+        )
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -1455,7 +1463,11 @@ class RepLDMSDXLControlNetPipeline(
                 negative_add_time_ids = add_time_ids
             if do_classifier_free_guidance:
                 add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
-            add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+            add_time_ids = expand_cfg_time_ids(
+                add_time_ids.to(device),
+                batch_size * num_images_per_prompt,
+                do_classifier_free_guidance,
+            )
             # reset warmup steps
             num_warmup_steps = len(timesteps) - num_resample_timesteps * self.scheduler.order
             num_warmup_steps = int(round(num_warmup_steps))

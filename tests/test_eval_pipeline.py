@@ -34,6 +34,7 @@ from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
 )
 from InferencePipelines.cfg_batch import (  # noqa: E402
     expand_cfg_latents,
+    expand_cfg_time_ids,
     split_cfg_noise_pred,
 )
 analyze_adaptivity = load_module(
@@ -83,6 +84,29 @@ class EvalPipelineTest(unittest.TestCase):
         torch.testing.assert_close(negative, torch.tensor([[100.0], [200.0]]))
         torch.testing.assert_close(positive, torch.tensor([[300.0], [400.0]]))
         self.assertIs(expand_cfg_latents(latents, enabled=False), latents)
+
+    def test_cfg_time_ids_expand_in_branch_block_order(self):
+        branch_ids = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
+        expanded = expand_cfg_time_ids(branch_ids, batch_size=3, enabled=True)
+        torch.testing.assert_close(
+            expanded,
+            torch.tensor(
+                [
+                    [10.0, 11.0],
+                    [10.0, 11.0],
+                    [10.0, 11.0],
+                    [20.0, 21.0],
+                    [20.0, 21.0],
+                    [20.0, 21.0],
+                ]
+            ),
+        )
+
+        no_cfg = expand_cfg_time_ids(branch_ids[:1], batch_size=3, enabled=False)
+        torch.testing.assert_close(no_cfg, branch_ids[:1].repeat(3, 1))
+
+        with self.assertRaises(ValueError):
+            expand_cfg_time_ids(branch_ids[:1], batch_size=2, enabled=True)
 
     def test_trajectory_correction_requires_single_generator(self):
         correction = generate.trajectory_correction_runtime(
