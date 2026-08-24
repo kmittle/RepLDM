@@ -24,9 +24,18 @@ def freeze_validation_config(
     selection: Dict[str, Any], source: Dict[str, Any], template: Dict[str, Any]
 ) -> Dict[str, Any]:
     train_requirements = template.get("train_selection_requirements", {})
-    for field in ("baseline", "selection_metric", "topiq_used_for_selection", "bootstrap", "seed"):
+    for field in (
+        "baseline",
+        "selection_metric",
+        "topiq_used_for_selection",
+        "require_positive_hpsv2_ci",
+        "bootstrap",
+        "seed",
+    ):
         if selection.get(field) != train_requirements.get(field):
-            raise ValueError(f"train selection field {field!r} differs from registration")
+            raise ValueError(
+                f"train selection field {field!r} differs from registration"
+            )
     if selection.get("constraints") != train_requirements.get("constraints"):
         raise ValueError("train selection constraints differ from registration")
     registration = selection.get("registration")

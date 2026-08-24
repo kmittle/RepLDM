@@ -223,9 +223,10 @@ After strict scoring, apply the frozen train-only proxy rule mechanically:
   --prompts eval-pipeline/prompts/latent_renderer_train.csv
 ```
 
-The selector uses paired HPSv2 means, CLIP/pixel guards, finite renderer
-diagnostics, and the recorded YAML order. It never reads TOPIQ-NR or any test
-row; `fixed_action_selection.json` is the only action authorization for the
+The selector requires a positive paired HPSv2 mean and 95% interval relative
+to `no_ag`, then applies CLIP/pixel guards, finite renderer diagnostics, and
+the recorded YAML order. It never reads TOPIQ-NR or any test row;
+`fixed_action_selection.json` is the only action authorization for the
 validation run. It also rejects any seed, coefficient, provider, action-set, or
 input-hash drift from the registered YAML. A `no_ag` result closes LR-1 without
 a post-hoc search.

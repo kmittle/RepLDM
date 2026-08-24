@@ -285,7 +285,11 @@ def select_fixed_action(
         })
 
     table = pd.DataFrame(rows)
-    eligible = table[table["eligible"]].copy()
+    eligible = table[
+        table["eligible"]
+        & (table["delta_hpsv2"] > 0.0)
+        & (table["hpsv2_ci_low"] > 0.0)
+    ].copy()
     if eligible.empty:
         selected = baseline
     else:
@@ -306,6 +310,7 @@ def select_fixed_action(
         "candidate_actions": candidates,
         "selection_metric": "hpsv2",
         "topiq_used_for_selection": False,
+        "require_positive_hpsv2_ci": True,
         "constraints": {
             "clip_cosine_min_delta": clip_floor,
             "clipped_fraction_max_delta": clip_max,

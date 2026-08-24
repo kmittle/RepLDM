@@ -10,6 +10,7 @@ train_selection_requirements:
   baseline: no_ag
   selection_metric: hpsv2
   topiq_used_for_selection: false
+  require_positive_hpsv2_ci: true
   bootstrap: 10000
   seed: 2026
   constraints:

@@ -132,11 +132,14 @@ with seeds `7,19,73`, keep
 `HPSv2` delta subject to all of the following: paired `CLIP cosine` delta is not
 below `-0.005`, mean clipped-fraction delta is at most `+0.001`, mean
 saturation delta is at most `+0.005`, and every record is finite and within the
-registered moment/trust bounds. Ties whose HPSv2 95% intervals overlap are
-resolved by the smaller mean renderer update ratio, then by the fixed YAML
-order. The train split is not used to claim efficacy and `TOPIQ-NR` is not used
-for this selection. Freeze the resulting action and run the validation split
-once; LR-1 can proceed only if validation satisfies the TOPIQ, non-inferiority,
+registered moment/trust bounds. Because `no_ag` is a candidate with zero
+delta, a renderer must have positive mean HPSv2 delta and a 95% interval wholly
+above zero; otherwise `no_ag` wins. Among surviving renderers, overlapping
+HPSv2 intervals are resolved by the smaller mean renderer update ratio, then
+by the fixed YAML order. The train split is not used to claim efficacy and
+`TOPIQ-NR` is not used for this selection. Freeze the resulting action and run
+the validation split once; LR-1 can proceed only if validation satisfies the
+TOPIQ, non-inferiority,
 guard, and qualitative gates above. If no non-`no_ag` action satisfies the
 train rule, record `no_ag` and close the learned/RL path without a validation
 search. No amplitude, metric, or tie-breaker may be changed after viewing

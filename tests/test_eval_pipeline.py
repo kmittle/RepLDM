@@ -67,6 +67,9 @@ class EvalPipelineTest(unittest.TestCase):
             "candidate_actions": candidates,
             "selection_metric": requirements["selection_metric"],
             "topiq_used_for_selection": requirements["topiq_used_for_selection"],
+            "require_positive_hpsv2_ci": requirements[
+                "require_positive_hpsv2_ci"
+            ],
             "constraints": requirements["constraints"],
             "bootstrap": requirements["bootstrap"],
             "seed": requirements["seed"],
@@ -267,6 +270,36 @@ class EvalPipelineTest(unittest.TestCase):
             pd.DataFrame(rows), action_order=["no_ag", "unsafe"], bootstrap=100
         )
         self.assertEqual(result["selected_action"], "no_ag")
+
+    def test_fixed_action_selector_requires_hps_interval_above_baseline(self):
+        rows = []
+        for prompt_index, candidate_hps in ((0, 0.10), (1, -0.09)):
+            for action, hps in (("no_ag", 0.0), ("uncertain", candidate_hps)):
+                rows.append(
+                    {
+                        "prompt_index": prompt_index,
+                        "seed": 7,
+                        "action_id": action,
+                        "device": "cuda:1",
+                        "hpsv2": hps,
+                        "clip_cosine": 0.0,
+                        "clipped_fraction": 0.0,
+                        "mean_saturation": 0.0,
+                        "action": {"max_update_ratio": 0.05},
+                        "latent_renderer_diagnostics": {
+                            "update_ratio": [0.01],
+                            "mean_error": [0.0],
+                            "variance_error": [0.0],
+                        },
+                    }
+                )
+        result = select_fixed_action.select_fixed_action(
+            pd.DataFrame(rows),
+            action_order=["no_ag", "uncertain"],
+            bootstrap=1000,
+        )
+        self.assertEqual(result["selected_action"], "no_ag")
+        self.assertTrue(result["require_positive_hpsv2_ci"])
 
     def test_registered_train_run_requires_exact_seeds_actions_and_coefficients(self):
         source, _, _ = self._registered_validation_inputs()
