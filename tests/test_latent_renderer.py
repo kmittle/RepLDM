@@ -175,6 +175,70 @@ class LatentRendererTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.guided_x0).all())
         self.assertIsNone(output.diagnostics.update_ratio)
 
+    def test_spatial_head_is_zero_initialised_but_trainable(self):
+        latent, bases, scheduler_update = self.make_inputs()
+        renderer = StructuralLatentRenderer(
+            LatentRendererConfig(
+                num_bases=4,
+                spatial_hidden_dim=8,
+                max_update_ratio=0.1,
+            )
+        )
+        identity = renderer(latent, bases, scheduler_update=scheduler_update)
+        self.assertTrue(torch.equal(identity.guided_x0, latent))
+        renderer.spatial_head["output"].weight.data.normal_(std=0.01)
+        renderer.spatial_head["output"].bias.data.fill_(0.1)
+        output = renderer(latent, bases, scheduler_update=scheduler_update)
+        self.assertTrue(torch.isfinite(output.guided_x0).all())
+        self.assertTrue(torch.all(output.diagnostics.update_ratio <= 0.10001))
+        self.assertTrue(torch.all(output.diagnostics.mean_error < 1e-5))
+        loss = output.guided_x0.square().mean()
+        loss.backward()
+        self.assertTrue(
+            all(
+                parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                for parameter in renderer.spatial_head.parameters()
+            )
+        )
+
+    def test_spatial_head_preserves_flip_equivariance(self):
+        latent, bases, scheduler_update = self.make_inputs()
+        renderer = StructuralLatentRenderer(
+            LatentRendererConfig(num_bases=4, spatial_hidden_dim=8, max_update_ratio=0.1)
+        )
+        renderer.spatial_head["output"].weight.data.normal_(std=0.01)
+        output = renderer(latent, bases, scheduler_update=scheduler_update)
+        flipped = renderer(
+            torch.flip(latent, dims=(-1,)),
+            torch.flip(bases, dims=(-1,)),
+            scheduler_update=torch.flip(scheduler_update, dims=(-1,)),
+        )
+        torch.testing.assert_close(
+            flipped.guided_x0,
+            torch.flip(output.guided_x0, dims=(-1,)),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+    def test_spatial_head_preserves_quarter_turn_equivariance(self):
+        latent, bases, scheduler_update = self.make_inputs()
+        renderer = StructuralLatentRenderer(
+            LatentRendererConfig(num_bases=4, spatial_hidden_dim=8, max_update_ratio=0.1)
+        )
+        renderer.spatial_head["output"].weight.data.normal_(std=0.01)
+        output = renderer(latent, bases, scheduler_update=scheduler_update)
+        rotated = renderer(
+            torch.rot90(latent, 1, dims=(-2, -1)),
+            torch.rot90(bases, 1, dims=(-2, -1)),
+            scheduler_update=torch.rot90(scheduler_update, 1, dims=(-2, -1)),
+        )
+        torch.testing.assert_close(
+            rotated.guided_x0,
+            torch.rot90(output.guided_x0, 1, dims=(-2, -1)),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

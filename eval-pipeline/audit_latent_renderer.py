@@ -59,16 +59,19 @@ def run_audit(
     renderer = StructuralLatentRenderer(
         LatentRendererConfig(
             num_bases=6,
+            latent_channels=4,
             prompt_dim=32,
             state_dim=16,
             hidden_dim=256,
             depth=2,
+            spatial_hidden_dim=32,
             max_update_ratio=0.05,
         )
     ).to(target)
     renderer.policy[-1].bias.data.copy_(
         torch.tensor([0.20, -0.10, 0.05, 0.15, 0.08, -0.06], device=target)
     )
+    renderer.spatial_head["output"].weight.data.normal_(std=0.01)
     prompt = torch.randn(2, 32, device=target)
     state = torch.randn(2, 16, device=target)
     output = renderer(
@@ -87,6 +90,14 @@ def run_audit(
         state_features=state,
         scheduler_update=torch.flip(scheduler_update, dims=(-1,)),
     )
+    rotated = renderer(
+        torch.rot90(latent, 1, dims=(-2, -1)),
+        torch.rot90(bases, 1, dims=(-2, -1)),
+        timestep=torch.tensor([0.2, 0.8], device=target),
+        prompt_embedding=prompt,
+        state_features=state,
+        scheduler_update=torch.rot90(scheduler_update, 1, dims=(-2, -1)),
+    )
     identity_renderer = StructuralLatentRenderer(
         LatentRendererConfig(num_bases=6, max_update_ratio=0.05)
     ).to(target)
@@ -95,6 +106,22 @@ def run_audit(
         bases,
         scheduler_update=scheduler_update,
     )
+    capacity_counts = {}
+    for name, hidden_dim, depth, spatial_hidden_dim in (
+        ("renderer_0p1m", 256, 2, 32),
+        ("renderer_0p6m", 512, 3, 64),
+        ("renderer_5m", 1536, 3, 128),
+    ):
+        capacity_counts[name] = StructuralLatentRenderer(
+            LatentRendererConfig(
+                num_bases=6,
+                prompt_dim=32,
+                state_dim=16,
+                hidden_dim=hidden_dim,
+                depth=depth,
+                spatial_hidden_dim=spatial_hidden_dim,
+            )
+        ).parameter_count
     injected = inject_rendered_clean_update(
         latent, latent, output.guided_x0
     )
@@ -102,6 +129,12 @@ def run_audit(
     flip_error = float(
         (
             flipped.guided_x0 - torch.flip(output.guided_x0, dims=(-1,))
+        ).abs().max().cpu()
+    )
+    rotation_error = float(
+        (
+            rotated.guided_x0
+            - torch.rot90(output.guided_x0, 1, dims=(-2, -1))
         ).abs().max().cpu()
     )
     identity_error = float((identity_output.guided_x0 - latent).abs().max().cpu())
@@ -113,16 +146,19 @@ def run_audit(
         "shape": list(latent.shape),
         "partition_error": partition_error,
         "flip_equivariance_error": flip_error,
+        "rotation_equivariance_error": rotation_error,
         "zero_initialization_error": identity_error,
         "scheduler_injection_error": injection_error,
         "max_update_ratio": float(output.diagnostics.update_ratio.max().cpu()),
         "max_mean_error": float(output.diagnostics.mean_error.max().cpu()),
         "max_variance_error": float(output.diagnostics.variance_error.max().cpu()),
         "parameter_count": renderer.parameter_count,
+        "capacity_parameter_counts": capacity_counts,
         "finite": bool(torch.isfinite(output.guided_x0).all().cpu()),
         "checks": {
             "spectral_partition": partition_error <= 1e-4,
             "flip_equivariance": flip_error <= 1e-4,
+            "rotation_equivariance": rotation_error <= 1e-4,
             "zero_initialization": identity_error == 0.0,
             "scheduler_injection": injection_error <= 1e-6,
             "trust_region": float(output.diagnostics.update_ratio.max().cpu()) <= 0.05001,

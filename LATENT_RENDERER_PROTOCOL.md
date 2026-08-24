@@ -27,9 +27,12 @@ At each ordinary scheduler step, form the candidate bases in this order:
 
 The renderer predicts six bounded coefficients from basis statistics,
 normalized timestep, pooled prompt features, and compact denoising-state
-features. It produces `guided_x0` by projecting the combined residual to the
-fixed-mean/fixed-variance tangent space, applying a scheduler-update
-trust-region cap, and using the sphere geodesic. The next latent is always
+features, and the candidate model adds a D4-symmetrized depthwise-separable
+spatial head. The coefficient-only model is a required control, not the main
+neural-renderer claim. The renderer produces `guided_x0` by projecting the
+combined residual to the fixed-mean/fixed-variance tangent space, applying a
+scheduler-update trust-region cap, and using the sphere geodesic. The next
+latent is always
 
 ```text
 prev_sample + (guided_x0 - pred_original_sample)

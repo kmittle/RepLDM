@@ -60,10 +60,12 @@ one scalar an "invariance" score.
 ## Candidate Renderer
 
 The first implementation is frozen in `AttentionGuidance/latent_renderer.py`
-and registered separately in `LATENT_RENDERER_PROTOCOL.md`. It is a
-zero-initialized basis allocator rather than a free-form latent generator:
-this keeps the initial identity, parameter count, residual geometry, and
-scheduler injection auditable before any learned weights or RL are introduced.
+and registered separately in `LATENT_RENDERER_PROTOCOL.md`. It has a
+zero-initialized basis allocator plus an optional D4-symmetrized,
+depthwise-separable spatial head; the coefficient-only path is retained as a
+matched control. This keeps the initial identity, parameter count, residual
+geometry, and scheduler injection auditable before any learned weights or RL
+are introduced.
 The companion YAML is a registration manifest only and must not be passed to
 the legacy image-generation action loader.
 

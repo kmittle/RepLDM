@@ -32,12 +32,16 @@ class LatentRendererConfig:
     """Architecture and safety settings for one renderer instance."""
 
     num_bases: int
+    latent_channels: int = 4
     prompt_dim: int = 0
     state_dim: int = 0
     hidden_dim: int = 128
     depth: int = 2
     timestep_dim: int = 16
     coefficient_bound: float = 1.0
+    spatial_hidden_dim: int = 0
+    spatial_kernel_size: int = 3
+    spatial_bound: float = 1.0
     max_update_ratio: Optional[float] = 0.05
     preserve_moments: bool = True
     normalize_bases: bool = True
@@ -46,10 +50,16 @@ class LatentRendererConfig:
     def __post_init__(self) -> None:
         if int(self.num_bases) <= 0:
             raise ValueError("num_bases must be positive")
+        if int(self.latent_channels) <= 0:
+            raise ValueError("latent_channels must be positive")
         if int(self.prompt_dim) < 0 or int(self.state_dim) < 0:
             raise ValueError("prompt_dim and state_dim must be non-negative")
         if int(self.hidden_dim) <= 0 or int(self.depth) <= 0:
             raise ValueError("hidden_dim and depth must be positive")
+        if int(self.spatial_hidden_dim) < 0:
+            raise ValueError("spatial_hidden_dim must be non-negative")
+        if int(self.spatial_kernel_size) < 1 or int(self.spatial_kernel_size) % 2 == 0:
+            raise ValueError("spatial_kernel_size must be a positive odd integer")
         if int(self.timestep_dim) < 0:
             raise ValueError("timestep_dim must be non-negative")
         if (
@@ -57,6 +67,8 @@ class LatentRendererConfig:
             or self.coefficient_bound <= 0
         ):
             raise ValueError("coefficient_bound must be finite and positive")
+        if not math.isfinite(float(self.spatial_bound)) or self.spatial_bound <= 0:
+            raise ValueError("spatial_bound must be finite and positive")
         if self.max_update_ratio is not None:
             if not math.isfinite(float(self.max_update_ratio)) or self.max_update_ratio < 0:
                 raise ValueError("max_update_ratio must be finite and non-negative")
@@ -361,13 +373,52 @@ def inject_rendered_clean_update(
     return (prev_sample + guided_x0 - pred_original_sample).to(prev_sample.dtype)
 
 
+class _D4DepthwiseConv2d(nn.Module):
+    """Depthwise convolution whose kernel is symmetrized over flips/rotations."""
+
+    def __init__(self, channels: int, kernel_size: int) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.kernel_size = int(kernel_size)
+        self.weight = nn.Parameter(
+            torch.empty(self.channels, 1, self.kernel_size, self.kernel_size)
+        )
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    @staticmethod
+    def _d4_variants(weight: Tensor) -> Tuple[Tensor, ...]:
+        variants = []
+        for transpose in (False, True):
+            value = weight.transpose(-1, -2) if transpose else weight
+            variants.extend(
+                (
+                    value,
+                    torch.flip(value, dims=(-1,)),
+                    torch.flip(value, dims=(-2,)),
+                    torch.flip(value, dims=(-2, -1)),
+                )
+            )
+        return tuple(variants)
+
+    def forward(self, value: Tensor) -> Tensor:
+        kernel = torch.stack(self._d4_variants(self.weight), dim=0).mean(dim=0)
+        return F.conv2d(
+            value,
+            kernel,
+            padding=self.kernel_size // 2,
+            groups=self.channels,
+        )
+
+
 class StructuralLatentRenderer(nn.Module):
     """Allocate bounded coefficients over interpretable latent residual bases.
 
     ``timestep`` is expected to be normalized to ``[0, 1]`` by the caller.
     ``prompt_embedding`` and ``state_features`` are optional only when their
     configured dimensions are zero.  The final linear layer starts at zero,
-    making an untrained renderer an exact no-op.
+    making an untrained renderer an exact no-op.  Set ``spatial_hidden_dim``
+    above zero to add a depthwise-separable local latent head; zero keeps the
+    coefficient-only control used by the fixed-basis ablation.
     """
 
     def __init__(self, config: LatentRendererConfig) -> None:
@@ -390,6 +441,33 @@ class StructuralLatentRenderer(nn.Module):
         self.policy = nn.Sequential(*layers)
         nn.init.zeros_(self.policy[-1].weight)
         nn.init.zeros_(self.policy[-1].bias)
+        self.spatial_head: Optional[nn.Module]
+        if config.spatial_hidden_dim == 0:
+            self.spatial_head = None
+        else:
+            input_channels = 2 * config.latent_channels
+            self.spatial_head = nn.ModuleDict(
+                {
+                    "depthwise": _D4DepthwiseConv2d(
+                        input_channels, config.spatial_kernel_size
+                    ),
+                    "pointwise": nn.Conv2d(
+                        input_channels, config.spatial_hidden_dim, kernel_size=1
+                    ),
+                    "film": nn.Linear(
+                        input_dim, 2 * config.spatial_hidden_dim
+                    ),
+                    "output": nn.Conv2d(
+                        config.spatial_hidden_dim,
+                        config.latent_channels,
+                        kernel_size=1,
+                    ),
+                }
+            )
+            # Preserve the identity at initialization; the output projection
+            # can learn a local residual after the first optimizer update.
+            nn.init.zeros_(self.spatial_head["output"].weight)
+            nn.init.zeros_(self.spatial_head["output"].bias)
 
     @property
     def parameter_count(self) -> int:
@@ -397,6 +475,10 @@ class StructuralLatentRenderer(nn.Module):
 
     def _prepare_bases(self, latent: Tensor, bases: Tensor) -> Tensor:
         _require_nchw(latent, "latent")
+        if latent.shape[1] != self.config.latent_channels:
+            raise ValueError(
+                f"latent has {latent.shape[1]} channels; expected {self.config.latent_channels}"
+            )
         if not isinstance(bases, Tensor) or bases.ndim != 5:
             raise ValueError(
                 "bases must have shape (batch, num_bases, channels, height, width)"
@@ -421,6 +503,22 @@ class StructuralLatentRenderer(nn.Module):
         normalized = normalized * latent_rms
         active = basis_scale > self.config.epsilon
         return torch.where(active, normalized, torch.zeros_like(normalized))
+
+    def _spatial_residual(self, latent: Tensor, bases: Tensor, context: Tensor) -> Tensor:
+        if self.spatial_head is None:
+            return torch.zeros_like(latent, dtype=torch.float32)
+        feature = torch.cat((latent.float(), bases.mean(dim=1)), dim=1)
+        feature = self.spatial_head["depthwise"](feature)
+        feature = F.silu(self.spatial_head["pointwise"](feature))
+        film_scale, film_shift = self.spatial_head["film"](context).chunk(2, dim=-1)
+        film_scale = torch.tanh(film_scale).unsqueeze(-1).unsqueeze(-1)
+        film_shift = film_shift.unsqueeze(-1).unsqueeze(-1)
+        feature = feature * (1.0 + film_scale) + film_shift
+        local = torch.tanh(self.spatial_head["output"](feature))
+        latent_rms = _vector_norm(latent).reshape(-1, 1, 1, 1) / math.sqrt(
+            latent[0].numel()
+        )
+        return local * latent_rms * float(self.config.spatial_bound)
 
     def forward(
         self,
@@ -474,8 +572,15 @@ class StructuralLatentRenderer(nn.Module):
             ),
             dim=-1,
         )
-        coefficients = torch.tanh(self.policy(context)) * float(self.config.coefficient_bound)
-        raw_update = (coefficients[:, :, None, None, None] * prepared_bases).sum(dim=1)
+        coefficients = torch.tanh(self.policy(context)) * float(
+            self.config.coefficient_bound
+        )
+        basis_update = (
+            coefficients[:, :, None, None, None] * prepared_bases
+        ).sum(dim=1)
+        raw_update = basis_update + self._spatial_residual(
+            latent, prepared_bases, context
+        )
         if self.config.preserve_moments:
             update = _project_fixed_moment_tangent(
                 latent, raw_update, self.config.epsilon

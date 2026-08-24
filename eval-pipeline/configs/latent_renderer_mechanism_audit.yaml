@@ -16,6 +16,7 @@ sampling:
 
 renderer:
   num_bases: 6
+  latent_channels: 4
   basis_order:
     - reciprocal_semantic_transport
     - spectral_low
@@ -26,6 +27,9 @@ renderer:
   prompt_feature_dim: 32
   state_feature_dim: 16
   timestep_feature_dim: 16
+  spatial_hidden_dim: 32
+  spatial_kernel_size: 3
+  spatial_bound: 1.0
   coefficient_bound: 1.0
   max_update_ratio: 0.05
   preserve_moments: true
@@ -38,15 +42,18 @@ capacity_controls:
   - id: renderer_0p1m
     hidden_dim: 256
     depth: 2
-    parameter_count: 91654
+    spatial_hidden_dim: 32
+    parameter_count: 98226
   - id: renderer_0p6m
     hidden_dim: 512
     depth: 3
-    parameter_count: 577030
+    spatial_hidden_dim: 64
+    parameter_count: 590098
   - id: renderer_5m
     hidden_dim: 1536
     depth: 3
-    parameter_count: 4876806
+    spatial_hidden_dim: 128
+    parameter_count: 4902866
   - id: matched_random_renderer
     initialization: frozen_random
   - id: extra_unet_call
