@@ -77,6 +77,22 @@ class EvalPipelineTest(unittest.TestCase):
                 [torch.Generator()], correction
             )
 
+    def test_generation_runtime_provenance_is_json_safe(self):
+        provenance = generate.runtime_provenance()
+        self.assertEqual(
+            set(provenance),
+            {
+                "python_version",
+                "torch_version",
+                "diffusers_version",
+                "cuda_runtime_version",
+            },
+        )
+        json.dumps(provenance)
+        self.assertTrue(provenance["python_version"])
+        self.assertTrue(provenance["torch_version"])
+        self.assertTrue(provenance["diffusers_version"])
+
     def test_freeu_action_is_normalized_and_reentrant(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "freeu.yaml"

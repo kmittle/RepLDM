@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import queue
 import re
 import subprocess
@@ -44,6 +45,7 @@ import pandas as pd
 import torch
 import torch.multiprocessing as tmp
 import yaml
+import diffusers
 from diffusers import EulerAncestralDiscreteScheduler
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -591,6 +593,16 @@ def git_commit() -> str:
         return "unknown"
 
 
+def runtime_provenance() -> dict:
+    """Return package/runtime versions that can affect generated pixels."""
+    return {
+        "python_version": platform.python_version(),
+        "torch_version": str(torch.__version__),
+        "diffusers_version": str(getattr(diffusers, "__version__", "unknown")),
+        "cuda_runtime_version": torch.version.cuda,
+    }
+
+
 def validate_model_cache(model_name: str, cache_dir: str) -> None:
     if os.path.isdir(model_name):
         if not os.path.isfile(os.path.join(model_name, "model_index.json")):
@@ -897,6 +909,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "active_scheduler_config_sha256": active_scheduler_hash,
                 "scheduler_reference": scheduler_reference,
                 "git_commit": commit,
+                **cfg["runtime_provenance"],
                 "device": device,
                 "latent_renderer_diagnostics": (
                     renderer_diagnostics.to_record()
@@ -1066,6 +1079,7 @@ def main():
         "prompts_sha256": sha256_file(args.prompts),
         "actions_yaml": os.path.abspath(args.actions) if args.actions else None,
         "actions_sha256": sha256_file(args.actions) if args.actions else None,
+        "runtime_provenance": runtime_provenance(),
         **stage_settings,
     }
 
