@@ -10,6 +10,7 @@ from AttentionGuidance.latent_renderer import (
     StructuralLatentRenderer,
     _fixed_moment_geodesic,
     _project_fixed_moment_tangent,
+    _cast_guided_x0_with_cap,
     build_fixed_coefficient_renderer,
     cap_update_norm,
 )
@@ -32,6 +33,27 @@ split_cfg_noise_pred = _cfg_batch.split_cfg_noise_pred
 
 
 class FRLAStructuralAuditTest(unittest.TestCase):
+    @staticmethod
+    def _deterministic_cast_case(dtype, preserve_moments=True, enforce=True):
+        """Return one deliberate overrun and one exact no-op sample."""
+        base = torch.tensor(
+            [[[[1.0, 2.0], [3.0, 4.0]]], [[[2.0, 4.0], [6.0, 8.0]]]],
+            dtype=dtype,
+        )
+        update = torch.zeros_like(base)
+        update[0].fill_(0.02)
+        scheduler_update = torch.ones_like(base)
+        result = _cast_guided_x0_with_cap(
+            base,
+            update,
+            scheduler_update,
+            0.005,
+            preserve_moments,
+            1e-6,
+            enforce,
+        )
+        return base, update, scheduler_update, result
+
     @staticmethod
     def _renderer_case(dtype, seed, strict=True, preserve_moments=True):
         torch.manual_seed(seed)
@@ -89,21 +111,25 @@ class FRLAStructuralAuditTest(unittest.TestCase):
         self.assertGreater(float(cast_ratio.max()), 0.1002)
 
     def test_strict_cap_corrects_one_of_two_low_precision_samples(self):
-        for dtype, seed in ((torch.float16, 1712), (torch.bfloat16, 2094)):
-            latent, _scheduler_update, output = self._renderer_case(dtype, seed)
-            diagnostics = output.diagnostics
-            self.assertEqual(output.residual.dtype, dtype)
-            self.assertEqual(diagnostics.postcast_update_ratio.shape, (2,))
-            self.assertEqual(diagnostics.precast_update_ratio.shape, (2,))
-            observed_overrun = diagnostics.observed_postcast_overrun.detach()
+        for dtype in (torch.float16, torch.bfloat16):
+            latent, _update, scheduler_update, result = self._deterministic_cast_case(
+                dtype, preserve_moments=True, enforce=True
+            )
+            _guided_float, guided_x0, observed_overrun, cap_applied, fallback = result
+            denominator = torch.linalg.vector_norm(
+                scheduler_update.float().flatten(1), dim=-1
+            )
+            ratio = torch.linalg.vector_norm(
+                (guided_x0.float() - latent.float()).flatten(1), dim=-1
+            ) / denominator.clamp_min(1e-6)
             self.assertGreater(float(observed_overrun[0]), 0.0)
             self.assertEqual(float(observed_overrun[1]), 0.0)
-            self.assertTrue(torch.all(diagnostics.postcast_overrun <= 1e-7))
-            self.assertTrue(torch.all(diagnostics.update_ratio <= 0.1 + 1e-7))
-            self.assertTrue(bool(diagnostics.postcast_cap_applied[0]))
-            self.assertFalse(bool(diagnostics.postcast_cap_applied[1]))
-            if bool(diagnostics.postcast_noop_fallback[0]):
-                self.assertTrue(torch.equal(output.guided_x0[0], latent[0]))
+            self.assertTrue(torch.all(ratio <= 0.005 + 1e-6))
+            self.assertTrue(bool(cap_applied[0]))
+            self.assertFalse(bool(cap_applied[1]))
+            self.assertFalse(bool(fallback[1]))
+            if bool(fallback[0]):
+                self.assertTrue(torch.equal(guided_x0[0], latent[0]))
 
     def test_strict_cap_zero_scheduler_and_zero_initialization_are_identity(self):
         torch.manual_seed(29)
@@ -146,29 +172,27 @@ class FRLAStructuralAuditTest(unittest.TestCase):
         self.assertTrue(renderer.config.enforce_post_cast_cap)
 
     def test_strict_cap_also_applies_without_moment_retraction(self):
-        for dtype, seed in ((torch.float16, 1712), (torch.bfloat16, 2094)):
-            _latent, _scheduler_update, output = self._renderer_case(
-                dtype, seed, strict=True, preserve_moments=False
+        for dtype in (torch.float16, torch.bfloat16):
+            latent, _update, scheduler_update, result = self._deterministic_cast_case(
+                dtype, preserve_moments=False, enforce=True
             )
-            diagnostics = output.diagnostics
-            self.assertTrue(torch.all(diagnostics.postcast_overrun <= 1e-7))
-            self.assertTrue(torch.all(diagnostics.update_ratio <= 0.1 + 1e-7))
+            _guided_float, guided_x0, _observed, _applied, _fallback = result
+            ratio = torch.linalg.vector_norm(
+                (guided_x0.float() - latent.float()).flatten(1), dim=-1
+            ) / torch.linalg.vector_norm(
+                scheduler_update.float().flatten(1), dim=-1
+            ).clamp_min(1e-6)
+            self.assertTrue(torch.all(ratio <= 0.005 + 1e-6))
 
     def test_non_strict_mode_preserves_historical_post_cast_action(self):
-        _latent, _scheduler_update, legacy = self._renderer_case(
-            torch.bfloat16, 2094, strict=False
+        latent, update, _scheduler_update, result = self._deterministic_cast_case(
+            torch.bfloat16, preserve_moments=False, enforce=False
         )
-        _latent, _scheduler_update, explicit = self._renderer_case(
-            torch.bfloat16, 2094, strict=False
-        )
-        self.assertTrue(torch.equal(legacy.guided_x0, explicit.guided_x0))
-        self.assertTrue(torch.equal(legacy.residual, explicit.residual))
-        torch.testing.assert_close(
-            legacy.diagnostics.update_ratio, explicit.diagnostics.update_ratio
-        )
-        self.assertGreater(
-            float(legacy.diagnostics.postcast_overrun.detach().max()), 0.0002
-        )
+        _guided_float, guided_x0, observed_overrun, _cap_applied, _fallback = result
+        expected = (latent.float() + update.float()).to(latent.dtype)
+        self.assertTrue(torch.equal(guided_x0, expected))
+        self.assertGreater(float(observed_overrun[0]), 0.0)
+        self.assertEqual(float(observed_overrun[1]), 0.0)
 
     def test_diagnostics_record_is_additive_and_preserves_boolean_flags(self):
         _latent, _scheduler_update, output = self._renderer_case(
