@@ -71,3 +71,11 @@ Stage-2 actions must share both the Stage-1 seed and explicitly seeded resamplin
 The spectral-TFSA claim and G1-G4 ladder above are historical and failed in S0-S4. S5 may not reuse their proposal source or enter adaptive control. Its sole admissible static hypothesis is scheduler-consistent reciprocal semantic transport, preregistered in `MODEL_ITERATIONS.md` and bounded by `S5_RELATED_WORK.md`.
 
 For S5, G1 is replaced by a stricter static gate: on new prompts, a candidate must improve TOPIQ-NR by at least `+0.005` with a positive 95% crossed-bootstrap interval and within-metric Holm significance; remain non-inferior on HPSv2 and CLIP; satisfy clipping/saturation guards; beat no-AG, conference TFSA, raw and clean latent controls, the permuted semantic control, CFG 5.0, PLADIS, and GAG; and show a structural/detail gain in a fixed montage. Failure closes the Attention Guidance extension. Success permits only prompt-disjoint confirmation and high-resolution transfer; RL still requires a later, separately registered headroom argument.
+
+The S5 development gate was subsequently run at `cb8eddd` on 12 prompt x 3
+seed x 14 action blocks (504 paired records). The best reciprocal-semantic
+TOPIQ delta was only `+0.000509` with a 95% interval crossing zero, and no
+action passed the registered threshold or fixed-montage structural review.
+This is a null result: the Attention Guidance extension is closed, and the
+latent-renderer/RL design must be registered as a new hypothesis rather than
+trained on S5 outcomes.

@@ -38,6 +38,25 @@ must not be written as a successful continuation of Attention Guidance.
   extra denoiser calls, schedules, and policy optimization. They must be
   baselines or explicit scope boundaries, not components of a novelty claim.
 
+Two additional overlaps are important for the word "renderer": **LaRender
+(arXiv:2508.07647)** already performs training-free volumetric compositing of
+object-wise cross-attention features in latent space, using masks and an
+occlusion graph. **SATeCo (arXiv:2403.17000)** freezes a pretrained UNet/VAE
+and trains small spatial/temporal feature adapters. The proposed method is not
+the first latent renderer or the first frozen-backbone adapter: it is a
+different, narrower object that renders a bounded residual for the scheduler
+transition from self-attention and decoder structure, without object masks,
+extra prompt branches, or a second denoiser call. LaRender-style compositing,
+FreeU, and matched random adapters must be included wherever their task is
+well-defined.
+
+The second supplied paper is also more precisely described as **equivariance**
+regularization: EQ-VAE asks transformed inputs to produce correspondingly
+transformed latents/reconstructions, rather than forcing all transformed views
+to share an invariant code. This distinction determines the renderer test:
+measure both equivariance error and unwanted content change instead of calling
+one scalar an "invariance" score.
+
 ## Candidate Renderer
 
 At step `t`, one frozen U-Net evaluation returns noise `epsilon_t` and exposes a

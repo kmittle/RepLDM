@@ -277,6 +277,8 @@ scheduler 使用 Euler 和 epsilon prediction。S5 不得自己重新计算 `x_0
 
 严格冒烟测试已在 24 August 2026 完成 `28/28` 个配对任务。两个 prompts 都生成了有限、非空的 1024² RGB PNG；no-AG 和 zero-angle identity 的 hash 完全相同，独立重复运行也复现了全部 28 个图像 hash 和必需 metadata。没有 semantic angle 触发预先登记的灾难性门槛，因此完整区间已固定到 `eval-pipeline/configs/s5_development.yaml`。这些分数只证明工程实现通过检查，不能用来选择赢家。
 
+随后在当前运行时 commit `cb8eddd` 上重跑了同一个 smoke，目录为 `outputs/exp_s5/engineering_smoke_v2`。它的 28 个 PNG 与此前两轮 smoke 的 hash 完全一致，关键 metadata 也一致；因此早期工作树 provenance 问题不会改变区间判定。
+
 在解释冒烟分数之前，unit test 和真实模型检查还必须证明：确实使用 scheduler 返回的 `x_0`；no-AG 和 zero-angle PNG hash 精确相同；`guided_x_0` 保持各通道均值和方差；reciprocal support 同时满足 mutual 和 row-stochastic；spatial permutation 是确定性的；重复运行能复现 hash；每个 sidecar 都记录 latency、peak memory、normalized affinity entropy、transport confidence，以及 transport 与 scheduler update 的 norm ratio。
 
 ## S5：正式开发实验的通过条件
@@ -294,4 +296,31 @@ S5 动作只有同时满足以下条件，才能进入下一步：
 
 通过只代表可以继续做不重合 prompts 的确认实验和第二阶段（Stage-2）迁移，还不能开始 RL。如果结果仍为空，就关闭 Attention Guidance 作为期刊扩展的方向；之后不再继续搜索 angle、top-k、layer、schedule、reward 或 controller。
 
-截至这份记录，S5 只完成了方案登记和冒烟工程检查，文档中没有正式开发实验结果。因此不能说 S5 已经有效，更不能说它已经推翻 S0-S4 的失败结论。
+## S5：正式开发结果（Null）
+
+正式目录为 `outputs/exp_s5/development_12prompt_3seed_v2`，由 `cb8eddd` 生成并通过 strict scorer。12 个 prompt、3 个 seed、14 个动作共 `504/504` 条记录完整；36 个 prompt/seed block 各自固定在一张 GPU 上。所有图像都是有效的 1024² RGB PNG，所有非零 semantic action 都记录了 50 个 transport steps、entropy、confidence 和 scheduler-update ratio。
+
+TOPIQ-NR 的 crossed-bootstrap 相对 no-AG 结果如下（均未通过 `+0.005`、CI 排除零和 Holm 三项门槛）：
+
+| action | mean delta | 95% CI |
+|---|---:|---:|
+| reciprocal semantic 0.005 | `+0.000459` | `[-0.000445, +0.001400]` |
+| reciprocal semantic 0.01 | `+0.000509` | `[-0.000571, +0.001771]` |
+| reciprocal semantic 0.02 | `-0.000233` | `[-0.001787, +0.001227]` |
+| reciprocal semantic 0.04 | `-0.000775` | `[-0.002919, +0.001477]` |
+| reciprocal semantic permuted 0.02 | `-0.000974` | `[-0.003585, +0.001618]` |
+
+The matched latent, clean-TFSA, raw-TFSA, conference expert, PLADIS and GAG
+controls also failed the registered S5 gate. HPSv2 and pixel guards do not
+rescue the missing TOPIQ gain; the fixed seed-0 montage at
+`outputs/exp_s5/development_12prompt_3seed_v2/figs/s5_structure_focus_seed0.png`
+shows no stable
+counting, position, text, or detail correction. The semantic and permuted
+graphs are statistically indistinguishable at the required scale, so the
+development run does not establish a causal spatial-graph benefit.
+
+Per the preregistration, S5 is closed as an Attention Guidance extension: do
+not search another angle, top-k, layer, schedule, reward, or controller, and do
+not start RL on this failed static family. The separately documented
+low-capacity latent-renderer proposal may be registered as a new project, but
+it must compete directly with no-AG and cannot be presented as a rescue of S5.

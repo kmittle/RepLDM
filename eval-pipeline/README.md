@@ -72,6 +72,11 @@ and retain the two smallest digests from each of `Complex`, `Fine-grained Detail
 
 Only the registered catastrophic thresholds may remove an extreme contiguous angle. Freeze a new development YAML before generating `s5_development.csv`; never use smoke scores to choose a winner.
 
+For a provenance-clean engineering replay, the same command was run in
+`outputs/exp_s5/engineering_smoke_v2` at commit `cb8eddd`. It reproduced the
+earlier smoke hashes and metadata exactly; smoke remains correctness evidence,
+not efficacy evidence.
+
 `configs/s5_development.yaml` is the frozen development grid produced after the smoke gate. In `engineering_smoke_v1`, no registered catastrophic condition occurred, so the complete contiguous semantic interval `0.005, 0.01, 0.02, 0.04` is retained. Generate it only after freezing this file:
 
 ```bash
@@ -80,6 +85,20 @@ Only the registered catastrophic thresholds may remove an extreme contiguous ang
   --out_dir outputs/exp_s5/development_12prompt_3seed_v1 \
   --actions eval-pipeline/configs/s5_development.yaml --seeds 0,42,123
 ```
+
+The provenance-clean development run is `outputs/exp_s5/development_12prompt_3seed_v2`
+(`cb8eddd`), with 504/504 records and strict scores. Reproduce the paired
+comparison with:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/compare_actions.py \
+  --run_dir outputs/exp_s5/development_12prompt_3seed_v2 --baseline no_ag \
+  --metrics topiq_nr,hpsv2,imagereward,clip_cosine,clipped_fraction,mean_saturation
+```
+
+No semantic action reached the `+0.005` TOPIQ gate or showed a stable
+structural gain in the fixed montage. S5 is therefore a registered null and
+must not be followed by an angle/top-k/layer/reward sweep or RL training.
 
 ## Prepare Scorers
 
