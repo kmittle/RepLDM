@@ -177,7 +177,9 @@ class CFGECProxyTest(unittest.TestCase):
         # The interface has no scheduler/model argument and must remain a
         # pure tensor transform.  Patching the only common random entry point
         # makes an accidental intervention draw fail loudly.
-        with mock.patch.object(torch, "randn", side_effect=AssertionError("unexpected RNG draw")):
+        with mock.patch.object(
+            torch, "randn", side_effect=AssertionError("unexpected RNG draw")
+        ):
             output, diagnostics = correct_cfg_prediction(
                 self.current_u[:1],
                 self.current_c[:1],
