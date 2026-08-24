@@ -10,7 +10,8 @@ For each effective sample `b`, provide current predictions `u_t`, `c_t` and
 the immediately preceding pair `u_prev`, `c_prev`, all with shape `(B, ...)`.
 `current_time` and `previous_time` are scalar, finite, monotonically decreasing
 normalized timestep/sigma coordinates. `CFGECConfig` also supplies CFG scale
-`w`, alignment threshold `tau`, and correction strength `blend` in `[0, 1]`.
+`w`, alignment threshold `tau` in `[0, 1]`, and correction strength `blend` in
+`[0, 1]`.
 
 The first denoising step passes both previous tensors as `None`; it returns
 ordinary CFG exactly and does not inspect a history cache. A partial history is
@@ -59,6 +60,12 @@ configuration accepts only a unit normalized interval
 formula at a non-unit normalized interval; this is an interface smoke ablation,
 not a claim of physical scheduler equivalence. A future pipeline integration
 must derive and register its scheduler-specific horizon before use.
+
+**TODO / no-go for integration:** do not pass raw Euler or Euler-Ancestral
+sigmas into this proxy as if the local equal-step extrapolation were physically
+valid. A scheduler-specific derivation, prediction-parameterization audit, and
+matched control are required before this function can be wired into a denoising
+loop.
 
 ## Identity and Diagnostics
 
