@@ -89,6 +89,23 @@ run the confirmation command with `--split_role validation_confirmation` and
 seeds `11,29,101`. Do not add a new mix or noise mode after looking at those
 validation scores.
 
+For unattended, resumable execution of this registered sequence, use
+`run_trajectory_correction_queue.sh`. It takes an exclusive lock, records input
+hashes and stage state under `outputs/trajectory_correction/queue_v1/`, waits
+for a GPU with at least 22 GiB free, and resumes incomplete generation or
+scoring. A failed development selector writes an auditable `null_route.json`
+and stops. Only a passing selector can freeze the validation YAML and queue the
+44-prompt x 3-seed x 7-action confirmation run; after validation scoring it
+stops in `awaiting_review` and never starts a renderer or RL job.
+
+```bash
+bash eval-pipeline/run_trajectory_correction_queue.sh
+```
+
+Use `--status` to inspect the state, or `--dry-run` with
+`S7_DRY_RUN_SELECTION=ancestral_mix_050` to exercise the pass branch without
+touching a GPU. The queue never terminates or signals an unrelated process.
+
 `configs/frequency_amplitude_followup.yaml` is explicitly post-hoc: it checks whether the 0.004 pilot simply used too much scalar or mid-band guidance. Treat it as search data and validate any selected amplitude on new prompts.
 
 `configs/moment_tangent_smoke.yaml` is registered in `MODEL_ITERATIONS.md`. Run it on `prompts/smoke.csv` with seed `0` before freezing a larger development grid; its two prompts may reject broken or catastrophic actions but cannot support an efficacy claim.

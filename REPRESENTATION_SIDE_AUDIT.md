@@ -39,3 +39,35 @@ controls. A fixed adapter must beat no-op and SPA with positive confidence,
 without a saturation/contrast/sharpness shortcut and across CFG/NFE (plus a
 second backbone), before any distillation or RL controller is authorized.
 
+## Candidate After The S7 Gate: FRLA
+
+The most promising non-spectral candidate from the follow-up audit is **Frozen
+Relational Latent Alignment (FRLA)**. It is only a registered hypothesis until
+S7 is resolved. In the ordinary conditional U-Net forward, capture one decoder
+feature map and downsample it, together with `pred_original_sample`, to a fixed
+`16 x 16` token grid. The primary descriptor is five fixed local cosine
+autocorrelations at lags `(1,0)`, `(0,1)`, `(1,1)`, `(2,0)`, and `(0,2)`; a full
+Gram matrix is only an ablation because the four-channel latent and a wider
+feature map have incompatible ranks. Take one latent-only gradient step that
+reduces the lag-wise discrepancy, then inject the clean-latent residual after
+the scheduler step with a scheduler-update trust cap and a channel-covariance
+(`Mahalanobis`) retraction. This adds no U-Net call; the extra descriptor and
+backward cost and peak memory must be recorded.
+
+The motivation is relational rather than spectral: iREPA (arXiv:2512.10794),
+SARA (arXiv:2503.08253), sREPA (arXiv:2605.16949), and *Diffusing in the Right
+Space* (arXiv:2606.03578) point to spatial self-similarity and semantic
+separability as useful structure signals. DiffRGD (arXiv:2606.28417) and
+LatSearch (arXiv:2603.14526) show that frozen-base latent manipulation is
+already an active area; their extra inner loops or candidate trajectories are
+controls and novelty boundaries, not claims for FRLA.
+
+The preregistered comparison must include no-op, conference TFSA, SPA, FreeU,
+FRLA, shuffled/detached features, pointwise feature matching, a
+relation-preserving-only projection, an isotropic shell, and a matched dummy
+latent-gradient control. Report TOPIQ-NR, HPSv2, CLIP, OCR/count/spatial
+probes, LPIPS/diversity, Gram error, latent moments, DCT/SEC, runtime/FLOPs,
+and clipping/saturation/contrast/sharpness guards. A fixed FRLA action must
+clear the same `+0.005`, crossed-bootstrap, sign-flip/Holm, and guard gates on
+new prompts before any search, distillation, or RL is allowed. If it fails,
+close the representation route rather than tuning the relation target.
