@@ -38,6 +38,18 @@ must not be written as a successful continuation of Attention Guidance.
   extra denoiser calls, schedules, and policy optimization. They must be
   baselines or explicit scope boundaries, not components of a novelty claim.
 
+The 2026 full-text audit tightens this boundary further. The unified path-space
+view (arXiv:2608.14430) treats reverse-trajectory gradients and forward reward
+matching as one objective; SGPO (2608.06768) assigns different objectives to
+SNR/semantic stages; JAGG (2607.17572) approximates intermediate Jacobians;
+CRD (2603.14128), GeMPO (2603.10250), MARBLE (2605.06507), RTDMD
+(2605.26108), and REST (2608.09226) cover centered/anchored reward matching,
+generalized reweighting, multi-reward gradient balancing, and scored-trajectory
+distillation. Consequently, the first learning comparison must be
+search-then-distill with an anchored, multi-reward objective. A later RL arm may
+use antithetic shared-prefix rollouts, but its estimator, stage partition, and
+reward aggregation are controls to be compared, not claimed contributions.
+
 Two additional overlaps are important for the word "renderer": **LaRender
 (arXiv:2508.07647)** already performs training-free volumetric compositing of
 object-wise cross-attention features in latent space, using masks and an

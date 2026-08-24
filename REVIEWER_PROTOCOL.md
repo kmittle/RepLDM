@@ -25,6 +25,33 @@ z_t <- z_t + u_t
 | SGPO, arXiv:2608.06768 | Stage-specific objectives for diffusion RL | Stage-aware optimization is a baseline, not a contribution |
 | BranchGRPO, arXiv:2509.06040 | Shared-prefix branches and depth-wise advantages | Generic branching/counterfactual rollout language is overlapped; any estimator claim needs a precise mathematical difference |
 
+## 2026 Literature Audit (正文核对)
+
+The following arXiv versions were checked against their full text on 2026-08-24.
+They are rejection-risk controls, not claims that these papers are peer-reviewed
+or that their reported gains transfer to SDXL.
+
+| Work | Full-text fact relevant here | Protocol consequence |
+|---|---|---|
+| Unified path-space view (2608.14430v1) | Reverse-trajectory policy gradients and forward matching are derived from one path-space objective; value-gradient and scale-bounded weights are explicit design axes. | Do not claim a new RL estimator. Report action bounds, variance, and a matched path-space/search baseline. |
+| SGPO (2608.06768v1) | SNR and semantic change divide denoising into chaotic, structure-stable, and convergent stages with different objectives. | Stage partitioning is a baseline/analysis variable; any renderer must beat a frozen stage-wise controller. |
+| JAGG (2607.17572v3) | Endpoint Jacobians are interpolated to approximate intermediate GRPO gradients, with routing by cosine similarity. | A Jacobian shortcut needs an exact-autograd and SPSA comparison; it is not a novelty claim. |
+| DRM (2605.25661) | A diffusion-backed reward model supplies noisy-latent, step-wise rewards for Step-GRPO. | Dense credit assignment is covered; use terminal and independent native-resolution witnesses, not only a learned 224px reward. |
+| LeSAMP (2607.23488) | A frozen diffusion/flow model is controlled by a prompt-conditioned LLM policy emitting timestep-varying sampling parameters. | “Frozen backbone + adaptive schedule” is directly overlapped; compare equal-NFE policy capacity and wall-clock cost. |
+| CRD (2603.14128v1) | Within-prompt centered reward distillation and KL anchoring explicitly control distribution drift and reward hacking. | Search-then-distill and an anchored reference are mandatory before online RL. |
+| GeMPO (2603.10250) | Generalized measure matching allows flexible, even signed, reward reweighting instead of fixed exponential weights. | A reweighting choice is an ablation, not the contribution; retain negative-sample and exploration controls. |
+| MARBLE (2605.06507v1) | Per-reward advantages are harmonized in gradient space rather than collapsed into a hand-weighted sum. | If multiple rewards train the renderer, report per-reward gradients and conflict diagnostics. |
+| RTDMD (2605.26108v3) / REST (2608.09226) | Reward-tilted distribution matching and RL-native scored-trajectory distillation combine alignment with a simpler student. | Distillation is the required first learning baseline; RL is allowed only after held-out residual headroom. |
+| BranchGRPO (2509.06040v5) | Shared-prefix branching and depth-wise advantages reduce rollout cost and terminal-reward sparsity. | Any later black-box controller must use shared prefixes and an equal-budget branch control. |
+
+These overlaps sharpen the journal contribution boundary: the only admissible
+claim is a low-capacity, structure-conditioned residual renderer that acts on a
+frozen model's native latent trajectory, with scheduler-consistent constraints.
+The conference connection is the shared latent-trajectory principle; neither
+“RL”, “adaptive”, nor “stage-wise” is sufficient novelty. The LR-1 static gate,
+search-then-distill control, held-out metrics, and human evaluation therefore
+remain hard prerequisites rather than optional ablations.
+
 This matrix is a rejection-risk screen, not a related-work conclusion. It must be refreshed before submission and supported by full-paper comparison rather than abstract-only wording.
 
 ## Baseline Ladder
