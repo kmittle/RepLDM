@@ -1,0 +1,94 @@
+# S5 development grid frozen after engineering_smoke_v1. This is development
+# evidence only; it is not a prompt-disjoint confirmation set.
+# The complete contiguous non-catastrophic semantic interval is retained.
+semantic_transport_layer: up_blocks.0.attentions.0.transformer_blocks.0.attn1
+semantic_transport_topk: 16
+
+actions:
+  - id: no_ag
+    type: none
+    cfg_scale: 7.5
+
+  - id: zero_angle_identity
+    type: clean_transport
+    transport_mode: reciprocal_semantic
+    angle: 0.0
+    topk: 16
+    cfg_scale: 7.5
+
+  - id: cfg_only_5.0
+    type: none
+    cfg_scale: 5.0
+
+  - id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+    cfg_scale: 7.5
+
+  - id: raw_noisy_tfsa_0.001
+    type: scalar
+    scale: 0.001
+    cfg_scale: 7.5
+
+  - id: clean_tfsa_0.02
+    type: clean_transport
+    transport_mode: clean_tfsa
+    angle: 0.02
+    cfg_scale: 7.5
+
+  - id: reciprocal_latent_0.02
+    type: clean_transport
+    transport_mode: reciprocal_latent
+    angle: 0.02
+    topk: 16
+    cfg_scale: 7.5
+
+  - id: reciprocal_semantic_0.005
+    type: clean_transport
+    transport_mode: reciprocal_semantic
+    angle: 0.005
+    topk: 16
+    cfg_scale: 7.5
+  - id: reciprocal_semantic_0.01
+    type: clean_transport
+    transport_mode: reciprocal_semantic
+    angle: 0.01
+    topk: 16
+    cfg_scale: 7.5
+  - id: reciprocal_semantic_0.02
+    type: clean_transport
+    transport_mode: reciprocal_semantic
+    angle: 0.02
+    topk: 16
+    cfg_scale: 7.5
+  - id: reciprocal_semantic_0.04
+    type: clean_transport
+    transport_mode: reciprocal_semantic
+    angle: 0.04
+    topk: 16
+    cfg_scale: 7.5
+
+  - id: reciprocal_semantic_permuted_0.02
+    type: clean_transport
+    transport_mode: reciprocal_semantic_permuted
+    angle: 0.02
+    topk: 16
+    cfg_scale: 7.5
+
+  - id: pladis_official
+    type: attention_baseline
+    attention_baseline: pladis
+    alpha: 1.5
+    baseline_scale: 2.0
+    cfg_scale: 5.0
+
+  - id: gag_official
+    type: attention_baseline
+    attention_baseline: gag
+    alpha: 1.5
+    baseline_scale: 10.0
+    eta: 15.0
+    zeta: 0.0
+    cfg_scale: 5.0

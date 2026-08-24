@@ -16,6 +16,7 @@ dependencies = [
     "transformers~=4.34.0",
     "tqdm",
     "einops",
+    "entmax",
     "matplotlib",
     "gradio",
     "gradio_imageslider",

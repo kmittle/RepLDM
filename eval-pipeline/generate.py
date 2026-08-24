@@ -27,14 +27,17 @@ Example:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import glob
 import hashlib
 import json
+import math
 import os
 import queue
 import re
 import subprocess
 import sys
+import time
 import traceback
 
 import pandas as pd
@@ -50,7 +53,9 @@ from AttentionGuidance import (
     ConstantGuidanceController,
     MOMENT_TANGENT_MODES,
     RESIDUAL_MODES,
+    SEMANTIC_TRANSPORT_MODES,
 )
+from AttentionGuidance.attention_baselines import installed_attention_baseline
 from InferencePipelines import RepLDMSDXLPipeline
 
 DEFAULT_CACHE_DIR = "/mnt/miah204/bycao/RepLDM/pretrained_ckpts"
@@ -180,6 +185,15 @@ def load_actions(path: str, num_inference_steps: int):
         raise ValueError("action config must contain a non-empty 'actions' list")
 
     seen = set()
+    default_layer = str(
+        config.get(
+            "semantic_transport_layer",
+            "up_blocks.0.attentions.0.transformer_blocks.0.attn1",
+        )
+    )
+    default_topk = int(config.get("semantic_transport_topk", 16))
+    if default_topk <= 0:
+        raise ValueError("semantic_transport_topk must be positive")
     normalized = []
     for raw in actions:
         action = dict(raw)
@@ -190,7 +204,14 @@ def load_actions(path: str, num_inference_steps: int):
             raise ValueError(f"duplicate action id {action_id!r}")
         seen.add(action_id)
         action_type = action.get("type")
-        if action_type not in {"none", "scalar", "legacy", "frequency_bands"}:
+        if action_type not in {
+            "none",
+            "scalar",
+            "legacy",
+            "frequency_bands",
+            "clean_transport",
+            "attention_baseline",
+        }:
             raise ValueError(f"unsupported action type {action_type!r} for {action_id}")
 
         if action_type == "none":
@@ -199,10 +220,48 @@ def load_actions(path: str, num_inference_steps: int):
             action["scale"] = float(action["scale"])
             if action["scale"] < 0:
                 raise ValueError(f"{action_id}: scale must be non-negative")
-        else:
+        elif action_type == "frequency_bands":
             action["band_scales"] = [float(value) for value in action["band_scales"]]
             if len(action["band_scales"]) != 3 or min(action["band_scales"]) < 0:
                 raise ValueError(f"{action_id}: band_scales must be three non-negative values")
+        elif action_type == "clean_transport":
+            mode = str(action.get("transport_mode", ""))
+            if mode not in SEMANTIC_TRANSPORT_MODES:
+                raise ValueError(f"{action_id}: unsupported transport_mode {mode!r}")
+            angle = float(action.get("angle", -1.0))
+            if not math.isfinite(angle) or angle < 0:
+                raise ValueError(f"{action_id}: angle must be finite and non-negative")
+            topk = int(action.get("topk", default_topk))
+            if topk <= 0:
+                raise ValueError(f"{action_id}: topk must be positive")
+            action["transport_mode"] = mode
+            action["angle"] = angle
+            action["topk"] = topk
+            action["semantic_transport_layer"] = str(
+                action.get("semantic_transport_layer", default_layer)
+            )
+            action["permutation_seed"] = int(action.get("permutation_seed", 1729))
+            action["scale"] = 0.0
+        elif action_type == "attention_baseline":
+            baseline = str(action.get("attention_baseline", ""))
+            if baseline not in {"pladis", "gag"}:
+                raise ValueError(f"{action_id}: attention_baseline must be pladis or gag")
+            alpha = float(action.get("alpha", 1.5))
+            baseline_scale = float(action.get("baseline_scale", -1.0))
+            if alpha != 1.5 or not math.isfinite(baseline_scale) or baseline_scale < 0:
+                raise ValueError(
+                    f"{action_id}: alpha must be 1.5 and baseline_scale non-negative"
+                )
+            action["attention_baseline"] = baseline
+            action["alpha"] = alpha
+            action["baseline_scale"] = baseline_scale
+            action["eta"] = float(action.get("eta", 15.0))
+            action["zeta"] = float(action.get("zeta", 0.0))
+            if baseline == "gag" and (
+                action["eta"] <= 0 or not 0 <= action["zeta"] <= 1
+            ):
+                raise ValueError(f"{action_id}: invalid GAG eta/zeta")
+            action["scale"] = 0.0
 
         residual_mode = str(action.get("residual_mode", "raw"))
         if residual_mode not in RESIDUAL_MODES:
@@ -210,6 +269,12 @@ def load_actions(path: str, num_inference_steps: int):
         if action_type != "scalar" and residual_mode != "raw":
             raise ValueError(f"{action_id}: only scalar actions support non-raw residual modes")
         action["residual_mode"] = residual_mode
+
+        if "cfg_scale" in action:
+            cfg_scale = float(action["cfg_scale"])
+            if not math.isfinite(cfg_scale) or cfg_scale < 0:
+                raise ValueError(f"{action_id}: cfg_scale must be finite and non-negative")
+            action["cfg_scale"] = cfg_scale
 
         delay_steps = int(action.get("delay_steps", 0))
         if not 0 <= delay_steps < num_inference_steps:
@@ -320,6 +385,32 @@ def guidance_runtime(action: dict, num_inference_steps: int):
     return controller, attn_scale, attn_density, attn_decay
 
 
+def clean_transport_runtime(action: dict):
+    """Translate a validated clean-transport action for the pipeline."""
+    if action["type"] != "clean_transport":
+        return None
+    return {
+        "mode": action["transport_mode"],
+        "angle": action["angle"],
+        "topk": action["topk"],
+        "layer_name": action["semantic_transport_layer"],
+        "permutation_seed": action["permutation_seed"],
+    }
+
+
+def attention_baseline_runtime(action: dict):
+    """Translate a validated PLADIS/GAG action for the worker context."""
+    if action["type"] != "attention_baseline":
+        return None
+    return {
+        "kind": action["attention_baseline"],
+        "attention_scale": action["baseline_scale"],
+        "alpha": action["alpha"],
+        "eta": action["eta"],
+        "zeta": action["zeta"],
+    }
+
+
 def worker_process(cfg: dict, device: str, task_queue, error_queue):
     torch.cuda.set_device(device)
     pipe = RepLDMSDXLPipeline.from_pretrained(
@@ -348,35 +439,60 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             controller, attn_scale, attn_density, attn_decay = guidance_runtime(
                 action, cfg["num_inference_steps"]
             )
-            images = pipe(
-                task["prompt"],
-                negative_prompt=cfg["negative_prompt"],
-                generator=generator,
-                height=cfg["resolution"], width=cfg["resolution"],
-                num_inference_steps=cfg["num_inference_steps"],
-                guidance_scale=cfg["guidance_scale"],
-                show_image=False,
-                multi_decoder=cfg["multi_decoder"],
-                multi_encoder=cfg["multi_encoder"],
-                models_to_cpu=cfg["models_to_cpu"],
-                num_resample_timesteps=cfg["num_resample_timesteps"],
-                init_rates=cfg["init_rates"],
-                attn_type="vanilla",
-                attn_guidance_scale=attn_scale,
-                attn_guidance_density=attn_density,
-                attn_guidance_decay=attn_decay,
-                power_calibrate=cfg["power_calibrate"],
-                attn_guidance_filter=None,
-                attn_guidance_controller=controller,
-                attn_guidance_band_cutoffs=tuple(cfg["frequency_band_cutoffs"]),
+            clean_config = clean_transport_runtime(action)
+            baseline_config = attention_baseline_runtime(action)
+            if cfg["stage2_enabled"] and clean_config is not None:
+                raise ValueError("clean transport is registered for Stage 1 only")
+            cfg_scale = float(action.get("cfg_scale", cfg["guidance_scale"]))
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            start_time = time.perf_counter()
+            baseline_context = (
+                installed_attention_baseline(pipe.unet, **baseline_config)
+                if baseline_config is not None
+                else nullcontext()
             )
+            with baseline_context:
+                images = pipe(
+                    task["prompt"],
+                    negative_prompt=cfg["negative_prompt"],
+                    generator=generator,
+                    height=cfg["resolution"], width=cfg["resolution"],
+                    num_inference_steps=cfg["num_inference_steps"],
+                    guidance_scale=cfg_scale,
+                    show_image=False,
+                    multi_decoder=cfg["multi_decoder"],
+                    multi_encoder=cfg["multi_encoder"],
+                    models_to_cpu=cfg["models_to_cpu"],
+                    num_resample_timesteps=cfg["num_resample_timesteps"],
+                    init_rates=cfg["init_rates"],
+                    attn_type="vanilla",
+                    attn_guidance_scale=attn_scale,
+                    attn_guidance_density=attn_density,
+                    attn_guidance_decay=attn_decay,
+                    power_calibrate=cfg["power_calibrate"],
+                    attn_guidance_filter=None,
+                    attn_guidance_controller=controller,
+                    attn_guidance_band_cutoffs=tuple(cfg["frequency_band_cutoffs"]),
+                    semantic_transport_config=clean_config,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+                peak_memory = int(torch.cuda.max_memory_allocated(device))
+            else:
+                peak_memory = None
+            elapsed = time.perf_counter() - start_time
+            diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
             images[-1].save(png_path)  # lossless PNG
             record = {
                 **task,
                 "image_path": os.path.relpath(png_path, cfg["out_dir"]),
                 "height": cfg["resolution"], "width": cfg["resolution"],
                 "num_inference_steps": cfg["num_inference_steps"],
-                "guidance_scale": cfg["guidance_scale"],
+                "guidance_scale": cfg_scale,
+                "inference_seconds": elapsed,
+                "peak_gpu_memory_bytes": peak_memory,
                 "power_calibrate": cfg["power_calibrate"],
                 "attn_guidance_density": attn_density,
                 "attn_guidance_decay": attn_decay,
@@ -393,6 +509,23 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "git_commit": commit,
                 "device": device,
             }
+            if diagnostics:
+                record.update(diagnostics)
+            else:
+                record.update(
+                    {
+                        "semantic_transport_mode": None,
+                        "semantic_transport_layer": None,
+                        "semantic_transport_angle": None,
+                        "semantic_transport_topk": None,
+                        "semantic_transport_steps": 0,
+                        "mean_normalized_affinity_entropy": None,
+                        "mean_transport_confidence": None,
+                        "mean_transport_scheduler_update_norm_ratio": None,
+                        "mean_transport_update_norm": None,
+                        "mean_scheduler_update_norm": None,
+                    }
+                )
             with open(json_path, "w") as f:
                 json.dump(record, f)
             del images

@@ -72,6 +72,15 @@ and retain the two smallest digests from each of `Complex`, `Fine-grained Detail
 
 Only the registered catastrophic thresholds may remove an extreme contiguous angle. Freeze a new development YAML before generating `s5_development.csv`; never use smoke scores to choose a winner.
 
+`configs/s5_development.yaml` is the frozen development grid produced after the smoke gate. In `engineering_smoke_v1`, no registered catastrophic condition occurred, so the complete contiguous semantic interval `0.005, 0.01, 0.02, 0.04` is retained. Generate it only after freezing this file:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1,2,3,4 --prompts eval-pipeline/prompts/s5_development.csv \
+  --out_dir outputs/exp_s5/development_12prompt_3seed_v1 \
+  --actions eval-pipeline/configs/s5_development.yaml --seeds 0,42,123
+```
+
 ## Prepare Scorers
 
 The scoring environment is a clone of `diff_attn` with independent evaluation packages:

@@ -14,6 +14,7 @@
 
 import inspect
 import os
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import matplotlib.pyplot as plt
 
@@ -48,7 +49,14 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-from AttentionGuidance import AttnGuidance, GuidanceAction, GuidanceController, GuidanceObservation
+from AttentionGuidance import (
+    AttnGuidance,
+    GuidanceAction,
+    GuidanceController,
+    GuidanceObservation,
+    SemanticTransport,
+    SemanticTransportConfig,
+)
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -193,6 +201,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.default_sample_size = self.unet.config.sample_size
+        self._last_guidance_diagnostics = None
 
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
 
@@ -798,6 +807,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         attn_guidance_filter: Optional[Union[tuple, list]] = None,
         attn_guidance_controller: Optional[GuidanceController] = None,
         attn_guidance_band_cutoffs: Tuple[float, float] = (0.08, 0.25),
+        semantic_transport_config: Optional[Dict[str, Any]] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1103,6 +1113,25 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         
         alphas_cumprod_sample = self.scheduler.alphas_cumprod.to(device)[timesteps.type(torch.int) - 1]
         num_timesteps = len(timesteps)
+        semantic_transport = None
+        if semantic_transport_config is not None:
+            if height * width > 1024**2:
+                raise ValueError("semantic transport is registered for Stage 1 only")
+            if attn_guidance_controller is not None or attn_guidance_scale > 0:
+                raise ValueError(
+                    "semantic transport cannot be combined with legacy Attention Guidance"
+                )
+            if isinstance(semantic_transport_config, SemanticTransportConfig):
+                transport_config = semantic_transport_config
+            else:
+                transport_config = SemanticTransportConfig(**dict(semantic_transport_config))
+            if transport_config.angle > 0:
+                semantic_transport = SemanticTransport(
+                    self.unet,
+                    transport_config,
+                    batch_size=latents.shape[0],
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                )
         attn_guidance = AttnGuidance(
             dtype=latents.dtype, device=latents.device, num_total_steps=num_timesteps,
             h=h_resized, w=w_resized, attn_type=attn_type, guidance_scale=attn_guidance_scale,
@@ -1143,14 +1172,15 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
     
                     # predict the noise residual
                     added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=prompt_embeds,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        added_cond_kwargs=added_cond_kwargs,
-                        return_dict=False,
-                    )[0]
+                    with semantic_transport.capture_forward() if semantic_transport is not None else nullcontext():
+                        noise_pred = self.unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                        )[0]
     
                     # perform guidance
                     if do_classifier_free_guidance:
@@ -1161,10 +1191,25 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                         noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
     
-                    # compute the previous noisy sample x_t -> x_t-1
+                    # Compute the previous noisy sample x_t -> x_t-1. Semantic
+                    # transport must consume the scheduler's own x_0 estimate.
                     latents_before_step = latents
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    if semantic_transport is None:
+                        latents = self.scheduler.step(
+                            noise_pred, t, latents, **extra_step_kwargs, return_dict=False
+                        )[0]
+                    else:
+                        step_output = self.scheduler.step(
+                            noise_pred, t, latents, **extra_step_kwargs, return_dict=True
+                        )
+                        latents = step_output.prev_sample
                     denoising_update = latents - latents_before_step
+
+                    if semantic_transport is not None:
+                        latents = semantic_transport.apply(
+                            step_output=step_output,
+                            scheduler_update=denoising_update,
+                        )
 
                     # AttnFusion
                     t_index = num_timesteps - 1 - i
@@ -1245,6 +1290,10 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             plt.show()
         output_images.append(img[0])
         # return output_images  # to be deleted
+
+        self._last_guidance_diagnostics = (
+            semantic_transport.diagnostics() if semantic_transport is not None else None
+        )
     
     ###################################################### Resample ######################################################
         if height * width <= 1024**2:
