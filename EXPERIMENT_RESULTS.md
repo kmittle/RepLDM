@@ -275,7 +275,7 @@ attention/FreeU。实现保持冻结 SDXL U-Net、CFG、NFE 和初始 noise；�
 clipping 和 saturation，故不能据此选择强 mix 或声称收益。
 
 新的 development gate 已冻结为 11 个与仓库旧 prompt 无 normalized-text overlap
-的 PartiPrompts 候选（源 commit `5a657978134374ce28973948331b319adef164bd`）、seeds `[0,42]`、50 steps、1024²、CFG 7.5，并预注册 deterministic drift (`none`，`.25/.50`) 与 stochastic ancestral (`sqrt`，`.25/.50/.75`) 对照。源 TSV 与 prompt hash 记录在
+的 PartiPrompts 候选（源 commit `5a657978134374ce28973948331b319adef164bd`）、seeds `[0,42]`、50 steps、1024²、CFG 7.5，并预注册原生 `EulerAncestralDiscreteScheduler` reference（只报告、不参与选择）、deterministic drift (`none`，`.25/.50`) 与 stochastic ancestral (`sqrt`，`.25/.50/.75`) 对照。源 TSV 与 prompt hash 记录在
 `eval-pipeline/prompts/trajectory_correction_heldout_v1.metadata.json`。在该 gate
 完成前不允许 renderer/RL；即使 development 通过，也必须在更大的新 validation
 split 上用 crossed prompt/seed bootstrap、prompt sign-flip、Holm correction 和

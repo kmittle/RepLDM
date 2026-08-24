@@ -1,5 +1,6 @@
-# Validation confirmation template.  Fill selected_action only after the
-# development gate is complete; do not change the action values or prompts.
+# Validation confirmation template. Fill selected_action only after the
+# development gate is complete; keep the native scheduler reference and do not
+# change any registered action values or prompts.
 schema: trajectory_correction_validation_v1
 experiment_id: trajectory_correction_validation_v1
 parent_experiment_id: trajectory_correction_development_v1
@@ -22,6 +23,10 @@ sampling:
 actions:
   - id: no_correction
     type: none
+  - id: euler_ancestral_reference
+    type: scheduler_baseline
+    scheduler_class: EulerAncestralDiscreteScheduler
+    selection_eligible: false
   - id: drift_mix_025
     type: trajectory_correction
     mix: 0.25

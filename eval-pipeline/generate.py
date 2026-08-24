@@ -44,6 +44,7 @@ import pandas as pd
 import torch
 import torch.multiprocessing as tmp
 import yaml
+from diffusers import EulerAncestralDiscreteScheduler
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -198,9 +199,14 @@ def load_actions(path: str, num_inference_steps: int):
             raise ValueError(
                 "trajectory-correction validation requires selected_action frozen from development"
             )
-        selected_ids = {"no_correction", selected_action}
+        reference_ids = {
+            str(action.get("id"))
+            for action in actions
+            if not bool(action.get("selection_eligible", True))
+        }
+        selected_ids = {"no_correction", selected_action} | reference_ids
         actions = [action for action in actions if str(action.get("id")) in selected_ids]
-        if len(actions) != 2 or selected_action not in {
+        if len(actions) < 2 or selected_action not in {
             str(action.get("id")) for action in actions
         }:
             raise ValueError(
@@ -240,6 +246,7 @@ def load_actions(path: str, num_inference_steps: int):
             "latent_renderer_fixed",
             "freeu",
             "trajectory_correction",
+            "scheduler_baseline",
         }:
             raise ValueError(f"unsupported action type {action_type!r} for {action_id}")
 
@@ -400,6 +407,19 @@ def load_actions(path: str, num_inference_steps: int):
             action["noise_mode"] = noise_mode
             action["max_correction_ratio"] = max_ratio
             action["scale"] = 0.0
+        elif action_type == "scheduler_baseline":
+            scheduler_class = str(
+                action.get("scheduler_class", "EulerAncestralDiscreteScheduler")
+            )
+            if scheduler_class != "EulerAncestralDiscreteScheduler":
+                raise ValueError(
+                    f"{action_id}: only EulerAncestralDiscreteScheduler is registered"
+                )
+            action["scheduler_class"] = scheduler_class
+            # Reference actions are reported but never selected by the fixed
+            # correction gate unless explicitly marked eligible.
+            action["selection_eligible"] = bool(action.get("selection_eligible", False))
+            action["scale"] = 0.0
 
         residual_mode = str(action.get("residual_mode", "raw"))
         if residual_mode not in RESIDUAL_MODES:
@@ -529,6 +549,13 @@ def sha256_file(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def scheduler_config_sha256(scheduler) -> str:
+    """Hash the JSON-normalized scheduler config for paired provenance."""
+    config = getattr(scheduler, "config", {})
+    payload = json.dumps(dict(config), sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def validate_final_test_authorization(
@@ -726,6 +753,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
         cache_dir=cfg["cache_dir"], local_files_only=True,
     ).to(device)
     pipe.set_progress_bar_config(disable=True)
+    base_scheduler = pipe.scheduler
+    base_scheduler_name = type(base_scheduler).__name__
+    base_scheduler_hash = scheduler_config_sha256(base_scheduler)
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
@@ -779,35 +809,53 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 if baseline_config is not None
                 else nullcontext()
             )
-            with baseline_context:
-                images = pipe(
-                    task["prompt"],
-                    negative_prompt=cfg["negative_prompt"],
-                    generator=generator,
-                    height=cfg["resolution"], width=cfg["resolution"],
-                    num_inference_steps=cfg["num_inference_steps"],
-                    guidance_scale=cfg_scale,
-                    show_image=False,
-                    multi_decoder=cfg["multi_decoder"],
-                    multi_encoder=cfg["multi_encoder"],
-                    models_to_cpu=cfg["models_to_cpu"],
-                    num_resample_timesteps=cfg["num_resample_timesteps"],
-                    init_rates=cfg["init_rates"],
-                    attn_type="vanilla",
-                    attn_guidance_scale=attn_scale,
-                    attn_guidance_density=attn_density,
-                    attn_guidance_decay=attn_decay,
-                    power_calibrate=cfg["power_calibrate"],
-                    attn_guidance_filter=None,
-                    attn_guidance_controller=controller,
-                    attn_guidance_band_cutoffs=tuple(cfg["frequency_band_cutoffs"]),
-                    semantic_transport_config=clean_config,
-                    latent_renderer=latent_renderer,
-                    latent_renderer_basis_provider=latent_provider,
-                    freeu_schedule=freeu_schedule,
-                    freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
-                    trajectory_correction=trajectory_correction,
+            scheduler_reference = action["type"] == "scheduler_baseline"
+            scheduler_name = base_scheduler_name
+            active_scheduler_hash = base_scheduler_hash
+            if scheduler_reference:
+                if scheduler_name != "EulerDiscreteScheduler":
+                    raise ValueError(
+                        "EulerAncestralDiscreteScheduler reference requires an "
+                        f"EulerDiscreteScheduler base, got {scheduler_name}"
+                    )
+                pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
+                    base_scheduler.config
                 )
+                scheduler_name = type(pipe.scheduler).__name__
+                active_scheduler_hash = scheduler_config_sha256(pipe.scheduler)
+            try:
+                with baseline_context:
+                    images = pipe(
+                        task["prompt"],
+                        negative_prompt=cfg["negative_prompt"],
+                        generator=generator,
+                        height=cfg["resolution"], width=cfg["resolution"],
+                        num_inference_steps=cfg["num_inference_steps"],
+                        guidance_scale=cfg_scale,
+                        show_image=False,
+                        multi_decoder=cfg["multi_decoder"],
+                        multi_encoder=cfg["multi_encoder"],
+                        models_to_cpu=cfg["models_to_cpu"],
+                        num_resample_timesteps=cfg["num_resample_timesteps"],
+                        init_rates=cfg["init_rates"],
+                        attn_type="vanilla",
+                        attn_guidance_scale=attn_scale,
+                        attn_guidance_density=attn_density,
+                        attn_guidance_decay=attn_decay,
+                        power_calibrate=cfg["power_calibrate"],
+                        attn_guidance_filter=None,
+                        attn_guidance_controller=controller,
+                        attn_guidance_band_cutoffs=tuple(cfg["frequency_band_cutoffs"]),
+                        semantic_transport_config=clean_config,
+                        latent_renderer=latent_renderer,
+                        latent_renderer_basis_provider=latent_provider,
+                        freeu_schedule=freeu_schedule,
+                        freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
+                        trajectory_correction=trajectory_correction,
+                    )
+            finally:
+                if scheduler_reference:
+                    pipe.scheduler = base_scheduler
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
                 peak_memory = int(torch.cuda.max_memory_allocated(device))
@@ -843,6 +891,11 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "init_rates": cfg["init_rates"],
                 "stage2_noise_source": cfg["stage2_noise_source"],
                 "model_name": cfg["model_name"],
+                "scheduler_name": scheduler_name,
+                "base_scheduler_name": base_scheduler_name,
+                "scheduler_config_sha256": base_scheduler_hash,
+                "active_scheduler_config_sha256": active_scheduler_hash,
+                "scheduler_reference": scheduler_reference,
                 "git_commit": commit,
                 "device": device,
                 "latent_renderer_diagnostics": (

@@ -306,9 +306,12 @@ ancestral drift，并以 `mix` 和可选 trust cap 注入 Euler transition。实
 
 执行顺序固定如下：
 
-1. 在 development manifest 上只比较 `no_correction`、deterministic drift
-   (`none`, `.25/.50`) 和 stochastic ancestral (`sqrt`, `.25/.50/.75`)，核对 exact
-   `mix=0` parity、sidecar diagnostics 和 finite pixel guards。
+1. 在 development manifest 上比较 `no_correction`、原生
+   `euler_ancestral_reference`、deterministic drift (`none`, `.25/.50`) 和
+   stochastic ancestral (`sqrt`, `.25/.50/.75`)，核对 exact `mix=0` parity、
+   sidecar scheduler/config hash、correction diagnostics 和 finite pixel guards。
+   原生 scheduler、DPM-Solver++ 和 UniPC 是解释 sampler gain 的 reference，不能
+   被包装成本文方法；后两者至少要在 validation/最终实验中用相同 NFE 复核。
 2. 若 development 有信号，重新冻结更大的 prompt-disjoint validation split，先
    选择一个固定 mix；不得在 validation 上追加 mix、noise mode 或 cap。
 3. 只有固定动作在 validation 同时通过 TOPIQ、HPSv2/CLIP 非劣、clipping/saturation

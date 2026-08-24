@@ -471,8 +471,9 @@ trajectory correction，以及 path-space 统一视角（2608.14430）。这些�
 开发配置和 prompt provenance 已冻结在
 `eval-pipeline/configs/trajectory_correction_development.yaml` 与
 `eval-pipeline/prompts/trajectory_correction_heldout_v1.csv`。当前 manifest 只有
-11 个 prompt、2 个 seed，并同时登记 deterministic drift (`noise_mode=none`，mix
-`.25/.50`) 与 stochastic ancestral (`noise_mode=sqrt`，mix `.25/.50/.75`) 对照；源 TSV 与 PartiPrompts commit
+11 个 prompt、2 个 seed，并同时登记原生 `EulerAncestralDiscreteScheduler` reference
+（只报告、不参与选择）、deterministic drift (`noise_mode=none`，mix `.25/.50`) 与
+stochastic ancestral (`noise_mode=sqrt`，mix `.25/.50/.75`) 对照；源 TSV 与 PartiPrompts commit
 `5a657978134374ce28973948331b319adef164bd` 已在本地 clone 中核验；因此它仍只是
 development，不是 validation/test。4-prompt exploratory probe 的
 TOPIQ 均值差值随 mix 为 `+0.005616/+0.013206/+0.021842/+0.024682`，但 prompt

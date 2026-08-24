@@ -24,6 +24,10 @@ sampling:
 actions:
   - id: no_correction
     type: none
+  - id: euler_ancestral_reference
+    type: scheduler_baseline
+    scheduler_class: EulerAncestralDiscreteScheduler
+    selection_eligible: false
   - id: drift_mix_025
     type: trajectory_correction
     mix: 0.25

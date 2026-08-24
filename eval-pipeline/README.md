@@ -11,7 +11,7 @@ analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 
 ## Generate
 
-Stage 1 at up to 1024² is the default. A resolution above 1024 requires the explicit `--stage2` opt-in, which enables the repository's high-resolution resampling path and records all phase settings. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, low/mid/high-frequency, and standalone `trajectory_correction` actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry. A trajectory correction interpolates an Euler step toward its analytical ancestral transition, supports `mix` in `[0,1]`, and records per-step norm diagnostics; it is Stage-1-only and cannot be combined with another intervention.
+Stage 1 at up to 1024² is the default. A resolution above 1024 requires the explicit `--stage2` opt-in, which enables the repository's high-resolution resampling path and records all phase settings. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, low/mid/high-frequency, standalone `trajectory_correction`, and scheduler-reference actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry. A trajectory correction interpolates an Euler step toward its analytical ancestral transition, supports `mix` in `[0,1]`, and records per-step norm diagnostics; it is Stage-1-only and cannot be combined with another intervention. Scheduler references replace only the sampler, record the base scheduler config hash, and are marked `selection_eligible: false` when they are controls rather than proposed methods.
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -45,16 +45,20 @@ final test. After checking the exact prompt/config hashes, run it with:
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
   --devices 1 --prompts eval-pipeline/prompts/trajectory_correction_heldout_v1.csv \
-  --out_dir outputs/trajectory_correction/development_v1 \
+  --out_dir outputs/trajectory_correction/development_v2 \
   --actions eval-pipeline/configs/trajectory_correction_development.yaml \
   --split_role development --seeds 0,42
 ```
 
 Score the resulting manifest with the ordinary `score.py` and compare paired
-actions against `no_correction`; the registered `noise_mode=none` actions are
-the deterministic-drift ablation for the `sqrt` ancestral actions. Do not select a winner or start renderer/RL
-training from this 11-prompt development gate; a larger, separately frozen
-validation split is required.
+actions against `no_correction`. The `euler_ancestral_reference` action is the
+native `EulerAncestralDiscreteScheduler` control; it is reported but excluded
+from fixed-action selection. The registered `noise_mode=none` actions are the
+deterministic-drift ablation for the `sqrt` ancestral actions. Any correction
+must be interpreted against this native sampler and later against DPM-Solver++
+and UniPC same-NFE controls before a paper claim. Do not select a winner or
+start renderer/RL training from this 11-prompt development gate; a larger,
+separately frozen validation split is required.
 
 After scoring, the preregistered S7 gate can be audited with:
 
@@ -73,6 +77,7 @@ itself is immutable):
 ```bash
 /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/freeze_trajectory_correction_validation.py \
   --selection outputs/trajectory_correction/development_v2/trajectory_correction_selection.json \
+  --source-actions eval-pipeline/configs/trajectory_correction_development.yaml \
   --output eval-pipeline/configs/trajectory_correction_validation_v1.yaml
 ```
 

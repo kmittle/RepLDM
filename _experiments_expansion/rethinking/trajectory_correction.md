@@ -46,8 +46,8 @@ the per-prompt TOPIQ changes ranged from `-0.026565` to `+0.065755`, and the
 largest mixes increased clipping and saturation on some prompts.  No
 inferential claim or renderer/RL decision can be made from four prompts.
 
-The newly registered development manifest has 11 prompt-disjoint records,
-two seeds, and mixes `0.25/0.50/0.75`.  The source TSV hash and verified
+The newly registered development manifest has 11 prompt-disjoint prompts,
+two seeds, a native Euler-Ancestral reference, and mixes `0.25/0.50/0.75`.  The source TSV hash and verified
 PartiPrompts commit `5a657978134374ce28973948331b319adef164bd` are recorded in
 the YAML and metadata.  It is a development gate, not the journal test set.
 
@@ -58,8 +58,10 @@ selected on development data and then beat `no_correction` on a newly frozen,
 larger prompt-disjoint validation split.  The primary endpoint remains
 TOPIQ-NR with crossed prompt/seed bootstrap and prompt sign-flip tests;
 HPSv2/CLIP are witnesses, while clipping, saturation, contrast, colorfulness,
-and sharpness are guards.  Holm correction and a pre-registered minimum effect
-are required.  If the correction fails these guards, this route closes and no
-RL is trained.  If it passes, only then will a small state-conditioned renderer
+and sharpness are guards.  The native Euler-Ancestral result is a required
+sampler control; DPM-Solver++ and UniPC at the same NFE are required before a
+publication claim.  Holm correction and a pre-registered minimum effect are
+required.  If the correction fails these guards, this route closes and no RL
+is trained.  If it passes, only then will a small state-conditioned renderer
 be searched and distilled; RL is allowed only if it beats both the fixed search
 and the distilled controller under the same held-out protocol.

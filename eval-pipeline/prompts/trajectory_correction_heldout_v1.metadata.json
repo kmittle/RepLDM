@@ -19,6 +19,7 @@
     "seeds": [0, 42],
     "actions": [
       {"mix": 0.0, "noise_mode": "none", "id": "no_correction"},
+      {"id": "euler_ancestral_reference", "scheduler": "EulerAncestralDiscreteScheduler", "selection_eligible": false},
       {"mix": 0.25, "noise_mode": "none", "id": "drift_mix_025"},
       {"mix": 0.5, "noise_mode": "none", "id": "drift_mix_050"},
       {"mix": 0.25, "noise_mode": "sqrt", "id": "ancestral_mix_025"},

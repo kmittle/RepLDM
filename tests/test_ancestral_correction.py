@@ -2,6 +2,12 @@ import unittest
 
 import torch
 
+try:
+    from diffusers import EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
+except ImportError:  # pragma: no cover - exercised in the minimal unit-test env
+    EulerAncestralDiscreteScheduler = None
+    EulerDiscreteScheduler = None
+
 from AttentionGuidance import (
     TrajectoryCorrectionConfig,
     apply_ancestral_correction,
@@ -78,6 +84,96 @@ class AncestralCorrectionTest(unittest.TestCase):
                 euler_prev_sample=self.euler,
                 step_index=0,
                 config=TrajectoryCorrectionConfig(mix=0.5, noise_mode="none"),
+            )
+
+    @unittest.skipIf(
+        EulerAncestralDiscreteScheduler is None,
+        "diffusers is not installed; native scheduler parity is unavailable",
+    )
+    def test_mix_one_matches_native_euler_ancestral_scheduler(self):
+        """The endpoint must reproduce the native scheduler at every step."""
+
+        euler = EulerDiscreteScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="linear",
+            prediction_type="epsilon",
+        )
+        ancestral = EulerAncestralDiscreteScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="linear",
+            prediction_type="epsilon",
+        )
+        num_steps = 5
+        euler.set_timesteps(num_steps)
+        ancestral.set_timesteps(num_steps)
+        self.assertTrue(torch.equal(euler.timesteps, ancestral.timesteps))
+        self.assertTrue(torch.allclose(euler.sigmas, ancestral.sigmas, atol=1e-7, rtol=1e-7))
+
+        sample = torch.randn((1, 4, 8, 8), generator=torch.Generator().manual_seed(123))
+        model_generator = torch.Generator().manual_seed(456)
+        native_generator = torch.Generator().manual_seed(789)
+        correction_generator = torch.Generator().manual_seed(789)
+        diagnostics = []
+
+        for step_index, (euler_timestep, ancestral_timestep) in enumerate(
+            zip(euler.timesteps, ancestral.timesteps)
+        ):
+            # Both schedulers must receive the same pre-step state. Calling
+            # scale_model_input initializes their internal step index.
+            euler.scale_model_input(sample, euler_timestep)
+            ancestral.scale_model_input(sample, ancestral_timestep)
+            model_output = torch.randn(
+                sample.shape, generator=model_generator, dtype=sample.dtype
+            )
+            euler_output = euler.step(
+                model_output, euler_timestep, sample, return_dict=True
+            )
+            native_output = ancestral.step(
+                model_output,
+                ancestral_timestep,
+                sample,
+                generator=native_generator,
+                return_dict=True,
+            )
+            corrected, step_diagnostics = apply_ancestral_correction(
+                scheduler=euler,
+                sample=sample,
+                pred_original_sample=euler_output.pred_original_sample,
+                euler_prev_sample=euler_output.prev_sample,
+                step_index=step_index,
+                config=TrajectoryCorrectionConfig(mix=1.0, noise_mode="sqrt"),
+                generator=correction_generator,
+            )
+            self.assertTrue(
+                torch.allclose(corrected, native_output.prev_sample, atol=2e-6, rtol=2e-6),
+                msg=f"native parity failed at step {step_index}",
+            )
+            diagnostics.append(step_diagnostics.to_record())
+            sample = native_output.prev_sample
+
+        self.assertEqual(len(diagnostics), num_steps)
+        self.assertEqual(
+            [record["step_index"] for record in diagnostics], list(range(num_steps))
+        )
+        for previous, current in zip(diagnostics, diagnostics[1:]):
+            self.assertGreater(previous["sigma_from"], current["sigma_from"])
+            self.assertGreaterEqual(previous["sigma_to"], current["sigma_to"])
+        for record in diagnostics:
+            self.assertTrue(
+                all(
+                    torch.isfinite(torch.tensor(record[key]))
+                    for key in (
+                        "sigma_from",
+                        "sigma_to",
+                        "sigma_up",
+                        "raw_correction_norm_ratio",
+                        "applied_correction_norm_ratio",
+                    )
+                )
             )
 
 

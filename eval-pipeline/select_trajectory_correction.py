@@ -12,7 +12,7 @@ import hashlib
 import json
 import math
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -63,7 +63,13 @@ def _diagnostics_are_valid(frame: pd.DataFrame, action: str) -> bool:
     for value in rows["trajectory_correction_diagnostics"]:
         if not isinstance(value, list) or not value:
             return False
-        for record in value:
+        expected_steps = None
+        if "num_inference_steps" in rows:
+            expected_steps = int(rows.loc[rows.index[0], "num_inference_steps"])
+            if expected_steps <= 0 or len(value) != expected_steps:
+                return False
+        previous_sigma_from = None
+        for expected_index, record in enumerate(value):
             if not isinstance(record, dict):
                 return False
             for key in (
@@ -76,12 +82,30 @@ def _diagnostics_are_valid(frame: pd.DataFrame, action: str) -> bool:
             ):
                 if not math.isfinite(float(record.get(key))):
                     return False
-            if int(record["step_index"]) < 0:
+            if int(record["step_index"]) != expected_index:
                 return False
+            sigma_from = float(record["sigma_from"])
+            sigma_to = float(record["sigma_to"])
+            sigma_up = float(record["sigma_up"])
+            if sigma_from <= 0.0 or sigma_to < 0.0 or sigma_to > sigma_from:
+                return False
+            if sigma_up < 0.0 or sigma_up > sigma_to + 1e-6:
+                return False
+            if previous_sigma_from is not None and sigma_from > previous_sigma_from + 1e-5:
+                return False
+            previous_sigma_from = sigma_from
     return True
 
 
-def select(frame: pd.DataFrame, *, action_order: List[str], baseline: str = "no_correction", bootstrap: int = 10000, seed: int = 2026) -> Dict[str, Any]:
+def select(
+    frame: pd.DataFrame,
+    *,
+    action_order: List[str],
+    selection_eligible: Optional[List[str]] = None,
+    baseline: str = "no_correction",
+    bootstrap: int = 10000,
+    seed: int = 2026,
+) -> Dict[str, Any]:
     """Return a frozen action decision and the complete gate table."""
     if bootstrap <= 0:
         raise ValueError("bootstrap must be positive")
@@ -111,10 +135,26 @@ def select(frame: pd.DataFrame, *, action_order: List[str], baseline: str = "no_
         )
     metrics = ["topiq_nr", "hpsv2", "clip_cosine", "clipped_fraction", "mean_saturation"]
     pivots = {metric: _complete_pivot(frame, metric, ordered) for metric in metrics}
-    candidates = [action for action in ordered if action != baseline]
+    eligible_set = (
+        set(ordered) - {baseline}
+        if selection_eligible is None
+        else {str(action) for action in selection_eligible}
+    )
+    if baseline in eligible_set:
+        raise ValueError("baseline cannot be a selectable candidate")
+    if not eligible_set.issubset(set(ordered)):
+        raise ValueError("selection_eligible contains an unregistered action")
+    candidates = [
+        action for action in ordered if action != baseline and action in eligible_set
+    ]
+    reference_actions = [
+        action for action in ordered if action != baseline and action not in eligible_set
+    ]
     rows = []
     topiq_p = []
-    for index, action in enumerate(candidates):
+    eligible_row_indices = []
+    all_candidates = [action for action in ordered if action != baseline]
+    for index, action in enumerate(all_candidates):
         deltas = {
             metric: pivots[metric][action] - pivots[metric][baseline]
             for metric in metrics
@@ -125,30 +165,44 @@ def select(frame: pd.DataFrame, *, action_order: List[str], baseline: str = "no_
             )
             for metric_index, metric in enumerate(metrics)
         }
-        p = prompt_sign_flip_pvalue(
-            deltas["topiq_nr"], n_random=max(10000, bootstrap), seed=seed + index
+        p = None
+        if action in eligible_set:
+            p = prompt_sign_flip_pvalue(
+                deltas["topiq_nr"], n_random=max(10000, bootstrap), seed=seed + index
+            )
+            topiq_p.append(p)
+            eligible_row_indices.append(len(rows))
+        # Scheduler references have no correction diagnostics by design; their
+        # finite scorer values are sufficient for the auditable comparison.
+        valid_diagnostics = (
+            True if action in reference_actions else _diagnostics_are_valid(frame, action)
         )
-        topiq_p.append(p)
-        valid_diagnostics = _diagnostics_are_valid(frame, action)
         row = {
             "action": action,
             "order": index,
+            "selection_eligible": action in eligible_set,
             "valid_diagnostics": valid_diagnostics,
             "topiq_mean_delta": float(deltas["topiq_nr"].mean()),
             "topiq_ci_low": float(cis["topiq_nr"][0]),
             "topiq_ci_high": float(cis["topiq_nr"][1]),
-            "topiq_p_sign_flip": float(p),
+            "topiq_p_sign_flip": None if p is None else float(p),
         }
         for metric in metrics[1:]:
             row[f"{metric}_mean_delta"] = float(deltas[metric].mean())
             row[f"{metric}_ci_low"] = float(cis[metric][0])
             row[f"{metric}_ci_high"] = float(cis[metric][1])
         rows.append(row)
-    adjusted = holm_adjust(topiq_p)
-    for row, adjusted_p in zip(rows, adjusted):
-        row["topiq_p_holm"] = float(adjusted_p)
+    adjusted = holm_adjust(topiq_p) if topiq_p else []
+    adjusted_by_row = dict(zip(eligible_row_indices, adjusted))
+    for row_index, row in enumerate(rows):
+        if row_index in eligible_row_indices:
+            adjusted_p = adjusted_by_row[row_index]
+            row["topiq_p_holm"] = float(adjusted_p)
+        else:
+            row["topiq_p_holm"] = None
         row["passes_gate"] = bool(
-            row["valid_diagnostics"]
+            row["selection_eligible"]
+            and row["valid_diagnostics"]
             and row["topiq_mean_delta"] >= PRIMARY_MIN_DELTA
             and row["topiq_ci_low"] > 0.0
             and row["topiq_p_holm"] < 0.05
@@ -168,6 +222,8 @@ def select(frame: pd.DataFrame, *, action_order: List[str], baseline: str = "no_
         "selected_action": selected,
         "baseline": baseline,
         "candidate_actions": candidates,
+        "reference_actions": reference_actions,
+        "selection_eligible": candidates,
         "gate": {
             "primary_metric": "topiq_nr",
             "minimum_mean_delta": PRIMARY_MIN_DELTA,
@@ -199,6 +255,12 @@ def main() -> None:
     action_order = [str(action.get("id", "")) for action in config.get("actions", [])]
     if not action_order or any(not action for action in action_order):
         raise ValueError("actions YAML must contain non-empty action ids")
+    selection_eligible = [
+        str(action.get("id"))
+        for action in config.get("actions", [])
+        if bool(action.get("selection_eligible", True))
+        and str(action.get("id")) != args.baseline
+    ]
     manifest = pd.DataFrame(load_jsonl(os.path.join(args.run_dir, "manifest.jsonl")))
     scores = pd.DataFrame(load_jsonl(os.path.join(args.run_dir, "scores.jsonl")))
     if manifest.empty or scores.empty:
@@ -208,6 +270,7 @@ def main() -> None:
     result = select(
         frame,
         action_order=action_order,
+        selection_eligible=selection_eligible,
         baseline=args.baseline,
         bootstrap=args.bootstrap,
         seed=args.seed,

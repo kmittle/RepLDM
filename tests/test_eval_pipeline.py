@@ -148,8 +148,23 @@ class EvalPipelineTest(unittest.TestCase):
             actions, _ = generate.load_actions(str(path), 50)
             self.assertEqual(
                 [action["id"] for action in actions],
-                ["no_correction", "ancestral_mix_050"],
+                ["no_correction", "euler_ancestral_reference", "ancestral_mix_050"],
             )
+
+    def test_scheduler_reference_is_normalized_and_retained_for_validation(self):
+        config_path = ROOT / "eval-pipeline/configs/trajectory_correction_validation_template.yaml"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "validation.yaml"
+            source = yaml.safe_load(config_path.read_text())
+            source["selected_action"] = "ancestral_mix_050"
+            path.write_text(yaml.safe_dump(source, sort_keys=False))
+            actions, _ = generate.load_actions(str(path), 50)
+            by_id = {action["id"]: action for action in actions}
+            self.assertIn("euler_ancestral_reference", by_id)
+            self.assertEqual(
+                by_id["euler_ancestral_reference"]["type"], "scheduler_baseline"
+            )
+            self.assertFalse(by_id["euler_ancestral_reference"]["selection_eligible"])
 
     def test_trajectory_selector_applies_primary_and_pixel_gates(self):
         rows = []
@@ -157,6 +172,7 @@ class EvalPipelineTest(unittest.TestCase):
             for seed in (0, 42):
                 for action_id, topiq_delta, clip_delta in (
                     ("no_correction", 0.0, 0.0),
+                    ("euler_ancestral_reference", 0.004, 0.0),
                     ("ancestral_mix_050", 0.01, 0.0),
                     ("ancestral_mix_075", 0.01, 0.002),
                 ):
@@ -173,7 +189,7 @@ class EvalPipelineTest(unittest.TestCase):
                             "mean_saturation": 0.2,
                             "trajectory_correction_diagnostics": (
                                 None
-                                if action_id == "no_correction"
+                                if action_id in {"no_correction", "euler_ancestral_reference"}
                                 else [
                                     {
                                         "step_index": 0,
@@ -190,12 +206,20 @@ class EvalPipelineTest(unittest.TestCase):
         frame = pd.DataFrame(rows)
         result = select_trajectory_correction.select(
             frame,
-            action_order=["no_correction", "ancestral_mix_050", "ancestral_mix_075"],
+            action_order=[
+                "no_correction",
+                "euler_ancestral_reference",
+                "ancestral_mix_050",
+                "ancestral_mix_075",
+            ],
+            selection_eligible=["ancestral_mix_050", "ancestral_mix_075"],
             bootstrap=500,
             seed=3,
         )
         self.assertEqual(result["selected_action"], "ancestral_mix_050")
         rows_by_action = {row["action"]: row for row in result["rows"]}
+        self.assertIn("euler_ancestral_reference", result["reference_actions"])
+        self.assertFalse(rows_by_action["euler_ancestral_reference"]["passes_gate"])
         self.assertTrue(rows_by_action["ancestral_mix_050"]["passes_gate"])
         self.assertFalse(rows_by_action["ancestral_mix_075"]["passes_gate"])
 
@@ -220,19 +244,40 @@ class EvalPipelineTest(unittest.TestCase):
                     }
                 )
             )
+            source = root / "development.yaml"
+            source.write_text(
+                yaml.safe_dump(
+                    {
+                        "schema": "trajectory_correction_actions_v1",
+                        "actions": [
+                            {"id": "no_correction", "type": "none"},
+                            {
+                                "id": "ancestral_mix_050",
+                                "type": "trajectory_correction",
+                                "mix": 0.5,
+                                "noise_mode": "sqrt",
+                            },
+                        ],
+                    }
+                )
+            )
             selection = root / "selection.json"
+            selection_provenance = {
+                "actions_sha256": freeze_trajectory_correction.sha256_file(str(source))
+            }
             selection.write_text(
                 json.dumps(
                     {
                         "selected_action": "ancestral_mix_050",
                         "gate": {"primary_metric": "topiq_nr"},
                         "rows": [{"action": "ancestral_mix_050", "passes_gate": True}],
+                        "provenance": selection_provenance,
                     }
                 )
             )
             output = root / "frozen.yaml"
             frozen = freeze_trajectory_correction.freeze(
-                str(selection), str(template), str(output)
+                str(selection), str(template), str(output), str(source)
             )
             self.assertEqual(frozen["selected_action"], "ancestral_mix_050")
             self.assertTrue(output.exists())
