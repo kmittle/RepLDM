@@ -370,6 +370,32 @@ def load_actions(path: str, num_inference_steps: int):
     return normalized, cutoffs
 
 
+def validate_split_seed_role(path: str, split_role, seeds) -> None:
+    """Enforce registered search/validation/test seeds when a YAML defines them."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    registered = config.get("split_seeds")
+    if registered is None:
+        if split_role is not None:
+            raise ValueError("--split_role requires an action config with split_seeds")
+        return
+    if not isinstance(registered, dict) or not registered:
+        raise ValueError("split_seeds must be a non-empty mapping")
+    if split_role is None:
+        raise ValueError(
+            "this action config registers split_seeds; pass --split_role explicitly"
+        )
+    if split_role not in registered:
+        raise ValueError(
+            f"unknown --split_role {split_role!r}; expected one of {sorted(registered)}"
+        )
+    expected = [int(value) for value in registered[split_role]]
+    if list(seeds) != expected:
+        raise ValueError(
+            f"--seeds {list(seeds)} do not match {split_role} registered seeds {expected}"
+        )
+
+
 def git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -693,6 +719,11 @@ def main():
                     help="comma-separated constant attn_guidance_scale values")
     ap.add_argument("--actions", default=None,
                     help="YAML action grid; mutually exclusive with --scales")
+    ap.add_argument(
+        "--split_role",
+        default=None,
+        help="registered split_seeds role, e.g. train_search or validation_confirmation",
+    )
     ap.add_argument("--seeds", default="0,42,123", help="comma-separated seeds")
     ap.add_argument("--resolution", type=int, default=1024)
     ap.add_argument(
@@ -723,8 +754,14 @@ def main():
         ap.error("--actions and --scales are mutually exclusive")
     if args.actions:
         actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
+        try:
+            validate_split_seed_role(args.actions, args.split_role, seeds)
+        except ValueError as exc:
+            ap.error(str(exc))
         legacy_scale_ids = False
     else:
+        if args.split_role is not None:
+            ap.error("--split_role requires --actions")
         scale_values = args.scales or "0,0.001,0.002,0.003,0.005"
         scales = [float(s) for s in scale_values.split(",") if s != ""]
         actions = scale_actions(scales)

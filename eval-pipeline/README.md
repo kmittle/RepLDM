@@ -206,7 +206,7 @@ used only after the action is frozen):
   --prompts eval-pipeline/prompts/latent_renderer_train.csv \
   --out_dir outputs/latent_renderer/lr1_fixed_train_searchseeds_v2 \
   --actions eval-pipeline/configs/latent_renderer_fixed_lr1.yaml \
-  --seeds 7,19,73
+  --split_role train_search --seeds 7,19,73
 ```
 
 `latent_renderer_fixed` emits constant six-dimensional coefficients through

@@ -153,6 +153,16 @@ class EvalPipelineTest(unittest.TestCase):
         tasks = generate.build_tasks(prompts, [0], actions[:2])
         self.assertEqual(tasks[1]["action_type"], "latent_renderer_fixed")
 
+    def test_latent_renderer_split_seeds_are_enforced(self):
+        path = ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml"
+        generate.validate_split_seed_role(path, "train_search", [7, 19, 73])
+        with self.assertRaisesRegex(ValueError, "pass --split_role"):
+            generate.validate_split_seed_role(path, None, [7, 19, 73])
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            generate.validate_split_seed_role(path, "train_search", [0, 42, 123])
+        with self.assertRaisesRegex(ValueError, "unknown --split_role"):
+            generate.validate_split_seed_role(path, "unknown", [7, 19, 73])
+
     def test_moment_tangent_config_and_runtime_wiring(self):
         actions, _ = generate.load_actions(
             ROOT / "eval-pipeline/configs/moment_tangent_smoke.yaml", 50
