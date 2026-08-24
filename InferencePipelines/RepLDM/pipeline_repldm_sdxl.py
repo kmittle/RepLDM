@@ -1028,6 +1028,16 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         """
         
         # 0. Default height and width to unet
+        # Runtime diagnostics belong to exactly one pipeline invocation.  Clear
+        # them before input validation so a failed or early-returned task cannot
+        # leak the previous action's records into the next sidecar.
+        self._last_guidance_diagnostics = None
+        self._last_freeu_schedule = None
+        self._last_freeu_preserve_moments = False
+        self._last_trajectory_correction = None
+        self._last_trajectory_correction_diagnostics = []
+        self._last_latent_renderer_diagnostics = None
+        self._last_latent_renderer_provider_diagnostics = None
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
