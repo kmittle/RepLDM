@@ -19,6 +19,8 @@ from .semantic_transport import (
     infer_token_grid,
 )
 from .latent_renderer import (
+    InjectionDiagnostics,
+    InjectionOutput,
     LatentRendererConfig,
     RendererBasisProvider,
     RendererCondition,
@@ -68,6 +70,8 @@ __all__ = [
     "fixed_moment_transport",
     "inject_predicted_clean_update",
     "infer_token_grid",
+    "InjectionDiagnostics",
+    "InjectionOutput",
     "LatentRendererConfig",
     "RendererBasisProvider",
     "RendererCondition",

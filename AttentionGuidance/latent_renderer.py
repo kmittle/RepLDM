@@ -21,7 +21,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import math
-from typing import Any, Callable, Iterator, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterator, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -142,6 +142,53 @@ class RendererDiagnostics:
             "postcast_cap_applied": encode(self.postcast_cap_applied),
             "postcast_noop_fallback": encode(self.postcast_noop_fallback),
         }
+
+
+@dataclass(frozen=True)
+class InjectionDiagnostics:
+    """Auditable residuals for the final scheduler-sample injection."""
+
+    scheduler_update_norm: Optional[Tensor]
+    precast_residual_norm: Tensor
+    precast_update_ratio: Optional[Tensor]
+    precast_overrun: Optional[Tensor]
+    postcast_residual_norm: Tensor
+    postcast_update_ratio: Optional[Tensor]
+    postcast_overrun: Optional[Tensor]
+    observed_postcast_overrun: Optional[Tensor]
+    postcast_cap_applied: Optional[Tensor]
+    postcast_noop_fallback: Optional[Tensor]
+
+    def to_record(self) -> dict:
+        """Return JSON-safe per-sample injection diagnostics."""
+
+        def encode(value: Optional[Tensor]):
+            if value is None:
+                return None
+            if value.dtype == torch.bool:
+                return value.detach().cpu().tolist()
+            return value.detach().float().cpu().tolist()
+
+        return {
+            "scheduler_update_norm": encode(self.scheduler_update_norm),
+            "precast_residual_norm": encode(self.precast_residual_norm),
+            "precast_update_ratio": encode(self.precast_update_ratio),
+            "precast_overrun": encode(self.precast_overrun),
+            "postcast_residual_norm": encode(self.postcast_residual_norm),
+            "postcast_update_ratio": encode(self.postcast_update_ratio),
+            "postcast_overrun": encode(self.postcast_overrun),
+            "observed_postcast_overrun": encode(self.observed_postcast_overrun),
+            "postcast_cap_applied": encode(self.postcast_cap_applied),
+            "postcast_noop_fallback": encode(self.postcast_noop_fallback),
+        }
+
+
+@dataclass(frozen=True)
+class InjectionOutput:
+    """Final injected sample and optional strict-cap diagnostics."""
+
+    sample: Tensor
+    diagnostics: InjectionDiagnostics
 
 
 @dataclass(frozen=True)
@@ -527,18 +574,228 @@ def build_feature_difference_basis(
 
 
 def inject_rendered_clean_update(
-    prev_sample: Tensor, pred_original_sample: Tensor, guided_x0: Tensor
-) -> Tensor:
-    """Inject a rendered ``x0`` while retaining the scheduler's own step."""
+    prev_sample: Tensor,
+    pred_original_sample: Tensor,
+    guided_x0: Tensor,
+    *,
+    scheduler_update: Optional[Tensor] = None,
+    max_update_ratio: Optional[float] = None,
+    enforce_post_cast_cap: bool = False,
+    return_diagnostics: bool = False,
+    epsilon: float = 1e-6,
+) -> Union[Tensor, InjectionOutput]:
+    """Inject a rendered ``x0`` while retaining the scheduler's own step.
+
+    The three positional arguments intentionally retain the historical
+    implementation byte-for-byte when no keyword options are supplied.  The
+    optional contract measures the *actual* residual after conversion to
+    ``prev_sample.dtype``.  With ``enforce_post_cast_cap=True``, samples that
+    exceed ``max_update_ratio`` of ``scheduler_update`` are scaled and then
+    checked again after conversion; an unrepresentable or still-over-limit
+    action is replaced by the exact scheduler sample (a no-op).
+    """
+    # Keep the old validation and arithmetic on the compatibility path.  This
+    # matters for callers that rely on low-precision operation ordering.  The
+    # strict path permits a non-finite rendered candidate so it can turn that
+    # action into an exact no-op instead of propagating it.
+    if not isinstance(enforce_post_cast_cap, bool):
+        raise ValueError("enforce_post_cast_cap must be a boolean")
+
+    def _require_layout(value: Tensor, name: str) -> None:
+        if not isinstance(value, Tensor) or value.ndim != 4:
+            raise ValueError(f"{name} must have shape (batch, channels, height, width)")
+
     _require_nchw(prev_sample, "prev_sample")
-    _require_nchw(pred_original_sample, "pred_original_sample")
-    _require_nchw(guided_x0, "guided_x0")
+    if enforce_post_cast_cap:
+        _require_layout(pred_original_sample, "pred_original_sample")
+        _require_layout(guided_x0, "guided_x0")
+    else:
+        _require_nchw(pred_original_sample, "pred_original_sample")
+        _require_nchw(guided_x0, "guided_x0")
     if (
         prev_sample.shape != pred_original_sample.shape
         or guided_x0.shape != prev_sample.shape
     ):
         raise ValueError("scheduler samples and guided_x0 must have identical shapes")
-    return (prev_sample + guided_x0 - pred_original_sample).to(prev_sample.dtype)
+
+    compatibility_path = (
+        scheduler_update is None
+        and max_update_ratio is None
+        and not enforce_post_cast_cap
+        and not return_diagnostics
+    )
+    if compatibility_path:
+        return (prev_sample + guided_x0 - pred_original_sample).to(prev_sample.dtype)
+
+    try:
+        epsilon_value = float(epsilon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("epsilon must be finite and positive") from exc
+    if not math.isfinite(epsilon_value) or epsilon_value <= 0:
+        raise ValueError("epsilon must be finite and positive")
+
+    ratio_bound: Optional[float]
+    if max_update_ratio is None:
+        ratio_bound = None
+    else:
+        try:
+            ratio_bound = float(max_update_ratio)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_update_ratio must be finite and non-negative") from exc
+        if not math.isfinite(ratio_bound) or ratio_bound < 0:
+            raise ValueError("max_update_ratio must be finite and non-negative")
+
+    if ratio_bound is not None and scheduler_update is None:
+        raise ValueError("scheduler_update is required with max_update_ratio")
+    if enforce_post_cast_cap and (scheduler_update is None or ratio_bound is None):
+        raise ValueError(
+            "enforce_post_cast_cap requires scheduler_update and max_update_ratio"
+        )
+
+    if scheduler_update is not None:
+        _require_nchw(scheduler_update, "scheduler_update")
+        if scheduler_update.shape != prev_sample.shape:
+            raise ValueError("scheduler_update must have the same shape as prev_sample")
+
+    # The strict path is also a finite-value guard.  Inputs are normally
+    # finite, but allowing a non-finite rendered candidate here lets the
+    # exact-no-op fallback protect the scheduler transition instead of
+    # propagating an invalid latent.  ``prev_sample`` and the reference update
+    # themselves must remain finite so the fallback and ratio are meaningful.
+    if enforce_post_cast_cap:
+        if not torch.isfinite(prev_sample).all():
+            raise ValueError("prev_sample contains non-finite values")
+        if scheduler_update is not None and not torch.isfinite(scheduler_update).all():
+            raise ValueError("scheduler_update contains non-finite values")
+
+    # This is intentionally the historical expression.  In particular, the
+    # pre-cast value may already be half precision; it is the quantity whose
+    # final cast is audited below.  The compatibility path above returns before
+    # any additional work is performed.
+    candidate_precast = prev_sample + guided_x0 - pred_original_sample
+    candidate_cast = candidate_precast.to(prev_sample.dtype)
+    batch = prev_sample.shape[0]
+    # Addition/subtraction in fp16 can round a mathematically zero rendered
+    # delta (``guided_x0 == pred_original_sample``) away from the scheduler
+    # sample.  Preserve the identity contract on the opt-in path explicitly;
+    # the legacy three-argument path above remains untouched.
+    zero_render_delta = (
+        (guided_x0 == pred_original_sample).flatten(1).all(dim=1)
+        & torch.isfinite(guided_x0).flatten(1).all(dim=1)
+        & torch.isfinite(pred_original_sample).flatten(1).all(dim=1)
+    )
+    candidate_precast = torch.where(
+        zero_render_delta.reshape((-1, 1, 1, 1)),
+        prev_sample,
+        candidate_precast,
+    )
+    candidate_cast = torch.where(
+        zero_render_delta.reshape((-1, 1, 1, 1)),
+        prev_sample,
+        candidate_cast,
+    )
+    prev_float = prev_sample.float()
+    precast_residual = candidate_precast.float() - prev_float
+    postcast_residual = candidate_cast.float() - prev_float
+    precast_norm = _vector_norm(precast_residual)
+    postcast_norm_observed = _vector_norm(postcast_residual)
+
+    scheduler_norm: Optional[Tensor] = None
+    precast_ratio: Optional[Tensor] = None
+    observed_postcast_ratio: Optional[Tensor] = None
+    precast_overrun: Optional[Tensor] = None
+    observed_postcast_overrun: Optional[Tensor] = None
+    if scheduler_update is not None:
+        scheduler_norm = _vector_norm(scheduler_update)
+        denominator = scheduler_norm.clamp_min(epsilon_value)
+        precast_ratio = precast_norm / denominator
+        observed_postcast_ratio = postcast_norm_observed / denominator
+        if ratio_bound is not None:
+            precast_overrun = (precast_ratio - ratio_bound).clamp_min(0.0)
+            observed_postcast_overrun = (
+                observed_postcast_ratio - ratio_bound
+            ).clamp_min(0.0)
+
+    # Detect invalid values using the cast representation, because that is
+    # what the scheduler will actually consume.  ``isfinite`` on the ratio is
+    # included for the zero/overflow cases where a norm can become NaN.
+    cast_finite = torch.isfinite(candidate_cast).flatten(1).all(dim=1)
+    if ratio_bound is not None and observed_postcast_ratio is not None:
+        over_limit = (
+            ~cast_finite
+            | ~torch.isfinite(observed_postcast_ratio)
+            | (observed_postcast_ratio > ratio_bound)
+        )
+    else:
+        over_limit = ~cast_finite if enforce_post_cast_cap else torch.zeros(
+            batch, dtype=torch.bool, device=prev_sample.device
+        )
+
+    correction_applied = torch.zeros(
+        batch, dtype=torch.bool, device=prev_sample.device
+    )
+    noop_fallback = torch.zeros_like(correction_applied)
+    final_sample = candidate_cast
+    if enforce_post_cast_cap and torch.any(over_limit):
+        correction_applied = over_limit
+
+        # Recompute in float32 for correction.  This recovers finite values
+        # when the original half-precision sum overflowed before its final
+        # cast, while still falling back when the rendered inputs themselves
+        # are non-finite.
+        safe_candidate = prev_float + guided_x0.float() - pred_original_sample.float()
+        safe_residual = safe_candidate - prev_float
+        safe_finite = torch.isfinite(safe_candidate).flatten(1).all(dim=1)
+        safe_norm = _vector_norm(safe_residual)
+        target_norm = scheduler_norm * ratio_bound
+        scale = torch.clamp(
+            target_norm / (safe_norm + epsilon_value), max=1.0
+        )
+        scaled_candidate = prev_float + safe_residual * scale.reshape(
+            (-1, 1, 1, 1)
+        )
+        scaled_sample = scaled_candidate.to(prev_sample.dtype)
+        scaled_finite = torch.isfinite(scaled_sample).flatten(1).all(dim=1)
+        scaled_residual = scaled_sample.float() - prev_float
+        scaled_ratio = _vector_norm(scaled_residual) / scheduler_norm.clamp_min(
+            epsilon_value
+        )
+        still_invalid = (
+            ~safe_finite
+            | ~scaled_finite
+            | ~torch.isfinite(scaled_ratio)
+            | (scaled_ratio > ratio_bound)
+        )
+        correction_mask = over_limit.reshape((-1, 1, 1, 1))
+        final_sample = torch.where(correction_mask, scaled_sample, candidate_cast)
+        noop_fallback = over_limit & still_invalid
+        fallback_mask = noop_fallback.reshape((-1, 1, 1, 1))
+        final_sample = torch.where(fallback_mask, prev_sample, final_sample)
+
+    final_residual = final_sample.float() - prev_float
+    final_norm = _vector_norm(final_residual)
+    final_ratio: Optional[Tensor] = None
+    final_overrun: Optional[Tensor] = None
+    if scheduler_norm is not None:
+        final_ratio = final_norm / scheduler_norm.clamp_min(epsilon_value)
+        if ratio_bound is not None:
+            final_overrun = (final_ratio - ratio_bound).clamp_min(0.0)
+
+    if not return_diagnostics:
+        return final_sample
+    diagnostics = InjectionDiagnostics(
+        scheduler_update_norm=scheduler_norm,
+        precast_residual_norm=precast_norm,
+        precast_update_ratio=precast_ratio,
+        precast_overrun=precast_overrun,
+        postcast_residual_norm=final_norm,
+        postcast_update_ratio=final_ratio,
+        postcast_overrun=final_overrun,
+        observed_postcast_overrun=observed_postcast_overrun,
+        postcast_cap_applied=correction_applied,
+        postcast_noop_fallback=noop_fallback,
+    )
+    return InjectionOutput(sample=final_sample, diagnostics=diagnostics)
 
 
 class _D4DepthwiseConv2d(nn.Module):
