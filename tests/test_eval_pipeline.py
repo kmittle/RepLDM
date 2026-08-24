@@ -30,6 +30,7 @@ compare_actions = load_module("compare_actions", "eval-pipeline/compare_actions.
 generate = load_module("generate", "eval-pipeline/generate.py")
 from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
     _sample_resample_noise,
+    _validate_trajectory_correction_generator,
 )
 analyze_adaptivity = load_module(
     "analyze_adaptivity", "eval-pipeline/analyze_adaptivity.py"
@@ -65,6 +66,17 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_trajectory_correction_requires_single_generator(self):
+        correction = generate.trajectory_correction_runtime(
+            {"type": "trajectory_correction", "mix": 0.0, "noise_mode": "sqrt"}
+        )
+        _validate_trajectory_correction_generator(None, correction)
+        _validate_trajectory_correction_generator(torch.Generator(), correction)
+        with self.assertRaisesRegex(TypeError, "single torch.Generator"):
+            _validate_trajectory_correction_generator(
+                [torch.Generator()], correction
+            )
+
     def test_freeu_action_is_normalized_and_reentrant(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "freeu.yaml"

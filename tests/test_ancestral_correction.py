@@ -176,6 +176,103 @@ class AncestralCorrectionTest(unittest.TestCase):
                 )
             )
 
+    def _assert_native_scheduler_parity(self, dtype):
+        """Run a low-precision endpoint comparison against native sampling."""
+        euler = EulerDiscreteScheduler(num_train_timesteps=1000, prediction_type="epsilon")
+        ancestral = EulerAncestralDiscreteScheduler.from_config(euler.config)
+        euler.set_timesteps(5)
+        ancestral.set_timesteps(5)
+        sample = torch.randn(
+            (1, 4, 8, 8),
+            generator=torch.Generator().manual_seed(123),
+            dtype=dtype,
+        )
+        model_generator = torch.Generator().manual_seed(456)
+        native_generator = torch.Generator().manual_seed(789)
+        correction_generator = torch.Generator().manual_seed(789)
+        for step_index, (euler_timestep, ancestral_timestep) in enumerate(
+            zip(euler.timesteps, ancestral.timesteps)
+        ):
+            euler.scale_model_input(sample, euler_timestep)
+            ancestral.scale_model_input(sample, ancestral_timestep)
+            model_output = torch.randn(
+                sample.shape, generator=model_generator, dtype=sample.dtype
+            )
+            euler_output = euler.step(
+                model_output, euler_timestep, sample, return_dict=True
+            )
+            native_output = ancestral.step(
+                model_output,
+                ancestral_timestep,
+                sample,
+                generator=native_generator,
+                return_dict=True,
+            )
+            corrected, _ = apply_ancestral_correction(
+                scheduler=euler,
+                sample=sample,
+                pred_original_sample=euler_output.pred_original_sample,
+                euler_prev_sample=euler_output.prev_sample,
+                step_index=step_index,
+                config=TrajectoryCorrectionConfig(mix=1.0, noise_mode="sqrt"),
+                generator=correction_generator,
+            )
+            max_abs = float(
+                (corrected.float() - native_output.prev_sample.float()).abs().max()
+            )
+            self.assertLessEqual(
+                max_abs,
+                2e-3,
+                msg=f"{dtype} native parity failed at step {step_index}: max_abs={max_abs}",
+            )
+            sample = native_output.prev_sample
+
+    @unittest.skipIf(
+        EulerAncestralDiscreteScheduler is None,
+        "diffusers is not installed; native scheduler parity is unavailable",
+    )
+    def test_mix_one_matches_native_scheduler_in_fp16(self):
+        """The endpoint must not depend on an fp32-only latent path."""
+        self._assert_native_scheduler_parity(torch.float16)
+
+    @unittest.skipIf(
+        EulerAncestralDiscreteScheduler is None,
+        "diffusers is not installed; native scheduler parity is unavailable",
+    )
+    def test_mix_one_matches_native_scheduler_in_bfloat16(self):
+        """The endpoint preserves native bfloat16 arithmetic as well."""
+        self._assert_native_scheduler_parity(torch.bfloat16)
+
+    def test_mix_one_matches_legacy_native_dtype_stub(self):
+        """Cover the pre-upcast scheduler path without pinning an old package."""
+        sample = self.sample.to(dtype=torch.float16)
+        x0 = self.x0.to(dtype=torch.float16)
+        sigma_from, sigma_to = self.scheduler.sigmas[:2]
+        euler = sample + (sample - x0) / sigma_from * (sigma_to - sigma_from)
+        native_generator = torch.Generator().manual_seed(53)
+        correction_generator = torch.Generator().manual_seed(53)
+        sigma_up = torch.sqrt(
+            sigma_to.square()
+            * (sigma_from.square() - sigma_to.square())
+            / sigma_from.square()
+        )
+        sigma_down = torch.sqrt(torch.clamp(sigma_to.square() - sigma_up.square(), min=0.0))
+        native = sample + (sample - x0) / sigma_from * (sigma_down - sigma_from)
+        native = native + torch.randn(
+            sample.shape, generator=native_generator, dtype=sample.dtype
+        ) * sigma_up
+        corrected, _ = apply_ancestral_correction(
+            scheduler=self.scheduler,
+            sample=sample,
+            pred_original_sample=x0,
+            euler_prev_sample=euler,
+            step_index=0,
+            config=TrajectoryCorrectionConfig(mix=1.0, noise_mode="sqrt"),
+            generator=correction_generator,
+        )
+        max_abs = float((corrected.float() - native.float()).abs().max())
+        self.assertLessEqual(max_abs, 2e-3, msg=f"legacy max_abs={max_abs}")
+
 
 if __name__ == "__main__":
     unittest.main()

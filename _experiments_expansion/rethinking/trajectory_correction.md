@@ -38,6 +38,11 @@ The optional trust cap bounds `||raw|| / ||euler_prev - x_t||` per sample.
 `mix=0` returns the scheduler output without arithmetic or RNG consumption;
 without a cap, `mix=1` is numerically the Euler-Ancestral transition.  The
 hook is Stage-1-only, standalone, and records every correction/update norm.
+The endpoint implementation preserves the native low-precision arithmetic of
+the repository's pinned `diffusers~=0.21.4` scheduler and the upcast path in
+the current `0.32.1` evaluation environment; both paths are covered by strict
+fp16/bf16 parity tests.  Paired correction runs require one task
+`torch.Generator` (generator lists are rejected).
 
 ## Development Result
 

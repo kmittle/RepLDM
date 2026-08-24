@@ -136,6 +136,23 @@ def _sample_resample_noise(
     )
 
 
+def _validate_trajectory_correction_generator(
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+    trajectory_correction: Optional[TrajectoryCorrectionConfig],
+) -> None:
+    """Require one generator for correction's separately cloned RNG stream."""
+
+    if (
+        trajectory_correction is not None
+        and generator is not None
+        and not isinstance(generator, torch.Generator)
+    ):
+        raise TypeError(
+            "trajectory_correction currently requires a single torch.Generator; "
+            "generator lists are unsupported"
+        )
+
+
 class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin):
     """
     Pipeline for text-to-image generation using Stable Diffusion XL.
@@ -995,7 +1012,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 A bounded, scheduler-consistent interpolation between the
                 ordinary Euler transition and its Euler-Ancestral counterpart.
                 It is registered for Stage 1 Euler-compatible, epsilon-prediction
-                sampling only. ``mix=0`` is an exact no-op.
+                sampling only. ``mix=0`` is an exact no-op. Strict paired RNG
+                parity requires a single ``torch.Generator``; generator lists
+                are rejected for this intervention.
         
         Examples:
 
@@ -1051,6 +1070,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             raise TypeError(
                 "trajectory_correction must be a TrajectoryCorrectionConfig or None"
             )
+        _validate_trajectory_correction_generator(generator, trajectory_correction)
         if not isinstance(freeu_preserve_moments, bool):
             raise TypeError("freeu_preserve_moments must be a bool")
         if freeu_preserve_moments and freeu_schedule is None:
@@ -1152,6 +1172,21 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         target_size = target_size or (h_resized, w_resized)
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+        # Older diffusers Euler schedulers draw an unused noise tensor even
+        # when churn is disabled.  A trajectory correction must own its RNG
+        # stream so ``mix=0`` stays a true no-op and the mix=1 endpoint uses
+        # the same noise sequence as native Euler-Ancestral sampling.
+        trajectory_scheduler_kwargs = extra_step_kwargs
+        if (
+            trajectory_correction is not None
+            and generator is not None
+            and "generator" in extra_step_kwargs
+        ):
+            generator_device = getattr(generator, "device", latents.device)
+            scheduler_generator = torch.Generator(device=generator_device)
+            scheduler_generator.set_state(generator.get_state())
+            trajectory_scheduler_kwargs = dict(extra_step_kwargs)
+            trajectory_scheduler_kwargs["generator"] = scheduler_generator
 
         # 7. Prepare added time ids & embeddings
         add_text_embeds = pooled_prompt_embeds
@@ -1331,7 +1366,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         )[0]
                     else:
                         step_output = self.scheduler.step(
-                            noise_pred, t, latents, **extra_step_kwargs, return_dict=True
+                            noise_pred, t, latents, **trajectory_scheduler_kwargs, return_dict=True
                         )
                         latents = step_output.prev_sample
                     denoising_update = latents - latents_before_step

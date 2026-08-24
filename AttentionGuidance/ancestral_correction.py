@@ -195,6 +195,7 @@ def apply_ancestral_correction(
     ancestral_drift = sample_work + derivative * (sigma_down - sigma_from)
     drift_delta = ancestral_drift - euler_work
 
+    native_endpoint = None
     if config.noise_mode == "sqrt":
         noise_scale = math.sqrt(float(config.mix))
     elif config.noise_mode == "linear":
@@ -204,8 +205,35 @@ def apply_ancestral_correction(
     if noise_scale:
         # Euler-Ancestral draws in the model/output dtype.  Matching that
         # choice keeps the mix=1 comparison meaningful for fp16 SDXL latents.
-        noise = _randn_like(euler_prev_sample, generator=generator).to(dtype=work_dtype)
-        raw_correction = float(config.mix) * drift_delta + sigma_up * noise_scale * noise
+        native_noise = _randn_like(euler_prev_sample, generator=generator)
+        noise = native_noise.to(dtype=work_dtype)
+        ancestral_noise = sigma_up * noise_scale * noise
+        if (
+            float(config.mix) == 1.0
+            and config.noise_mode == "sqrt"
+            and config.max_correction_ratio is None
+        ):
+            # The native Euler-Ancestral scheduler forms the whole transition
+            # before casting back to the model dtype.  Reconstruct that
+            # endpoint directly instead of adding a drift delta to the
+            # already-quantized Euler output (which can differ by 0.25 in the
+            # first fp16 SDXL step at large sigma).
+            # diffusers <=0.21 computes the derivative in the model dtype;
+            # newer schedulers upcast the sample to fp32 before the same
+            # calculation.  The dtype of pred_original_sample distinguishes
+            # those paths without depending on a scheduler version string.
+            if pred_original_sample.dtype == sample.dtype:
+                native_sample = sample
+                native_x0 = pred_original_sample
+            else:
+                native_sample = sample.to(dtype=work_dtype)
+                native_x0 = pred_original_sample.to(dtype=work_dtype)
+            native_derivative = (native_sample - native_x0) / sigma_from
+            native_drift = native_sample + native_derivative * (sigma_down - sigma_from)
+            native_endpoint = native_drift + native_noise * sigma_up
+            raw_correction = native_endpoint.to(dtype=work_dtype) - euler_work
+        else:
+            raw_correction = float(config.mix) * drift_delta + ancestral_noise
     else:
         raw_correction = float(config.mix) * drift_delta
 
@@ -221,7 +249,13 @@ def apply_ancestral_correction(
         applied = raw_correction * scale[view]
         capped = bool(torch.any(raw_norm > limit))
     applied_ratio = _batch_norm(applied) / euler_update_norm.clamp_min(torch.finfo(work_dtype).eps)
-    corrected = (euler_work + applied).to(dtype=euler_prev_sample.dtype)
+    if native_endpoint is not None:
+        # The endpoint is already the scheduler transition; applying the
+        # correction through the quantized Euler output would reintroduce the
+        # fp16 rounding error this branch is intended to avoid.
+        corrected = native_endpoint.to(dtype=euler_prev_sample.dtype)
+    else:
+        corrected = (euler_work + applied).to(dtype=euler_prev_sample.dtype)
     diagnostics = TrajectoryCorrectionDiagnostics(
         step_index=step_index,
         mix=float(config.mix),
