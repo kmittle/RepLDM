@@ -75,6 +75,11 @@ from InferencePipelines.cfg_batch import (
     expand_cfg_time_ids,
     split_cfg_noise_pred,
 )
+from InferencePipelines.cfg_batch import (
+    expand_cfg_latents,
+    expand_cfg_time_ids,
+    split_cfg_noise_pred,
+)
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -1084,6 +1089,16 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         _reset_frla_diagnostics(self)
         
         # 0. Default height and width to unet
+        # Runtime diagnostics belong to exactly one pipeline invocation.  Clear
+        # them before input validation so a failed or early-returned task cannot
+        # leak the previous action's records into the next sidecar.
+        self._last_guidance_diagnostics = None
+        self._last_freeu_schedule = None
+        self._last_freeu_preserve_moments = False
+        self._last_trajectory_correction = None
+        self._last_trajectory_correction_diagnostics = []
+        self._last_latent_renderer_diagnostics = None
+        self._last_latent_renderer_provider_diagnostics = None
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
