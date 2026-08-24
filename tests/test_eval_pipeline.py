@@ -32,6 +32,10 @@ from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
     _sample_resample_noise,
     _validate_trajectory_correction_generator,
 )
+from InferencePipelines.cfg_batch import (  # noqa: E402
+    expand_cfg_latents,
+    split_cfg_noise_pred,
+)
 analyze_adaptivity = load_module(
     "analyze_adaptivity", "eval-pipeline/analyze_adaptivity.py"
 )
@@ -66,6 +70,20 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_cfg_latent_expansion_matches_concatenated_embedding_order(self):
+        latents = torch.tensor([[10.0], [20.0]])
+        expanded = expand_cfg_latents(latents, enabled=True)
+        torch.testing.assert_close(expanded, torch.tensor([[10.0], [20.0], [10.0], [20.0]]))
+        negative, positive = expanded.chunk(2)
+        torch.testing.assert_close(negative, latents)
+        torch.testing.assert_close(positive, latents)
+        negative, positive = split_cfg_noise_pred(
+            torch.tensor([[100.0], [200.0], [300.0], [400.0]])
+        )
+        torch.testing.assert_close(negative, torch.tensor([[100.0], [200.0]]))
+        torch.testing.assert_close(positive, torch.tensor([[300.0], [400.0]]))
+        self.assertIs(expand_cfg_latents(latents, enabled=False), latents)
+
     def test_trajectory_correction_requires_single_generator(self):
         correction = generate.trajectory_correction_runtime(
             {"type": "trajectory_correction", "mix": 0.0, "noise_mode": "sqrt"}
