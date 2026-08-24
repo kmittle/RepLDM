@@ -239,6 +239,17 @@ class LatentRendererTest(unittest.TestCase):
             atol=1e-5,
         )
 
+    def test_diagnostics_have_json_safe_records(self):
+        latent, bases, scheduler_update = self.make_inputs()
+        renderer = StructuralLatentRenderer(
+            LatentRendererConfig(num_bases=4, max_update_ratio=0.1)
+        )
+        output = renderer(latent, bases, scheduler_update=scheduler_update)
+        record = output.diagnostics.to_record()
+        self.assertEqual(len(record["update_ratio"]), 2)
+        self.assertEqual(len(record["mean_error"]), 2)
+        self.assertIsInstance(record["variance_error"][0], float)
+
 
 if __name__ == "__main__":
     unittest.main()

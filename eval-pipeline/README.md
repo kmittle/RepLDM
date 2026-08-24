@@ -174,6 +174,17 @@ Run the synthetic correctness audit without model weights:
 The command must report `"passed": true`; its output is engineering evidence
 only and cannot substitute for the prompt-disjoint LR-1 quality experiment.
 
+With the local SDXL cache, the inference-only pipeline wiring smoke is:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python \
+  eval-pipeline/latent_renderer_smoke.py --device cuda:1
+```
+
+It requires the zero renderer to reproduce the no-renderer PNG exactly and a
+fixed non-zero probe to change it. The probe is deliberately not a learned
+checkpoint and its image must not enter coefficient selection or scoring.
+
 ## Layout
 
 ```text

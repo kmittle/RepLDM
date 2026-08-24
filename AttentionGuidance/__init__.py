@@ -20,7 +20,10 @@ from .semantic_transport import (
 )
 from .latent_renderer import (
     LatentRendererConfig,
+    RendererBasisProvider,
+    RendererCondition,
     RendererDiagnostics,
+    RendererObservation,
     RendererOutput,
     StructuralLatentRenderer,
     build_feature_difference_basis,
@@ -51,7 +54,10 @@ __all__ = [
     "inject_predicted_clean_update",
     "infer_token_grid",
     "LatentRendererConfig",
+    "RendererBasisProvider",
+    "RendererCondition",
     "RendererDiagnostics",
+    "RendererObservation",
     "RendererOutput",
     "StructuralLatentRenderer",
     "build_feature_difference_basis",

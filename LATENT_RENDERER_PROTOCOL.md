@@ -91,3 +91,9 @@ construction, constrained renderer, diagnostics, and scheduler-safe injection
 primitives. It is not wired into default generation, and no checkpoint or RL
 training result is claimed by this registration. The frozen YAML companion is
 `eval-pipeline/configs/latent_renderer_mechanism_audit.yaml`.
+
+The inference hook is exercised by
+`eval-pipeline/latent_renderer_smoke.py`. A 50-step cached-SDXL run on GPU 1
+produced valid 1024x1024 RGB images, exact no-op hash parity, and a distinct
+fixed-probe hash. This is wiring evidence only; the probe is not trained,
+scored, or used to choose any later action.

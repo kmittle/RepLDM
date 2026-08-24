@@ -69,6 +69,13 @@ are introduced.
 The companion YAML is a registration manifest only and must not be passed to
 the legacy image-generation action loader.
 
+The inference-only pipeline hook is now explicit: a
+`RendererBasisProvider` receives one ordinary scheduler transition and returns
+`RendererCondition`. It is mutually exclusive with the old guidance paths and
+is limited to Stage 1. The 50-step cached-SDXL wiring smoke reproduced the
+no-renderer hash with the zero renderer and changed it with a fixed non-zero
+probe; this validates plumbing only, not image quality or learned behavior.
+
 At step `t`, one frozen U-Net evaluation returns noise `epsilon_t` and exposes a
 small set of decoder backbone/skip features (B_t^l,S_t^l), self-attention
 affinity (G_t), and the scheduler's own predicted clean latent

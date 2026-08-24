@@ -53,9 +53,14 @@ from AttentionGuidance import (
     AttnGuidance,
     GuidanceAction,
     GuidanceController,
+    RendererBasisProvider,
+    RendererCondition,
+    RendererObservation,
+    StructuralLatentRenderer,
     GuidanceObservation,
     SemanticTransport,
     SemanticTransportConfig,
+    inject_rendered_clean_update,
 )
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -808,6 +813,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         attn_guidance_controller: Optional[GuidanceController] = None,
         attn_guidance_band_cutoffs: Tuple[float, float] = (0.08, 0.25),
         semantic_transport_config: Optional[Dict[str, Any]] = None,
+        latent_renderer: Optional[StructuralLatentRenderer] = None,
+        latent_renderer_basis_provider: Optional[RendererBasisProvider] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -957,6 +964,14 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     attn_guidance_controller=None,
                     attn_guidance_band_cutoffs=(0.08, 0.25),
                 For a detailed explanation of these parameters, please refer to the `attn_guidance.py` module.
+            latent_renderer (`StructuralLatentRenderer`, *optional*):
+                Inference-only Stage-1 latent renderer. It must be paired with
+                `latent_renderer_basis_provider` and cannot be combined with
+                legacy Attention Guidance or semantic transport.
+            latent_renderer_basis_provider (`RendererBasisProvider`, *optional*):
+                Builds candidate bases and compact conditioning from the
+                scheduler transition. This hook is intentionally explicit so
+                feature extraction and parameter counts remain auditable.
         
         Examples:
 
@@ -1113,6 +1128,26 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         
         alphas_cumprod_sample = self.scheduler.alphas_cumprod.to(device)[timesteps.type(torch.int) - 1]
         num_timesteps = len(timesteps)
+        if latent_renderer is not None:
+            if latent_renderer_basis_provider is None:
+                raise ValueError(
+                    "latent_renderer_basis_provider is required with latent_renderer"
+                )
+            if semantic_transport_config is not None:
+                raise ValueError(
+                    "latent_renderer cannot be combined with semantic transport"
+                )
+            if attn_guidance_controller is not None or attn_guidance_scale > 0:
+                raise ValueError(
+                    "latent_renderer cannot be combined with legacy Attention Guidance"
+                )
+            if height * width > 1024**2:
+                raise ValueError("latent_renderer is registered for Stage 1 only")
+            if image_lr is not None:
+                raise ValueError("latent_renderer requires text-to-image denoising")
+            latent_renderer.to(device)
+            latent_renderer.eval()
+        self._last_latent_renderer_diagnostics = None
         semantic_transport = None
         if semantic_transport_config is not None:
             if height * width > 1024**2:
@@ -1194,7 +1229,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     # Compute the previous noisy sample x_t -> x_t-1. Semantic
                     # transport must consume the scheduler's own x_0 estimate.
                     latents_before_step = latents
-                    if semantic_transport is None:
+                    if semantic_transport is None and latent_renderer is None:
                         latents = self.scheduler.step(
                             noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                         )[0]
@@ -1210,6 +1245,38 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             step_output=step_output,
                             scheduler_update=denoising_update,
                         )
+
+                    if latent_renderer is not None:
+                        observation = RendererObservation(
+                            latents_before_step=latents_before_step,
+                            pred_original_sample=step_output.pred_original_sample,
+                            scheduler_update=denoising_update,
+                            step_index=i,
+                            timestep=t,
+                            normalized_timestep=latents.new_tensor(
+                                i / max(num_timesteps - 1, 1)
+                            ),
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                        )
+                        condition = latent_renderer_basis_provider(observation)
+                        if not isinstance(condition, RendererCondition):
+                            raise TypeError(
+                                "latent_renderer_basis_provider must return RendererCondition"
+                            )
+                        rendered = latent_renderer(
+                            step_output.pred_original_sample,
+                            condition.bases,
+                            timestep=observation.normalized_timestep,
+                            prompt_embedding=condition.prompt_embedding,
+                            state_features=condition.state_features,
+                            scheduler_update=denoising_update,
+                        )
+                        latents = inject_rendered_clean_update(
+                            step_output.prev_sample,
+                            step_output.pred_original_sample,
+                            rendered.guided_x0,
+                        )
+                        self._last_latent_renderer_diagnostics = rendered.diagnostics
 
                     # AttnFusion
                     t_index = num_timesteps - 1 - i

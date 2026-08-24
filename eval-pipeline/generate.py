@@ -489,6 +489,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 peak_memory = None
             elapsed = time.perf_counter() - start_time
             diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
+            renderer_diagnostics = getattr(
+                pipe, "_last_latent_renderer_diagnostics", None
+            )
             images[-1].save(png_path)  # lossless PNG
             record = {
                 **task,
@@ -513,6 +516,12 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "model_name": cfg["model_name"],
                 "git_commit": commit,
                 "device": device,
+                "latent_renderer_diagnostics": (
+                    renderer_diagnostics.to_record()
+                    if renderer_diagnostics is not None
+                    and hasattr(renderer_diagnostics, "to_record")
+                    else None
+                ),
             }
             if diagnostics:
                 record.update(diagnostics)

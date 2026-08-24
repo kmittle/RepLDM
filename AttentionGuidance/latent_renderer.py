@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Protocol, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -87,6 +87,23 @@ class RendererDiagnostics:
     mean_error: Tensor
     variance_error: Tensor
 
+    def to_record(self) -> dict:
+        """Return JSON-safe per-sample diagnostics for an experiment sidecar."""
+
+        def encode(value: Optional[Tensor]):
+            if value is None:
+                return None
+            return value.detach().float().cpu().tolist()
+
+        return {
+            "raw_update_norm": encode(self.raw_update_norm),
+            "bounded_update_norm": encode(self.bounded_update_norm),
+            "scheduler_update_norm": encode(self.scheduler_update_norm),
+            "update_ratio": encode(self.update_ratio),
+            "mean_error": encode(self.mean_error),
+            "variance_error": encode(self.variance_error),
+        }
+
 
 @dataclass(frozen=True)
 class RendererOutput:
@@ -96,6 +113,35 @@ class RendererOutput:
     residual: Tensor
     coefficients: Tensor
     diagnostics: RendererDiagnostics
+
+
+@dataclass(frozen=True)
+class RendererObservation:
+    """One scheduler transition exposed to a basis provider."""
+
+    latents_before_step: Tensor
+    pred_original_sample: Tensor
+    scheduler_update: Tensor
+    step_index: int
+    timestep: Tensor
+    normalized_timestep: Tensor
+    pooled_prompt_embeds: Optional[Tensor] = None
+
+
+@dataclass(frozen=True)
+class RendererCondition:
+    """Candidate bases and optional compact conditioning for one renderer call."""
+
+    bases: Tensor
+    prompt_embedding: Optional[Tensor] = None
+    state_features: Optional[Tensor] = None
+
+
+class RendererBasisProvider(Protocol):
+    """Build renderer bases from one ordinary frozen denoising transition."""
+
+    def __call__(self, observation: RendererObservation) -> RendererCondition:
+        ...
 
 
 def _require_nchw(value: Tensor, name: str) -> None:
@@ -483,6 +529,8 @@ class StructuralLatentRenderer(nn.Module):
             raise ValueError(
                 "bases must have shape (batch, num_bases, channels, height, width)"
             )
+        if bases.device != latent.device:
+            raise ValueError("bases and latent must be on the same device")
         if bases.shape[0] != latent.shape[0] or bases.shape[1] != self.config.num_bases:
             raise ValueError("bases batch or num_bases does not match the renderer")
         if bases.shape[2:] != latent.shape[1:]:
