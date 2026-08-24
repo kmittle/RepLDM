@@ -266,10 +266,23 @@ R_total = z(IR) + Σ guards
 - **决定性的 over-engineering 测试**：`CMA-ES{2–3 段调度}` vs `CMA-ES{自由 50-向量}`。若 50-向量没 > seed-CI 地打败 2–3 段，**控制器就不该输出 per-step `a_t`**（退化为 2–3 段），直接杀掉 RISK-6。
 - **控制器输入从 C / D-only 起步**（非 D+C）：C（`alpha_t`+通道均值/方差/‖z‖+attn 熵）≈零成本、负责 step/state 自适应；**D-only**（纯 prompt、无 latent 反馈）是**最干净的 content-adaptivity 测试**，也直接喂 latent-shuffle 判别实验。full-latent conv encoder 推到 shuffle/残差/分层判别**通过后**再建。
 
-### 13.7 Phase 0.5 —— must-fix（阻塞一切多-rollout 实验，先于 Phase 1）
-1. **迭代器可重入**：把 `guidance_step_scale`(L111)/`filter_range`(L203) 的 `iter()` 换成**按 `t_index` 索引预计算张量** + 加 `reset()`；否则 CMA-ES（需数百次 replay）与 DRaFT rollout 第二次就 `StopIteration`，或被"循环 cycle"悄悄喂错每步 filter 窗（伪装成训练噪声的 reward 腐蚀 bug）。
-2. **接线**：`pipeline_repldm_sdxl.py:1152` 把控制器输出作为 `scale` kwarg 传入；核对去噪环 UNet 调用的 grad/no_grad 上下文与 DRaFT-K 兼容。
-3. **reward 环境**：在 `sana_cby` 或将 `ImageReward` 装进 `diff_attn`；复用 `ReFL.py:744-756` 配方；用 `madebyollin/sdxl-vae-fp16-fix` 保解码在图内（避开 upcast 到 fp32 后无法回传）；reward-grad pass 对 `(b,c,c)` softmax + FFT 往返用 fp32/autocast 防数值噪声。
+### 13.7 Phase 0.5 —— wiring audit status
+这部分曾经标成 must-fix，但当前代码状态已经变化，不能继续把已修复问题写成
+未完成事项：
+
+1. **✅ Iterator reentrancy**：`guidance_step_scale` 和 filter ranges 已改为按
+   `t_index` 索引的预计算值；`tests/test_attention_guidance.py::test_legacy_schedule_is_reentrant`
+   覆盖同一实例的重复 rollout。
+2. **✅ Controller wiring**：RepLDM Stage-1 的 controller action 已通过
+   `scale=action.scale` 传入 `AttnGuidance`，并记录 denoising update；相关
+   action-contract 测试已通过。
+3. **⚠️ Reward environment**：ReFL 的可微 ImageReward 配方已经定位，但尚未
+   建立经过审计的 DRaFT harness、patch-IR/color-normalization reward 和 Stage-2
+   外层目标。因此在固定机制 gate 通过前，不得启动训练。
+4. **⚠️ Batched CFG ordering**：RepLDM/ControlNet 的旧实现把 `[all negative,
+   all positive]` embeddings 与 `repeat_interleave(2)` latent 配错。隔离修复和
+   100 项 unittest 已在本地 commit `7930f92`，但尚未合并到 `rl-version`；在
+   batched FRLA/renderer/RL 前必须合并并做 multi-prompt deterministic smoke。
 
 ### 13.8 related work 必补（reviewer "not novel" kill 防御）
 - **自适应/学习式 guidance-scale 线**（计划完全没提）：CFG scheduling / Guidance-Interval（Kynkäänniemi 2024）、Autoguidance（Karras 2024）、CADS、dynamic/rescaled CFG（Lin 2024）。差异化：*它们调的是 CFG 项（文本条件外推），与采样纠缠；我们调的是**冻结**模型上一次 post-step 的 TFSA 修正，正交且可与任意 CFG 调度复合。*
@@ -292,10 +305,11 @@ Gate-4 METHOD    : SEARCH-THEN-DISTILL 设为主方法跑 holdout；
 | RISK-9 | 高(可能致命) | reward 在 224px 看不见 detail，只见 saturation ⇒ 卖点不可见 + 强化 hacking | ✅已确认(H2)；缓解 13.2 patch-IR/HF-reward/color-norm |
 | RISK-10 | 高 | 早步 `dR/da_t` 经 K 个冻结 UNet Jacobian 连乘，消失/爆炸；DRaFT-LV 不完全修截断偏置 | **Exp-1.5** SPSA 梯度核对(~10 rollout) |
 | RISK-11 | 中-高 | Stage-1 proxy ≠ shipped hi-res；DRaFT 决策只对 Stage-1 成立 | Stage-2 `init_rate` 零阶外环(hybrid 13.1.3) |
-| RISK-12 | 中(阻塞) | 一次性迭代器不可重入，阻塞所有多-rollout 循环 | ✅已确认；Phase 0.5 索引化 |
+| RISK-12 | 中(已修复) | 一次性迭代器不可重入，阻塞所有多-rollout 循环 | ✅已修复；保留回归测试 |
 | RISK-13 | 中 | 第二指标与 hack 相关，非独立见证 | colorfulness 相关性 disqualification + 去相关 witness |
 | RISK-14 | 中-高 | content-optimum 可能内容不变(saturation 驱动)，oracle gap≈0 ⇒ 否决自适应 | oracle gap 跨 ≥2 reward，预注册 go/no-go |
 | RISK-15 | 中(定位) | related work 缺失(adaptive-guidance line + GRPO) ⇒ "not novel" | §13.8 补文献 + 差异化 |
+| RISK-16 | 高(阻塞 batched rollout) | CFG latent 与 embedding 行序错配，污染多 prompt 对照和条件控制器 | 合并 `7930f92`，运行 batch=2 deterministic smoke |
 
 ## 14. S7 实验漏斗：scheduler-consistent correction
 
