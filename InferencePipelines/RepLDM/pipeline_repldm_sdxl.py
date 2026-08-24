@@ -66,7 +66,11 @@ from AttentionGuidance import (
     TrajectoryCorrectionConfig,
     apply_ancestral_correction,
 )
-from InferencePipelines.cfg_batch import expand_cfg_latents, split_cfg_noise_pred
+from InferencePipelines.cfg_batch import (
+    expand_cfg_latents,
+    expand_cfg_time_ids,
+    split_cfg_noise_pred,
+)
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -1212,7 +1216,11 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+        add_time_ids = expand_cfg_time_ids(
+            add_time_ids.to(device),
+            batch_size * num_images_per_prompt,
+            do_classifier_free_guidance,
+        )
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -1296,10 +1304,6 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         self.vae.cpu()
                         self.unet.to(device)
     
-                    add_time_ids = torch.tensor(
-                        [[h_resized, w_resized, 0, 0, h_resized, w_resized],
-                            [h_resized, w_resized, 0, 0, h_resized, w_resized]],
-                        device=latents.device, dtype=self.vae.dtype)
                     latents_for_view = latents
     
                     # expand the latents if we are doing classifier free guidance
@@ -1548,9 +1552,20 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                                                              init_rates[resample_index])
             del latents
             dtype = self.vae.dtype
-            add_time_ids = torch.tensor([[current_h, current_w, 0, 0, current_h, current_w],
-                                        [current_h, current_w, 0, 0, current_h, current_w]],
-                                        device=device, dtype=dtype)
+            resample_time_ids = torch.tensor(
+                [[current_h, current_w, 0, 0, current_h, current_w]],
+                device=device,
+                dtype=dtype,
+            )
+            if do_classifier_free_guidance:
+                resample_time_ids = torch.cat(
+                    (resample_time_ids, resample_time_ids), dim=0
+                )
+            add_time_ids = expand_cfg_time_ids(
+                resample_time_ids,
+                batch_size * num_images_per_prompt,
+                do_classifier_free_guidance,
+            )
             # upsample in RGB space
             self.vae.type(torch.float32)
             image = image.type(torch.float32)
