@@ -275,6 +275,24 @@ winner's coefficient L2 norm. Generate validation exactly once with:
 Do not create the emitted YAML when selection returns `no_ag`, and do not run
 the final-test split unless every registered validation gate passes.
 
+After strict scoring and the result-blind run audit, apply the frozen
+statistical gate:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/evaluate_latent_renderer_validation.py \
+  --run_dir outputs/latent_renderer/lr1_fixed_validation_v1 \
+  --frozen_actions eval-pipeline/configs/latent_renderer_validation_lr1.yaml \
+  --audit outputs/latent_renderer/lr1_fixed_validation_v1/run_audit.json
+```
+
+The selected action must pass TOPIQ comparisons against `no_ag`, the conference
+expert, and the matched-random control with one Holm-corrected family. HPSv2
+and CLIP use CI-based non-inferiority against `no_ag`; pixel guards use paired
+mean deltas. Even a statistical pass returns `qualitative_review_required`:
+the frozen 24-prompt, seed-11 blinded review must still be completed before a
+validation pass or final-test authorization can be recorded.
+
 ## Layout
 
 ```text
@@ -288,6 +306,7 @@ analyze_adaptivity.py    leave-one-seed-out action-selection headroom
 select_fixed_action.py   frozen train-only LR-1 action selection
 freeze_latent_renderer_validation.py  one-shot validation config freezer
 audit_latent_renderer_run.py  result-blind design and numerical audit
+evaluate_latent_renderer_validation.py  frozen LR-1 statistical gate
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

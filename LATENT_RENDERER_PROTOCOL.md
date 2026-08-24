@@ -57,6 +57,10 @@ least `+0.005`, have a crossed-bootstrap 95% interval excluding zero and a
 Holm-adjusted prompt sign-flip `p < 0.05`, remain non-inferior on HPSv2 and
 CLIP, and stay within the clipping/saturation guards. The fixed montage must
 show a structural, text, counting, positional, or detail improvement.
+The frozen winner must also have positive, Holm-significant TOPIQ differences
+against the conference expert and the L2-matched random direction. HPSv2 and
+CLIP non-inferiority are judged by the crossed-bootstrap lower bound, not the
+point estimate.
 
 **LR-2 granularity and adaptivity.** Compare two/three-stage coefficients with
 a free per-step vector. Estimate the per-prompt oracle gap on validation data;
@@ -155,6 +159,13 @@ direction to the sole train winner and emits one executable validation YAML.
 It refuses `no_ag`, altered candidates, changed selection statistics, or seed
 drift. Validation is confirmation, not a second search: none of its four
 actions may be tuned or dropped after scores are observed.
+
+The validation montage contains all 24 validation prompts at seed `11`, with
+action sides assigned from the frozen blinding seed. At least two external
+reviewers are required; the statistical gate only returns
+`qualitative_review_required` and cannot itself authorize final test. This
+small review is a mechanism gate, not a substitute for the larger final-paper
+human study.
 
 Every completed train, validation, or test run must first pass
 `eval-pipeline/audit_latent_renderer_run.py`. The audit requires the exact

@@ -43,6 +43,10 @@ freeze_validation = load_module(
 audit_renderer_run = load_module(
     "audit_latent_renderer_run", "eval-pipeline/audit_latent_renderer_run.py"
 )
+evaluate_renderer_validation = load_module(
+    "evaluate_latent_renderer_validation",
+    "eval-pipeline/evaluate_latent_renderer_validation.py",
+)
 
 
 class EvalPipelineTest(unittest.TestCase):
@@ -400,6 +404,52 @@ class EvalPipelineTest(unittest.TestCase):
                     freeze_validation.freeze_validation_config(
                         changed, source, template
                     )
+
+    def test_validation_gate_requires_controls_and_qualitative_review(self):
+        source, template, selection = self._registered_validation_inputs()
+        frozen = freeze_validation.freeze_validation_config(
+            selection, source, template
+        )
+        frozen["validation_requirements"]["bootstrap"] = 100
+        frozen["validation_requirements"]["randomizations"] = 5000
+        rows = []
+        selected = frozen["selected_action"]
+        for prompt_index in range(12):
+            for seed in (11, 29, 101):
+                for action in ("no_ag", selected, "conference_expert", "matched_random"):
+                    topiq = 0.0
+                    if action in ("conference_expert", "matched_random"):
+                        topiq = 0.005
+                    if action == selected:
+                        topiq = 0.02
+                    rows.append(
+                        {
+                            "prompt_index": prompt_index,
+                            "seed": seed,
+                            "action_id": action,
+                            "device": "cuda:1",
+                            "topiq_nr": topiq,
+                            "clip_cosine": 0.3,
+                            "hpsv2": 0.25,
+                            "clipped_fraction": 0.0,
+                            "mean_saturation": 0.2,
+                        }
+                    )
+        frame = pd.DataFrame(rows)
+        result = evaluate_renderer_validation.evaluate_validation(frame, frozen)
+        self.assertTrue(result["statistical_pass"])
+        self.assertFalse(result["validation_pass"])
+        self.assertEqual(result["decision"], "qualitative_review_required")
+        self.assertEqual(
+            {row["comparator"] for row in result["primary"]},
+            {"no_ag", "conference_expert", "matched_random"},
+        )
+
+        failed = frame.copy()
+        failed.loc[failed["action_id"] == selected, "topiq_nr"] = 0.001
+        failed_result = evaluate_renderer_validation.evaluate_validation(failed, frozen)
+        self.assertFalse(failed_result["statistical_pass"])
+        self.assertEqual(failed_result["decision"], "close_lr1")
 
     def test_latent_renderer_run_audit_accepts_complete_safe_design(self):
         with tempfile.TemporaryDirectory() as temp_dir:

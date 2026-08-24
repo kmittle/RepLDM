@@ -40,10 +40,26 @@ validation_requirements:
   split_role: validation_confirmation
   seeds: [11, 29, 101]
   primary_metric: topiq_nr
-  minimum_delta: 0.005
+  primary_comparators:
+    no_ag: 0.005
+    conference_expert: 0.0
+    matched_random: 0.0
   require_positive_crossed_bootstrap_ci: true
   require_holm_p_below: 0.05
+  bootstrap: 10000
+  randomizations: 100000
+  seed: 2026
+  noninferiority_reference: no_ag
+  noninferiority_uses_ci_low: true
   clip_cosine_min_delta: -0.005
   hpsv2_min_delta: -0.003
   clipped_fraction_max_delta: 0.001
   mean_saturation_max_delta: 0.005
+  qualitative_montage:
+    prompt_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    seed: 11
+    actions: [no_ag, selected_action]
+    blinding_seed: 20260824
+    require_external_blinded_review: true
+    minimum_reviewers: 2
+    target_dimensions: [structure, text, counting, position, detail]
