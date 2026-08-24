@@ -1,13 +1,13 @@
 # 实验结果与阶段性结论
 
 > 分支：`rl-version` ｜ 方法与停止规则：[`REVIEWER_PROTOCOL.md`](./REVIEWER_PROTOCOL.md)
-> 截止提交：频谱 pilot `63184bc`，幅度 follow-up `c385223`，固定矩 pilot `65ba734`，轨迹锥 pilot `b0aa343`。本文只记录当前产物可复核的事实。
+> 截止提交：频谱 pilot `63184bc`，幅度 follow-up `c385223`，固定矩 pilot `65ba734`，轨迹锥 pilot `b0aa343`，Stage-2 pilot `a31cb75`。本文只记录当前产物可复核的事实。
 
 ## 0. 审稿结论
 
-**G1（频谱 headroom）、G3（内容自适应 headroom）、S2（固定矩切空间）和 S3（轨迹锥）均失败，因此这些动作空间都不应训练 RL 控制器。** 频谱分配相对统一标量大幅减轻了 TOPIQ-NR 损伤，但没有优于 `no_ag`。把幅度从 `0.004` 降到 `0.001` 只会收敛回 `no_ag`，未出现内部质量最优点。固定矩约束成功消除了饱和度漂移；轨迹锥进一步删除与 scheduler 转移相反的切向分量，但两者都没有质量或偏好收益。
+**G1（频谱 headroom）、G3（内容自适应 headroom）、S2（固定矩切空间）、S3（轨迹锥）和 S4（2048² 目标域迁移）均失败，因此这些动作空间都不应训练 RL 控制器。** 频谱分配相对统一标量大幅减轻了 TOPIQ-NR 损伤，但没有优于 `no_ag`。把幅度从 `0.004` 降到 `0.001` 只会收敛回 `no_ag`，未出现内部质量最优点。固定矩约束成功消除了饱和度漂移；轨迹锥进一步删除与 scheduler 转移相反的切向分量，但两者都没有质量或偏好收益。Stage 2 没有逆转这一排序，反而放大了 expert/raw 的质量与像素 guard 损伤。
 
-这是对当前动作算子和实验域的否定性 pilot 结论，不是“Attention Guidance 在所有任务上无效”的等价性证明。样本只有 12 prompts、3 seeds、SDXL Stage-1 1024²，且没有盲评人类偏好；因此不得把这些数值包装成最终 benchmark 结果。
+这是对当前动作算子和实验域的否定性 pilot 结论，不是“Attention Guidance 在所有任务上无效”的等价性证明。样本只有 12 prompts、3 seeds、单一 SDXL backbone；S4 虽覆盖最终 2048² 图像，仍复用了开发 prompts，且没有盲评人类偏好。因此不得把这些数值包装成最终 benchmark 结果。
 
 ## 1. 实验与完整性审计
 
@@ -18,6 +18,7 @@
 | amplitude follow-up | 12×3×10 = 360 | 后验替代解释检查，不是确认集 |
 | moment-tangent pilot | 12×3×10 = 360 | S2 冻结开发实验 |
 | trajectory-cone pilot | 12×3×9 = 324 | S3 冻结开发实验 |
+| Stage-2 transfer pilot | 12×3×5 = 180 | S4 预注册 2048² 目标域诊断 |
 
 频谱 pilot 与 amplitude follow-up 的每个 `(prompt, seed)` 动作区块均固定在同一 GPU；两轮共 756 条记录，follow-up 与 pilot 重复的 4 个动作共 144 对 PNG，其 SHA-256 和全部评分逐值相同。S2 的 360 条和 S3 的 324 条也都完整同卡配对；S3 中 144 个历史控制哈希精确复现 S2。重复控制用于工程复现，不是新增独立证据。
 
@@ -72,7 +73,7 @@ follow-up 检查“0.004 仅仅过强”的解释。所有 TOPIQ 差值仍以 `n
 | G2 schedule granularity | 不执行 | 被 G1 阻断 |
 | G3 adaptivity | **失败** | 不做 search-distill 或 prompt controller |
 | G4 RL necessity | **拒绝进入** | 不以调 reward/控制器复杂度绕过失败门 |
-| G5 transfer | 仅作 S4 目标域诊断 | 检查 1024² proxy 是否掩盖最终 2048² 效应；不能绕过 G1-G4 |
+| G5 transfer | **失败** | 最终 2048² 图像仍无正向 headroom；关闭目标域例外 |
 
 若继续研究，必须先提出**实质不同的残差算子**，而不是在当前频带增益上叠加 RL。新算子应先用固定动作在全新的 prompt-disjoint 集上同时优于 `no_ag`、conference expert 和等预算 scalar，并保持 clipping/saturation 非劣。只有该门通过后，才值得设计约 50 prompts × ≥5 seeds、第二 backbone、Stage-2/ControlNet 和随机左右顺序的人类配对盲评。
 
@@ -132,4 +133,23 @@ TOPIQ 留一 seed 的逐 prompt 选择相对 `no_ag` 为 `+0.001791 [-0.004392,+
 
 TOPIQ seed-CV 的全局动作在三个 fold 都是 `no_ag`；逐 prompt 相对 no-AG 为 `+0.001120 [-0.004272,+0.006516]`，同时 clipping 增加 `+0.001262`、saturation 增加 `+0.012097`。按 HPSv2 选择时，逐 prompt 策略反而比全局 expert 低 `-0.001604 [-0.003455,-0.000190]`，且像素 guard 显著恶化。固定拼图 `outputs/exp_trajectory_cone/development_12prompt_3seed_v1/figs/all_actions_seed0.png` 覆盖全 12 prompt × 全 9 动作，没有显示稳定结构或文字修复。S3 按停止规则关闭，不再扫幅度，也不进入 RL。
 
-下一步仅允许执行已在 `MODEL_ITERATIONS.md` 注册的 2048² Stage-2 目标域诊断。它用于检验当前 1024² 代理终点是否错配论文的高分辨率主张，不构成对 S0-S3 的确认性复活。
+S3 的失败触发了 `MODEL_ITERATIONS.md` 中预注册的 2048² Stage-2 目标域诊断，用于检验 1024² 代理终点是否错配论文的高分辨率主张；它不构成对 S0-S3 的确认性复活。
+
+## 10. S4 2048² Stage-2 目标域诊断（失败）
+
+工程 smoke 先修复了两个会破坏配对的实现问题：Stage-2 noise 改为使用 task generator；`models_to_cpu=True` 的普通 decoder 会显式把 VAE/latent 放回执行设备。两个独立 smoke run 的三动作哈希 3/3 精确复现，同一 run 的重复 no-AG 完全一致，expert 不同；正常 2048² 路径峰值约 21.2 GB。
+
+正式 run `outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1` 包含 180 张最终 2048² 图。36 个区块均为五动作同卡配对，四卡各 45 条；全部图像、metadata 和 14 个评分键完整，两个 smoke 控制哈希再次复现。no-AG 的绝对均值为 TOPIQ `0.440022`、HPSv2 `0.290171`、ImageReward `0.839265`、CLIP cosine `0.345825`、clipped fraction `0.002606`。
+
+| 动作 | Δ TOPIQ-NR [95% CI] | Δ HPSv2 | Δ CLIP | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|---:|
+| conference expert | -0.020052 [-0.037713,-0.003316] | +0.004754 | -0.004435 | +0.010235 | +0.044811 |
+| raw 0.001 | -0.005907 [-0.011608,-0.000872] | +0.001333 | -0.004632 | +0.002392 | +0.014894 |
+| plain tangent 0.002 | -0.002836 [-0.006932,+0.001057] | +0.000756 | -0.003126 | -0.000102 | -0.000058 |
+| cone 0.002 | -0.002091 [-0.006817,+0.002305] | +0.001133 | -0.003167 | -0.000059 | +0.000653 |
+
+cone 相对 matched tangent 仅 `+0.000745 [-0.001212,+0.002815]`；相对 raw 为 `+0.003816 [-0.001550,+0.009215]`。相对 expert 的 paired 差值为 `+0.017961 [+0.002937,+0.033567]`，但 cone 仍低于 no-AG、未达到 `+0.005`，且 CLIP CI 下界 `-0.010214` 超出非劣界。Patch-IR 也下降 `-0.017641`，没有局部细节确认信号。
+
+TOPIQ seed-CV 的全局与逐 prompt 结果分别为 `-0.002148` 和 `-0.003216`。按 HPSv2 选择的逐 prompt 策略虽为 `+0.005022 [+0.000604,+0.009759]`，却同时造成 TOPIQ `-0.012735`、clipping `+0.001673`、saturation `+0.028848`，属于明确的 proxy/guard 冲突。固定 seed-0 拼图 `outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/figs/all_actions_seed0.png` 没有稳定结构或文字修复。
+
+因此 S4 和高分辨率例外关闭，不再扫 2048² scale/schedule，也不进入 RL。下一候选必须更换 proposal 来源：从 raw 四通道 noisy-latent TFSA 转向 scheduler-consistent predicted-clean/UNet semantic transport，并在新的 prompt-disjoint 数据上先证明固定静态 headroom。若该静态门仍失败，应放弃 Attention Guidance 作为期刊扩展主轴。

@@ -10,9 +10,9 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 | S1 | Low/mid/high spectral residual gains | Invalidated | Best action, `mid_only_0.004`, is non-superior to no-AG; seed-CV finds no adaptive headroom. |
 | S2 | Moment-Tangent Attention Guidance (MTAG) | Invalidated | It removes moment drift but does not improve quality or preference. |
 | S3 | Trajectory-Cone Moment Guidance (TCMG) | Invalidated | Cone geometry is active but does not improve quality, preference, or adaptive headroom. |
-| S4 | 2048² Stage-2 target-domain audit | Engineering gate passed | Paired Stage-2 noise and normal decode are reproducible; frozen 180-image pilot is authorized. |
+| S4 | 2048² Stage-2 target-domain audit | Invalidated | Stage 2 preserves the negative ranking; no static action beats no-AG or licenses RL. |
 
-S0-S3 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
+S0-S4 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
 ## S2 Mechanistic Hypothesis
 
@@ -127,6 +127,31 @@ TOPIQ-NR is primary. A TCMG result can reopen the method only if its gain over n
 
 ## S4 Engineering Outcome
 
-Runs `outputs/exp_stage2_transfer/engineering_smoke_v1` and `engineering_smoke_repeat_v1` were produced independently from commit `f18b6b1` on GPU 1. Both completed the normal 2048² encoder/decoder path for all three actions without OOM or device mismatch; observed peak allocation was approximately 21.2 GB. Every output is a valid nonblank 2048² RGB PNG with complete Stage-2 metadata.
+Runs `outputs/exp_stage2_transfer/engineering_smoke_v1` and `engineering_smoke_repeat_v1` were produced independently from commit `f18b6b1` on GPU 1. Both completed the normal 2048² encoder/decoder path for all three actions without OOM or device mismatch; observed peak GPU memory use was approximately 21.2 GB. Every output is a valid nonblank 2048² RGB PNG with complete Stage-2 metadata.
 
 Within each run, `no_ag` and `no_ag_repeat` have the same SHA-256 (`3187f72c...0930a55`), while `conference_expert` is distinct (`a513da66...8efddf`). Across fresh processes and output directories, all three action hashes reproduce exactly. The task generator therefore controls both sampling phases, the pipeline remains reentrant after CPU phase offload, and the engineering gate authorizes the already-frozen five-action pilot without changing actions or thresholds.
+
+## S4 Pilot Outcome
+
+Run: `outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1`, 12 prompts × 3 seeds × 5 actions, produced by commit `a31cb75`. All 180 final images are valid 2048² RGB PNGs; 36 prompt/seed blocks are complete and same-device, each GPU produced 45 records, all within-block action hashes differ, and the two smoke controls reproduce exactly. Strict scoring produced all 14 configured outputs for every image.
+
+No action improves the primary endpoint over no-AG:
+
+| Action | Δ TOPIQ-NR [95% CI] | Δ HPSv2 | Δ CLIP | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|---:|
+| conference expert | -0.020052 [-0.037713,-0.003316] | +0.004754 | -0.004435 | +0.010235 | +0.044811 |
+| raw 0.001 | -0.005907 [-0.011608,-0.000872] | +0.001333 | -0.004632 | +0.002392 | +0.014894 |
+| plain tangent 0.002 | -0.002836 [-0.006932,+0.001057] | +0.000756 | -0.003126 | -0.000102 | -0.000058 |
+| cone 0.002 | -0.002091 [-0.006817,+0.002305] | +0.001133 | -0.003167 | -0.000059 | +0.000653 |
+
+Cone `0.002` is only `+0.000745` above matched plain tangent, CI `[-0.001212,+0.002815]`. It is `+0.003816` above raw, CI `[-0.001550,+0.009215]`, and `+0.017961` above expert, CI `[+0.002937,+0.033567]`; these are reductions in harm, not efficacy, because cone remains below no-AG and fails the preregistered CLIP non-inferiority bound. Patch-IR also decreases by `-0.017641`, with no local-detail confirmation signal.
+
+TOPIQ seed-CV produces `-0.002148` for the global policy and `-0.003216` for per-prompt selection versus no-AG. HPS selection gives a nominal `+0.005022`, CI `[+0.000604,+0.009759]`, but TOPIQ falls `-0.012735`, clipping rises `+0.001673`, and saturation rises `+0.028848`; this is proxy/guard conflict, not adaptive headroom. The fixed montage at `outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/figs/all_actions_seed0.png` shows stronger expert/raw color and composition changes without stable structure or text repair. Stage 2 therefore does not rescue Stage-1 Attention Guidance. S4 and the target-domain exception are closed without high-resolution scale tuning.
+
+## Post-S4 Algorithm Bar
+
+No S5 claim is registered. Four failed operator families plus the high-resolution audit are evidence against continuing to transform the same raw four-channel noisy-latent TFSA residual. The next admissible hypothesis must change the proposal source, not its scale, schedule, frequency weights, geometric projection, or controller.
+
+A defensible candidate is scheduler-consistent predicted-clean semantic transport: obtain the scheduler's predicted clean sample `x0`, derive spatial transport from frozen UNet self-attention features rather than four-channel latent dot products, apply a fixed-moment transport to `x0`, then reconstruct the next latent while holding the predicted noise component fixed. This specifically tests whether S0-S4 failed because TFSA was computed on noisy, semantically weak latents. Before implementation it requires a full related-work audit and an exact scheduler-reconstruction test.
+
+Any such operator must first use a new prompt-disjoint development set and fixed static actions. It must compare raw-latent TFSA, predicted-clean TFSA, semantic-feature transport, no-AG, conference expert, and an equal-compute post-step control; if it adds a UNet call, it also needs an equal-call score-correction baseline. The same `+0.005` TOPIQ gate, preference/alignment non-inferiority, pixel guards, high-resolution transfer, and fixed qualitative views apply. Only a static winner can justify search, distillation, or RL; another null result closes Attention Guidance as the journal-extension axis.
