@@ -101,13 +101,14 @@ close the route. Do not add sigma-horizon or new noise modes to this queue.
 
 ### H2: A fixed structural basis beats capacity-matched controls
 
-Only if H1 passes, freeze one development-selected coefficient vector for a
-zero-init structural basis (FreeU backbone-minus-skip, one radial DCT band, and
-one local relation basis). On unseen prompts, it must beat no-op, conference
-TFSA, the best fixed scalar schedule, and a parameter/FLOP-matched random or
-shuffled-feature renderer on TOPIQ-NR with a positive crossed-bootstrap
-interval, while preserving latent channel moments within `1%`, scheduler
-update ratio below the preregistered cap, and non-inferior HPSv2/CLIP and
+Only if H1 passes, freeze one development-selected six-coordinate coefficient
+vector in the registered order `[semantic, spectral-low, spectral-mid,
+spectral-high, FreeU-backbone-minus-skip, Laplacian]` and record it in YAML.
+The zero-init structural basis must then beat no-op, conference TFSA, the best
+fixed scalar schedule, and a parameter/FLOP-matched random or shuffled-feature
+renderer on TOPIQ-NR with a positive crossed-bootstrap interval, while
+preserving latent channel moments within `1%`, keeping the scheduler update
+ratio below the preregistered cap, and remaining non-inferior on HPSv2/CLIP and
 human preference. Matching the random renderer or a searched fixed basis
 falsifies the learned-structure claim; no RL is then authorized.
 
