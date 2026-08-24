@@ -25,6 +25,9 @@ class CFGECConfig:
     threshold, matching CFG-OEC Eq. (13)--(15).  ``blend`` interpolates the
     gated OEC unconditional prediction with the original unconditional one;
     it is an explicit strength control, so zero is an exact CFG identity.
+    Negative-cosine rows are conservatively skipped because the paper's
+    dynamic mix assumes predominantly non-negative alignment; this prevents
+    unbounded extrapolation from being silently treated as a correction.
 
     The paper writes ``2 * prediction_current - prediction_previous`` for
     adjacent, equally spaced steps.  This implementation computes the same
@@ -49,8 +52,8 @@ class CFGECConfig:
         projection_epsilon = float(self.projection_epsilon)
         if not math.isfinite(guidance_scale):
             raise ValueError("guidance_scale must be finite")
-        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
-            raise ValueError("alignment_threshold must be finite and in [-1, 1]")
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("alignment_threshold must be finite and in [0, 1]")
         if not math.isfinite(blend) or not 0.0 <= blend <= 1.0:
             raise ValueError("blend must be finite and in [0, 1]")
         if not math.isfinite(tolerance) or tolerance < 0.0:
@@ -82,6 +85,7 @@ class CFGECDiagnostics:
 
     history_valid: bool
     applied_rows: Tuple[bool, ...]
+    negative_alignment_rows: Tuple[bool, ...]
     alignment_cosine: Tuple[float, ...]
     correction_norm_ratio: Tuple[float, ...]
     proxy_norm_ratio: Tuple[float, ...]
@@ -95,6 +99,9 @@ class CFGECDiagnostics:
         record: Dict[str, Any] = {
             "history_valid": bool(self.history_valid),
             "applied_rows": [bool(value) for value in self.applied_rows],
+            "negative_alignment_rows": [
+                bool(value) for value in self.negative_alignment_rows
+            ],
             "alignment_cosine": [float(value) for value in self.alignment_cosine],
             "correction_norm_ratio": [float(value) for value in self.correction_norm_ratio],
             "proxy_norm_ratio": [float(value) for value in self.proxy_norm_ratio],
@@ -197,7 +204,8 @@ def correct_cfg_prediction(
     ``B_perp = B - <A,B>/<A,A> * A``
     ``u_bar = hat{u} + B_perp``
     ``s = cos(A,B)``
-    ``u_oec = (1-s) * u_bar + s * u_cur`` when ``s < threshold``
+    ``u_oec = (1-s) * u_bar + s * u_cur`` when ``0 <= s < threshold``;
+    negative-``s`` rows are explicitly skipped
     ``u_out = u_cur + blend * (u_oec-u_cur)``
     ``cfg_out = u_out + guidance_scale * (c_cur-u_out)``.
 
@@ -223,6 +231,7 @@ def correct_cfg_prediction(
         diagnostics = CFGECDiagnostics(
             history_valid=False,
             applied_rows=(False,) * batch,
+            negative_alignment_rows=(False,) * batch,
             alignment_cosine=(0.0,) * batch,
             correction_norm_ratio=(0.0,) * batch,
             proxy_norm_ratio=(0.0,) * batch,
@@ -238,6 +247,7 @@ def correct_cfg_prediction(
         diagnostics = CFGECDiagnostics(
             history_valid=False,
             applied_rows=(False,) * batch,
+            negative_alignment_rows=(False,) * batch,
             alignment_cosine=(0.0,) * batch,
             correction_norm_ratio=(0.0,) * batch,
             proxy_norm_ratio=(0.0,) * batch,
@@ -310,7 +320,11 @@ def correct_cfg_prediction(
     ).clamp(min=-1.0, max=1.0)
     valid = a_norm > float(config.projection_epsilon)
     valid = valid & (b_norm > float(config.projection_epsilon))
-    gate = valid & (cosine < float(config.alignment_threshold))
+    negative_alignment = valid & (cosine < 0.0)
+    # The published dynamic mix uses s directly and notes that observed s is
+    # mostly non-negative.  We register the conservative alternative here:
+    # negative rows are skipped and surfaced in diagnostics.
+    gate = valid & ~negative_alignment & (cosine < float(config.alignment_threshold))
 
     projection_coeff = dot / a_norm.square().clamp_min(float(config.projection_epsilon))
     b_perp = b - projection_coeff[:, None] * a
@@ -348,12 +362,21 @@ def correct_cfg_prediction(
     diagnostics = CFGECDiagnostics(
         history_valid=True,
         applied_rows=tuple(bool(value) for value in gate.cpu().tolist()),
+        negative_alignment_rows=tuple(
+            bool(value) for value in negative_alignment.cpu().tolist()
+        ),
         alignment_cosine=tuple(float(value) for value in cosine.cpu().tolist()),
         correction_norm_ratio=tuple(float(value) for value in correction_ratio.cpu().tolist()),
         proxy_norm_ratio=tuple(float(value) for value in proxy_ratio.cpu().tolist()),
         time_delta=float(time_delta),
         effective_blend=tuple(float(value) for value in applied_weight.cpu().tolist()),
-        reason="applied" if bool(gate.any()) else "alignment_gate",
+        reason=(
+            "applied"
+            if bool(gate.any())
+            else "negative_alignment"
+            if bool(negative_alignment.any())
+            else "alignment_gate"
+        ),
     )
     diagnostics.to_record()
     return output, diagnostics

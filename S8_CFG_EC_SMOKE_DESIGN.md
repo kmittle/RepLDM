@@ -35,6 +35,13 @@ acceptable implementation contract. The correction must either use a registered
 sigma/timestep normalization or explicitly define why the scheduler's prediction
 parameterization makes the subtraction valid.
 
+The CPU proxy registers a conservative negative-cosine policy: valid rows with
+cos(A,B) < 0 are skipped and reported, because the paper's direct dynamic mix
+would extrapolate in that case. A direct-mix CFG-OEC arm is a separate baseline
+and must report a scheduler-update trust cap; it cannot silently replace the
+conservative action. Freeze the alignment threshold on development data before
+any validation run; the CPU test value is only a fixture.
+
 The first denoising step has no history. It must use ordinary CFG and then seed
 the history cache. History is per pipeline invocation, effective sample, action,
 and scheduler phase; it must never cross a prompt, seed, action, scheduler, or
@@ -99,6 +106,10 @@ previous_timestep: scalar
 previous_unconditional: Tensor[B,C,H,W]
 previous_conditional: Tensor[B,C,H,W]
 previous_scheduler_signature: immutable hash/identifier
+
+Diagnostics must include the per-row alignment cosine, negative-cosine skip
+flag, gate flag, correction norm ratio, and scheduler-update ratio. A negative
+cosine row must be an exact ordinary-CFG row under the conservative action.
 ```
 
 Implementation requirements:

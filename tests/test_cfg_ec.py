@@ -246,6 +246,29 @@ class CFGECProxyTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertAlmostEqual(diagnostics.time_delta, -0.5)
 
+    def test_negative_proxy_alignment_is_skipped_and_reported(self):
+        # A and B point in opposite directions.  Applying the paper's raw
+        # negative cosine mix would extrapolate; the registered smoke policy
+        # keeps this row at ordinary CFG and records the reason explicitly.
+        current_u = torch.tensor([[[[0.0, 0.0]]]])
+        current_c = torch.tensor([[[[1.0, 0.0]]]])
+        previous_u = torch.tensor([[[[1.0, 0.0]]]])
+        previous_c = torch.tensor([[[[0.0, 0.0]]]])
+        output, diagnostics = correct_cfg_prediction(
+            current_u,
+            current_c,
+            previous_u,
+            previous_c,
+            current_time=0.0,
+            previous_time=1.0,
+            config=CFGECConfig(2.0, 0.99, 1.0),
+        )
+        torch.testing.assert_close(output, self._ordinary_cfg(current_u, current_c))
+        self.assertEqual(diagnostics.applied_rows, (False,))
+        self.assertEqual(diagnostics.negative_alignment_rows, (True,))
+        self.assertEqual(diagnostics.reason, "negative_alignment")
+        self._assert_record_finite(diagnostics.to_record())
+
     def test_time_order_and_partial_history_are_rejected(self):
         args = dict(
             current_unconditional=self.current_u[:1],

@@ -125,6 +125,11 @@ coefficient-only version are required controls. This tests whether structure
 and spectrum are complementary, not whether a larger neural renderer can fit a
 reward.
 
+When both gradients are combined, normalize each component before the trust
+cap and report their cosine. Additive, equal-norm, and gradient-orthogonal
+combinations are separate actions; otherwise a gain can be explained entirely
+by doubling the update magnitude.
+
 ### Boundary and overlap
 
 SPA already provides FFT guidance with a 3-4% overhead and an official SDXL

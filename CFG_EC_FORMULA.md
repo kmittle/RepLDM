@@ -33,8 +33,11 @@ u_bar   = hat{u} + B_perp
 s       = <A,B> / (||A|| ||B||)
 ```
 
-For rows with nonzero proxy errors and `s < tau`, the dynamic OEC candidate is
-`u_oec = (1-s) u_bar + s u_t`. The registered `blend` scales this complete
+For rows with nonzero proxy errors, non-negative `s`, and `s < tau`, the
+dynamic OEC candidate is `u_oec = (1-s) u_bar + s u_t`. Negative-cosine rows
+are explicitly skipped and recorded as a guard: the paper notes that observed
+values are predominantly non-negative but does not provide a universal bound
+for the extrapolating case. The registered `blend` scales this complete
 correction:
 
 ```text
@@ -61,7 +64,7 @@ must derive and register its scheduler-specific horizon before use.
 
 `blend=0` bypasses all history arithmetic and returns ordinary CFG exactly.
 Missing history does the same with `history_valid=false`. Diagnostics contain
-finite, per-row alignment, applied-gate, correction-ratio, and effective-blend
-values, plus the normalized time delta and a reason string. Shape, dtype,
-device, ordering, and finite-value mismatches raise instead of broadcasting or
-silently falling back.
+finite, per-row alignment, negative-guard, applied-gate, correction-ratio, and
+effective-blend values, plus the normalized time delta and a reason string.
+Shape, dtype, device, ordering, and finite-value mismatches raise instead of
+broadcasting or silently falling back.
