@@ -69,6 +69,38 @@ to share an invariant code. This distinction determines the renderer test:
 measure both equivariance error and unwanted content change instead of calling
 one scalar an "invariance" score.
 
+### Representation-side factorial (post-LR-1 only)
+
+The current LR-1 gate deliberately freezes the SDXL VAE, so a positive result
+can be attributed to the renderer. If LR-1 passes, register a separate,
+prompt-disjoint representation study before touching validation or test:
+
+| Arm | VAE/AE | Renderer | Purpose |
+|---|---|---|---|
+| R0 | frozen SDXL VAE | frozen winner | causal reference |
+| R1 | frozen VAE + fixed radial-DCT projection | frozen winner | non-learned spectral control |
+| R2 | AE adapter with high-frequency penalty | frozen winner | diffusability hypothesis |
+| R3 | AE adapter with transform-equivariance loss | frozen winner | EQ-VAE hypothesis |
+| R4 | R2/R3 adapter + renderer | frozen winner | interaction, not the primary claim |
+
+R2 uses a radial-frequency penalty on the encoded latent, a reconstruction
+term, and a channel-moment/scaling constraint; R3 adds transformed
+input/latent/reconstruction consistency and measures equivariance error rather
+than an invariance proxy. Train only on the registered train images, keep the
+diffusion denoiser, scheduler, NFE, CFG, and renderer weights fixed, and match
+the adapter parameter/FLOP budget to a random convolutional control. The AE
+arms must preserve the scheduler's latent scale and channel moments; otherwise
+they are representation changes, not fair renderer comparisons.
+
+For every arm report native-resolution reconstruction/LPIPS, CLIP alignment,
+radial DCT slope and high-frequency excess, equivariance error, latent
+mean/variance drift, coarse-to-fine denoising order, latency, memory, and
+parameter count. A spectral or equivariant AE that improves a proxy while
+losing reconstruction, alignment, or the fixed montage is a failed arm. These
+experiments are forbidden from rescuing a failed LR-1 gate and cannot authorize
+RL; they only establish whether the journal contribution is the constrained
+renderer, the representation, or their interaction.
+
 ## Candidate Renderer
 
 The first implementation is frozen in `AttentionGuidance/latent_renderer.py`
