@@ -27,7 +27,7 @@
 | S1 | 分别调低频、中频和高频 residual 的强度 | 已否定 | 最好的动作 `mid_only_0.004` 也不优于 no-AG；按 seed 做交叉验证后，也看不到值得自适应选择的空间。 |
 | S2 | 固定均值和方差的 Attention Guidance（MTAG） | 已否定 | 它确实消除了均值和方差漂移，但没有提高画质或偏好指标。 |
 | S3 | 删除“逆着正常去噪方向走”的更新分量（TCMG） | 已否定 | 这个方向约束确实生效了，但没有提高画质、偏好指标，也没有带来可用的自适应空间。 |
-| S4 | 在最终 2048² 高分辨率结果上复查前面方案 | 已否定 | 第二阶段没有改变此前的负面排序；没有任何固定动作胜过 no-AG，因此仍不能开始 RL。 |
+| S4 | 在最终 2048² 高分辨率结果上复查前面方案（Stage-2 audit） | 已否定 | 第二阶段（Stage 2）没有改变此前的负面排序；没有任何固定动作胜过 no-AG，因此仍不能开始 RL。 |
 | S5 | 与 scheduler 一致的双向语义传输（SCRST） | 已登记，待验证 | 不再从 noisy latent 的 TFSA 取更新方向，改用 conditional UNet self-attention 和 scheduler 返回的 predicted-clean latent。这里登记的是待检验方案，不是成功结论。 |
 
 S0-S4 的完整证据见 `EXPERIMENT_RESULTS.md`。这些轮次已经失败，不能把它们的动作集合拿去训练 RL。
@@ -74,7 +74,7 @@ z' = mean_spatial(z) + cos(theta)x + sin(theta)||x||v/||v||.
 3. HPSv2 和 CLIP 不能明显变差；clipped fraction 和 saturation 相对 no-AG 的增量分别不能超过 `0.001` 和 `0.005`。
 4. 固定版式的对比图必须显示可信的结构或细节改善，不能只是全局颜色或对比度变化。
 
-通过这道门槛，只代表可以换一套不重合的提示词做确认实验，并测试高分辨率第二阶段迁移；还不能直接宣称形成了期刊结论。未通过就结束 S2，下一步必须换一个新的算子假设，不能继续调 reward 或堆更复杂的 controller。
+通过这道门槛，只代表可以换一套不重合的提示词做确认实验，并测试高分辨率第二阶段（Stage-2）迁移；还不能直接宣称形成了期刊结论。未通过就结束 S2，下一步必须换一个新的算子假设，不能继续调 reward 或堆更复杂的 controller。
 
 ### 冒烟测试结果
 
@@ -127,11 +127,11 @@ GAG 的平行/正交分解处理的是 sparse 与 dense cross-attention guidance
 
 ### 冒烟测试怎么定
 
-配置为 `eval-pipeline/configs/trajectory_cone_smoke.yaml`：两个 prompts、seed `0`、GPU 1。动作包括 no-AG、expert、raw `0.001`、plain tangent `0.002`、TCMG `0.001/0.002/0.004/0.008`，以及 energy-matched TCMG `0.001/0.002/0.004`。沿用 S2 的淘汰规则：非有限值、动作没生效、TOPIQ 低于 no-AG 超过 `0.05`，或 clipping 高于 no-AG 超过 `0.01`。冒烟测试只确定一段连续 scale 范围。只要至少有一段 TCMG 区间存活，才允许做 12×3 开发实验；正式门槛与 S2 完全相同。
+配置为 `eval-pipeline/configs/trajectory_cone_smoke.yaml`：两个 prompts、seed `0`、GPU 1。动作包括 no-AG、expert、raw `0.001`、plain tangent `0.002`、TCMG `0.001/0.002/0.004/0.008`，以及 energy-matched TCMG `0.001/0.002/0.004`。沿用 S2 的淘汰规则：TOPIQ 变化低于 `-0.05`，或 clipping 增量高于 `+0.01`；非有限值和动作没生效也会淘汰。冒烟测试只确定一段连续 scale 范围。只要至少有一段 TCMG 区间存活，才允许做 12×3 开发实验；正式门槛与 S2 完全相同。
 
 ### 冒烟测试结果
 
-运行目录：`outputs/exp_trajectory_cone/smoke_2prompt_1seed_v1`，由 commit `0e00fe6` 在 GPU 1 上生成。22 条记录都完整、有限，而且像素结果不同。8 个 no-AG、expert、raw、plain-tangent 对照精确复现了 S2 的 hash，说明 tangent 重构没有引入集成回归。TCMG 与 plain tangent 的 PNG 不同，说明“删掉反向分量”这个操作在真实 scheduler 轨迹上确实生效了。
+运行目录：`outputs/exp_trajectory_cone/smoke_2prompt_1seed_v1`，由 commit `0e00fe6` 在 GPU 1 上生成。22 条记录都完整、有限，而且像素结果不同。八个 no-AG、expert、raw、plain-tangent 对照精确复现了 S2 的 hash，说明 tangent 重构没有引入集成回归。TCMG 与 plain tangent 的 PNG 不同，说明“删掉反向分量”这个操作在真实 scheduler 轨迹上确实生效了。
 
 两个提示词上的 TOPIQ 平均变化全部为负：TCMG `0.001/0.002/0.004` 分别是 `-0.006597/-0.007909/-0.010637`；energy-matched `0.001/0.002` 分别是 `-0.010521/-0.008155`。TCMG `0.002` 的 HPSv2 是 `+0.005859`，但两个提示词的区间没有解释力，而且 ImageReward 是 `-0.065652`。固定对比图显示它会随状态改变构图，却没有稳定修复结构。
 
@@ -157,33 +157,33 @@ TCMG `0.008` 因为一个 prompt 的 clipping 超出 `+0.01` 限制而被删掉�
 
 完整的 seed-0 对比图位于 `outputs/exp_trajectory_cone/development_12prompt_3seed_v1/figs/all_actions_seed0.png`。它显示动作会随状态改变构图，但没有稳定修复结构或文字。因此 S3 到此结束，不再做另一轮 scale 搜索，也不能拿来启动 RL。
 
-## S4：只检查高分辨率第二阶段会不会改变结论
+## S4：只检查高分辨率第二阶段（Stage-2）会不会改变结论
 
 ### 为什么做
 
-S0-S3 评估的是第一阶段生成的 1024² 图像，但 RepLDM 最终交付的是重采样后的高分辨率图像。S4 只检查这两者是否存在偏差：前面在第一阶段表现不好的动作，经过第二阶段后会不会反而变好。
+S0-S3 评估的是第一阶段（Stage-1）生成的 1024² 图像，但 RepLDM 最终交付的是重采样后的高分辨率图像。S4 只检查这两者是否存在偏差：前面表现不好的动作，经过第二阶段（Stage 2）后会不会反而变好。
 
-这不是给失败方案“再调一次”的机会，也不能把已经用过的开发 prompts 当成独立确认数据。Attention Guidance 仍然只作用在第一阶段；S4 只是观察第二阶段会放大、减弱，还是反转它带来的影响。
+这不是给失败方案“再调一次”的机会，也不能把已经用过的开发 prompts 当成独立确认数据。Attention Guidance 仍然只作用在第一阶段（Stage-1-only）；S4 只是观察后续高分辨率处理会放大、减弱，还是反转它带来的影响。
 
 ### 先过工程正确性检查
 
-批量生成之前，必须在 `prompts/stage2_smoke.csv`、seed `0`、单张 GPU 和 `configs/stage2_engineering_smoke.yaml` 上通过检查。第二阶段噪声必须来自当前任务自己的 generator，不能依赖全局 RNG；启用 phase offload 时，正常 2048² 解码必须把 VAE 和 latents 放到实际执行设备上。
+批量生成之前，必须在 `prompts/stage2_smoke.csv`、seed `0`、单张 GPU 和 `configs/stage2_engineering_smoke.yaml` 上通过第二阶段正确性检查（Stage-2 correctness）。第二阶段噪声（Stage-2 noise）必须来自当前任务自己的 generator，不能依赖全局 RNG；启用 phase offload 时，正常 2048² 解码必须把 VAE 和 latents 放到实际执行设备上。
 
-两个重复的 no-AG 动作必须得到完全相同的最终 PNG hash，expert 必须不同；所有输出必须是 2048² RGB，metadata 必须记录第二阶段设置，重新运行也必须复现 hash。任何一项失败，都不能开始 pilot。
+两个重复的 no-AG 动作必须得到完全相同的最终 PNG hash，expert 必须不同；所有输出必须是 2048² RGB，metadata 必须记录第二阶段设置（Stage-2 settings），重新运行也必须复现 hash。任何一项失败，都不能开始 pilot。
 
 ### Pilot 固定方案和通过条件
 
-固定 pilot 使用 `configs/stage2_transfer_pilot.yaml`：12 prompts × 3 seeds × 5 actions = 180 张最终 2048² 图像。五个动作是 no-AG、论文版 expert、raw `0.001`、plain tangent `0.002` 和 cone `0.002`。它们是根据此前证据固定的机制阶梯，不允许在高分辨率上重新搜索 scale。同一 prompt/seed 下的动作必须共用 GPU 和任务级第二阶段噪声。
+固定 pilot 使用 `configs/stage2_transfer_pilot.yaml`：12 prompts × 3 seeds × 5 actions = 180 张最终 2048² 图像。五个动作是 no-AG、论文版 expert、raw `0.001`、plain tangent `0.002` 和 cone `0.002`。它们是根据此前证据固定的机制阶梯，不允许在高分辨率上重新搜索 scale。同一 prompt/seed 下的动作必须共用 GPU 和任务级第二阶段噪声（Stage-2 noise）。
 
 主指标仍是 TOPIQ-NR。只有 TCMG 相对 no-AG 至少提高 `+0.005`、95% CI 不跨零、同指标 Holm 校正后的检验值低于 `0.05`，并且直接配对比较也胜过 expert、raw 和 plain tangent，才允许重新打开这个方法。HPSv2 和 CLIP cosine 的 CI 下界必须高于 `-0.003` 和 `-0.005`；clipped fraction 和 saturation 的平均增量必须低于 `+0.001` 和 `+0.005`。还要报告 ImageReward、patch-IR、aesthetic、contrast、colorfulness、sharpness、所有失败动作和固定对比图。
 
-即使通过，也仍需使用不重合的 prompts 做确认，并进行盲评的高分辨率偏好比较和细节裁剪比较。如果没有动作通过，就关闭 Attention Guidance 在目标 pipeline 第一阶段上的路线，不能直接跳去设计 learned controller。
+即使通过，也仍需使用不重合的 prompts 做确认，并进行盲评的高分辨率偏好比较和细节裁剪比较。如果没有动作通过，就关闭 Attention Guidance 在目标 pipeline 第一阶段（Stage-1）上的路线，不能直接跳去设计 learned controller。
 
 ### 工程检查结果
 
 `outputs/exp_stage2_transfer/engineering_smoke_v1` 和 `engineering_smoke_repeat_v1` 是两个独立运行，都由 commit `f18b6b1` 在 GPU 1 上生成。三个动作都完成了正常的 2048² encoder/decoder 流程，没有 OOM 或设备不匹配；观察到的 GPU 峰值显存约为 21.2 GB。每张输出都是有效、非空白的 2048² RGB PNG，第二阶段 metadata 完整。
 
-每次运行内部，`no_ag` 与 `no_ag_repeat` 的 SHA-256 相同（`3187f72c...0930a55`），而 `conference_expert` 不同（`a513da66...8efddf`）。换新进程和输出目录后，三个动作的 hash 都能精确复现。因此，任务 generator 确实控制了两个采样阶段，CPU phase offload 后 pipeline 仍可再次运行。工程门槛通过，可以按已经固定的五个动作开始 pilot；动作和阈值都不变。
+每次运行内部，`no_ag` 与 `no_ag_repeat` 的 SHA-256 相同（`3187f72c...0930a55`），而 `conference_expert` 不同（`a513da66...8efddf`）。换新进程和输出目录后，三个动作的 hash 都能精确复现。因此，任务 generator 确实控制了两个采样阶段，CPU phase offload 后 pipeline 仍可再次运行。第二阶段 metadata（Stage-2 metadata）也完整。工程门槛通过，可以按已经固定的五个动作开始 pilot；动作和阈值都不变。
 
 ### Pilot 结果
 
@@ -202,7 +202,7 @@ cone `0.002` 只比相同 scale 的 plain tangent 高 `+0.000745`，CI `[-0.0012
 
 TOPIQ seed-CV 相对 no-AG 的结果是：全局 policy `-0.002148`，每 prompt 选择 `-0.003216`。按 HPS 选择虽然名义上提高 `+0.005022`，CI `[+0.000604,+0.009759]`，但 TOPIQ 下降 `-0.012735`，clipping 上升 `+0.001673`，saturation 上升 `+0.028848`。这说明选择器只是在迎合 HPS，同时破坏主指标和 guard，并不代表存在可用的自适应空间。
 
-固定对比图位于 `outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/figs/all_actions_seed0.png`。expert 和 raw 带来了更明显的颜色、构图变化，但没有稳定修复结构或文字。因此第二阶段没有救回第一阶段的 Attention Guidance。S4 以及“高分辨率可能翻盘”的例外都到此关闭，不再做高分辨率 scale 调参。
+固定对比图位于 `outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/figs/all_actions_seed0.png`。expert 和 raw 带来了更明显的颜色、构图变化，但没有稳定修复结构或文字。因此第二阶段（Stage 2）没有救回第一阶段（Stage-1）的 Attention Guidance。S4 以及“高分辨率可能翻盘”的例外都到此关闭，不再做高分辨率 scale 调参。
 
 ## S4 之后：旧 TFSA residual 路线不再继续调参
 
@@ -245,7 +245,7 @@ W = row_normalize(R restricted to mutual top-16 edges plus the diagonal)
 c_t = 1 - mean_i H(A_i) / log(N).
 ```
 
-大白话解释：`A` 是所有 attention heads 的平均连接强度；`R_ij` 只有在 `i` 看重 `j`、`j` 也看重 `i` 时才会大；`W` 对每个位置只保留 mutual top-16 连接和它自己，再把每行归一化；`c_t` 是置信度，attention 越集中，置信度越高，越分散则更新越弱。
+大白话解释：`A` 是所有 attention heads 的平均连接强度；`R_ij` 只有在 `i` 看重 `j`、`j` 也看重 `i` 时才会大；`W` 对每个位置只保留最强的双向连接和它自己，再把每行归一化；`c_t` 是置信度，attention 越集中，置信度越高，越分散则更新越弱。
 
 把 scheduler 返回的 `x_0` 按面积缩小到 attention 网格，计算 `d = upsample(W x_0 - x_0)`，再按 latent 通道把 `d` 投影到固定均值、固定方差的切空间。随后用固定角度 `theta * c_t` 在球面上移动，结果叫 `guided_x_0`。
 
@@ -292,6 +292,6 @@ S5 动作只有同时满足以下条件，才能进入下一步：
 3. HPSv2 和 CLIP 不能明显变差；clipped fraction 和 saturation 相对 no-AG 的增量分别不能超过 `0.001` 和 `0.005`。
 4. 固定的全动作对比图必须显示真实的结构、计数、位置、文字或细节改善，不能只是全局颜色、对比度或锐度变化。
 
-通过只代表可以继续做不重合 prompts 的确认实验和第二阶段迁移，还不能开始 RL。如果结果仍为空，就关闭 Attention Guidance 作为期刊扩展的方向；之后不再继续搜索 angle、top-k、layer、schedule、reward 或 controller。
+通过只代表可以继续做不重合 prompts 的确认实验和第二阶段（Stage-2）迁移，还不能开始 RL。如果结果仍为空，就关闭 Attention Guidance 作为期刊扩展的方向；之后不再继续搜索 angle、top-k、layer、schedule、reward 或 controller。
 
 截至这份记录，S5 只完成了方案登记和冒烟工程检查，文档中没有正式开发实验结果。因此不能说 S5 已经有效，更不能说它已经推翻 S0-S4 的失败结论。
