@@ -54,6 +54,7 @@ if is_invisible_watermark_available():
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 
 from AttentionGuidance import AttnGuidance
+from InferencePipelines.cfg_batch import expand_cfg_latents, split_cfg_noise_pred
 import time
 from diffusers import EulerDiscreteScheduler
 import gc
@@ -1262,10 +1263,8 @@ class RepLDMSDXLControlNetPipeline(
                     latents_for_view = latents
     
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = (
-                        latents.repeat_interleave(2, dim=0)
-                        if do_classifier_free_guidance
-                        else latents
+                    latent_model_input = expand_cfg_latents(
+                        latents, do_classifier_free_guidance
                     )
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
     
@@ -1330,7 +1329,7 @@ class RepLDMSDXLControlNetPipeline(
     
                     # perform guidance
                     if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
+                        noise_pred_uncond, noise_pred_text = split_cfg_noise_pred(noise_pred)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
     
                     # compute the previous noisy sample x_t -> x_t-1
@@ -1518,10 +1517,8 @@ class RepLDMSDXLControlNetPipeline(
                     
                     latents_for_view = latents
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = (
-                        latents.repeat_interleave(2, dim=0)
-                        if do_classifier_free_guidance
-                        else latents
+                    latent_model_input = expand_cfg_latents(
+                        latents, do_classifier_free_guidance
                     )
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                     
@@ -1585,7 +1582,7 @@ class RepLDMSDXLControlNetPipeline(
                     
                     # perform guidance
                     if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred[::2], noise_pred[1::2]
+                        noise_pred_uncond, noise_pred_text = split_cfg_noise_pred(noise_pred)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                     
                     # compute the previous noisy sample x_t -> x_t-1
