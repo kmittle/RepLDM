@@ -23,6 +23,13 @@ route works on RepLDM.
 - [SPA](https://arxiv.org/abs/2607.22091) already covers timestep-conditioned
   FFT-spectrum guidance, so a pure spectral correction needs it as a direct
   baseline and cannot be claimed as novel.
+- [SGA](https://arxiv.org/abs/2605.20808) and [SARA](https://arxiv.org/abs/2503.08253)
+  already use spatial self-similarity or cosine/Gram relations as alignment
+  signals. [DUNE](https://arxiv.org/abs/2607.09753) is a particularly relevant
+  frozen-SDXL, training-free latent intervention baseline. FRLA therefore cannot
+  claim first relational alignment or first frozen latent manipulation; its
+  narrow test is the fixed, rank-compatible local descriptor attached to a
+  detached U-Net feature and a bounded `pred_original_sample` update.
 
 ## Candidate And Gate
 
@@ -71,3 +78,13 @@ and clipping/saturation/contrast/sharpness guards. A fixed FRLA action must
 clear the same `+0.005`, crossed-bootstrap, sign-flip/Holm, and guard gates on
 new prompts before any search, distillation, or RL is allowed. If it fails,
 close the representation route rather than tuning the relation target.
+
+Engineering controls are part of the preregistration. The current S7 jobs use
+one prompt and one seed per block, but any batched FRLA implementation must
+pair CFG rows as `[all negative, all positive]` and replicate latents with
+`torch.cat([latents, latents])`; `repeat_interleave(2)` silently misaligns
+prompts when the batch size exceeds one. Report the feature row used for the
+conditional signal and test this pairing with a deterministic multi-prompt
+smoke. VIV-style diagnostics must be labelled exploratory for SDXL Euler,
+because the published derivation is for Flow Matching; use SEC/LNC/LDS/CDS/SRSS
+as the scheduler-agnostic structural report.

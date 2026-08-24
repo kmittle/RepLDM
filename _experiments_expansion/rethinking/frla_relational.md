@@ -30,6 +30,10 @@ regularization. These are direct baselines and novelty limits: FRLA cannot claim
 the gradient, tangent projection, local relation loss, or frozen manipulation
 itself as new. Covariance is a deterministic metric only; covariance-aware
 noise is excluded because it has been reported to hurt VAE latent diffusion.
+SGA ([2605.20808](https://arxiv.org/abs/2605.20808)) and SARA
+([2503.08253](https://arxiv.org/abs/2503.08253)) further rule out a claim of
+first relational or Gram alignment. The defensible claim is only the fixed
+rank-compatible local descriptor and its bounded scheduler-consistent update.
 
 ## Fixed Operator
 
@@ -74,4 +78,6 @@ search, distillation, or RL is allowed. If it passes, freeze one action on
 development data before any validation or learned controller; DiffRGD
 ([2606.28417](https://arxiv.org/abs/2606.28417)) and LatSearch
 ([2603.14526](https://arxiv.org/abs/2603.14526)) remain computational and
-novelty controls, not claims of FRLA novelty.
+novelty controls, not claims of FRLA novelty. VIV is reported only as an
+exploratory, Flow-Matching-derived diagnostic for SDXL Euler; SEC/LNC/LDS/CDS/
+SRSS are the primary scheduler-agnostic structural diagnostics.

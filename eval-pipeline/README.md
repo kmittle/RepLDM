@@ -94,7 +94,9 @@ For unattended, resumable execution of this registered sequence, use
 `run_trajectory_correction_queue.sh`. It takes an exclusive lock, records input
 hashes and stage state under `outputs/trajectory_correction/queue_v1/`, waits
 for a GPU with at least 22 GiB free, and resumes incomplete generation or
-scoring. A failed development selector writes an auditable `null_route.json`
+scoring. At every GPU stage it also waits for any older S7 watcher or scoring
+process targeting the same development run, so a handoff cannot start two
+owners on one device. A failed development selector writes an auditable `null_route.json`
 and stops. Only a passing selector can freeze the validation YAML and queue the
 44-prompt x 3-seed x 3-action confirmation run (baseline, native reference,
 selected action); after validation scoring it stops in `awaiting_review` and

@@ -326,14 +326,16 @@ find_gpu() {
 wait_existing() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     while :; do
-        # Match only the real legacy watcher or a Python generation worker.
-        # Do not search for the queue script's literal text: the ps/awk helper
-        # would then match its own command line and wait forever.
+        # Wait for every independently launched S7 stage that targets the
+        # development run.  Keep the queue's own inspection helpers out of the
+        # result: their awk source contains the same path expressions.
         pids=$(ps -eo pid=,comm=,args= | awk -v self="$$" '
           $1 == self {next}
-          $2 ~ /^python/ && $0 ~ /eval-pipeline\/generate\.py/ && $0 ~ /development_v2/ {print $1; next}
-          $2 == "bash" && $3 == "/bin/bash" && $4 == "-c" &&
-          $5 == "set" && $6 == "-u" && $7 == "while" && $0 ~ /development_v2/ {print $1}
+          $0 !~ /development_v2/ {next}
+          $0 !~ /eval-pipeline\/(generate|score|select_trajectory_correction)\.py/ {next}
+          $0 ~ /run_trajectory_correction_queue\.sh/ {next}
+          $2 ~ /^(awk|ps|rg|grep|sed)$/ {next}
+          {print $1}
         ')
         [ -z "$pids" ] && return 0
         CURRENT_STAGE=existing_process_wait
@@ -398,11 +400,12 @@ main() {
     fi
 
     if [ "$DRY_RUN" -eq 1 ] || ! manifest_complete "$DEV_RUN_DIR/scores.jsonl" "$EXPECTED_DEV_TASKS"; then
-        wait_gpu
+        wait_existing; wait_gpu
         run_stage development_scoring "$EVAL_PYTHON" "$ROOT/eval-pipeline/score.py" \
           --run_dir "$DEV_RUN_DIR" --device "$GPU" --strict || return $?
     fi
     if [ "$DRY_RUN" -eq 1 ] || [ ! -f "$DEV_RUN_DIR/trajectory_correction_selection.json" ]; then
+        wait_existing
         run_stage development_selection "$EVAL_PYTHON" "$ROOT/eval-pipeline/select_trajectory_correction.py" \
           --run_dir "$DEV_RUN_DIR" --actions "$DEV_ACTIONS" || return $?
     fi
@@ -444,7 +447,7 @@ main() {
         write_null_route incomplete_validation_manifest 1; return 1
     fi
     if [ ! -f "$VAL_RUN_DIR/scores.jsonl" ] || ! manifest_complete "$VAL_RUN_DIR/scores.jsonl" "$EXPECTED_VAL_TASKS"; then
-        wait_gpu
+        wait_existing; wait_gpu
         run_stage validation_scoring "$EVAL_PYTHON" "$ROOT/eval-pipeline/score.py" \
           --run_dir "$VAL_RUN_DIR" --device "$GPU" --strict || return $?
     fi
