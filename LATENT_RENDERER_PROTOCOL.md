@@ -152,3 +152,10 @@ direction to the sole train winner and emits one executable validation YAML.
 It refuses `no_ag`, altered candidates, changed selection statistics, or seed
 drift. Validation is confirmation, not a second search: none of its four
 actions may be tuned or dropped after scores are observed.
+
+Every completed train, validation, or test run must first pass
+`eval-pipeline/audit_latent_renderer_run.py`. The audit requires the exact
+prompt x seed x action product, one device and a full randomized execution-rank
+set per block, valid distinct RGB PNGs, complete finite strict scores, and all
+registered renderer moment/trust bounds. Its report contains hashes and maxima
+but no action ranking, so running it does not reveal the held-out endpoint.

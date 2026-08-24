@@ -230,6 +230,23 @@ validation run. It also rejects any seed, coefficient, provider, action-set, or
 input-hash drift from the registered YAML. A `no_ag` result closes LR-1 without
 a post-hoc search.
 
+Before selection, run the result-blind integrity audit on the complete scored
+design:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/audit_latent_renderer_run.py \
+  --run_dir outputs/latent_renderer/lr1_fixed_train_searchseeds_v2 \
+  --prompts eval-pipeline/prompts/latent_renderer_train.csv \
+  --source_actions eval-pipeline/configs/latent_renderer_fixed_lr1.yaml \
+  --split_role train_search
+```
+
+It rejects missing/extra cells, duplicate IDs, cross-device blocks, malformed
+PNGs, identical action images, missing or non-finite strict scores, stale
+diagnostics, and moment/trust violations. `run_audit.json` contains only
+integrity summaries and hashes, never action-quality rankings.
+
 If and only if a non-baseline action is selected, freeze the sole validation
 configuration and its preregistered controls:
 
@@ -269,6 +286,7 @@ compare_actions.py       paired inference and multiplicity correction
 analyze_adaptivity.py    leave-one-seed-out action-selection headroom
 select_fixed_action.py   frozen train-only LR-1 action selection
 freeze_latent_renderer_validation.py  one-shot validation config freezer
+audit_latent_renderer_run.py  result-blind design and numerical audit
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

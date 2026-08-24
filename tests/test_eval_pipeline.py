@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
+from PIL import Image
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -38,6 +39,9 @@ select_fixed_action = load_module(
 freeze_validation = load_module(
     "freeze_latent_renderer_validation",
     "eval-pipeline/freeze_latent_renderer_validation.py",
+)
+audit_renderer_run = load_module(
+    "audit_latent_renderer_run", "eval-pipeline/audit_latent_renderer_run.py"
 )
 
 
@@ -76,6 +80,110 @@ class EvalPipelineTest(unittest.TestCase):
             },
         }
         return source, template, selection
+
+    @staticmethod
+    def _write_renderer_audit_fixture(root, *, duplicate_images=False):
+        root = pathlib.Path(root)
+        run_dir = root / "run"
+        image_dir = run_dir / "images"
+        image_dir.mkdir(parents=True)
+        provider = {
+            "feature_block": "up_blocks.0",
+            "semantic_layer": "test.attn1",
+            "semantic_mode": "reciprocal_semantic",
+            "semantic_topk": 16,
+            "permutation_seed": 1729,
+            "prompt_dim": 0,
+            "state_dim": 0,
+        }
+        source = {
+            "schema": "latent_renderer_actions_v1",
+            "experiment_id": "fixture",
+            "split_seeds": {"train_search": [7]},
+            "latent_renderer_provider": provider,
+            "frequency_band_cutoffs": [0.08, 0.25],
+            "actions": [
+                {"id": "no_ag", "type": "none"},
+                {
+                    "id": "semantic_pos",
+                    "type": "latent_renderer_fixed",
+                    "coefficients": [0.08, 0.0, 0.0, 0.0, 0.0, 0.0],
+                },
+            ],
+        }
+        source_path = root / "actions.yaml"
+        source_path.write_text(yaml.safe_dump(source, sort_keys=False))
+        prompts_path = root / "prompts.csv"
+        pd.DataFrame(
+            [{"index": 0, "TEXT": "a test prompt", "split": "train"}]
+        ).to_csv(prompts_path, index=False)
+        configured_actions = [
+            {"id": "no_ag", "type": "none"},
+            {
+                "id": "semantic_pos",
+                "type": "latent_renderer_fixed",
+                "coefficients": [0.08, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "latent_renderer_provider": provider,
+                "max_update_ratio": 0.05,
+            },
+        ]
+        (run_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "resolution": 8,
+                    "split_role": "train_search",
+                    "seeds": [7],
+                    "actions": configured_actions,
+                    "frequency_band_cutoffs": [0.08, 0.25],
+                }
+            )
+        )
+        manifest = []
+        scores = []
+        for rank, action in enumerate(configured_actions):
+            action_id = action["id"]
+            row_id = f"p0_seed7_a{action_id}"
+            color = (10, 20, 30) if rank == 0 or duplicate_images else (30, 20, 10)
+            image_path = image_dir / f"{row_id}.png"
+            Image.new("RGB", (8, 8), color=color).save(image_path)
+            diagnostics = None
+            provider_diagnostics = None
+            if action["type"] == "latent_renderer_fixed":
+                diagnostics = {
+                    "update_ratio": [0.01],
+                    "mean_error": [0.0],
+                    "variance_error": [0.0],
+                }
+                provider_diagnostics = {
+                    "semantic_entropy": [0.5],
+                    "basis_rms": [0.25],
+                }
+            manifest.append(
+                {
+                    "id": row_id,
+                    "prompt_index": 0,
+                    "prompt": "a test prompt",
+                    "seed": 7,
+                    "action_id": action_id,
+                    "action_type": action["type"],
+                    "action": action,
+                    "execution_rank": rank,
+                    "image_path": f"images/{row_id}.png",
+                    "device": "cuda:1",
+                    "latent_renderer_diagnostics": diagnostics,
+                    "latent_renderer_provider_diagnostics": provider_diagnostics,
+                }
+            )
+            score = {"id": row_id}
+            score.update({key: 0.1 for key in audit_renderer_run.DEFAULT_SCORE_KEYS})
+            scores.append(score)
+        (run_dir / "manifest.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in manifest)
+        )
+        (run_dir / "scores.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in scores)
+        )
+        return run_dir, prompts_path, source_path
 
     def test_fixed_action_selector_rejects_final_seed_leakage(self):
         prompts = pd.DataFrame(
@@ -259,6 +367,35 @@ class EvalPipelineTest(unittest.TestCase):
                     freeze_validation.freeze_validation_config(
                         changed, source, template
                     )
+
+    def test_latent_renderer_run_audit_accepts_complete_safe_design(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                temp_dir
+            )
+            report = audit_renderer_run.audit_run(
+                run_dir,
+                prompts_path,
+                source_path,
+                split_role="train_search",
+            )
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["records"], 2)
+        self.assertEqual(report["blocks"], 1)
+        self.assertAlmostEqual(report["max_update_ratio"], 0.01)
+
+    def test_latent_renderer_run_audit_rejects_duplicate_action_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                temp_dir, duplicate_images=True
+            )
+            with self.assertRaisesRegex(ValueError, "identical PNG hashes"):
+                audit_renderer_run.audit_run(
+                    run_dir,
+                    prompts_path,
+                    source_path,
+                    split_role="train_search",
+                )
 
     def test_frequency_action_config_and_task_metadata(self):
         actions, cutoffs = generate.load_actions(
