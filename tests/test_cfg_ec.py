@@ -4,7 +4,12 @@ from unittest import mock
 
 import torch
 
-from AttentionGuidance.cfg_ec import CFGECConfig, correct_cfg_prediction
+from AttentionGuidance.cfg_ec import (
+    CFGECConfig,
+    CFGECDiagnostics,
+    correct_cfg_prediction,
+    correct_cfg_prediction_sigma,
+)
 
 
 class CFGECProxyTest(unittest.TestCase):
@@ -80,6 +85,32 @@ class CFGECProxyTest(unittest.TestCase):
         self.assertEqual(diagnostics.applied_rows, (True,))
         self.assertFalse(torch.equal(output, baseline))
         self._assert_record_finite(diagnostics.to_record())
+
+    def test_cfg_config_preserves_legacy_positional_order(self):
+        # Before the sigma variant, positional arguments four through six
+        # were allow_normalized_time_proxy, time_tolerance, and
+        # projection_epsilon.  New guards must remain trailing fields.
+        legacy = CFGECConfig(2.0, 0.99, 1.0, True, 0.25, 1e-7)
+        self.assertTrue(legacy.allow_normalized_time_proxy)
+        self.assertEqual(legacy.time_tolerance, 0.25)
+        self.assertEqual(legacy.projection_epsilon, 1e-7)
+        self.assertEqual(legacy.max_extrapolation_ratio, 4.0)
+        self.assertEqual(legacy.relative_time_tolerance, 1e-6)
+
+    def test_diagnostics_preserve_pre_sigma_positional_order(self):
+        legacy = CFGECDiagnostics(
+            False,
+            (False,),
+            (False,),
+            (0.0,),
+            (0.0,),
+            (0.0,),
+            0.0,
+            (0.0,),
+            "no_history",
+        )
+        self.assertEqual(legacy.negative_alignment_rows, (False,))
+        self.assertEqual(legacy.extrapolation_ratio, 1.0)
 
     def test_b2_rows_are_independent(self):
         batched, batched_diag = correct_cfg_prediction(
@@ -246,6 +277,196 @@ class CFGECProxyTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output).all())
         self.assertAlmostEqual(diagnostics.time_delta, -0.5)
 
+    def test_sigma_equal_spacing_degenerates_to_normalized_proxy(self):
+        sigma_output, sigma_diag = correct_cfg_prediction_sigma(
+            self.current_u,
+            self.current_c,
+            self.previous_u,
+            self.previous_c,
+            previous_sigma=2.0,
+            current_sigma=1.0,
+            next_sigma=0.0,
+            config=self.config,
+        )
+        normalized_output, normalized_diag = correct_cfg_prediction(
+            self.current_u,
+            self.current_c,
+            self.previous_u,
+            self.previous_c,
+            current_time=0.0,
+            previous_time=1.0,
+            config=self.config,
+        )
+        torch.testing.assert_close(sigma_output, normalized_output)
+        self.assertEqual(sigma_diag.extrapolation_ratio, 1.0)
+        self.assertEqual(normalized_diag.extrapolation_ratio, 1.0)
+        self.assertEqual(sigma_diag.applied_rows, normalized_diag.applied_rows)
+        self._assert_record_finite(sigma_diag.to_record())
+
+    def test_sigma_nonuniform_horizon_matches_synthetic_linear_trajectory(self):
+        # For a linear prediction p(sigma), the registered ratio recovers the
+        # exact prediction at next_sigma even when the gaps are unequal.
+        previous_sigma, current_sigma, next_sigma = 3.0, 2.0, 0.5
+        previous_u = torch.tensor([[[[3.0, 2.5]]]])
+        current_u = torch.tensor([[[[2.0, 2.0]]]])
+        previous_c = torch.tensor([[[[7.0, 1.0]]]])
+        current_c = torch.tensor([[[[5.0, 1.0]]]])
+        expected_proxy_u = torch.tensor([[[[0.5, 1.25]]]])
+        expected_proxy_c = torch.tensor([[[[2.0, 1.0]]]])
+        ratio = (current_sigma - next_sigma) / (previous_sigma - current_sigma)
+        self.assertEqual(ratio, 1.5)
+
+        sigma_output, sigma_diag = correct_cfg_prediction_sigma(
+            current_u,
+            current_c,
+            previous_u,
+            previous_c,
+            previous_sigma=previous_sigma,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            config=self.config,
+        )
+
+        # Feed the same extrapolated proxies through the unit-step API by
+        # constructing the equivalent synthetic previous pair.
+        synthetic_previous_u = 2.0 * current_u - expected_proxy_u
+        synthetic_previous_c = 2.0 * current_c - expected_proxy_c
+        reference_output, reference_diag = correct_cfg_prediction(
+            current_u,
+            current_c,
+            synthetic_previous_u,
+            synthetic_previous_c,
+            current_time=0.0,
+            previous_time=1.0,
+            config=self.config,
+        )
+        torch.testing.assert_close(sigma_output, reference_output)
+        self.assertAlmostEqual(sigma_diag.extrapolation_ratio, ratio)
+        self.assertAlmostEqual(
+            sigma_diag.alignment_cosine[0], reference_diag.alignment_cosine[0], places=6
+        )
+        self.assertEqual(sigma_diag.applied_rows, (True,))
+        self.assertTrue(torch.isfinite(sigma_output).all())
+
+    def test_sigma_batch_rows_are_independent(self):
+        batched, batched_diag = correct_cfg_prediction_sigma(
+            self.current_u,
+            self.current_c,
+            self.previous_u,
+            self.previous_c,
+            previous_sigma=3.0,
+            current_sigma=2.0,
+            next_sigma=0.5,
+            config=self.config,
+        )
+        for row in range(2):
+            single, single_diag = correct_cfg_prediction_sigma(
+                self.current_u[row : row + 1],
+                self.current_c[row : row + 1],
+                self.previous_u[row : row + 1],
+                self.previous_c[row : row + 1],
+                previous_sigma=3.0,
+                current_sigma=2.0,
+                next_sigma=0.5,
+                config=self.config,
+            )
+            torch.testing.assert_close(batched[row : row + 1], single)
+            self.assertEqual(batched_diag.applied_rows[row], single_diag.applied_rows[0])
+            self.assertAlmostEqual(
+                batched_diag.extrapolation_ratio, single_diag.extrapolation_ratio
+            )
+
+    def test_sigma_boundaries_and_nonfinite_values_are_rejected(self):
+        kwargs = dict(
+            current_unconditional=self.current_u[:1],
+            current_conditional=self.current_c[:1],
+            previous_unconditional=self.previous_u[:1],
+            previous_conditional=self.previous_c[:1],
+            config=self.config,
+        )
+        invalid_triplets = (
+            (1.0, 2.0, 0.0),  # previous is not greater than current
+            (2.0, 1.0, 1.0),  # zero next gap
+            (2.0, 1.0, 1.1),  # next is greater than current
+            (-1.0, 0.5, 0.0),  # negative sigma
+            (float("nan"), 1.0, 0.0),
+            (2.0, float("inf"), 0.0),
+            (2.0, 1.0, 0.999999),  # absolute + relative gap tolerance
+        )
+        for previous_sigma, current_sigma, next_sigma in invalid_triplets:
+            with self.subTest(
+                sigmas=(previous_sigma, current_sigma, next_sigma)
+            ):
+                with self.assertRaises(ValueError):
+                    correct_cfg_prediction_sigma(
+                        **kwargs,
+                        previous_sigma=previous_sigma,
+                        current_sigma=current_sigma,
+                        next_sigma=next_sigma,
+                    )
+
+        relative_guard = CFGECConfig(
+            2.0,
+            0.99,
+            1.0,
+            relative_time_tolerance=0.1,
+            time_tolerance=0.0,
+        )
+        with self.assertRaises(ValueError):
+            correct_cfg_prediction_sigma(
+                **{**kwargs, "config": relative_guard},
+                previous_sigma=1.0,
+                current_sigma=0.95,
+                next_sigma=0.9,
+            )
+
+        ratio_guard = CFGECConfig(2.0, 0.99, 1.0, max_extrapolation_ratio=1.0)
+        with self.assertRaisesRegex(ValueError, "max_extrapolation_ratio"):
+            correct_cfg_prediction_sigma(
+                **{**kwargs, "config": ratio_guard},
+                previous_sigma=3.0,
+                current_sigma=2.0,
+                next_sigma=0.5,
+            )
+
+        with self.assertRaises(ValueError):
+            CFGECConfig(2.0, 0.99, 1.0, max_extrapolation_ratio=0.0)
+        with self.assertRaises(ValueError):
+            CFGECConfig(2.0, 0.99, 1.0, max_extrapolation_ratio=0.5)
+        with self.assertRaises(ValueError):
+            CFGECConfig(2.0, 0.99, 1.0, relative_time_tolerance=-1.0)
+
+    def test_sigma_no_history_and_zero_blend_skip_sigma_validation(self):
+        baseline = self._ordinary_cfg(self.current_u[:1], self.current_c[:1])
+        no_history_output, no_history_diag = correct_cfg_prediction_sigma(
+            self.current_u[:1],
+            self.current_c[:1],
+            None,
+            None,
+            previous_sigma=None,
+            current_sigma=None,
+            next_sigma=None,
+            config=self.config,
+        )
+        torch.testing.assert_close(no_history_output, baseline)
+        self.assertFalse(no_history_diag.history_valid)
+        self.assertEqual(no_history_diag.extrapolation_ratio, 0.0)
+
+        zero_config = CFGECConfig(2.0, 0.99, 0.0)
+        zero_output, zero_diag = correct_cfg_prediction_sigma(
+            self.current_u[:1],
+            self.current_c[:1],
+            self.previous_u[:1],
+            self.previous_c[:1],
+            previous_sigma=float("nan"),
+            current_sigma=2.0,
+            next_sigma=1.0,
+            config=zero_config,
+        )
+        torch.testing.assert_close(zero_output, baseline)
+        self.assertFalse(zero_diag.history_valid)
+        self.assertEqual(zero_diag.extrapolation_ratio, 0.0)
+
     def test_negative_proxy_alignment_is_skipped_and_reported(self):
         # A and B point in opposite directions.  Applying the paper's raw
         # negative cosine mix would extrapolate; the registered smoke policy
@@ -394,6 +615,7 @@ class CFGECProxyTest(unittest.TestCase):
         self.assertEqual(len(record["alignment_cosine"]), 2)
         self.assertEqual(len(record["correction_norm_ratio"]), 2)
         self.assertEqual(len(record["effective_blend"]), 2)
+        self.assertEqual(record["extrapolation_ratio"], 1.0)
         self._assert_record_finite(record)
         self.assertTrue(torch.isfinite(output).all())
 
