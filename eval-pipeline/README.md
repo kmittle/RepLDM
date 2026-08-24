@@ -226,7 +226,36 @@ After strict scoring, apply the frozen train-only proxy rule mechanically:
 The selector uses paired HPSv2 means, CLIP/pixel guards, finite renderer
 diagnostics, and the recorded YAML order. It never reads TOPIQ-NR or any test
 row; `fixed_action_selection.json` is the only action authorization for the
-validation run. A `no_ag` result closes LR-1 without a post-hoc search.
+validation run. It also rejects any seed, coefficient, provider, action-set, or
+input-hash drift from the registered YAML. A `no_ag` result closes LR-1 without
+a post-hoc search.
+
+If and only if a non-baseline action is selected, freeze the sole validation
+configuration and its preregistered controls:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/freeze_latent_renderer_validation.py \
+  --selection outputs/latent_renderer/lr1_fixed_train_searchseeds_v2/fixed_action_selection.json \
+  --output eval-pipeline/configs/latent_renderer_validation_lr1.yaml
+```
+
+The freezer rejects changed selection metrics, thresholds, resampling counts,
+seeds, or candidate sets. It emits `no_ag`, the one train winner, the frozen
+conference expert, and a preregistered Rademacher direction matched to the
+winner's coefficient L2 norm. Generate validation exactly once with:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1,2,3,4 \
+  --prompts eval-pipeline/prompts/latent_renderer_validation.csv \
+  --out_dir outputs/latent_renderer/lr1_fixed_validation_v1 \
+  --actions eval-pipeline/configs/latent_renderer_validation_lr1.yaml \
+  --split_role validation_confirmation --seeds 11,29,101
+```
+
+Do not create the emitted YAML when selection returns `no_ag`, and do not run
+the final-test split unless every registered validation gate passes.
 
 ## Layout
 
@@ -239,6 +268,7 @@ score.py                 additive scoring runner
 compare_actions.py       paired inference and multiplicity correction
 analyze_adaptivity.py    leave-one-seed-out action-selection headroom
 select_fixed_action.py   frozen train-only LR-1 action selection
+freeze_latent_renderer_validation.py  one-shot validation config freezer
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

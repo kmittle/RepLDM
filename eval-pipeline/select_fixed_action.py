@@ -8,6 +8,7 @@ action.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from compare_actions import crossed_bootstrap_ci, validate_pairing
 
@@ -24,6 +26,14 @@ DEFAULT_CLIP_MAX = 0.001
 DEFAULT_SATURATION_MAX = 0.005
 DEFAULT_MEAN_ERROR_MAX = 1e-4
 DEFAULT_VARIANCE_ERROR_MAX = 1e-3
+
+
+def sha256_file(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -56,6 +66,83 @@ def validate_train_design(
         raise ValueError(
             f"train selection contains final-test seeds {leaked}; regenerate with search-only seeds"
         )
+
+
+def validate_registered_train_run(
+    frame: pd.DataFrame,
+    run_config: Dict[str, Any],
+    source: Dict[str, Any],
+    *,
+    split_role: str = "train_search",
+) -> Dict[str, Any]:
+    """Verify that selection uses the complete preregistered action/seed grid."""
+    if split_role != "train_search":
+        raise ValueError("fixed-action selection is authorized only for train_search")
+    split_seeds = source.get("split_seeds")
+    if not isinstance(split_seeds, dict) or split_role not in split_seeds:
+        raise ValueError("source YAML does not register train_search seeds")
+    expected_seeds = [int(value) for value in split_seeds[split_role]]
+    configured_seeds = [int(value) for value in run_config.get("seeds", [])]
+    observed_seeds = sorted(set(int(value) for value in frame["seed"]))
+    if configured_seeds != expected_seeds or observed_seeds != sorted(expected_seeds):
+        raise ValueError(
+            "run must use exactly the registered train_search seeds "
+            f"{expected_seeds}; configured={configured_seeds}, observed={observed_seeds}"
+        )
+
+    source_actions = source.get("actions")
+    run_actions = run_config.get("actions")
+    if not isinstance(source_actions, list) or not source_actions:
+        raise ValueError("source YAML must contain registered actions")
+    if not isinstance(run_actions, list) or not run_actions:
+        raise ValueError("run config must contain generated actions")
+    source_ids = [str(action.get("id", "")) for action in source_actions]
+    run_ids = [str(action.get("id", "")) for action in run_actions]
+    if len(source_ids) != len(set(source_ids)) or not all(source_ids):
+        raise ValueError("source YAML contains empty or duplicate action ids")
+    if run_ids != source_ids:
+        raise ValueError("run action order/set differs from the registered source YAML")
+    observed_ids = set(map(str, frame["action_id"]))
+    if observed_ids != set(source_ids):
+        raise ValueError("manifest action set differs from the registered source YAML")
+
+    provider_defaults = dict(source.get("latent_renderer_provider", {}) or {})
+    for registered, generated in zip(source_actions, run_actions):
+        action_id = str(registered["id"])
+        if generated.get("type") != registered.get("type"):
+            raise ValueError(f"{action_id}: generated action type differs from registration")
+        if registered.get("type") != "latent_renderer_fixed":
+            continue
+        registered_coefficients = [float(value) for value in registered.get("coefficients", [])]
+        generated_coefficients = [float(value) for value in generated.get("coefficients", [])]
+        if generated_coefficients != registered_coefficients:
+            raise ValueError(f"{action_id}: generated coefficients differ from registration")
+        expected_provider = dict(provider_defaults)
+        expected_provider.update(registered.get("provider", {}) or {})
+        generated_provider = generated.get("latent_renderer_provider", {}) or {}
+        for key, value in expected_provider.items():
+            if generated_provider.get(key) != value:
+                raise ValueError(
+                    f"{action_id}: generated provider field {key!r} differs from registration"
+                )
+
+    expected_cutoffs = [float(value) for value in source.get("frequency_band_cutoffs", [])]
+    configured_cutoffs = [float(value) for value in run_config.get("frequency_band_cutoffs", [])]
+    if configured_cutoffs != expected_cutoffs:
+        raise ValueError("run frequency-band cutoffs differ from registration")
+    candidate_actions = [
+        str(action["id"])
+        for action in source_actions
+        if action.get("type") == "latent_renderer_fixed"
+    ]
+    return {
+        "source_schema": str(source.get("schema", "")),
+        "source_experiment_id": str(source.get("experiment_id", "")),
+        "split_role": split_role,
+        "seeds": expected_seeds,
+        "action_ids": source_ids,
+        "candidate_actions": candidate_actions,
+    }
 
 
 def _action_order(run_dir: str, frame: pd.DataFrame) -> List[str]:
@@ -237,13 +324,11 @@ def main() -> None:
     parser.add_argument("--run_dir", required=True)
     parser.add_argument("--prompts", required=True, help="train-split CSV; never pass test here")
     parser.add_argument("--baseline", default="no_ag")
-    parser.add_argument("--candidates", default="", help="comma-separated fixed candidates")
     parser.add_argument("--bootstrap", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument(
-        "--forbidden_seeds",
-        default="0,42,123",
-        help="comma-separated final-test seeds that must not occur in train selection",
+        "--source_actions",
+        default="eval-pipeline/configs/latent_renderer_fixed_lr1.yaml",
     )
     args = parser.parse_args()
 
@@ -258,23 +343,46 @@ def main() -> None:
     frame = frame.merge(scores[score_columns], on="id", how="inner")
     if len(frame) != len(manifest[manifest["prompt_index"].isin(prompt_ids)]):
         raise ValueError("scores are incomplete for the requested split")
-    forbidden_seeds = [
-        int(value) for value in args.forbidden_seeds.split(",") if value
-    ]
+    with open(args.source_actions) as handle:
+        source = yaml.safe_load(handle) or {}
+    forbidden_seeds = [int(value) for value in source.get("split_seeds", {}).get("test_final", [])]
     validate_train_design(prompts, frame, forbidden_seeds)
     config_path = os.path.join(args.run_dir, "config.json")
-    action_order = None
-    if os.path.exists(config_path):
-        with open(config_path) as handle:
-            action_order = [str(action["id"]) for action in json.load(handle).get("actions", [])]
+    if not os.path.exists(config_path):
+        raise ValueError("run config.json is required for registered action selection")
+    with open(config_path) as handle:
+        run_config = json.load(handle)
+    registration = validate_registered_train_run(frame, run_config, source)
+    recorded_prompts = run_config.get("prompts_csv")
+    if recorded_prompts and os.path.realpath(recorded_prompts) != os.path.realpath(args.prompts):
+        raise ValueError("run config prompts_csv differs from --prompts")
+    recorded_action_hash = run_config.get("actions_sha256")
+    source_hash = sha256_file(args.source_actions)
+    if recorded_action_hash is not None and recorded_action_hash != source_hash:
+        raise ValueError("run config action YAML hash differs from --source_actions")
+    recorded_prompt_hash = run_config.get("prompts_sha256")
+    prompt_hash = sha256_file(args.prompts)
+    if recorded_prompt_hash is not None and recorded_prompt_hash != prompt_hash:
+        raise ValueError("run config prompt CSV hash differs from --prompts")
     result = select_fixed_action(
         frame,
-        action_order=action_order,
+        action_order=registration["action_ids"],
         baseline=args.baseline,
-        candidates=[value for value in args.candidates.split(",") if value] or None,
+        candidates=registration["candidate_actions"],
         bootstrap=args.bootstrap,
         seed=args.seed,
     )
+    result["registration"] = registration
+    result["provenance"] = {
+        "run_config_path": os.path.abspath(config_path),
+        "run_config_sha256": sha256_file(config_path),
+        "manifest_sha256": sha256_file(os.path.join(args.run_dir, "manifest.jsonl")),
+        "scores_sha256": sha256_file(os.path.join(args.run_dir, "scores.jsonl")),
+        "prompts_path": os.path.abspath(args.prompts),
+        "prompts_sha256": prompt_hash,
+        "source_actions_path": os.path.abspath(args.source_actions),
+        "source_actions_sha256": source_hash,
+    }
     output_path = os.path.join(args.run_dir, "fixed_action_selection.json")
     with open(output_path, "w") as handle:
         json.dump(result, handle, indent=2)

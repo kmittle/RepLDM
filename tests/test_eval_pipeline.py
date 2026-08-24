@@ -1,5 +1,7 @@
+import copy
 import json
 import importlib.util
+import math
 import pathlib
 import sys
 import tempfile
@@ -8,6 +10,7 @@ import unittest
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -32,9 +35,48 @@ analyze_adaptivity = load_module(
 select_fixed_action = load_module(
     "select_fixed_action", "eval-pipeline/select_fixed_action.py"
 )
+freeze_validation = load_module(
+    "freeze_latent_renderer_validation",
+    "eval-pipeline/freeze_latent_renderer_validation.py",
+)
 
 
 class EvalPipelineTest(unittest.TestCase):
+    @staticmethod
+    def _registered_validation_inputs():
+        with open(ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml") as handle:
+            source = yaml.safe_load(handle)
+        with open(
+            ROOT / "eval-pipeline/configs/latent_renderer_validation_template.yaml"
+        ) as handle:
+            template = yaml.safe_load(handle)
+        action_ids = [action["id"] for action in source["actions"]]
+        candidates = [
+            action["id"]
+            for action in source["actions"]
+            if action["type"] == "latent_renderer_fixed"
+        ]
+        requirements = template["train_selection_requirements"]
+        selection = {
+            "selected_action": "spectral_low_pos",
+            "baseline": requirements["baseline"],
+            "candidate_actions": candidates,
+            "selection_metric": requirements["selection_metric"],
+            "topiq_used_for_selection": requirements["topiq_used_for_selection"],
+            "constraints": requirements["constraints"],
+            "bootstrap": requirements["bootstrap"],
+            "seed": requirements["seed"],
+            "registration": {
+                "source_schema": source["schema"],
+                "source_experiment_id": source["experiment_id"],
+                "split_role": requirements["split_role"],
+                "seeds": source["split_seeds"][requirements["split_role"]],
+                "action_ids": action_ids,
+                "candidate_actions": candidates,
+            },
+        }
+        return source, template, selection
+
     def test_fixed_action_selector_rejects_final_seed_leakage(self):
         prompts = pd.DataFrame(
             [{"index": 0, "TEXT": "train prompt", "split": "train"}]
@@ -118,6 +160,106 @@ class EvalPipelineTest(unittest.TestCase):
         )
         self.assertEqual(result["selected_action"], "no_ag")
 
+    def test_registered_train_run_requires_exact_seeds_actions_and_coefficients(self):
+        source, _, _ = self._registered_validation_inputs()
+        run_actions = []
+        for registered in source["actions"]:
+            generated = copy.deepcopy(registered)
+            if generated["type"] == "latent_renderer_fixed":
+                generated["latent_renderer_provider"] = copy.deepcopy(
+                    source["latent_renderer_provider"]
+                )
+            run_actions.append(generated)
+        run_config = {
+            "seeds": source["split_seeds"]["train_search"],
+            "actions": run_actions,
+            "frequency_band_cutoffs": source["frequency_band_cutoffs"],
+        }
+        frame = pd.DataFrame(
+            [
+                {"seed": seed, "action_id": action["id"]}
+                for seed in source["split_seeds"]["train_search"]
+                for action in source["actions"]
+            ]
+        )
+        registration = select_fixed_action.validate_registered_train_run(
+            frame, run_config, source
+        )
+        self.assertEqual(registration["split_role"], "train_search")
+        self.assertEqual(
+            registration["action_ids"], [action["id"] for action in source["actions"]]
+        )
+
+        wrong_seeds = copy.deepcopy(run_config)
+        wrong_seeds["seeds"] = [8, 20, 74]
+        with self.assertRaisesRegex(ValueError, "exactly the registered"):
+            select_fixed_action.validate_registered_train_run(frame, wrong_seeds, source)
+
+        wrong_coefficient = copy.deepcopy(run_config)
+        wrong_coefficient["actions"][1]["coefficients"][0] = 0.09
+        with self.assertRaisesRegex(ValueError, "coefficients differ"):
+            select_fixed_action.validate_registered_train_run(
+                frame, wrong_coefficient, source
+            )
+
+    def test_validation_freezer_matches_random_control_norm(self):
+        source, template, selection = self._registered_validation_inputs()
+        frozen = freeze_validation.freeze_validation_config(
+            selection, source, template
+        )
+        self.assertEqual(
+            [action["id"] for action in frozen["actions"]],
+            ["no_ag", "spectral_low_pos", "conference_expert", "matched_random"],
+        )
+        selected_norm = math.sqrt(
+            sum(value * value for value in frozen["actions"][1]["coefficients"])
+        )
+        random_norm = math.sqrt(
+            sum(value * value for value in frozen["actions"][3]["coefficients"])
+        )
+        self.assertAlmostEqual(selected_norm, random_norm)
+        self.assertEqual(
+            frozen["validation_requirements"]["seeds"], [11, 29, 101]
+        )
+        self.assertEqual(
+            frozen["split_seeds"], {"validation_confirmation": [11, 29, 101]}
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frozen_path = pathlib.Path(temp_dir) / "validation.yaml"
+            frozen_path.write_text(yaml.safe_dump(frozen, sort_keys=False))
+            actions, _ = generate.load_actions(frozen_path, 50)
+            self.assertEqual(len(actions), 4)
+            generate.validate_split_seed_role(
+                frozen_path, "validation_confirmation", [11, 29, 101]
+            )
+            with self.assertRaisesRegex(ValueError, "unknown --split_role"):
+                generate.validate_split_seed_role(
+                    frozen_path, "test_final", [0, 42, 123]
+                )
+
+    def test_validation_freezer_rejects_selection_protocol_drift(self):
+        source, template, selection = self._registered_validation_inputs()
+        mutations = (
+            ("TOPIQ leakage", lambda item: item.update(topiq_used_for_selection=True)),
+            ("bootstrap drift", lambda item: item.update(bootstrap=999)),
+            (
+                "seed drift",
+                lambda item: item["registration"].update(seeds=[8, 20, 74]),
+            ),
+            (
+                "candidate omission",
+                lambda item: item.update(candidate_actions=item["candidate_actions"][:-1]),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                changed = copy.deepcopy(selection)
+                mutate(changed)
+                with self.assertRaises(ValueError):
+                    freeze_validation.freeze_validation_config(
+                        changed, source, template
+                    )
+
     def test_frequency_action_config_and_task_metadata(self):
         actions, cutoffs = generate.load_actions(
             ROOT / "eval-pipeline/configs/frequency_action_pilot.yaml", 50
@@ -135,8 +277,6 @@ class EvalPipelineTest(unittest.TestCase):
 
     def test_latent_renderer_fixed_action_config(self):
         with open(ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml") as handle:
-            import yaml
-
             raw_config = yaml.safe_load(handle)
         self.assertEqual(raw_config["split_seeds"]["train_search"], [7, 19, 73])
         self.assertEqual(raw_config["split_seeds"]["test_final"], [0, 42, 123])

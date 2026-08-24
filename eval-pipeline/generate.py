@@ -396,6 +396,14 @@ def validate_split_seed_role(path: str, split_role, seeds) -> None:
         )
 
 
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -786,6 +794,11 @@ def main():
         "cache_dir": args.cache_dir, "model_name": args.model_name, "low_vram": args.low_vram,
         "frequency_band_cutoffs": band_cutoffs,
         "git_commit": git_commit(),
+        "split_role": args.split_role,
+        "prompts_csv": os.path.abspath(args.prompts),
+        "prompts_sha256": sha256_file(args.prompts),
+        "actions_yaml": os.path.abspath(args.actions) if args.actions else None,
+        "actions_sha256": sha256_file(args.actions) if args.actions else None,
         **stage_settings,
     }
 
@@ -801,8 +814,7 @@ def main():
     if todo:
         with open(os.path.join(args.out_dir, "config.json"), "w") as f:
             json.dump({**cfg, "seeds": seeds, "actions": actions,
-                       "devices": devices,
-                       "prompts_csv": os.path.abspath(args.prompts)}, f, indent=2)
+                       "devices": devices}, f, indent=2)
         tmp.set_start_method("spawn", force=True)
         manager = tmp.Manager()
         error_queue = manager.Queue()

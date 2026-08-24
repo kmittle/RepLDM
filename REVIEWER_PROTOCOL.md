@@ -14,6 +14,18 @@ z_t <- z_t + u_t
 
 `P_b` are smooth masks forming a partition of unity. The norm cap is a safety constraint, not a claimed optimization contribution.
 
+## Journal Narrative and Evidence Boundary
+
+The conference-to-journal relationship may be argued at the level of the
+problem and principle: both reprogram a frozen diffusion model through its
+native latent trajectory. The journal paper need not preserve the conference
+attention-guidance mechanism if a smaller latent renderer realizes that
+principle more effectively. Writing may clarify this intellectual continuity,
+but it may not convert a new, weakly related module into a technical extension
+or hide a failed prerequisite. The manuscript must label inherited ideas, new
+mechanisms, and new evidence separately, and every causal or superiority claim
+must map to a preregistered ablation, held-out comparison, or transfer test.
+
 ## Novelty Threat Matrix
 
 | Closest line | What it already covers | Consequence for this work |

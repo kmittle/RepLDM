@@ -1,0 +1,48 @@
+# Registration-only template. freeze_latent_renderer_validation.py converts the
+# one train-selected action into an executable validation YAML.
+schema: latent_renderer_validation_template_v1
+experiment_id: lr1_fixed_validation_v1
+source_actions: eval-pipeline/configs/latent_renderer_fixed_lr1.yaml
+selected_action_count: 1
+train_selection_requirements:
+  source_experiment_id: lr1_fixed_basis_search_v1
+  split_role: train_search
+  baseline: no_ag
+  selection_metric: hpsv2
+  topiq_used_for_selection: false
+  bootstrap: 10000
+  seed: 2026
+  constraints:
+    clip_cosine_min_delta: -0.005
+    clipped_fraction_max_delta: 0.001
+    mean_saturation_max_delta: 0.005
+    mean_error_max: 0.0001
+    variance_error_max: 0.001
+controls:
+  include_no_ag: true
+  include_conference_expert: true
+  conference_expert:
+    id: conference_expert
+    type: legacy
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+  matched_random:
+    id: matched_random
+    type: latent_renderer_fixed
+    distribution: rademacher
+    # Fixed before valid train scoring; normalized to the selected coefficient L2.
+    signs: [1, -1, 1, 1, -1, -1]
+    seed_label: 20260824
+    norm_match: selected_coefficient_l2
+validation_requirements:
+  split_role: validation_confirmation
+  seeds: [11, 29, 101]
+  primary_metric: topiq_nr
+  minimum_delta: 0.005
+  require_positive_crossed_bootstrap_ci: true
+  require_holm_p_below: 0.05
+  clip_cosine_min_delta: -0.005
+  hpsv2_min_delta: -0.003
+  clipped_fraction_max_delta: 0.001
+  mean_saturation_max_delta: 0.005

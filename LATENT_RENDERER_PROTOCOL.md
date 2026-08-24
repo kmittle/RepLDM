@@ -141,3 +141,14 @@ guard, and qualitative gates above. If no non-`no_ag` action satisfies the
 train rule, record `no_ag` and close the learned/RL path without a validation
 search. No amplitude, metric, or tie-breaker may be changed after viewing
 train scores.
+
+The registration-only validation template is
+`eval-pipeline/configs/latent_renderer_validation_template.yaml`. Before any
+valid train score is read, it fixes the validation seeds and LR-1 thresholds,
+the conference expert, and one Rademacher coefficient direction. The train
+selector must verify the complete registered action grid and exact input
+hashes. `freeze_latent_renderer_validation.py` then L2-matches the random
+direction to the sole train winner and emits one executable validation YAML.
+It refuses `no_ag`, altered candidates, changed selection statistics, or seed
+drift. Validation is confirmation, not a second search: none of its four
+actions may be tuned or dropped after scores are observed.
