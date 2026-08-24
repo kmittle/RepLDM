@@ -55,6 +55,8 @@ def _complete_metric_pivot(
     pivot = pivot.reindex(expected)
     if pivot.isna().any().any():
         raise ValueError(f"incomplete prompt x seed x action design for {metric}")
+    if not np.isfinite(pivot.to_numpy(dtype=float)).all():
+        raise ValueError(f"non-finite values found for {metric}")
     return pivot
 
 
@@ -104,6 +106,8 @@ def select_fixed_action(
     seed: int = 2026,
 ) -> Dict[str, Any]:
     """Return the one action allowed to proceed to validation."""
+    if int(bootstrap) <= 0:
+        raise ValueError("bootstrap must be positive")
     validate_pairing(frame)
     required = {"action_id", "prompt_index", "seed", "hpsv2", "clip_cosine",
                 "clipped_fraction", "mean_saturation"}
