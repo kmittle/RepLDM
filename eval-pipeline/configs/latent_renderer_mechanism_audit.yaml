@@ -34,6 +34,12 @@ renderer:
   max_update_ratio: 0.05
   preserve_moments: true
   zero_initialization: true
+  structural_provider:
+    feature_block: up_blocks.0
+    semantic_layer: up_blocks.0.attentions.0.transformer_blocks.0.attn1
+    semantic_mode: reciprocal_semantic
+    semantic_topk: 16
+    channel_reduction: deterministic_group_mean
 
 capacity_controls:
   - id: fixed_basis

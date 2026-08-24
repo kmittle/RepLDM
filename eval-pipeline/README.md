@@ -185,6 +185,36 @@ It requires the zero renderer to reproduce the no-renderer PNG exactly and a
 fixed non-zero probe to change it. The probe is deliberately not a learned
 checkpoint and its image must not enter coefficient selection or scoring.
 
+The structural-provider smoke exercises the real UNet feature path used by the
+next LR-1 implementation:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python \
+  eval-pipeline/latent_renderer_structural_smoke.py --device cuda:1
+```
+
+It captures one ordinary `up_blocks.0` backbone/skip pair and the registered
+self-attention Q/K layer, then checks the same no-op/probe hash conditions.
+This remains plumbing evidence; it is not a scored development run.
+
+The first fixed-action LR-1 search uses the frozen train split (validation is
+used only after the action is frozen):
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1,2,3,4 \
+  --prompts eval-pipeline/prompts/latent_renderer_train.csv \
+  --out_dir outputs/latent_renderer/lr1_fixed_train_v1 \
+  --actions eval-pipeline/configs/latent_renderer_fixed_lr1.yaml \
+  --seeds 0,42,123
+```
+
+`latent_renderer_fixed` emits constant six-dimensional coefficients through
+the same moment/trust-region renderer and records provider diagnostics in each
+sidecar. Do not select an action from the test split or treat this generation
+command as evidence until the registered TOPIQ-NR and non-inferiority gates
+are evaluated.
+
 ## Layout
 
 ```text

@@ -18,13 +18,21 @@ RL experiments.
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import math
-from typing import Callable, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterator, Optional, Protocol, Tuple
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+from .semantic_transport import (
+    QKCapture,
+    affinity_from_qk,
+    affinity_from_tokens,
+    infer_token_grid,
+)
 
 
 @dataclass(frozen=True)
@@ -682,4 +690,446 @@ class StructuralLatentRenderer(nn.Module):
             residual=residual,
             coefficients=coefficients,
             diagnostics=diagnostics,
+        )
+
+
+def build_fixed_coefficient_renderer(
+    coefficients,
+    *,
+    latent_channels: int = 4,
+    coefficient_bound: float = 1.0,
+    max_update_ratio: Optional[float] = 0.05,
+    preserve_moments: bool = True,
+) -> StructuralLatentRenderer:
+    """Construct a parameter-free-in-behavior renderer for basis search.
+
+    The returned module uses the same constrained geometry and diagnostics as
+    :class:`StructuralLatentRenderer`, but all policy weights are zeroed and
+    the final bias is set so every sample emits the supplied coefficients.
+    Coefficients must be strictly inside the bound so the inverse ``atanh`` is
+    finite.  Prompt/state conditioning is intentionally disabled for this
+    fixed-action control.
+    """
+    values = torch.as_tensor(coefficients, dtype=torch.float32)
+    if values.ndim != 1 or values.numel() <= 0:
+        raise ValueError("coefficients must be a non-empty one-dimensional sequence")
+    if not torch.isfinite(values).all():
+        raise ValueError("coefficients must be finite")
+    bound = float(coefficient_bound)
+    if not math.isfinite(bound) or bound <= 0:
+        raise ValueError("coefficient_bound must be finite and positive")
+    if torch.any(values.abs() >= bound):
+        raise ValueError("fixed coefficients must be strictly inside coefficient_bound")
+    renderer = StructuralLatentRenderer(
+        LatentRendererConfig(
+            num_bases=int(values.numel()),
+            latent_channels=int(latent_channels),
+            prompt_dim=0,
+            state_dim=0,
+            hidden_dim=1,
+            depth=1,
+            timestep_dim=0,
+            coefficient_bound=bound,
+            spatial_hidden_dim=0,
+            max_update_ratio=max_update_ratio,
+            preserve_moments=preserve_moments,
+        )
+    )
+    with torch.no_grad():
+        for parameter in renderer.policy.parameters():
+            parameter.zero_()
+        renderer.policy[-1].bias.copy_(torch.atanh(values / bound))
+    return renderer
+
+
+def _resolve_module_path(root: nn.Module, path: str) -> nn.Module:
+    """Resolve attributes and numeric ``ModuleList`` components explicitly."""
+    module: Any = root
+    for component in str(path).split("."):
+        if component.isdigit() and isinstance(module, (nn.ModuleList, nn.Sequential)):
+            index = int(component)
+            if index >= len(module):
+                raise AttributeError(f"module path {path!r} index {index} is out of range")
+            module = module[index]
+        elif hasattr(module, component):
+            module = getattr(module, component)
+        else:
+            raise AttributeError(
+                f"module path {path!r} missing component {component!r}"
+            )
+    if not isinstance(module, nn.Module):
+        raise TypeError(f"module path {path!r} does not resolve to a module")
+    return module
+
+
+class StructuralUNetFeatureCapture:
+    """Capture one UNet backbone/skip pair and optional self-attention Q/K.
+
+    Hooks are active only inside :meth:`capture_forward`; they observe the
+    ordinary denoiser call and detach their outputs so a provider cannot keep
+    the full UNet autograd graph alive.  SDXL's classifier-free guidance rows
+    are reduced to the positive half when the provider is queried.
+    """
+
+    def __init__(
+        self,
+        unet: nn.Module,
+        *,
+        batch_size: int,
+        do_classifier_free_guidance: bool,
+        feature_block: str = "up_blocks.0",
+        attention_layer: Optional[str] = (
+            "up_blocks.0.attentions.0.transformer_blocks.0.attn1"
+        ),
+    ) -> None:
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        self.batch_size = int(batch_size)
+        self.do_classifier_free_guidance = bool(do_classifier_free_guidance)
+        self.feature_module = _resolve_module_path(unet, feature_block)
+        self.attention_module = (
+            _resolve_module_path(unet, attention_layer)
+            if attention_layer is not None
+            else None
+        )
+        self.qk_capture = (
+            QKCapture(self.attention_module)
+            if self.attention_module is not None
+            else None
+        )
+        self.backbone: Optional[Tensor] = None
+        self.skip: Optional[Tensor] = None
+
+    @staticmethod
+    def _as_tensor(value: Any, name: str) -> Tensor:
+        if not isinstance(value, Tensor) or value.ndim != 4:
+            raise RuntimeError(f"captured {name} must be a four-dimensional tensor")
+        if not torch.isfinite(value).all():
+            raise FloatingPointError(f"captured {name} contains non-finite values")
+        return value.detach()
+
+    def _capture_feature_inputs(self, _module, args, kwargs) -> None:
+        hidden = kwargs.get("hidden_states")
+        if hidden is None and args:
+            hidden = args[0]
+        hidden = self._as_tensor(hidden, "backbone feature")
+        residuals = kwargs.get("res_hidden_states_tuple")
+        if residuals is None and len(args) > 1:
+            residuals = args[1]
+        if residuals is None:
+            raise RuntimeError("the selected UNet block did not expose skip features")
+        candidates = [
+            value
+            for value in reversed(tuple(residuals))
+            if isinstance(value, Tensor)
+            and value.ndim == 4
+            and tuple(value.shape[-2:]) == tuple(hidden.shape[-2:])
+        ]
+        if not candidates:
+            raise RuntimeError(
+                "the selected UNet block has no skip feature at the backbone resolution"
+            )
+        self.backbone = hidden
+        self.skip = self._as_tensor(candidates[0], "skip feature")
+
+    @contextmanager
+    def capture_forward(self) -> Iterator["StructuralUNetFeatureCapture"]:
+        self.backbone = None
+        self.skip = None
+        feature_handle = self.feature_module.register_forward_pre_hook(
+            self._capture_feature_inputs, with_kwargs=True
+        )
+        qk_context = (
+            self.qk_capture.forward() if self.qk_capture is not None else nullcontext()
+        )
+        try:
+            with qk_context:
+                yield self
+        finally:
+            feature_handle.remove()
+
+    def _select_cfg_rows(self, value: Tensor, name: str) -> Tensor:
+        if value.shape[0] == self.batch_size:
+            return value
+        if (
+            self.do_classifier_free_guidance
+            and value.shape[0] == 2 * self.batch_size
+        ):
+            return value[self.batch_size :]
+        raise RuntimeError(
+            f"captured {name} has batch {value.shape[0]}, expected "
+            f"{self.batch_size} or {2 * self.batch_size} with CFG"
+        )
+
+    def conditional_features(self) -> Tuple[Tensor, Tensor]:
+        if self.backbone is None or self.skip is None:
+            raise RuntimeError(
+                "no UNet structural features were captured; wrap the denoiser call "
+                "in capture_forward()"
+            )
+        return (
+            self._select_cfg_rows(self.backbone, "backbone feature"),
+            self._select_cfg_rows(self.skip, "skip feature"),
+        )
+
+    def conditional_qk(self) -> Optional[Tuple[Tensor, Tensor]]:
+        if self.qk_capture is None:
+            return None
+        query = self.qk_capture.query
+        key = self.qk_capture.key
+        if query is None or key is None:
+            raise RuntimeError(
+                "no self-attention Q/K tensors were captured; check attention_layer"
+            )
+        return (
+            self._select_cfg_rows(query, "query"),
+            self._select_cfg_rows(key, "key"),
+        )
+
+
+class StructuralUNetBasisProvider:
+    """Build the registered six latent bases from one frozen UNet forward.
+
+    The provider has no trainable parameters.  Channel reduction and prompt
+    pooling are deterministic, while the semantic graph uses the selected
+    self-attention Q/K tensors.  It is therefore suitable for fixed-action
+    LR-1 audits before introducing a learned renderer.
+    """
+
+    def __init__(
+        self,
+        unet: nn.Module,
+        *,
+        batch_size: int,
+        do_classifier_free_guidance: bool,
+        latent_channels: int = 4,
+        semantic_mode: str = "reciprocal_semantic",
+        semantic_topk: int = 16,
+        semantic_layer: Optional[str] = (
+            "up_blocks.0.attentions.0.transformer_blocks.0.attn1"
+        ),
+        feature_block: str = "up_blocks.0",
+        permutation_seed: int = 1729,
+        prompt_dim: int = 32,
+        state_dim: int = 16,
+    ) -> None:
+        if int(latent_channels) <= 0:
+            raise ValueError("latent_channels must be positive")
+        if int(semantic_topk) <= 0:
+            raise ValueError("semantic_topk must be positive")
+        if semantic_mode not in {
+            "clean_tfsa",
+            "reciprocal_latent",
+            "reciprocal_semantic",
+            "reciprocal_semantic_permuted",
+        }:
+            raise ValueError(f"unsupported semantic_mode {semantic_mode!r}")
+        if int(prompt_dim) < 0 or int(state_dim) < 0:
+            raise ValueError("prompt_dim and state_dim must be non-negative")
+        self.latent_channels = int(latent_channels)
+        self.semantic_mode = semantic_mode
+        self.semantic_topk = int(semantic_topk)
+        self.permutation_seed = int(permutation_seed)
+        self.prompt_dim = int(prompt_dim)
+        self.state_dim = int(state_dim)
+        self.capture = StructuralUNetFeatureCapture(
+            unet,
+            batch_size=batch_size,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            feature_block=feature_block,
+            attention_layer=semantic_layer,
+        )
+        self.last_diagnostics: Optional[dict] = None
+
+    def capture_forward(self) -> Iterator[StructuralUNetFeatureCapture]:
+        """Return the context manager used around the ordinary UNet call."""
+        return self.capture.capture_forward()
+
+    @staticmethod
+    def _reduce_channels(value: Tensor, channels: int) -> Tensor:
+        if value.shape[1] == channels:
+            return value
+        groups = int(math.ceil(value.shape[1] / channels))
+        padded_channels = groups * channels
+        if padded_channels != value.shape[1]:
+            value = torch.cat(
+                (
+                    value,
+                    value.new_zeros(
+                        value.shape[0],
+                        padded_channels - value.shape[1],
+                        value.shape[2],
+                        value.shape[3],
+                    ),
+                ),
+                dim=1,
+            )
+        return value.reshape(
+            value.shape[0], channels, groups, value.shape[2], value.shape[3]
+        ).mean(dim=2)
+
+    @staticmethod
+    def _normalize_feature(value: Tensor, epsilon: float = 1e-6) -> Tensor:
+        mean = value.float().mean(dim=(1, 2, 3), keepdim=True)
+        centered = value.float() - mean
+        rms = centered.square().mean(dim=(1, 2, 3), keepdim=True).sqrt()
+        return centered / rms.clamp_min(epsilon)
+
+    @staticmethod
+    def _rms(value: Tensor, epsilon: float = 1e-6) -> Tensor:
+        return _vector_norm(value).div(math.sqrt(value[0].numel())).clamp_min(epsilon)
+
+    def _prompt_features(
+        self, pooled_prompt_embeds: Optional[Tensor], batch: int, reference: Tensor
+    ) -> Optional[Tensor]:
+        if self.prompt_dim == 0:
+            if pooled_prompt_embeds is not None and pooled_prompt_embeds.numel() > 0:
+                return None
+            return reference.new_empty((batch, 0), dtype=torch.float32)
+        if pooled_prompt_embeds is None:
+            raise ValueError("pooled_prompt_embeds is required for prompt conditioning")
+        value = pooled_prompt_embeds
+        if not isinstance(value, Tensor) or value.ndim != 2:
+            raise ValueError("pooled_prompt_embeds must have shape (batch, features)")
+        if value.shape[0] not in (1, batch):
+            raise ValueError("pooled_prompt_embeds batch does not match latent batch")
+        if value.shape[0] == 1:
+            value = value.expand(batch, -1)
+        value = value.to(device=reference.device, dtype=torch.float32)
+        pooled = F.adaptive_avg_pool1d(
+            value.unsqueeze(1), self.prompt_dim
+        ).squeeze(1)
+        pooled = pooled - pooled.mean(dim=-1, keepdim=True)
+        return pooled / pooled.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
+
+    def _state_features(
+        self,
+        observation: RendererObservation,
+        x0: Tensor,
+        backbone: Tensor,
+        skip: Tensor,
+        freeu: Tensor,
+        laplacian: Tensor,
+        entropy: Tensor,
+    ) -> Optional[Tensor]:
+        if self.state_dim == 0:
+            return x0.new_empty((x0.shape[0], 0), dtype=torch.float32)
+        timestep = _coerce_batch_vector(
+            observation.normalized_timestep, x0.shape[0], "normalized_timestep"
+        ).to(device=x0.device, dtype=torch.float32)
+        raw_timestep = _coerce_batch_vector(
+            observation.timestep, x0.shape[0], "timestep"
+        ).to(device=x0.device, dtype=torch.float32)
+        x0_work = x0.float()
+        scheduler_rms = self._rms(observation.scheduler_update)
+        x0_rms = self._rms(x0)
+        spectral = _spectral_summary(x0, 1e-6)
+        confidence = (1.0 - entropy).clamp(0.0, 1.0)
+        full = torch.stack(
+            (
+                timestep,
+                (raw_timestep / 1000.0).clamp(0.0, 1.0),
+                x0_work.mean(dim=(1, 2, 3)),
+                x0_work.std(dim=(1, 2, 3), unbiased=False),
+                x0_rms,
+                scheduler_rms,
+                scheduler_rms / x0_rms,
+                entropy,
+                confidence,
+                spectral[:, 0],
+                spectral[:, 1],
+                spectral[:, 2],
+                self._rms(backbone),
+                self._rms(skip),
+                self._rms(freeu),
+                self._rms(laplacian),
+            ),
+            dim=-1,
+        )
+        if self.state_dim == full.shape[1]:
+            return full
+        return F.adaptive_avg_pool1d(full.unsqueeze(1), self.state_dim).squeeze(1)
+
+    def __call__(self, observation: RendererObservation) -> RendererCondition:
+        x0 = observation.pred_original_sample
+        _require_nchw(x0, "observation.pred_original_sample")
+        if x0.shape[1] != self.latent_channels:
+            raise ValueError(
+                f"predicted clean latent has {x0.shape[1]} channels; "
+                f"expected {self.latent_channels}"
+            )
+        if observation.scheduler_update.shape != x0.shape:
+            raise ValueError("scheduler_update must match predicted clean latent")
+        backbone, skip = self.capture.conditional_features()
+        qk = self.capture.conditional_qk()
+        if qk is None:
+            grid_height = min(x0.shape[-2], max(1, round(x0.shape[-2] / 4)))
+            grid_width = min(x0.shape[-1], max(1, round(x0.shape[-1] / 4)))
+            tokens = F.interpolate(
+                backbone.float(), size=(grid_height, grid_width), mode="area"
+            ).flatten(2).transpose(1, 2)
+            graph, entropy = affinity_from_tokens(
+                tokens,
+                mode=self.semantic_mode,
+                topk=self.semantic_topk,
+                permutation_seed=self.permutation_seed,
+            )
+        else:
+            query, key = qk
+            grid_height, grid_width = infer_token_grid(
+                query.shape[1], x0.shape[-2], x0.shape[-1]
+            )
+            graph, entropy = affinity_from_qk(
+                query,
+                key,
+                attention_module=self.capture.attention_module,
+                mode=self.semantic_mode,
+                topk=self.semantic_topk,
+                permutation_seed=self.permutation_seed,
+            )
+        semantic = build_graph_transport_basis(
+            x0, graph, grid_height, grid_width
+        )[:, 0]
+        spectral = build_spectral_bases(x0)
+        backbone_latent = self._reduce_channels(backbone, self.latent_channels)
+        skip_latent = self._reduce_channels(skip, self.latent_channels)
+        backbone_latent = self._normalize_feature(backbone_latent)
+        skip_latent = self._normalize_feature(skip_latent)
+        freeu = build_feature_difference_basis(
+            backbone_latent,
+            skip_latent,
+            tuple(x0.shape[-2:]),
+        )[:, 0]
+        laplacian = build_laplacian_basis(x0)[:, 0]
+        bases = torch.cat(
+            (semantic[:, None], spectral, freeu[:, None], laplacian[:, None]), dim=1
+        ).to(dtype=x0.dtype)
+        prompt_features = self._prompt_features(
+            observation.pooled_prompt_embeds, x0.shape[0], x0
+        )
+        state_features = self._state_features(
+            observation,
+            x0,
+            backbone_latent,
+            skip_latent,
+            freeu,
+            laplacian,
+            entropy,
+        )
+        self.last_diagnostics = {
+            "semantic_graph_mode": self.semantic_mode,
+            "semantic_graph_topk": self.semantic_topk,
+            "semantic_token_grid": [int(grid_height), int(grid_width)],
+            "semantic_entropy": entropy.detach().float().cpu().tolist(),
+            "backbone_shape": list(backbone.shape),
+            "skip_shape": list(skip.shape),
+            "basis_rms": self._rms(bases.reshape(x0.shape[0], -1, *x0.shape[1:])).detach()
+            .float()
+            .cpu()
+            .tolist(),
+        }
+        return RendererCondition(
+            bases=bases,
+            prompt_embedding=prompt_features,
+            state_features=state_features,
         )

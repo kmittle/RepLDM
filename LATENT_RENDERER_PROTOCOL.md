@@ -106,7 +106,18 @@ training result is claimed by this registration. The frozen YAML companion is
 `eval-pipeline/configs/latent_renderer_mechanism_audit.yaml`.
 
 The inference hook is exercised by
-`eval-pipeline/latent_renderer_smoke.py`. A 50-step cached-SDXL run on GPU 1
-produced valid 1024x1024 RGB images, exact no-op hash parity, and a distinct
-fixed-probe hash. This is wiring evidence only; the probe is not trained,
-scored, or used to choose any later action.
+`eval-pipeline/latent_renderer_smoke.py` (basis-construction plumbing) and
+`eval-pipeline/latent_renderer_structural_smoke.py` (the real SDXL provider).
+The structural provider captures `up_blocks.0` backbone/skip tensors and
+`up_blocks.0...attn1` Q/K from the ordinary UNet forward, deterministically
+reduces features to four latent channels, and emits the six bases in the order
+above. A cached-SDXL run at 1024x1024 produced exact no-op hash parity and a
+distinct fixed-probe hash, with finite moment/trust diagnostics. This is
+wiring evidence only; the probe is not trained, scored, or used to choose any
+later action.
+
+The first reproducible fixed-action grid is
+`eval-pipeline/configs/latent_renderer_fixed_lr1.yaml`; its coefficients are
+registered search candidates, not selected results. The generation harness
+accepts these only as `latent_renderer_fixed` actions and records the provider
+diagnostics alongside each paired sidecar.

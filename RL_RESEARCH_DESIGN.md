@@ -71,10 +71,15 @@ the legacy image-generation action loader.
 
 The inference-only pipeline hook is now explicit: a
 `RendererBasisProvider` receives one ordinary scheduler transition and returns
-`RendererCondition`. It is mutually exclusive with the old guidance paths and
-is limited to Stage 1. The 50-step cached-SDXL wiring smoke reproduced the
-no-renderer hash with the zero renderer and changed it with a fixed non-zero
-probe; this validates plumbing only, not image quality or learned behavior.
+`RendererCondition`. `StructuralUNetBasisProvider` is the first concrete
+provider. It captures `up_blocks.0` backbone/skip inputs plus
+`up_blocks.0.attentions.0.transformer_blocks.0.attn1` Q/K during that same
+forward, uses deterministic group-mean channel reduction, and emits the six
+registered bases in a fixed order. It is mutually exclusive with the old
+guidance paths and limited to Stage 1. The structural cached-SDXL smoke
+reproduces the no-renderer hash with the zero renderer and changes it with a
+fixed non-zero probe; this validates plumbing only, not image quality or
+learned behavior.
 
 At step `t`, one frozen U-Net evaluation returns noise `epsilon_t` and exposes a
 small set of decoder backbone/skip features (B_t^l,S_t^l), self-attention

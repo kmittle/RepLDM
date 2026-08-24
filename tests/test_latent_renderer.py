@@ -1,16 +1,52 @@
 import unittest
 
 import torch
+from torch import nn
 
 from AttentionGuidance import (
     LatentRendererConfig,
+    RendererObservation,
     StructuralLatentRenderer,
+    StructuralUNetBasisProvider,
+    build_fixed_coefficient_renderer,
     build_feature_difference_basis,
     build_graph_transport_basis,
     build_laplacian_basis,
     build_spectral_bases,
     inject_rendered_clean_update,
 )
+
+
+class _FakeAttention(nn.Module):
+    heads = 2
+
+    def __init__(self, channels=8):
+        super().__init__()
+        self.to_q = nn.Linear(channels, channels, bias=False)
+        self.to_k = nn.Linear(channels, channels, bias=False)
+
+    def forward(self, tokens):
+        return self.to_q(tokens), self.to_k(tokens)
+
+
+class _FakeUpBlock(nn.Module):
+    def forward(self, hidden_states, res_hidden_states_tuple=None):
+        return hidden_states + res_hidden_states_tuple[-1]
+
+
+class _FakeUNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up_blocks = nn.ModuleList([_FakeUpBlock()])
+        self.attn = _FakeAttention()
+
+    def forward(self, hidden_states, skip):
+        output = self.up_blocks[0](
+            hidden_states=hidden_states,
+            res_hidden_states_tuple=(skip,),
+        )
+        self.attn(output.flatten(2).transpose(1, 2))
+        return output
 
 
 class LatentRendererTest(unittest.TestCase):
@@ -72,6 +108,27 @@ class LatentRendererTest(unittest.TestCase):
         self.assertTrue(torch.equal(output.guided_x0, latent))
         self.assertTrue(torch.equal(output.residual, torch.zeros_like(latent)))
         self.assertTrue(torch.equal(output.coefficients, torch.zeros(2, 4)))
+
+    def test_fixed_coefficient_renderer_emits_constant_action(self):
+        latent, bases, scheduler_update = self.make_inputs()
+        coefficients = [0.1, -0.05, 0.02, 0.0]
+        renderer = build_fixed_coefficient_renderer(
+            coefficients, max_update_ratio=0.1
+        )
+        output = renderer(
+            latent,
+            bases,
+            timestep=torch.tensor([0.2, 0.8]),
+            scheduler_update=scheduler_update,
+        )
+        torch.testing.assert_close(
+            output.coefficients,
+            torch.tensor(coefficients).expand(2, -1),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        with self.assertRaises(ValueError):
+            build_fixed_coefficient_renderer([1.0, 0.0])
 
     def test_renderer_preserves_moments_and_trust_region(self):
         latent, bases, scheduler_update = self.make_inputs()
@@ -249,6 +306,63 @@ class LatentRendererTest(unittest.TestCase):
         self.assertEqual(len(record["update_ratio"]), 2)
         self.assertEqual(len(record["mean_error"]), 2)
         self.assertIsInstance(record["variance_error"][0], float)
+
+    def test_structural_provider_captures_cfg_features_and_qk(self):
+        torch.manual_seed(23)
+        unet = _FakeUNet()
+        provider = StructuralUNetBasisProvider(
+            unet,
+            batch_size=1,
+            do_classifier_free_guidance=True,
+            semantic_layer="attn",
+            feature_block="up_blocks.0",
+            prompt_dim=4,
+            state_dim=16,
+        )
+        hidden = torch.randn(2, 8, 4, 4)
+        skip = torch.randn_like(hidden)
+        with provider.capture_forward():
+            unet(hidden, skip)
+        x0 = torch.randn(1, 4, 8, 8)
+        observation = RendererObservation(
+            latents_before_step=torch.randn_like(x0),
+            pred_original_sample=x0,
+            scheduler_update=torch.randn_like(x0),
+            step_index=2,
+            timestep=torch.tensor([500.0]),
+            normalized_timestep=torch.tensor([0.5]),
+            pooled_prompt_embeds=torch.randn(1, 16),
+        )
+        condition = provider(observation)
+        self.assertEqual(condition.bases.shape, (1, 6, 4, 8, 8))
+        self.assertEqual(condition.prompt_embedding.shape, (1, 4))
+        self.assertEqual(condition.state_features.shape, (1, 16))
+        self.assertTrue(torch.isfinite(condition.bases).all())
+        self.assertTrue(torch.isfinite(condition.state_features).all())
+        self.assertEqual(provider.last_diagnostics["semantic_token_grid"], [4, 4])
+        self.assertEqual(provider.capture.backbone.shape[0], 2)
+
+    def test_structural_provider_requires_a_forward_capture(self):
+        provider = StructuralUNetBasisProvider(
+            _FakeUNet(),
+            batch_size=1,
+            do_classifier_free_guidance=False,
+            semantic_layer="attn",
+            feature_block="up_blocks.0",
+            prompt_dim=0,
+            state_dim=0,
+        )
+        x0 = torch.randn(1, 4, 8, 8)
+        observation = RendererObservation(
+            latents_before_step=torch.randn_like(x0),
+            pred_original_sample=x0,
+            scheduler_update=torch.randn_like(x0),
+            step_index=0,
+            timestep=torch.tensor([999.0]),
+            normalized_timestep=torch.tensor([0.0]),
+        )
+        with self.assertRaises(RuntimeError):
+            provider(observation)
 
 
 if __name__ == "__main__":

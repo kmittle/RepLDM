@@ -346,3 +346,18 @@ prompt/seed 运行了 `outputs/latent_renderer/wiring_smoke_50_fee18b3`。no-ren
 scheduler 注入的接线正确，不能证明质量增益，也不能用于挑选 probe。下一步
 仍必须先冻结全新的 train/validation/test prompts，比较固定基底动作与
 no-AG、随机匹配容量和 search-then-distill；LR-1 未通过前禁止 RL。
+
+在冻结 prompt manifest 后，新增 `StructuralUNetBasisProvider`：它在同一
+次 SDXL UNet forward 中捕获 `up_blocks.0` 的 backbone/skip 与注册的
+self-attention Q/K，经过确定性的 group-mean channel reduction 后生成六个
+基底。`eval-pipeline/latent_renderer_structural_smoke.py` 在 1024²、4 NFE、
+GPU 1 上验证了 no-renderer/zero-renderer 的 exact hash parity，以及固定
+probe 的差异；provider 的 semantic token grid 为 32×32，最后一步 update
+ratio 为 `0.0007790`，moment errors 小于 `1.5e-8`。这仍然只是接线和数值
+约束证据，不是 LR-1 质量结果，不能用于选择固定系数。
+
+固定动作搜索网格已登记在
+`eval-pipeline/configs/latent_renderer_fixed_lr1.yaml`。它只包含 no-AG、单
+基底正负方向和均衡正负方向，所有动作共享 provider、NFE、CFG、scheduler
+和 `0.05` trust-region；应先在 train split 选择一个动作，再在 validation
+冻结确认，test 只允许一次最终报告。该 YAML 目前没有任何分数或 RL 权重。

@@ -1148,6 +1148,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             latent_renderer.to(device)
             latent_renderer.eval()
         self._last_latent_renderer_diagnostics = None
+        self._last_latent_renderer_provider_diagnostics = None
         semantic_transport = None
         if semantic_transport_config is not None:
             if height * width > 1024**2:
@@ -1207,7 +1208,18 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
     
                     # predict the noise residual
                     added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                    with semantic_transport.capture_forward() if semantic_transport is not None else nullcontext():
+                    renderer_capture = nullcontext()
+                    if latent_renderer is not None:
+                        capture_forward = getattr(
+                            latent_renderer_basis_provider, "capture_forward", None
+                        )
+                        if capture_forward is not None:
+                            renderer_capture = capture_forward()
+                    with (
+                        semantic_transport.capture_forward()
+                        if semantic_transport is not None
+                        else nullcontext()
+                    ), renderer_capture:
                         noise_pred = self.unet(
                             latent_model_input,
                             t,
@@ -1277,6 +1289,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             rendered.guided_x0,
                         )
                         self._last_latent_renderer_diagnostics = rendered.diagnostics
+                        self._last_latent_renderer_provider_diagnostics = getattr(
+                            latent_renderer_basis_provider, "last_diagnostics", None
+                        )
 
                     # AttnFusion
                     t_index = num_timesteps - 1 - i

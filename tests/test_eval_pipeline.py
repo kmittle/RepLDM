@@ -47,6 +47,20 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual([task["action_id"] for task in groups[0]], ["no_ag", "conference_expert"])
 
+    def test_latent_renderer_fixed_action_config(self):
+        actions, cutoffs = generate.load_actions(
+            ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml", 50
+        )
+        self.assertEqual(cutoffs, [0.08, 0.25])
+        self.assertEqual(len(actions), 10)
+        fixed = next(action for action in actions if action["id"] == "semantic_pos")
+        self.assertEqual(fixed["type"], "latent_renderer_fixed")
+        self.assertEqual(fixed["coefficients"], [0.08, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(fixed["latent_renderer_provider"]["semantic_topk"], 16)
+        prompts = pd.DataFrame([{"index": 3, "TEXT": "test prompt"}])
+        tasks = generate.build_tasks(prompts, [0], actions[:2])
+        self.assertEqual(tasks[1]["action_type"], "latent_renderer_fixed")
+
     def test_moment_tangent_config_and_runtime_wiring(self):
         actions, _ = generate.load_actions(
             ROOT / "eval-pipeline/configs/moment_tangent_smoke.yaml", 50

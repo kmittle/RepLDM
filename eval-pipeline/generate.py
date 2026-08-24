@@ -54,6 +54,8 @@ from AttentionGuidance import (
     MOMENT_TANGENT_MODES,
     RESIDUAL_MODES,
     SEMANTIC_TRANSPORT_MODES,
+    StructuralUNetBasisProvider,
+    build_fixed_coefficient_renderer,
 )
 from AttentionGuidance.attention_baselines import installed_attention_baseline
 from InferencePipelines import RepLDMSDXLPipeline
@@ -199,6 +201,9 @@ def load_actions(path: str, num_inference_steps: int):
     default_topk = int(config.get("semantic_transport_topk", 16))
     if default_topk <= 0:
         raise ValueError("semantic_transport_topk must be positive")
+    provider_defaults = config.get("latent_renderer_provider", {}) or {}
+    if not isinstance(provider_defaults, dict):
+        raise ValueError("latent_renderer_provider must be a mapping")
     normalized = []
     for raw in actions:
         action = dict(raw)
@@ -216,6 +221,7 @@ def load_actions(path: str, num_inference_steps: int):
             "frequency_bands",
             "clean_transport",
             "attention_baseline",
+            "latent_renderer_fixed",
         }:
             raise ValueError(f"unsupported action type {action_type!r} for {action_id}")
 
@@ -266,6 +272,65 @@ def load_actions(path: str, num_inference_steps: int):
                 action["eta"] <= 0 or not 0 <= action["zeta"] <= 1
             ):
                 raise ValueError(f"{action_id}: invalid GAG eta/zeta")
+            action["scale"] = 0.0
+        elif action_type == "latent_renderer_fixed":
+            coefficients = [float(value) for value in action.get("coefficients", [])]
+            if len(coefficients) != 6 or not all(math.isfinite(value) for value in coefficients):
+                raise ValueError(
+                    f"{action_id}: latent_renderer_fixed requires six finite coefficients"
+                )
+            coefficient_bound = float(
+                action.get("coefficient_bound", provider_defaults.get("coefficient_bound", 1.0))
+            )
+            if not math.isfinite(coefficient_bound) or coefficient_bound <= 0:
+                raise ValueError(f"{action_id}: coefficient_bound must be positive")
+            if any(abs(value) >= coefficient_bound for value in coefficients):
+                raise ValueError(
+                    f"{action_id}: coefficients must be strictly inside coefficient_bound"
+                )
+            provider = dict(provider_defaults)
+            provider.update(action.get("provider", {}) or {})
+            semantic_mode = str(provider.get("semantic_mode", "reciprocal_semantic"))
+            if semantic_mode not in {
+                "clean_tfsa",
+                "reciprocal_latent",
+                "reciprocal_semantic",
+                "reciprocal_semantic_permuted",
+            }:
+                raise ValueError(f"{action_id}: unsupported latent renderer semantic_mode")
+            semantic_topk = int(provider.get("semantic_topk", 16))
+            if semantic_topk <= 0:
+                raise ValueError(f"{action_id}: semantic_topk must be positive")
+            prompt_dim = int(provider.get("prompt_dim", 0))
+            state_dim = int(provider.get("state_dim", 0))
+            if prompt_dim != 0 or state_dim != 0:
+                raise ValueError(
+                    f"{action_id}: fixed renderer actions require prompt_dim=state_dim=0"
+                )
+            feature_block = str(provider.get("feature_block", "up_blocks.0"))
+            semantic_layer = provider.get(
+                "semantic_layer",
+                "up_blocks.0.attentions.0.transformer_blocks.0.attn1",
+            )
+            action["coefficients"] = coefficients
+            action["coefficient_bound"] = coefficient_bound
+            action["max_update_ratio"] = float(
+                action.get("max_update_ratio", 0.05)
+            )
+            if (
+                not math.isfinite(action["max_update_ratio"])
+                or action["max_update_ratio"] < 0
+            ):
+                raise ValueError(f"{action_id}: max_update_ratio must be non-negative")
+            action["latent_renderer_provider"] = {
+                "feature_block": feature_block,
+                "semantic_layer": None if semantic_layer is None else str(semantic_layer),
+                "semantic_mode": semantic_mode,
+                "semantic_topk": semantic_topk,
+                "permutation_seed": int(provider.get("permutation_seed", 1729)),
+                "prompt_dim": prompt_dim,
+                "state_dim": state_dim,
+            }
             action["scale"] = 0.0
 
         residual_mode = str(action.get("residual_mode", "raw"))
@@ -416,6 +481,37 @@ def attention_baseline_runtime(action: dict):
     }
 
 
+def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: float):
+    """Construct one fixed LR-1 renderer/provider pair for a worker device."""
+    if action["type"] != "latent_renderer_fixed":
+        return None, None
+    renderer = build_fixed_coefficient_renderer(
+        action["coefficients"],
+        latent_channels=4,
+        coefficient_bound=action["coefficient_bound"],
+        max_update_ratio=action["max_update_ratio"],
+        preserve_moments=True,
+    ).to(device)
+    provider_config = action["latent_renderer_provider"]
+    provider = StructuralUNetBasisProvider(
+        pipe.unet,
+        batch_size=1,
+        do_classifier_free_guidance=float(
+            action.get("cfg_scale", guidance_scale)
+        ) > 1.0,
+        latent_channels=4,
+        semantic_mode=provider_config["semantic_mode"],
+        semantic_topk=provider_config["semantic_topk"],
+        semantic_layer=provider_config["semantic_layer"],
+        feature_block=provider_config["feature_block"],
+        permutation_seed=provider_config["permutation_seed"],
+        prompt_dim=provider_config["prompt_dim"],
+        state_dim=provider_config["state_dim"],
+    )
+    renderer.eval()
+    return renderer, provider
+
+
 def worker_process(cfg: dict, device: str, task_queue, error_queue):
     torch.cuda.set_device(device)
     pipe = RepLDMSDXLPipeline.from_pretrained(
@@ -426,6 +522,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
+    latent_runtime_cache = {}
     n_done = 0
     while True:
         try:
@@ -446,6 +543,17 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             )
             clean_config = clean_transport_runtime(action)
             baseline_config = attention_baseline_runtime(action)
+            if cfg["stage2_enabled"] and action["type"] == "latent_renderer_fixed":
+                raise ValueError("latent renderer is registered for Stage 1 only")
+            if action["type"] == "latent_renderer_fixed":
+                latent_renderer, latent_provider = latent_runtime_cache.get(action["id"], (None, None))
+                if latent_renderer is None:
+                    latent_renderer, latent_provider = latent_renderer_runtime(
+                        action, pipe, device, cfg["guidance_scale"]
+                    )
+                    latent_runtime_cache[action["id"]] = (latent_renderer, latent_provider)
+            else:
+                latent_renderer, latent_provider = None, None
             if cfg["stage2_enabled"] and clean_config is not None:
                 raise ValueError("clean transport is registered for Stage 1 only")
             cfg_scale = float(action.get("cfg_scale", cfg["guidance_scale"]))
@@ -481,6 +589,8 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     attn_guidance_controller=controller,
                     attn_guidance_band_cutoffs=tuple(cfg["frequency_band_cutoffs"]),
                     semantic_transport_config=clean_config,
+                    latent_renderer=latent_renderer,
+                    latent_renderer_basis_provider=latent_provider,
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
@@ -491,6 +601,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
             renderer_diagnostics = getattr(
                 pipe, "_last_latent_renderer_diagnostics", None
+            )
+            renderer_provider_diagnostics = getattr(
+                pipe, "_last_latent_renderer_provider_diagnostics", None
             )
             images[-1].save(png_path)  # lossless PNG
             record = {
@@ -522,6 +635,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     and hasattr(renderer_diagnostics, "to_record")
                     else None
                 ),
+                "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
             }
             if diagnostics:
                 record.update(diagnostics)

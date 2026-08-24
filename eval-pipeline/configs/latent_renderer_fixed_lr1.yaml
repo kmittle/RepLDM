@@ -1,0 +1,45 @@
+# Frozen LR-1 fixed-action search.  Select an action on train only, confirm on
+# validation, and reserve latent_renderer_test.csv for one final evaluation.
+schema: latent_renderer_actions_v1
+experiment_id: lr1_fixed_basis_search_v1
+latent_renderer_provider:
+  feature_block: up_blocks.0
+  semantic_layer: up_blocks.0.attentions.0.transformer_blocks.0.attn1
+  semantic_mode: reciprocal_semantic
+  semantic_topk: 16
+  permutation_seed: 1729
+  prompt_dim: 0
+  state_dim: 0
+
+actions:
+  - id: no_ag
+    type: none
+  - id: semantic_pos
+    type: latent_renderer_fixed
+    coefficients: [0.08, 0.0, 0.0, 0.0, 0.0, 0.0]
+  - id: semantic_neg
+    type: latent_renderer_fixed
+    coefficients: [-0.08, 0.0, 0.0, 0.0, 0.0, 0.0]
+  - id: spectral_low_pos
+    type: latent_renderer_fixed
+    coefficients: [0.0, 0.08, 0.0, 0.0, 0.0, 0.0]
+  - id: spectral_mid_pos
+    type: latent_renderer_fixed
+    coefficients: [0.0, 0.0, 0.08, 0.0, 0.0, 0.0]
+  - id: spectral_high_pos
+    type: latent_renderer_fixed
+    coefficients: [0.0, 0.0, 0.0, 0.08, 0.0, 0.0]
+  - id: freeu_pos
+    type: latent_renderer_fixed
+    coefficients: [0.0, 0.0, 0.0, 0.0, 0.08, 0.0]
+  - id: laplacian_pos
+    type: latent_renderer_fixed
+    coefficients: [0.0, 0.0, 0.0, 0.0, 0.0, 0.08]
+  - id: balanced_pos
+    type: latent_renderer_fixed
+    coefficients: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
+  - id: balanced_neg
+    type: latent_renderer_fixed
+    coefficients: [-0.04, -0.04, -0.04, -0.04, -0.04, -0.04]
+
+frequency_band_cutoffs: [0.08, 0.25]
