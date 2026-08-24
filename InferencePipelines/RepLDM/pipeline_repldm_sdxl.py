@@ -62,6 +62,7 @@ from AttentionGuidance import (
     SemanticTransportConfig,
     inject_rendered_clean_update,
     FreeUSchedule,
+    MomentPreservingFreeUController,
 )
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -209,6 +210,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self.default_sample_size = self.unet.config.sample_size
         self._last_guidance_diagnostics = None
         self._last_freeu_schedule = None
+        self._last_freeu_preserve_moments = False
 
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
 
@@ -818,6 +820,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         latent_renderer: Optional[StructuralLatentRenderer] = None,
         latent_renderer_basis_provider: Optional[RendererBasisProvider] = None,
         freeu_schedule: Optional[FreeUSchedule] = None,
+        freeu_preserve_moments: bool = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -978,6 +981,11 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             freeu_schedule (`FreeUSchedule`, *optional*):
                 A validated, Stage-1-only schedule for FreeU backbone/skip
                 reweighting. It is disabled before Stage 2 or return.
+            freeu_preserve_moments (`bool`, *optional*, defaults to `False`):
+                If enabled with a FreeU schedule, apply the structural
+                backbone/skip transform with per-channel feature moment
+                preservation. This is a diagnostic anti-shortcut constraint and
+                does not add a denoiser evaluation.
         
         Examples:
 
@@ -1027,9 +1035,22 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self.lowvram = lowvram
         if freeu_schedule is not None and not isinstance(freeu_schedule, FreeUSchedule):
             raise TypeError("freeu_schedule must be a FreeUSchedule or None")
+        if not isinstance(freeu_preserve_moments, bool):
+            raise TypeError("freeu_preserve_moments must be a bool")
+        if freeu_preserve_moments and freeu_schedule is None:
+            raise ValueError("freeu_preserve_moments requires a FreeUSchedule")
+        if image_lr is not None and freeu_schedule is not None:
+            raise ValueError("FreeU is registered for Stage 1 only")
+        MomentPreservingFreeUController.clear(self.unet)
+        moment_controller = (
+            MomentPreservingFreeUController(self.unet)
+            if freeu_preserve_moments
+            else None
+        )
         self._last_freeu_schedule = (
             freeu_schedule.to_record() if freeu_schedule is not None else None
         )
+        self._last_freeu_preserve_moments = bool(freeu_preserve_moments)
         if self.lowvram:
             self.vae.cpu()
             self.unet.cpu()
@@ -1219,7 +1240,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
     
                     # Apply any scheduled backbone/skip reweighting immediately
                     # before the ordinary frozen-UNet evaluation.
-                    if freeu_schedule is not None:
+                    if moment_controller is not None:
+                        moment_controller.apply(freeu_schedule, i, num_timesteps)
+                    elif freeu_schedule is not None:
                         freeu_schedule.apply(self.unet, i, num_timesteps)
 
                     # predict the noise residual
@@ -1345,7 +1368,10 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         if callback is not None and i % callback_steps == 0:
                             step_idx = i // getattr(self.scheduler, "order", 1)
                             callback(step_idx, t, latents)
-            if freeu_schedule is not None:
+            if moment_controller is not None:
+                # Remove hooks before Stage 2 or return.
+                moment_controller.disable()
+            elif freeu_schedule is not None:
                 # FreeU is limited to the base-resolution denoising loop.
                 freeu_schedule.disable(self.unet)
             del latents_for_view, latent_model_input, noise_pred

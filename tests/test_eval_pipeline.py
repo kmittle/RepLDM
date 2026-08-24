@@ -73,6 +73,7 @@ class EvalPipelineTest(unittest.TestCase):
                                     {"position": 0.0, "parameters": [1, 1, 1, 1]},
                                     {"position": 1.0, "parameters": [0.6, 0.4, 1.1, 1.2]},
                                 ],
+                                "preserve_moments": True,
                             }
                         ]
                     }
@@ -80,6 +81,7 @@ class EvalPipelineTest(unittest.TestCase):
             )
             actions, _ = generate.load_actions(str(path), 4)
             self.assertEqual(actions[0]["type"], "freeu")
+            self.assertTrue(actions[0]["freeu_preserve_moments"])
             schedule = generate.freeu_runtime(actions[0])
             self.assertEqual(schedule.at(1.0).as_tuple(), (0.6, 0.4, 1.1, 1.2))
 

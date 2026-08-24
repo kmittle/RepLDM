@@ -354,10 +354,15 @@ def load_actions(path: str, num_inference_steps: int):
                 schedule = FreeUSchedule(knots)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{action_id}: invalid FreeU schedule: {exc}") from exc
+            preserve_moments = action.get("preserve_moments", False)
+            if not isinstance(preserve_moments, bool):
+                raise ValueError(f"{action_id}: preserve_moments must be a boolean")
             action["freeu_schedule"] = schedule.to_record()
+            action["freeu_preserve_moments"] = preserve_moments
             action.pop("parameters", None)
             action.pop("knots", None)
             action.pop("schedule", None)
+            action.pop("preserve_moments", None)
             action["scale"] = 0.0
 
         residual_mode = str(action.get("residual_mode", "raw"))
@@ -693,6 +698,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     latent_renderer=latent_renderer,
                     latent_renderer_basis_provider=latent_provider,
                     freeu_schedule=freeu_schedule,
+                    freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
@@ -739,6 +745,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 ),
                 "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
+                "freeu_preserve_moments": getattr(pipe, "_last_freeu_preserve_moments", False),
             }
             if diagnostics:
                 record.update(diagnostics)

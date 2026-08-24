@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable, Optional, Protocol, Sequence, Tuple, Union
+from typing import Iterable, Protocol, Sequence, Tuple, Union
+
+import torch
 
 
 class _FreeUModel(Protocol):
@@ -142,3 +144,156 @@ class FreeUSchedule:
                 for knot in self._knots
             ]
         }
+
+
+def match_channel_moments(candidate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Match per-channel spatial mean and RMS without changing tensor shape.
+
+    The projection is an inference-time guard for structural interventions.  It
+    preserves the candidate's spatial arrangement while removing first/second
+    moment changes that can otherwise appear as global contrast or saturation.
+    Computation uses float32 for half-precision inputs and returns the original
+    dtype.
+    """
+
+    if candidate.shape != reference.shape:
+        raise ValueError("candidate and reference must have identical shapes")
+    if candidate.ndim < 3:
+        raise ValueError("moment matching requires a channel and spatial dimension")
+    if not candidate.is_floating_point() or not reference.is_floating_point():
+        raise TypeError("moment matching requires floating-point tensors")
+
+    work_dtype = torch.float32 if candidate.dtype in (torch.float16, torch.bfloat16) else candidate.dtype
+    candidate_work = candidate.to(dtype=work_dtype)
+    reference_work = reference.to(dtype=work_dtype)
+    spatial_dims = tuple(range(2, candidate.ndim))
+    reference_mean = reference_work.mean(dim=spatial_dims, keepdim=True)
+    candidate_mean = candidate_work.mean(dim=spatial_dims, keepdim=True)
+    reference_centered = reference_work - reference_mean
+    candidate_centered = candidate_work - candidate_mean
+    reference_rms = reference_centered.square().mean(dim=spatial_dims, keepdim=True).sqrt()
+    candidate_rms = candidate_centered.square().mean(dim=spatial_dims, keepdim=True).sqrt()
+    finite_rms = torch.finfo(work_dtype).eps
+    scale = torch.where(
+        candidate_rms > finite_rms,
+        reference_rms / candidate_rms.clamp_min(finite_rms),
+        torch.ones_like(candidate_rms),
+    )
+    projected = candidate_centered * scale + reference_mean
+    return projected.to(dtype=candidate.dtype)
+
+
+class MomentPreservingFreeUController:
+    """Apply FreeU's structural transform while preserving feature moments.
+
+    Diffusers applies FreeU inside each up block through a module-level helper.
+    Forward pre-hooks let this controller apply the same backbone/skip
+    transform, then match each transformed feature's spatial mean and RMS to
+    its unmodified value.  The scheduler trajectory is therefore untouched;
+    only the feature-space structural redistribution remains.
+    """
+
+    _ATTRIBUTE = "_repldm_moment_preserving_freeu_controller"
+
+    def __init__(self, unet) -> None:
+        self.unet = unet
+        self._parameters = FreeUParameters(1.0, 1.0, 1.0, 1.0)
+        self._handles = []
+        try:
+            from diffusers.utils.torch_utils import fourier_filter
+        except ImportError as exc:  # pragma: no cover - diffusers is an runtime dependency
+            raise RuntimeError("moment-preserving FreeU requires diffusers' fourier_filter") from exc
+        self._fourier_filter = fourier_filter
+        blocks = getattr(unet, "up_blocks", None)
+        if not blocks:
+            raise TypeError("the denoiser must expose non-empty up_blocks")
+        for block_index, block in enumerate(blocks):
+            resolution_index = int(getattr(block, "resolution_idx", block_index))
+            register = getattr(block, "register_forward_pre_hook", None)
+            if register is None or not callable(register):
+                raise TypeError("up blocks must support forward pre-hooks")
+            handle = register(
+                lambda module, args, kwargs, index=resolution_index: self._pre_hook(
+                    module, args, kwargs, index
+                ),
+                with_kwargs=True,
+            )
+            self._handles.append(handle)
+        setattr(unet, self._ATTRIBUTE, self)
+
+    @classmethod
+    def clear(cls, unet) -> None:
+        existing = getattr(unet, cls._ATTRIBUTE, None)
+        if existing is not None:
+            existing.disable()
+
+    def apply(
+        self, schedule: FreeUSchedule, step_index: int, total_steps: int
+    ) -> FreeUParameters:
+        if not isinstance(schedule, FreeUSchedule):
+            raise TypeError("schedule must be a FreeUSchedule")
+        if int(total_steps) <= 0 or not 0 <= int(step_index) < int(total_steps):
+            raise ValueError("step_index must be in [0, total_steps)")
+        self._parameters = schedule.at(
+            float(step_index) / max(int(total_steps) - 1, 1)
+        )
+        # The controller performs the transform itself; never leave
+        # diffusers' in-place FreeU helper active at the same time.
+        self.unet.disable_freeu()
+        return self._parameters
+
+    def _pre_hook(self, module, args, kwargs, resolution_index):
+        if resolution_index not in (0, 1):
+            return args, kwargs
+        if "hidden_states" in kwargs:
+            hidden_states = kwargs["hidden_states"]
+            hidden_in_args = False
+        elif args:
+            hidden_states = args[0]
+            hidden_in_args = True
+        else:
+            return args, kwargs
+        if "res_hidden_states_tuple" in kwargs:
+            skip_states = kwargs["res_hidden_states_tuple"]
+            skips_in_args = False
+        elif len(args) > 1:
+            skip_states = args[1]
+            skips_in_args = True
+        else:
+            return args, kwargs
+
+        backbone_scale = self._parameters.b1 if resolution_index == 0 else self._parameters.b2
+        skip_scale = self._parameters.s1 if resolution_index == 0 else self._parameters.s2
+        half_channels = int(hidden_states.shape[1]) // 2
+        if half_channels > 0:
+            scaled = hidden_states[:, :half_channels] * backbone_scale
+            scaled = match_channel_moments(scaled, hidden_states[:, :half_channels])
+            hidden_states = torch.cat((scaled, hidden_states[:, half_channels:]), dim=1)
+
+        transformed_skips = []
+        for skip in skip_states:
+            filtered = self._fourier_filter(skip, threshold=1, scale=skip_scale)
+            transformed_skips.append(match_channel_moments(filtered, skip))
+        transformed_skips = tuple(transformed_skips)
+
+        new_args = args
+        new_kwargs = dict(kwargs)
+        if hidden_in_args:
+            args_list = list(new_args)
+            args_list[0] = hidden_states
+            if skips_in_args:
+                args_list[1] = transformed_skips
+            new_args = tuple(args_list)
+        else:
+            new_kwargs["hidden_states"] = hidden_states
+        if not skips_in_args:
+            new_kwargs["res_hidden_states_tuple"] = transformed_skips
+        return new_args, new_kwargs
+
+    def disable(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        if getattr(self.unet, self._ATTRIBUTE, None) is self:
+            delattr(self.unet, self._ATTRIBUTE)
+        self.unet.disable_freeu()

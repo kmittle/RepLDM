@@ -1,6 +1,8 @@
 import unittest
 
-from AttentionGuidance import FreeUParameters, FreeUSchedule
+import torch
+
+from AttentionGuidance import FreeUParameters, FreeUSchedule, match_channel_moments
 
 
 class _FakeUNet:
@@ -49,6 +51,29 @@ class FreeUTest(unittest.TestCase):
             schedule.apply(_FakeUNet(), 3, 3)
         with self.assertRaises(ValueError):
             schedule.apply(_FakeUNet(), 0, 0)
+
+    def test_moment_projection_preserves_reference_channel_statistics(self):
+        reference = torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 4)
+        candidate = reference * 3.0 + 11.0
+        projected = match_channel_moments(candidate, reference)
+        for tensor in (projected, reference):
+            self.assertTrue(torch.isfinite(tensor).all())
+        self.assertTrue(
+            torch.allclose(
+                projected.mean(dim=(-2, -1)),
+                reference.mean(dim=(-2, -1)),
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                projected.std(dim=(-2, -1), unbiased=False),
+                reference.std(dim=(-2, -1), unbiased=False),
+                atol=1e-6,
+            )
+        )
+        with self.assertRaises(ValueError):
+            match_channel_moments(candidate[:, :, :-1], reference)
 
 
 if __name__ == "__main__":

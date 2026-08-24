@@ -36,7 +36,13 @@ from .latent_renderer import (
     cap_update_norm,
     inject_rendered_clean_update,
 )
-from .freeu import FreeUKnot, FreeUParameters, FreeUSchedule
+from .freeu import (
+    FreeUKnot,
+    FreeUParameters,
+    FreeUSchedule,
+    MomentPreservingFreeUController,
+    match_channel_moments,
+)
 
 __all__ = [
     "AttnGuidance",
@@ -76,4 +82,6 @@ __all__ = [
     "FreeUKnot",
     "FreeUParameters",
     "FreeUSchedule",
+    "MomentPreservingFreeUController",
+    "match_channel_moments",
 ]

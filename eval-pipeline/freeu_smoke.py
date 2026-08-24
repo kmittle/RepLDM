@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import sys
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -25,7 +25,7 @@ if ROOT not in sys.path:
 from InferencePipelines import RepLDMSDXLPipeline  # noqa: E402
 
 
-SETTINGS: Dict[str, Tuple[float, float, float, float] | None] = {
+SETTINGS: Dict[str, Optional[Tuple[float, float, float, float]]] = {
     "no_freeu": None,
     # Values reported for SDXL in the official FreeU implementation and
     # commonly used as a starting point for a backbone/skip control.
