@@ -22,6 +22,8 @@ from compare_actions import crossed_bootstrap_ci, validate_pairing
 DEFAULT_CLIP_FLOOR = -0.005
 DEFAULT_CLIP_MAX = 0.001
 DEFAULT_SATURATION_MAX = 0.005
+DEFAULT_MEAN_ERROR_MAX = 1e-4
+DEFAULT_VARIANCE_ERROR_MAX = 1e-3
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -72,6 +74,10 @@ def _finite_renderer_diagnostics(frame: pd.DataFrame, action: str) -> bool:
                 return False
             if not all(math.isfinite(float(value)) for value in values):
                 return False
+        if max(map(abs, map(float, diagnostics["mean_error"]))) > DEFAULT_MEAN_ERROR_MAX:
+            return False
+        if max(map(abs, map(float, diagnostics["variance_error"]))) > DEFAULT_VARIANCE_ERROR_MAX:
+            return False
         action_record = row.get("action")
         if isinstance(action_record, dict):
             bound = action_record.get("max_update_ratio")
@@ -190,6 +196,8 @@ def select_fixed_action(
             "clip_cosine_min_delta": clip_floor,
             "clipped_fraction_max_delta": clip_max,
             "mean_saturation_max_delta": saturation_max,
+            "mean_error_max": DEFAULT_MEAN_ERROR_MAX,
+            "variance_error_max": DEFAULT_VARIANCE_ERROR_MAX,
         },
         "bootstrap": bootstrap,
         "seed": seed,
