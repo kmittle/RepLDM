@@ -62,4 +62,8 @@ validation_requirements:
     blinding_seed: 20260824
     require_external_blinded_review: true
     minimum_reviewers: 2
+    minimum_overall_preference_rate: 0.55
+    overall_wilson_ci_low: 0.5
+    minimum_positive_dimensions: 2
+    dimension_minimum_win_rate: 0.5
     target_dimensions: [structure, text, counting, position, detail]

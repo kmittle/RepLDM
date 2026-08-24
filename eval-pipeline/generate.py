@@ -404,6 +404,29 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def validate_final_test_authorization(
+    authorization_path: str, actions_path: str, seeds
+) -> None:
+    """Require an independently hashed LR-1 validation/review authorization."""
+    with open(authorization_path) as handle:
+        authorization = json.load(handle)
+    if authorization.get("schema") != "latent_renderer_final_authorization_v1":
+        raise ValueError("invalid final-test authorization schema")
+    if authorization.get("status") != "authorized_final_test":
+        raise ValueError("final-test authorization is not active")
+    expected_seeds = [int(value) for value in authorization.get("test_seeds", [])]
+    if list(seeds) != expected_seeds:
+        raise ValueError(
+            f"--seeds {list(seeds)} do not match authorized final-test seeds {expected_seeds}"
+        )
+    source_hash = authorization.get("source_actions_sha256")
+    if source_hash != sha256_file(actions_path):
+        raise ValueError("final-test authorization hash does not match --actions")
+    summary = authorization.get("review_summary", {})
+    if summary.get("passed") is not True:
+        raise ValueError("final-test authorization lacks a passing blinded review")
+
+
 def git_commit() -> str:
     try:
         return subprocess.check_output(
@@ -732,6 +755,11 @@ def main():
         default=None,
         help="registered split_seeds role, e.g. train_search or validation_confirmation",
     )
+    ap.add_argument(
+        "--authorization",
+        default=None,
+        help="final-test authorization JSON required for latent-renderer test_final runs",
+    )
     ap.add_argument("--seeds", default="0,42,123", help="comma-separated seeds")
     ap.add_argument("--resolution", type=int, default=1024)
     ap.add_argument(
@@ -764,6 +792,17 @@ def main():
         actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
         try:
             validate_split_seed_role(args.actions, args.split_role, seeds)
+            with open(args.actions) as action_handle:
+                action_config = yaml.safe_load(action_handle) or {}
+            if (
+                args.split_role == "test_final"
+                and action_config.get("schema") == "latent_renderer_actions_v1"
+            ):
+                if not args.authorization:
+                    raise ValueError(
+                        "latent-renderer test_final requires --authorization from the validation gate"
+                    )
+                validate_final_test_authorization(args.authorization, args.actions, seeds)
         except ValueError as exc:
             ap.error(str(exc))
         legacy_scale_ids = False

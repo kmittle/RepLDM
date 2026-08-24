@@ -1,4 +1,5 @@
 import copy
+import csv
 import json
 import importlib.util
 import math
@@ -50,6 +51,10 @@ evaluate_renderer_validation = load_module(
 blind_montage = load_module(
     "make_latent_renderer_blind_montage",
     "eval-pipeline/make_latent_renderer_blind_montage.py",
+)
+finalize_renderer_validation = load_module(
+    "finalize_latent_renderer_validation",
+    "eval-pipeline/finalize_latent_renderer_validation.py",
 )
 
 
@@ -491,8 +496,104 @@ class EvalPipelineTest(unittest.TestCase):
             )
             self.assertEqual(result_a["private_file"], "review_key.json")
             self.assertNotIn("semantic_pos", (first / "review_prompts.csv").read_text())
+            self.assertTrue((first / "review_form_template.csv").is_file())
             key = json.loads((first / "review_key.json").read_text())
             self.assertIn(key["pairs"][0]["left_action"], {"no_ag", "semantic_pos"})
+
+    def test_finalizer_requires_blinded_review_before_test_authorization(self):
+        source, template, selection = self._registered_validation_inputs()
+        frozen = freeze_validation.freeze_validation_config(
+            selection, source, template
+        )
+        frozen["validation_requirements"]["qualitative_montage"].update(
+            {
+                "prompt_indices": [0, 1],
+                "minimum_reviewers": 2,
+                "minimum_overall_preference_rate": 0.55,
+                "overall_wilson_ci_low": 0.5,
+                "minimum_positive_dimensions": 2,
+                "dimension_minimum_win_rate": 0.5,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            frozen_path = root / "frozen.yaml"
+            gate_path = root / "gate.json"
+            key_path = root / "key.json"
+            frozen_path.write_text(yaml.safe_dump(frozen, sort_keys=False))
+            gate_path.write_text(json.dumps({"statistical_pass": True}))
+            key = {
+                "selected_action": frozen["selected_action"],
+                "pairs": [
+                    {
+                        "pair_id": "pair_p0_s11",
+                        "left_action": frozen["selected_action"],
+                        "right_action": "no_ag",
+                    },
+                    {
+                        "pair_id": "pair_p1_s11",
+                        "left_action": frozen["selected_action"],
+                        "right_action": "no_ag",
+                    },
+                ],
+            }
+            key_path.write_text(json.dumps(key))
+            form_paths = []
+            header = [
+                "reviewer_id",
+                "pair_id",
+                "overall",
+                "structure",
+                "text",
+                "counting",
+                "position",
+                "detail",
+            ]
+            for reviewer in ("r1", "r2"):
+                form_path = root / f"{reviewer}.csv"
+                with form_path.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=header)
+                    writer.writeheader()
+                    for pair_id in ("pair_p0_s11", "pair_p1_s11"):
+                        writer.writerow(
+                            {
+                                "reviewer_id": reviewer,
+                                "pair_id": pair_id,
+                                "overall": "A",
+                                "structure": "A",
+                                "text": "A",
+                                "counting": "A",
+                                "position": "A",
+                                "detail": "A",
+                            }
+                        )
+                form_paths.append(form_path)
+            summary = finalize_renderer_validation.summarize_reviews(
+                key,
+                form_paths,
+                frozen["validation_requirements"]["qualitative_montage"],
+            )
+            self.assertTrue(summary["passed"])
+            final_config, authorization = finalize_renderer_validation.finalize(
+                frozen,
+                {"statistical_pass": True},
+                key,
+                summary,
+                frozen_path=str(frozen_path),
+                gate_path=str(gate_path),
+                key_path=str(key_path),
+            )
+            final_path = root / "final.yaml"
+            final_path.write_text(yaml.safe_dump(final_config, sort_keys=False))
+            authorization["source_actions_sha256"] = generate.sha256_file(final_path)
+            auth_path = root / "authorization.json"
+            auth_path.write_text(json.dumps(authorization))
+            generate.validate_split_seed_role(
+                final_path, "test_final", [0, 42, 123]
+            )
+            generate.validate_final_test_authorization(
+                auth_path, final_path, [0, 42, 123]
+            )
 
     def test_latent_renderer_run_audit_accepts_complete_safe_design(self):
         with tempfile.TemporaryDirectory() as temp_dir:

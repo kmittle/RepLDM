@@ -169,6 +169,13 @@ human study. `make_latent_renderer_blind_montage.py` creates the fixed pairs,
 prompt sheet, and a private action key without reading scores; reviewers see
 only anonymous A/B labels and the prompt text.
 
+The finalizer requires at least two independent reviewers, an overall selected
+action preference rate of `0.55` with a Wilson lower bound above `0.50`, and
+positive ratings on at least two of the five registered dimensions. It emits a
+four-action final-test YAML and a hash-bound authorization. `generate.py`
+rejects `test_final` latent-renderer runs without that authorization, so the
+ten-action search grid cannot be reused to tune on final seeds.
+
 Every completed train, validation, or test run must first pass
 `eval-pipeline/audit_latent_renderer_run.py`. The audit requires the exact
 prompt x seed x action product, one device and a full randomized execution-rank

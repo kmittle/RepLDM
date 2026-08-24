@@ -306,6 +306,36 @@ keep `review_key.json` private until all reviewers submit their forms:
   --output_dir outputs/latent_renderer/lr1_fixed_validation_v1/blind_review
 ```
 
+Complete one copy of `review_form_template.csv` per reviewer and finalize the
+gate only when the preregistered preference and dimension thresholds pass:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/finalize_latent_renderer_validation.py \
+  --frozen_actions eval-pipeline/configs/latent_renderer_validation_lr1.yaml \
+  --validation_gate outputs/latent_renderer/lr1_fixed_validation_v1/validation_gate.json \
+  --review_key outputs/latent_renderer/lr1_fixed_validation_v1/blind_review/review_key.json \
+  --review_forms outputs/latent_renderer/lr1_fixed_validation_v1/blind_review/reviewer_1.csv \
+                 outputs/latent_renderer/lr1_fixed_validation_v1/blind_review/reviewer_2.csv \
+  --output_actions eval-pipeline/configs/latent_renderer_final_test_lr1.yaml \
+  --output_authorization outputs/latent_renderer/latent_renderer_final_test_authorization.json
+```
+
+This emits a four-action test config only after statistical and blinded gates
+pass. The original ten-action search grid is never valid for final test. The
+generator requires the emitted authorization and exact action-YAML hash for
+`--split_role test_final`:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1,2,3,4 \
+  --prompts eval-pipeline/prompts/latent_renderer_test.csv \
+  --out_dir outputs/latent_renderer/lr1_fixed_final_test_v1 \
+  --actions eval-pipeline/configs/latent_renderer_final_test_lr1.yaml \
+  --split_role test_final --seeds 0,42,123 \
+  --authorization outputs/latent_renderer/latent_renderer_final_test_authorization.json
+```
+
 ## Layout
 
 ```text
@@ -321,6 +351,7 @@ freeze_latent_renderer_validation.py  one-shot validation config freezer
 audit_latent_renderer_run.py  result-blind design and numerical audit
 evaluate_latent_renderer_validation.py  frozen LR-1 statistical gate
 make_latent_renderer_blind_montage.py  deterministic blinded review package
+finalize_latent_renderer_validation.py  review-to-final authorization
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

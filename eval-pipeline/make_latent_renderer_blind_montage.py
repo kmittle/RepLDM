@@ -172,6 +172,23 @@ def build_blind_package(
         )
         writer.writeheader()
         writer.writerows(pairs)
+    with (output_dir / "review_form_template.csv").open("w", newline="") as handle:
+        fieldnames = ["reviewer_id", "pair_id", "overall", "structure", "text", "counting", "position", "detail"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for pair in pairs:
+            writer.writerow(
+                {
+                    "reviewer_id": "",
+                    "pair_id": pair["pair_id"],
+                    "overall": "",
+                    "structure": "",
+                    "text": "",
+                    "counting": "",
+                    "position": "",
+                    "detail": "",
+                }
+            )
 
     # Keep the mapping separate from the shareable review images and prompts.
     key = {
@@ -199,7 +216,7 @@ def build_blind_package(
         "pairs": len(pairs),
         "seed": seed,
         "selected_action": selected,
-        "shareable_files": ["montage.png", "review_prompts.csv"]
+        "shareable_files": ["montage.png", "review_prompts.csv", "review_form_template.csv"]
         + [pair["image_path"] for pair in pairs],
         "private_file": "review_key.json",
         "provenance": key["provenance"],
