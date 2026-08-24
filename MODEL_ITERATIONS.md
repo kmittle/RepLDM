@@ -11,6 +11,7 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 | S2 | Moment-Tangent Attention Guidance (MTAG) | Invalidated | It removes moment drift but does not improve quality or preference. |
 | S3 | Trajectory-Cone Moment Guidance (TCMG) | Invalidated | Cone geometry is active but does not improve quality, preference, or adaptive headroom. |
 | S4 | 2048² Stage-2 target-domain audit | Invalidated | Stage 2 preserves the negative ranking; no static action beats no-AG or licenses RL. |
+| S5 | Scheduler-Consistent Reciprocal Semantic Transport (SCRST) | Registered | Change the proposal source to conditional UNet self-attention and scheduler-returned predicted-clean latents. |
 
 S0-S4 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
@@ -155,3 +156,61 @@ No S5 claim is registered. Four failed operator families plus the high-resolutio
 A defensible candidate is scheduler-consistent predicted-clean semantic transport: obtain the scheduler's predicted clean sample `x0`, derive spatial transport from frozen UNet self-attention features rather than four-channel latent dot products, apply a fixed-moment transport to `x0`, then reconstruct the next latent while holding the predicted noise component fixed. This specifically tests whether S0-S4 failed because TFSA was computed on noisy, semantically weak latents. Before implementation it requires a full related-work audit and an exact scheduler-reconstruction test.
 
 Any such operator must first use a new prompt-disjoint development set and fixed static actions. It must compare raw-latent TFSA, predicted-clean TFSA, semantic-feature transport, no-AG, conference expert, and an equal-compute post-step control; if it adds a UNet call, it also needs an equal-call score-correction baseline. The same `+0.005` TOPIQ gate, preference/alignment non-inferiority, pixel guards, high-resolution transfer, and fixed qualitative views apply. Only a static winner can justify search, distillation, or RL; another null result closes Attention Guidance as the journal-extension axis.
+
+## S5 Related-Work Decision
+
+`S5_RELATED_WORK.md` records the full-text audit frozen on 24 August 2026. PLADIS and GAG already cover training-free, single-forward, sparse-versus-dense attention contrast and are mandatory same-NFE baselines. SAG, PAG, SEG, and ASAG form an extra-prediction upper-bound group. Predicted `x_0`, internal features, attention extrapolation, projection, adaptive schedules, and RL are all individually overlapped. The only claim under test is the complete scheduler-consistent reciprocal semantic transport operator; no component-level novelty is claimed.
+
+## S5 Registered Mechanistic Hypothesis
+
+S0-S4 may fail because four-channel noisy-latent dot products are semantically weak. S5 reads the standard conditional branch of
+
+```text
+up_blocks.0.attentions.0.transformer_blocks.0.attn1
+```
+
+without replacing its processor or changing its output. At 1024² this layer has a 32x32 grid, 20 heads, and 1280 channels. A frozen diagnostic found nonlocal mass beyond four tokens of `0.8433/0.7424/0.7132/0.6930/0.6163` at timesteps `801/601/401/201/1`, but normalized entropy remained `0.9000/0.8636/0.8414/0.8202/0.7876`. Direct dense transport therefore risks global averaging and motivates reciprocal mutual-neighbor sparsification.
+
+For the normal conditional forward, let
+
+```text
+A = mean_h softmax(Q_h K_h^T / sqrt(d))
+R_ij = sqrt(A_ij A_ji)
+W = row_normalize(R restricted to mutual top-16 edges plus the diagonal)
+c_t = 1 - mean_i H(A_i) / log(N).
+```
+
+Area-downsample the scheduler-returned `x_0` to the attention grid, form `d = upsample(W x_0 - x_0)`, and project `d` per latent channel onto the fixed-mean, fixed-variance tangent space. Move on that sphere by the fixed angle `theta * c_t`; call the result `guided_x_0`. The only scheduler integration allowed is
+
+```text
+step_output = scheduler.step(...)
+u = guided_x_0 - step_output.pred_original_sample
+latents = step_output.prev_sample + u.
+```
+
+The scheduler is Euler with epsilon prediction. S5 must not reconstruct `x_0` or the Euler step independently: the fp16 discrepancy from doing so can reach `0.03125`. `theta=0` must exactly reproduce no-AG. The operator uses no backpropagation and no additional UNet evaluation.
+
+## S5 Frozen Data and Controls
+
+`eval-pipeline/prompts/s5_development.csv` contains 12 new prompts, two each from PartiPrompts challenges Complex, Fine-grained Detail, Properties & Positioning, Quantity, Writing & Symbols, and Perspective. `s5_smoke.csv` contains two different prompts. They are disjoint from all prior repository prompt CSVs. Source commit is `5a657978134374ce28973948331b319adef164bd`; rows were selected before generation by the SHA-256 procedure recorded in the evaluation README. Prompts cannot be replaced after viewing images.
+
+Required controls are no-AG, the conference expert, raw noisy-latent TFSA, plain predicted-clean TFSA, predicted-clean reciprocal latent affinity, reciprocal semantic affinity, and the same semantic graph with rows and columns jointly permuted before application. The permutation preserves graph values and compute while destroying spatial alignment. Also include CFG-only 5.0, official PLADIS (`alpha=1.5`, scale `2.0`), and official GAG (`lambda=10`, `eta=15`, `zeta=0`). PLADIS/GAG run with CFG 5.0 as registered by their papers; all RepLDM controls retain CFG 7.5. Report NFE, wall time, and peak GPU memory.
+
+## S5 Registered Smoke and Engineering Gates
+
+`eval-pipeline/configs/s5_smoke.yaml` freezes top-k at `16`, the semantic layer above, matched control angle `0.02`, and a semantic angle range `0.005/0.01/0.02/0.04`. Run two prompts, seed `0`, on one GPU. Smoke is only for implementation and catastrophic-range rejection; it must not rank actions or choose an isolated angle. Remove only a contiguous extreme when any prompt has non-finite output, a nonzero no-op, TOPIQ below no-AG by more than `0.05`, or clipped fraction above no-AG by more than `0.01`.
+
+Before interpreting smoke, unit and real-model checks must show: scheduler-returned `x_0` is used; no-AG and zero-angle PNG hashes match exactly; channel means and variances are preserved in `guided_x_0`; reciprocal support is mutual and row-stochastic; the spatial permutation is deterministic; repeat runs reproduce hashes; and every sidecar records latency, peak memory, normalized affinity entropy, transport confidence, and transport-to-scheduler update norm ratio.
+
+## S5 Development Gate
+
+After smoke, freeze the complete contiguous non-catastrophic semantic interval and all matched controls in a new YAML before development generation. Run the 12 frozen prompts with seeds `0,42,123`, keeping every prompt/seed action block on one GPU. TOPIQ-NR is primary. Report HPSv2, ImageReward, patch-IR, CLIP alignment, aesthetic score, clipped fraction, saturation, contrast, colorfulness, sharpness, latency, memory, and every failed action. Use crossed prompt/seed bootstrap intervals, prompt sign-flip tests, and within-metric Holm correction.
+
+An S5 action advances only if all conditions hold:
+
+1. TOPIQ gain over no-AG is at least `+0.005`, its 95% CI excludes zero, and its within-metric Holm-adjusted test is below `0.05`.
+2. It directly beats the conference expert, raw TFSA, matched latent-affinity and permuted-graph controls, CFG 5.0, PLADIS, and GAG under the same NFE accounting.
+3. HPSv2 and CLIP are non-inferior; clipped fraction and saturation do not exceed no-AG by more than `0.001` and `0.005`.
+4. A fixed all-action montage shows real structure, counting, position, text, or detail improvement rather than global color, contrast, or sharpness manipulation.
+
+A pass licenses prompt-disjoint confirmation and Stage-2 transfer, not RL. A null result closes Attention Guidance as the journal extension; no angle, top-k, layer, schedule, reward, or controller sweep follows.

@@ -51,6 +51,27 @@ Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count 
 
 `configs/stage2_engineering_smoke.yaml` is correctness-only. `configs/stage2_transfer_pilot.yaml` freezes the five-action 2048² mechanistic ladder after S3; it reuses development prompts to audit target-domain mismatch and cannot support a confirmation claim. That registered pilot was negative and is closed in `MODEL_ITERATIONS.md`; do not rerun it with new scales or schedules.
 
+## S5 Registered Prompts and Actions
+
+S5 uses `prompts/s5_development.csv` and `prompts/s5_smoke.csv`, which were frozen before implementation and are disjoint from every earlier prompt CSV. The provenance source is PartiPrompts at commit `5a657978134374ce28973948331b319adef164bd`. Treat the TSV rows as zero-based after the header. With the fixed key `repldm-s5-v1`, rank each row in a challenge by
+
+```text
+SHA256("repldm-s5-v1:development:" + challenge + ":" + row_index + ":" + Prompt)
+```
+
+and retain the two smallest digests from each of `Complex`, `Fine-grained Detail`, `Properties & Positioning`, `Quantity`, `Writing & Symbols`, and `Perspective`. Exclude those 12 rows, then rank the remaining rows in those challenges by `SHA256("repldm-s5-v1:smoke:" + row_index + ":" + Prompt)` and retain the two smallest. The recorded source rows are `359,367,636,424,997,979,1045,1042,1621,1549,909,929` for development and `450,996` for smoke. Do not replace a prompt after seeing an image or score.
+
+`configs/s5_smoke.yaml` is a correctness and catastrophic-range check, not a tuning set. It fixes the self-attention layer `up_blocks.0.attentions.0.transformer_blocks.0.attn1`, mutual top-k `16`, and semantic angle candidates `0.005, 0.01, 0.02, 0.04`. It also freezes raw noisy-latent TFSA, clean latent controls, a jointly permuted semantic graph, CFG-only 5.0, official PLADIS, and official GAG. Run it as:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1 --prompts eval-pipeline/prompts/s5_smoke.csv \
+  --out_dir outputs/exp_s5/engineering_smoke_v1 \
+  --actions eval-pipeline/configs/s5_smoke.yaml --seeds 0
+```
+
+Only the registered catastrophic thresholds may remove an extreme contiguous angle. Freeze a new development YAML before generating `s5_development.csv`; never use smoke scores to choose a winner.
+
 ## Prepare Scorers
 
 The scoring environment is a clone of `diff_attn` with independent evaluation packages:

@@ -1,0 +1,13 @@
+index,TEXT,bucket,source_row,source_category,source_challenge
+0,"Painting of a panic-stricken creature, simultaneously corpselike and reminiscent of a sperm or fetus, whose contours are echoed in the swirling lines of the blood-red sky",complex,359,Arts,Complex
+1,"a glass of orange juice to the right of a plate with buttered toast on it",complex,367,Food & Beverage,Complex
+2,"an old red truck parked by the geyser Old Faithful",fine-grained-detail,636,World Knowledge,Fine-grained Detail
+3,"fairy cottage with smoke coming up chimney and a squirrel looking from the window",fine-grained-detail,424,Outdoor Scenes,Fine-grained Detail
+4,"a black background with a large yellow circle",properties-positioning,997,Illustrations,Properties & Positioning
+5,"A photo of a Persian Metal Engraving vase sitting to the left of a bunch of orange flowers.",properties-positioning,979,World Knowledge,Properties & Positioning
+6,"four teacups surounding a kettle",quantity,1045,Artifacts,Quantity
+7,"two violins standing up with their bows on the ground in front of them",quantity,1042,Artifacts,Quantity
+8,"the words 'KEEP OFF THE GRASS' on a sign next to a lawn",writing-symbols,1621,Outdoor Scenes,Writing & Symbols
+9,"Portrait of a tiger wearing a train conductor's hat and holding a skateboard that has a yin-yang symbol on it. oil painting",writing-symbols,1549,Animals,Writing & Symbols
+10,"Three-quarters front view of a blue 1977 Corvette coming around a curve in a mountain road and looking over a green valley on a cloudy day.",perspective,909,Vehicles,Perspective
+11,"Ground view of the Great Pyramids and Sphinx on the moon's surface. The back of an astronaut is in the foreground. The planet Earth looms in the sky.",perspective,929,World Knowledge,Perspective
