@@ -95,10 +95,19 @@ D1 = (1 / r0) * (m_i - m_(i-1)) = (h / h0) * (m_i - m_(i-1))
 ```
 
 UniPC, DEIS, LMS, PNDM, and related multistep methods likewise use
-nonuniform-history coefficients. Thus a sigma-horizon branch extrapolation is
-not a new high-order integrator. It changes the CFG branch before an Euler
-step; the defensible claim, if any, is a scheduler-specific error
-orthogonalization, not improved numerical integration in general.
+nonuniform-history coefficients. **DC-Solver** (arXiv:2409.03755) is an even
+closer boundary: it replaces a buffered model output with a Lagrange-interpolated
+history estimate controlled by a per-step compensation ratio, uses no extra
+NFE, and reports gains for both predictor-corrector and predictor-only solvers.
+Its ratio can be searched or regressed as a function of timestep/NFE/CFG. A
+sigma-horizon coefficient is therefore not a first use of adaptive temporal
+compensation; the only remaining distinction would have to be the branch-wise
+CFG-OEC projection and its independently validated error witness.
+
+Thus a sigma-horizon branch extrapolation is not a new high-order integrator.
+It changes the CFG branch before an Euler step; the defensible claim, if any,
+is a scheduler-specific error orthogonalization, not improved numerical
+integration in general.
 
 If the candidate is evaluated with DPM-Solver/UniPC, the scheduler's own
 history and the CFG-EC cache will be two coupled extrapolators. Attribution is
@@ -119,6 +128,7 @@ initial noise provenance. The minimum development matrix is:
 | Euler + horizon-only extrapolation | Uses the same `r_sigma` but no OEC projection; tests whether the gain is only prediction extrapolation. |
 | Euler + projection-only (`r=1`) | Tests orthogonalization without horizon adaptation. |
 | Native DPM-Solver++(2M), UniPC/DEIS/LMS (ordinary CFG) | Matched high-order-history controls at declared NFE. |
+| DC-Solver-style history compensation (official implementation or a faithful fixed-ratio port) | Direct no-extra-NFE temporal-compensation boundary; report its search/regression budget separately. |
 | Euler + matched dummy residual | Equal update norm/cap, shuffled branch or random direction; detects magnitude/sharpness shortcuts. |
 | Exact no-op (`blend=0`) | Must preserve PNG/hash and scheduler metadata byte-for-byte. |
 
@@ -155,8 +165,9 @@ use a matched scheduler control; it is not a history-only comparison.
 
 The strongest defensible boundary is: **a bounded, scheduler-aware adaptation
 of CFG-OEC for deterministic Euler epsilon prediction**. The sigma ratio alone
-is a finite-difference convention already present in multistep solver theory;
-it is not a new solver, latent representation, renderer, or RL algorithm. If
+is a finite-difference convention already present in multistep solver theory
+and no-extra-NFE compensation work (including DC-Solver); it is not a new
+solver, latent representation, renderer, or RL algorithm. If
 the result only beats ordinary Euler, loses to exact CFG-OEC or horizon-only
 extrapolation, or disappears against native high-order controls, close this
 route. A positive result must survive all controls, independent structural
