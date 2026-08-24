@@ -215,6 +215,19 @@ sidecar. Do not select an action from the test split or treat this generation
 command as evidence until the registered TOPIQ-NR and non-inferiority gates
 are evaluated.
 
+After strict scoring, apply the frozen train-only proxy rule mechanically:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/select_fixed_action.py \
+  --run_dir outputs/latent_renderer/lr1_fixed_train_v1 \
+  --prompts eval-pipeline/prompts/latent_renderer_train.csv
+```
+
+The selector uses paired HPSv2 means, CLIP/pixel guards, finite renderer
+diagnostics, and the recorded YAML order. It never reads TOPIQ-NR or any test
+row; `fixed_action_selection.json` is the only action authorization for the
+validation run. A `no_ag` result closes LR-1 without a post-hoc search.
+
 ## Layout
 
 ```text
@@ -225,6 +238,7 @@ generate.py              grouped multi-GPU generation
 score.py                 additive scoring runner
 compare_actions.py       paired inference and multiplicity correction
 analyze_adaptivity.py    leave-one-seed-out action-selection headroom
+select_fixed_action.py   frozen train-only LR-1 action selection
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

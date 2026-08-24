@@ -29,9 +29,75 @@ from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
 analyze_adaptivity = load_module(
     "analyze_adaptivity", "eval-pipeline/analyze_adaptivity.py"
 )
+select_fixed_action = load_module(
+    "select_fixed_action", "eval-pipeline/select_fixed_action.py"
+)
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_fixed_action_selector_applies_proxy_and_guard_rule(self):
+        rows = []
+        for prompt_index in (0, 1):
+            for seed in (0, 42):
+                device = "cuda:1" if prompt_index == 0 else "cuda:2"
+                for action, hps, clip, clipped, saturation in (
+                    ("no_ag", 0.0, 0.0, 0.0, 0.0),
+                    ("eligible", 0.2, 0.0, 0.0, 0.0),
+                    ("clip_bad", 0.5, -0.01, 0.0, 0.0),
+                ):
+                    rows.append(
+                        {
+                            "prompt_index": prompt_index,
+                            "seed": seed,
+                            "action_id": action,
+                            "device": device,
+                            "hpsv2": hps,
+                            "clip_cosine": clip,
+                            "clipped_fraction": clipped,
+                            "mean_saturation": saturation,
+                            "action": {"max_update_ratio": 0.05},
+                            "latent_renderer_diagnostics": {
+                                "update_ratio": [0.01],
+                                "mean_error": [0.0],
+                                "variance_error": [0.0],
+                            },
+                        }
+                    )
+        result = select_fixed_action.select_fixed_action(
+            pd.DataFrame(rows), action_order=["no_ag", "eligible", "clip_bad"], bootstrap=100
+        )
+        self.assertEqual(result["selected_action"], "eligible")
+        table = {row["action"]: row for row in result["rows"]}
+        self.assertTrue(table["eligible"]["eligible"])
+        self.assertFalse(table["clip_bad"]["eligible"])
+
+    def test_fixed_action_selector_falls_back_to_no_ag(self):
+        rows = []
+        for seed in (0, 42):
+            for action in ("no_ag", "unsafe"):
+                rows.append(
+                    {
+                        "prompt_index": 0,
+                        "seed": seed,
+                        "action_id": action,
+                        "device": "cuda:1",
+                        "hpsv2": 0.0,
+                        "clip_cosine": -0.01 if action == "unsafe" else 0.0,
+                        "clipped_fraction": 0.0,
+                        "mean_saturation": 0.0,
+                        "action": {"max_update_ratio": 0.05},
+                        "latent_renderer_diagnostics": {
+                            "update_ratio": [0.01],
+                            "mean_error": [0.0],
+                            "variance_error": [0.0],
+                        },
+                    }
+                )
+        result = select_fixed_action.select_fixed_action(
+            pd.DataFrame(rows), action_order=["no_ag", "unsafe"], bootstrap=100
+        )
+        self.assertEqual(result["selected_action"], "no_ag")
+
     def test_frequency_action_config_and_task_metadata(self):
         actions, cutoffs = generate.load_actions(
             ROOT / "eval-pipeline/configs/frequency_action_pilot.yaml", 50
