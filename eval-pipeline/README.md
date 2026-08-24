@@ -83,11 +83,12 @@ itself is immutable):
 
 `configs/trajectory_correction_validation_template.yaml` and
 `prompts/trajectory_correction_validation_v1.csv` are that larger split
-(44 prompts, three confirmation seeds). Keep `selected_action: null` until the
-development report is archived; then freeze the selected development action and
-run the confirmation command with `--split_role validation_confirmation` and
-seeds `11,29,101`. Do not add a new mix or noise mode after looking at those
-validation scores.
+(44 prompts, three confirmation seeds). The validation loader runs three actions
+per prompt/seed: `no_correction`, the native scheduler reference, and the one
+frozen selected action. Keep `selected_action: null` until the development report
+is archived; then freeze the selected development action and run the confirmation
+command with `--split_role validation_confirmation` and seeds `11,29,101`. Do
+not add a new mix or noise mode after looking at those validation scores.
 
 For unattended, resumable execution of this registered sequence, use
 `run_trajectory_correction_queue.sh`. It takes an exclusive lock, records input
@@ -95,8 +96,9 @@ hashes and stage state under `outputs/trajectory_correction/queue_v1/`, waits
 for a GPU with at least 22 GiB free, and resumes incomplete generation or
 scoring. A failed development selector writes an auditable `null_route.json`
 and stops. Only a passing selector can freeze the validation YAML and queue the
-44-prompt x 3-seed x 7-action confirmation run; after validation scoring it
-stops in `awaiting_review` and never starts a renderer or RL job.
+44-prompt x 3-seed x 3-action confirmation run (baseline, native reference,
+selected action); after validation scoring it stops in `awaiting_review` and
+never starts a renderer or RL job.
 
 ```bash
 bash eval-pipeline/run_trajectory_correction_queue.sh

@@ -20,6 +20,16 @@ LaRender ([2508.07647](https://arxiv.org/abs/2508.07647)) and SATeCo
 ([2403.17000](https://arxiv.org/abs/2403.17000)) are additional novelty
 boundaries: they use object-conditioned rendering or feature adapters, whereas
 FRLA has no object mask, prompt branch, or second denoiser.
+DUNE ([2607.09753](https://arxiv.org/abs/2607.09753)), DIAMOND
+([2602.00883](https://arxiv.org/abs/2602.00883)), InfSplign
+([2512.17851](https://arxiv.org/abs/2512.17851)), and PMG/LGDM
+([2506.00327](https://arxiv.org/abs/2506.00327)) already cover frozen-U-Net
+feature interventions or clean-latent gradient corrections. SSVAE
+([2512.05394](https://arxiv.org/abs/2512.05394)) also studies local correlation
+regularization. These are direct baselines and novelty limits: FRLA cannot claim
+the gradient, tangent projection, local relation loss, or frozen manipulation
+itself as new. Covariance is a deterministic metric only; covariance-aware
+noise is excluded because it has been reported to hurt VAE latent diffusion.
 
 ## Fixed Operator
 

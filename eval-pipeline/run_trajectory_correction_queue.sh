@@ -29,8 +29,10 @@ DEV_PROMPTS=$ROOT/eval-pipeline/prompts/trajectory_correction_heldout_v1.csv
 VAL_PROMPTS=$ROOT/eval-pipeline/prompts/trajectory_correction_validation_v1.csv
 # 11 development prompt rows x 2 seeds x 7 registered actions.
 EXPECTED_DEV_TASKS=154
-# 44 validation prompt rows x 3 confirmation seeds x 7 registered actions.
-EXPECTED_VAL_TASKS=924
+# 44 validation prompt rows x 3 confirmation seeds x (baseline + native
+# reference + one selected correction). The validation loader filters the
+# seven-entry template to those three actions after freezing selected_action.
+EXPECTED_VAL_TASKS=396
 DRY_RUN=0
 STATUS_ONLY=0
 GPU=
@@ -110,11 +112,67 @@ registered_task_count() {
     printf '%s\n' "$((prompt_count * seed_count * action_count))"
 }
 
+validation_action_count() {
+    config=$1
+    "$EVAL_PYTHON" - "$config" <<'PY'
+import sys
+
+import yaml
+
+
+with open(sys.argv[1]) as handle:
+    config = yaml.safe_load(handle) or {}
+if config.get("schema") != "trajectory_correction_validation_v1":
+    raise SystemExit("validation config has the wrong schema")
+actions = config.get("actions")
+if not isinstance(actions, list) or not actions:
+    raise SystemExit("validation config must contain a non-empty actions list")
+if any(not isinstance(action, dict) for action in actions):
+    raise SystemExit("validation config actions must be mappings")
+
+ids = [str(action.get("id", "")) for action in actions]
+if any(not action_id for action_id in ids) or len(ids) != len(set(ids)):
+    raise SystemExit("validation config actions must have unique non-empty ids")
+if ids.count("no_correction") != 1:
+    raise SystemExit("validation config must register exactly one no_correction action")
+
+# Mirror generate.load_actions(): references remain visible even though they
+# are ineligible for selection, while one selected action is retained after
+# the frozen file exists. The template has no selected action, so count that
+# one authorized slot without guessing which candidate wins.
+reference_ids = {
+    action_id
+    for action, action_id in zip(actions, ids)
+    if not bool(action.get("selection_eligible", True))
+}
+selected = config.get("selected_action")
+if selected not in (None, ""):
+    selected = str(selected)
+    selected_ids = {"no_correction", selected} | reference_ids
+    filtered = [action_id for action_id in ids if action_id in selected_ids]
+    if len(filtered) < 2 or selected not in filtered:
+        raise SystemExit("frozen validation selected_action is not registered")
+    print(len(filtered))
+else:
+    eligible_candidates = [
+        action_id
+        for action, action_id in zip(actions, ids)
+        if action_id != "no_correction"
+        and bool(action.get("selection_eligible", True))
+    ]
+    if not eligible_candidates:
+        raise SystemExit("validation template has no selectable correction action")
+    print(len({"no_correction", eligible_candidates[0]} | reference_ids))
+PY
+}
+
 validate_task_counts() {
     dev_count=$(registered_task_count "$DEV_PROMPTS" "$DEV_ACTIONS" 2)
-    val_count=$(registered_task_count "$VAL_PROMPTS" "$VAL_TEMPLATE" 3)
+    val_prompt_count=$(awk 'NR > 1 && NF { n++ } END { print n + 0 }' "$VAL_PROMPTS")
+    val_actions_per_task=$(validation_action_count "$VAL_TEMPLATE")
+    val_count=$((val_prompt_count * 3 * val_actions_per_task))
     if [ "$dev_count" -ne "$EXPECTED_DEV_TASKS" ] || [ "$val_count" -ne "$EXPECTED_VAL_TASKS" ]; then
-        log "registered task count mismatch: development=$dev_count/$EXPECTED_DEV_TASKS validation=$val_count/$EXPECTED_VAL_TASKS"
+        log "registered task count mismatch: development=$dev_count/$EXPECTED_DEV_TASKS validation=$val_count/$EXPECTED_VAL_TASKS (actions_per_prompt=$val_actions_per_task)"
         return 1
     fi
 }
@@ -268,11 +326,15 @@ find_gpu() {
 wait_existing() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     while :; do
-        pids=$(ps -eo pid=,args= | awk -v self="$$" '
-          $1 != self && $0 ~ /development_v2/ &&
-          ($0 ~ /eval-pipeline\/generate\.py/ ||
-           $0 ~ /run_trajectory_correction_queue\.sh/ ||
-           $0 ~ /waiting for >=22GiB/) {print $1}')
+        # Match only the real legacy watcher or a Python generation worker.
+        # Do not search for the queue script's literal text: the ps/awk helper
+        # would then match its own command line and wait forever.
+        pids=$(ps -eo pid=,comm=,args= | awk -v self="$$" '
+          $1 == self {next}
+          $2 ~ /^python/ && $0 ~ /eval-pipeline\/generate\.py/ && $0 ~ /development_v2/ {print $1; next}
+          $2 == "bash" && $3 == "/bin/bash" && $4 == "-c" &&
+          $5 == "set" && $6 == "-u" && $7 == "while" && $0 ~ /development_v2/ {print $1}
+        ')
         [ -z "$pids" ] && return 0
         CURRENT_STAGE=existing_process_wait
         write_state "$CURRENT_STAGE" waiting "pids=$pids"
