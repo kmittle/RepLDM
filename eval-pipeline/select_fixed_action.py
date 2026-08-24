@@ -116,7 +116,17 @@ def select_fixed_action(
     order = list(action_order or available)
     order.extend(action for action in available if action not in order)
     if candidates is None:
-        candidates = [action for action in order if action != baseline]
+        # Controls such as the conference expert may be added to a resumed
+        # manifest, but they are never candidates for this fixed-basis search.
+        if "action_type" in frame:
+            fixed_actions = set(
+                frame.loc[frame["action_type"] == "latent_renderer_fixed", "action_id"]
+            )
+        else:
+            fixed_actions = set(order)
+        candidates = [
+            action for action in order if action != baseline and action in fixed_actions
+        ]
     candidates = list(dict.fromkeys(candidates))
     unknown = sorted(set(candidates + [baseline]) - set(available))
     if unknown:
