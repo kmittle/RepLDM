@@ -117,6 +117,12 @@ def validate_registered_train_run(
         generated_coefficients = [float(value) for value in generated.get("coefficients", [])]
         if generated_coefficients != registered_coefficients:
             raise ValueError(f"{action_id}: generated coefficients differ from registration")
+        expected_cap = bool(registered.get("enforce_post_cast_cap", False))
+        generated_cap = generated.get("enforce_post_cast_cap", False)
+        if not isinstance(generated_cap, bool) or generated_cap != expected_cap:
+            raise ValueError(
+                f"{action_id}: generated enforce_post_cast_cap differs from registration"
+            )
         expected_provider = dict(provider_defaults)
         expected_provider.update(registered.get("provider", {}) or {})
         generated_provider = generated.get("latent_renderer_provider", {}) or {}
@@ -200,6 +206,17 @@ def _finite_renderer_diagnostics(frame: pd.DataFrame, action: str) -> bool:
                 for value in diagnostics["update_ratio"]
             ):
                 return False
+            if bool(action_record.get("enforce_post_cast_cap", False)):
+                strict_overrun = diagnostics.get("postcast_overrun")
+                postcast_ratio = diagnostics.get("postcast_update_ratio")
+                if (
+                    not isinstance(strict_overrun, list)
+                    or not isinstance(postcast_ratio, list)
+                    or len(strict_overrun) != len(diagnostics["update_ratio"])
+                    or len(postcast_ratio) != len(diagnostics["update_ratio"])
+                    or any(float(value) > 1e-7 for value in strict_overrun)
+                ):
+                    return False
     return True
 
 

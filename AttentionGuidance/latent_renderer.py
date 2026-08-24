@@ -54,6 +54,9 @@ class LatentRendererConfig:
     preserve_moments: bool = True
     normalize_bases: bool = True
     epsilon: float = 1e-6
+    # Keep the historical pre-cast behavior by default.  When enabled, the
+    # actual low-precision residual is rechecked and corrected per sample.
+    enforce_post_cast_cap: bool = False
 
     def __post_init__(self) -> None:
         if int(self.num_bases) <= 0:
@@ -82,6 +85,12 @@ class LatentRendererConfig:
                 raise ValueError("max_update_ratio must be finite and non-negative")
         if not math.isfinite(float(self.epsilon)) or self.epsilon <= 0:
             raise ValueError("epsilon must be finite and positive")
+        if not isinstance(self.enforce_post_cast_cap, bool):
+            raise ValueError("enforce_post_cast_cap must be a boolean")
+        if self.enforce_post_cast_cap and self.max_update_ratio is None:
+            raise ValueError(
+                "enforce_post_cast_cap requires max_update_ratio to be configured"
+            )
 
 
 @dataclass(frozen=True)
@@ -94,6 +103,17 @@ class RendererDiagnostics:
     update_ratio: Optional[Tensor]
     mean_error: Tensor
     variance_error: Tensor
+    # Optional fields keep positional construction of the original six-field
+    # diagnostics object source-compatible for downstream audit utilities.
+    precast_update_norm: Optional[Tensor] = None
+    precast_update_ratio: Optional[Tensor] = None
+    precast_overrun: Optional[Tensor] = None
+    postcast_update_norm: Optional[Tensor] = None
+    postcast_update_ratio: Optional[Tensor] = None
+    postcast_overrun: Optional[Tensor] = None
+    observed_postcast_overrun: Optional[Tensor] = None
+    postcast_cap_applied: Optional[Tensor] = None
+    postcast_noop_fallback: Optional[Tensor] = None
 
     def to_record(self) -> dict:
         """Return JSON-safe per-sample diagnostics for an experiment sidecar."""
@@ -101,6 +121,8 @@ class RendererDiagnostics:
         def encode(value: Optional[Tensor]):
             if value is None:
                 return None
+            if value.dtype == torch.bool:
+                return value.detach().cpu().tolist()
             return value.detach().float().cpu().tolist()
 
         return {
@@ -110,6 +132,15 @@ class RendererDiagnostics:
             "update_ratio": encode(self.update_ratio),
             "mean_error": encode(self.mean_error),
             "variance_error": encode(self.variance_error),
+            "precast_update_norm": encode(self.precast_update_norm),
+            "precast_update_ratio": encode(self.precast_update_ratio),
+            "precast_overrun": encode(self.precast_overrun),
+            "postcast_update_norm": encode(self.postcast_update_norm),
+            "postcast_update_ratio": encode(self.postcast_update_ratio),
+            "postcast_overrun": encode(self.postcast_overrun),
+            "observed_postcast_overrun": encode(self.observed_postcast_overrun),
+            "postcast_cap_applied": encode(self.postcast_cap_applied),
+            "postcast_noop_fallback": encode(self.postcast_noop_fallback),
         }
 
 
@@ -311,6 +342,89 @@ def cap_update_norm(
     return update * multiplier.reshape((-1, 1, 1, 1)).to(update.dtype)
 
 
+def _render_guided_x0(
+    latent: Tensor, update: Tensor, preserve_moments: bool, epsilon: float
+) -> Tensor:
+    """Map a float32 update to a clean latent before dtype conversion."""
+    if preserve_moments:
+        return _fixed_moment_geodesic(latent, update, epsilon)
+    return latent.float() + update.float()
+
+
+def _ratio_against_reference(
+    residual: Tensor, reference_update: Tensor, epsilon: float
+) -> Tensor:
+    """Return per-sample residual/reference norms in float32."""
+    return _vector_norm(residual) / _vector_norm(reference_update).clamp_min(epsilon)
+
+
+def _cast_guided_x0_with_cap(
+    latent: Tensor,
+    update: Tensor,
+    scheduler_update: Tensor,
+    max_update_ratio: float,
+    preserve_moments: bool,
+    epsilon: float,
+    enforce_post_cast_cap: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Cast a candidate and optionally enforce the cap after quantization.
+
+    The first return value is the float32 candidate corresponding to the final
+    action, the second is its stored latent-dtype representation, and the third
+    records any post-cast overrun observed before strict correction.  The fourth
+    and fifth values indicate correction and exact no-op fallback per sample.
+    Strict correction scales the tangent once, then falls back to an exact
+    no-op for samples that remain over the bound after quantization.
+    """
+    candidate_float = _render_guided_x0(
+        latent, update, preserve_moments, epsilon
+    )
+    candidate_cast = candidate_float.to(latent.dtype)
+    reference_norm = _vector_norm(scheduler_update)
+    candidate_finite = torch.isfinite(candidate_cast).flatten(1).all(dim=1)
+    observed_ratio = _ratio_against_reference(
+        candidate_cast.float() - latent.float(), scheduler_update, epsilon
+    )
+    observed_overrun = (observed_ratio - float(max_update_ratio)).clamp_min(0.0)
+    observed_overrun = torch.where(
+        candidate_finite,
+        observed_overrun,
+        torch.full_like(observed_overrun, float("inf")),
+    )
+    if not enforce_post_cast_cap or not torch.any(observed_overrun > 0):
+        zeros = torch.zeros_like(observed_overrun, dtype=torch.bool)
+        return candidate_float, candidate_cast, observed_overrun, zeros, zeros
+
+    overrun = observed_overrun > 0
+    cast_norm = _vector_norm(candidate_cast.float() - latent.float())
+    scale = torch.clamp(
+        float(max_update_ratio) * reference_norm / (cast_norm + epsilon), max=1.0
+    )
+    scaled_update = update * scale.reshape((-1, 1, 1, 1)).to(update.dtype)
+    scaled_float = _render_guided_x0(
+        latent, scaled_update, preserve_moments, epsilon
+    )
+    scaled_cast = scaled_float.to(latent.dtype)
+    scaled_ratio = _ratio_against_reference(
+        scaled_cast.float() - latent.float(), scheduler_update, epsilon
+    )
+    scaled_finite = torch.isfinite(scaled_cast).flatten(1).all(dim=1)
+    fallback = overrun & (
+        ~candidate_finite
+        | ~scaled_finite
+        | (scaled_ratio > float(max_update_ratio))
+    )
+    batch_mask = overrun.reshape((-1, 1, 1, 1))
+    fallback_mask = fallback.reshape((-1, 1, 1, 1))
+    final_float = torch.where(batch_mask, scaled_float, candidate_float)
+    final_cast = torch.where(batch_mask, scaled_cast, candidate_cast)
+    # Quantization can make a single representable step larger than the cap;
+    # an exact latent fallback is the only strict and moment-preserving action.
+    final_float = torch.where(fallback_mask, latent.float(), final_float)
+    final_cast = torch.where(fallback_mask, latent, final_cast)
+    return final_float, final_cast, observed_overrun, overrun, fallback
+
+
 def build_spectral_bases(
     reference: Tensor, cutoffs: Tuple[float, float] = (0.08, 0.25)
 ) -> Tensor:
@@ -472,7 +586,9 @@ class StructuralLatentRenderer(nn.Module):
     configured dimensions are zero.  The final linear layer starts at zero,
     making an untrained renderer an exact no-op.  Set ``spatial_hidden_dim``
     above zero to add a depthwise-separable local latent head; zero keeps the
-    coefficient-only control used by the fixed-basis ablation.
+    coefficient-only control used by the fixed-basis ablation.  Set
+    ``enforce_post_cast_cap`` to recheck the actual low-precision residual and
+    shrink or disable samples that quantize beyond the scheduler trust cap.
     """
 
     def __init__(self, config: LatentRendererConfig) -> None:
@@ -654,20 +770,62 @@ class StructuralLatentRenderer(nn.Module):
                 float(self.config.max_update_ratio),
                 self.config.epsilon,
             )
-        if self.config.preserve_moments:
-            guided_x0 = _fixed_moment_geodesic(latent, update, self.config.epsilon)
+        observed_postcast_overrun = None
+        postcast_cap_applied = None
+        postcast_noop_fallback = None
+        if self.config.max_update_ratio is not None:
+            # The helper preserves the historical path unless strict post-cast
+            # enforcement is explicitly enabled in the action configuration.
+            (
+                guided_float,
+                guided_x0,
+                observed_postcast_overrun,
+                postcast_cap_applied,
+                postcast_noop_fallback,
+            ) = (
+                _cast_guided_x0_with_cap(
+                    latent,
+                    update,
+                    scheduler_update,
+                    float(self.config.max_update_ratio),
+                    self.config.preserve_moments,
+                    self.config.epsilon,
+                    self.config.enforce_post_cast_cap,
+                )
+            )
         else:
-            guided_x0 = latent.float() + update.float()
-        guided_x0 = guided_x0.to(latent.dtype)
+            guided_float = _render_guided_x0(
+                latent, update, self.config.preserve_moments, self.config.epsilon
+            )
+            guided_x0 = guided_float.to(latent.dtype)
+        precast_residual = guided_float - latent.float()
+        # Preserve the historical output dtype; diagnostics use float32 views.
         residual = guided_x0 - latent
         raw_norm = _vector_norm(raw_update)
-        bounded_norm = _vector_norm(residual)
+        precast_norm = _vector_norm(precast_residual)
+        postcast_norm = _vector_norm(residual)
+        bounded_norm = postcast_norm
         scheduler_norm = (
             _vector_norm(scheduler_update) if scheduler_update is not None else None
         )
-        update_ratio = (
-            bounded_norm / scheduler_norm.clamp_min(self.config.epsilon)
+        precast_ratio = (
+            precast_norm / scheduler_norm.clamp_min(self.config.epsilon)
             if scheduler_norm is not None
+            else None
+        )
+        postcast_ratio = (
+            postcast_norm / scheduler_norm.clamp_min(self.config.epsilon)
+            if scheduler_norm is not None
+            else None
+        )
+        precast_overrun = (
+            (precast_ratio - float(self.config.max_update_ratio)).clamp_min(0.0)
+            if precast_ratio is not None and self.config.max_update_ratio is not None
+            else None
+        )
+        postcast_overrun = (
+            (postcast_ratio - float(self.config.max_update_ratio)).clamp_min(0.0)
+            if postcast_ratio is not None and self.config.max_update_ratio is not None
             else None
         )
         mean_error = (
@@ -681,9 +839,20 @@ class StructuralLatentRenderer(nn.Module):
             raw_update_norm=raw_norm,
             bounded_update_norm=bounded_norm,
             scheduler_update_norm=scheduler_norm,
-            update_ratio=update_ratio,
+            # ``update_ratio`` remains the actual injected post-cast ratio for
+            # compatibility with existing selection and audit consumers.
+            update_ratio=postcast_ratio,
             mean_error=mean_error,
             variance_error=variance_error,
+            precast_update_norm=precast_norm,
+            precast_update_ratio=precast_ratio,
+            precast_overrun=precast_overrun,
+            postcast_update_norm=postcast_norm,
+            postcast_update_ratio=postcast_ratio,
+            postcast_overrun=postcast_overrun,
+            observed_postcast_overrun=observed_postcast_overrun,
+            postcast_cap_applied=postcast_cap_applied,
+            postcast_noop_fallback=postcast_noop_fallback,
         )
         return RendererOutput(
             guided_x0=guided_x0,
@@ -700,6 +869,7 @@ def build_fixed_coefficient_renderer(
     coefficient_bound: float = 1.0,
     max_update_ratio: Optional[float] = 0.05,
     preserve_moments: bool = True,
+    enforce_post_cast_cap: bool = False,
 ) -> StructuralLatentRenderer:
     """Construct a parameter-free-in-behavior renderer for basis search.
 
@@ -733,6 +903,7 @@ def build_fixed_coefficient_renderer(
             spatial_hidden_dim=0,
             max_update_ratio=max_update_ratio,
             preserve_moments=preserve_moments,
+            enforce_post_cast_cap=enforce_post_cast_cap,
         )
     )
     with torch.no_grad():

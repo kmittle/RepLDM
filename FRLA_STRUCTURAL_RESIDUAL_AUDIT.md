@@ -42,12 +42,21 @@ exists after the cast: with `torch.manual_seed(21)`, tensors of shapes
 while the cast residual ratios are `[0.1003298, 0.1001001]`.  This is
 quantization, not a geodesic or per-channel-radius violation.
 
-The minimal hardening is to cap and record the final residual in float32 after
-the geodesic, before the dtype cast.  If a hard bound is required in the
-stored low-precision latent, re-check after casting and either shrink the
-action or use an explicit no-op fallback; otherwise report a dtype guard
-tolerance and the cast residual norm.  Silently reporting the pre-cast ratio as
-the injected ratio is not defensible.
+The hardening branch adds an opt-in `enforce_post_cast_cap` action/config flag.
+Diagnostics now retain pre-cast and post-cast norms/ratios, the observed
+pre-correction overrun, the final overrun, and per-sample correction/fallback
+flags.  In strict mode an overrun sample is scaled in tangent space and
+retracted again; if quantization still exceeds the cap it falls back to the
+exact original latent.  Thus `update_ratio` remains the actual injected
+post-cast ratio, while the uncorrected overrun is still auditable.  The flag is
+normalized into each action and written to `config.json` and task sidecars, so
+provenance cannot silently change the safety contract.  The default remains
+`false` for byte-compatible historical runs.
+
+This contract covers the renderer residual (`guided_x0 - pred_original_sample`).
+The later pipeline addition `prev_sample + guided_x0 - pred_original_sample`
+performs another low-precision arithmetic step; an end-to-end hard bound would
+need a separate injection-side check and is intentionally not claimed here.
 
 ## Identity and CFG contracts
 

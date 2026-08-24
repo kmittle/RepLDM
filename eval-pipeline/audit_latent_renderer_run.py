@@ -190,6 +190,7 @@ def audit_run(
 
     required_score_keys = tuple(required_score_keys)
     max_update_ratio = 0.0
+    max_postcast_overrun = 0.0
     max_mean_error = 0.0
     max_variance_error = 0.0
     image_hashes: Dict[tuple, str] = {}
@@ -250,6 +251,29 @@ def audit_run(
             if max(map(abs, variance_error)) > 1e-3:
                 raise ValueError(f"{expected_id}: renderer variance preservation is violated")
             max_update_ratio = max(max_update_ratio, max(update_ratio))
+            action_record = record.get("action", {})
+            if bool(action_record.get("enforce_post_cast_cap", False)):
+                precast_ratio = _finite_values(diagnostics, "precast_update_ratio")
+                postcast_ratio = _finite_values(diagnostics, "postcast_update_ratio")
+                observed_overrun = _finite_values(
+                    diagnostics, "observed_postcast_overrun"
+                )
+                postcast_overrun = _finite_values(diagnostics, "postcast_overrun")
+                if len(postcast_ratio) != len(update_ratio):
+                    raise ValueError(f"{expected_id}: post-cast ratio length differs")
+                if any(
+                    abs(left - right) > 1e-6
+                    for left, right in zip(postcast_ratio, update_ratio)
+                ):
+                    raise ValueError(f"{expected_id}: update_ratio is not post-cast ratio")
+                if max(postcast_overrun) > 1e-7:
+                    raise ValueError(f"{expected_id}: strict post-cast cap is violated")
+                if (
+                    len(precast_ratio) != len(update_ratio)
+                    or len(observed_overrun) != len(update_ratio)
+                ):
+                    raise ValueError(f"{expected_id}: strict renderer diagnostic lengths differ")
+                max_postcast_overrun = max(max_postcast_overrun, max(postcast_overrun))
             max_mean_error = max(max_mean_error, max(map(abs, mean_error)))
             max_variance_error = max(
                 max_variance_error, max(map(abs, variance_error))
@@ -293,6 +317,7 @@ def audit_run(
         "devices": sorted({next(iter(values)) for values in block_devices.values()}),
         "required_score_keys": list(required_score_keys),
         "max_update_ratio": max_update_ratio,
+        "max_postcast_overrun": max_postcast_overrun,
         "max_abs_mean_error": max_mean_error,
         "max_abs_variance_error": max_variance_error,
         "all_action_png_hashes_distinct_within_block": require_distinct_actions,

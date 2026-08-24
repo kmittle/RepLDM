@@ -349,6 +349,14 @@ def load_actions(path: str, num_inference_steps: int):
                 or action["max_update_ratio"] < 0
             ):
                 raise ValueError(f"{action_id}: max_update_ratio must be non-negative")
+            enforce_post_cast_cap = action.get("enforce_post_cast_cap", False)
+            if not isinstance(enforce_post_cast_cap, bool):
+                raise ValueError(
+                    f"{action_id}: enforce_post_cast_cap must be a boolean"
+                )
+            # Keep the dtype hard-bound choice in the normalized action so it
+            # is included in config.json, each task sidecar, and provenance.
+            action["enforce_post_cast_cap"] = enforce_post_cast_cap
             action["latent_renderer_provider"] = {
                 "feature_block": feature_block,
                 "semantic_layer": None if semantic_layer is None else str(semantic_layer),
@@ -737,6 +745,7 @@ def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: flo
         coefficient_bound=action["coefficient_bound"],
         max_update_ratio=action["max_update_ratio"],
         preserve_moments=True,
+        enforce_post_cast_cap=bool(action.get("enforce_post_cast_cap", False)),
     ).to(device)
     provider_config = action["latent_renderer_provider"]
     provider = StructuralUNetBasisProvider(

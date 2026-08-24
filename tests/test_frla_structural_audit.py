@@ -5,9 +5,12 @@ import unittest
 import torch
 
 from AttentionGuidance.latent_renderer import (
+    LatentRendererConfig,
     StructuralUNetFeatureCapture,
+    StructuralLatentRenderer,
     _fixed_moment_geodesic,
     _project_fixed_moment_tangent,
+    build_fixed_coefficient_renderer,
     cap_update_norm,
 )
 
@@ -29,6 +32,29 @@ split_cfg_noise_pred = _cfg_batch.split_cfg_noise_pred
 
 
 class FRLAStructuralAuditTest(unittest.TestCase):
+    @staticmethod
+    def _renderer_case(dtype, seed, strict=True, preserve_moments=True):
+        torch.manual_seed(seed)
+        latent = (torch.randn(2, 4, 8, 8) * 10.0).to(dtype)
+        bases = (torch.randn(2, 4, 4, 8, 8) * 1000.0).to(dtype)
+        scheduler_update = (torch.randn_like(latent) * 10.0).to(dtype)
+        renderer = StructuralLatentRenderer(
+            LatentRendererConfig(
+                num_bases=4,
+                max_update_ratio=0.1,
+                preserve_moments=preserve_moments,
+                enforce_post_cast_cap=strict,
+            )
+        )
+        with torch.no_grad():
+            renderer.policy[-1].bias.fill_(0.9)
+        output = renderer(
+            latent,
+            bases,
+            scheduler_update=scheduler_update,
+        )
+        return latent, scheduler_update, output
+
     def test_float32_geodesic_residual_stays_inside_trust_cap(self):
         torch.manual_seed(21)
         latent = torch.randn(2, 4, 8, 8) * 10.0
@@ -61,6 +87,105 @@ class FRLAStructuralAuditTest(unittest.TestCase):
         ) / denominator
         self.assertTrue(torch.all(float_ratio <= 0.1 + 1e-6))
         self.assertGreater(float(cast_ratio.max()), 0.1002)
+
+    def test_strict_cap_corrects_one_of_two_low_precision_samples(self):
+        for dtype, seed in ((torch.float16, 1712), (torch.bfloat16, 2094)):
+            latent, _scheduler_update, output = self._renderer_case(dtype, seed)
+            diagnostics = output.diagnostics
+            self.assertEqual(output.residual.dtype, dtype)
+            self.assertEqual(diagnostics.postcast_update_ratio.shape, (2,))
+            self.assertEqual(diagnostics.precast_update_ratio.shape, (2,))
+            observed_overrun = diagnostics.observed_postcast_overrun.detach()
+            self.assertGreater(float(observed_overrun[0]), 0.0)
+            self.assertEqual(float(observed_overrun[1]), 0.0)
+            self.assertTrue(torch.all(diagnostics.postcast_overrun <= 1e-7))
+            self.assertTrue(torch.all(diagnostics.update_ratio <= 0.1 + 1e-7))
+            self.assertTrue(bool(diagnostics.postcast_cap_applied[0]))
+            self.assertFalse(bool(diagnostics.postcast_cap_applied[1]))
+            if bool(diagnostics.postcast_noop_fallback[0]):
+                self.assertTrue(torch.equal(output.guided_x0[0], latent[0]))
+
+    def test_strict_cap_zero_scheduler_and_zero_initialization_are_identity(self):
+        torch.manual_seed(29)
+        latent = torch.randn(2, 4, 8, 8).bfloat16()
+        bases = torch.randn(2, 4, 4, 8, 8).bfloat16()
+        zero_scheduler = torch.zeros_like(latent)
+        renderer = StructuralLatentRenderer(
+            LatentRendererConfig(
+                num_bases=4,
+                max_update_ratio=0.1,
+                enforce_post_cast_cap=True,
+            )
+        )
+        output = renderer(
+            latent,
+            bases,
+            scheduler_update=zero_scheduler,
+        )
+        self.assertTrue(torch.equal(output.guided_x0, latent))
+        self.assertTrue(torch.equal(output.residual, torch.zeros_like(latent)))
+        self.assertTrue(torch.equal(output.diagnostics.update_ratio, torch.zeros(2)))
+        self.assertTrue(torch.equal(output.diagnostics.postcast_overrun, torch.zeros(2)))
+
+        renderer.policy[-1].bias.data.fill_(0.7)
+        output = renderer(latent, bases, scheduler_update=zero_scheduler)
+        self.assertTrue(torch.equal(output.guided_x0, latent))
+        self.assertTrue(torch.equal(output.residual, torch.zeros_like(latent)))
+
+    def test_strict_fixed_moment_errors_and_builder_flag(self):
+        latent, _scheduler_update, output = self._renderer_case(
+            torch.float32, 31, strict=True, preserve_moments=True
+        )
+        self.assertTrue(torch.all(output.diagnostics.mean_error < 1e-5))
+        self.assertTrue(torch.all(output.diagnostics.variance_error < 1e-4))
+        renderer = build_fixed_coefficient_renderer(
+            [0.02, 0.0, 0.0, 0.0],
+            max_update_ratio=0.1,
+            enforce_post_cast_cap=True,
+        )
+        self.assertTrue(renderer.config.enforce_post_cast_cap)
+
+    def test_strict_cap_also_applies_without_moment_retraction(self):
+        for dtype, seed in ((torch.float16, 1712), (torch.bfloat16, 2094)):
+            _latent, _scheduler_update, output = self._renderer_case(
+                dtype, seed, strict=True, preserve_moments=False
+            )
+            diagnostics = output.diagnostics
+            self.assertTrue(torch.all(diagnostics.postcast_overrun <= 1e-7))
+            self.assertTrue(torch.all(diagnostics.update_ratio <= 0.1 + 1e-7))
+
+    def test_non_strict_mode_preserves_historical_post_cast_action(self):
+        _latent, _scheduler_update, legacy = self._renderer_case(
+            torch.bfloat16, 2094, strict=False
+        )
+        _latent, _scheduler_update, explicit = self._renderer_case(
+            torch.bfloat16, 2094, strict=False
+        )
+        self.assertTrue(torch.equal(legacy.guided_x0, explicit.guided_x0))
+        self.assertTrue(torch.equal(legacy.residual, explicit.residual))
+        torch.testing.assert_close(
+            legacy.diagnostics.update_ratio, explicit.diagnostics.update_ratio
+        )
+        self.assertGreater(
+            float(legacy.diagnostics.postcast_overrun.detach().max()), 0.0002
+        )
+
+    def test_diagnostics_record_is_additive_and_preserves_boolean_flags(self):
+        _latent, _scheduler_update, output = self._renderer_case(
+            torch.bfloat16, 2094, strict=True
+        )
+        record = output.diagnostics.to_record()
+        for key in (
+            "update_ratio",
+            "precast_update_ratio",
+            "postcast_update_ratio",
+            "precast_overrun",
+            "postcast_overrun",
+            "observed_postcast_overrun",
+        ):
+            self.assertIn(key, record)
+        self.assertIsInstance(record["postcast_cap_applied"][0], bool)
+        self.assertIsInstance(record["postcast_noop_fallback"][0], bool)
 
     def test_cfg_helpers_and_capture_select_positive_block_for_batch_two(self):
         latents = torch.tensor([[10.0], [20.0]])
