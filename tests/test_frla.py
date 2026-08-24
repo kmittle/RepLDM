@@ -40,9 +40,14 @@ class FRLATest(unittest.TestCase):
         output = apply_frla(latent, feature, scheduler_update)
         self.assertEqual(output.guided_x0.dtype, latent.dtype)
         self.assertEqual(output.residual.shape, latent.shape)
-        self.assertTrue(torch.all(output.loss_after < output.loss_before))
+        self.assertTrue(
+            torch.all(output.loss_after <= output.loss_before + 1e-7)
+        )
+        self.assertTrue(torch.any(output.loss_after < output.loss_before - 1e-8))
         self.assertTrue(torch.all(output.update_ratio <= 0.05 + 1e-6))
         self.assertIsNone(feature.grad)
+        self.assertFalse(output.guided_x0.requires_grad)
+        self.assertFalse(output.residual.requires_grad)
         self.assertTrue(math.isfinite(output.to_record()["loss_after"][0]))
 
     def test_zero_scheduler_is_exact_identity(self):

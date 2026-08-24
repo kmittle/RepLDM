@@ -7,6 +7,7 @@ latent residual that can be injected after the scheduler step.
 """
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Sequence, Tuple
 
 import torch
@@ -50,9 +51,19 @@ class FRLAConfig:
     epsilon: float = 1e-6
 
     def __post_init__(self) -> None:
-        if int(self.grid_size) < 2:
+        try:
+            grid_size = int(self.grid_size)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("grid_size must be an integer") from exc
+        if grid_size < 2:
             raise ValueError("grid_size must be at least two")
-        if not torch.isfinite(torch.tensor(float(self.eta))) or self.eta <= 0:
+        try:
+            eta = float(self.eta)
+            max_update_ratio = float(self.max_update_ratio)
+            epsilon = float(self.epsilon)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("eta, max_update_ratio, and epsilon must be numeric") from exc
+        if not math.isfinite(eta) or eta <= 0:
             raise ValueError("eta must be finite and positive")
         if int(self.projection_seed) < 0:
             raise ValueError("projection_seed must be non-negative")
@@ -61,14 +72,13 @@ class FRLAConfig:
         for lag in self.lags:
             if len(lag) != 2 or min(int(lag[0]), int(lag[1])) < 0:
                 raise ValueError("lags must contain non-negative (dy, dx) pairs")
-            if max(int(lag[0]), int(lag[1])) >= self.grid_size:
+            if max(int(lag[0]), int(lag[1])) >= grid_size:
                 raise ValueError("lag must fit inside grid_size")
         if (
-            not torch.isfinite(torch.tensor(float(self.max_update_ratio)))
-            or self.max_update_ratio < 0
+            not math.isfinite(max_update_ratio) or max_update_ratio < 0
         ):
             raise ValueError("max_update_ratio must be finite and non-negative")
-        if not torch.isfinite(torch.tensor(float(self.epsilon))) or self.epsilon <= 0:
+        if not math.isfinite(epsilon) or epsilon <= 0:
             raise ValueError("epsilon must be finite and positive")
 
 
@@ -116,6 +126,8 @@ def fixed_channel_projection(
     """Return a deterministic, row-normalized Gaussian projection."""
     if int(in_channels) <= 0 or int(out_channels) <= 0:
         raise ValueError("projection dimensions must be positive")
+    if int(seed) < 0:
+        raise ValueError("seed must be non-negative")
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
     matrix = torch.randn(
@@ -140,11 +152,24 @@ def _reduce_to_grid(
 def local_cosine_descriptor(value: Tensor, lags: Sequence[Lag], epsilon: float = 1e-6) -> Tensor:
     """Compute mean local cosine similarity for each fixed spatial lag."""
     _check_nchw(value, "value")
+    try:
+        epsilon_value = float(epsilon)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("epsilon must be finite and positive") from exc
+    if not math.isfinite(epsilon_value) or epsilon_value <= 0:
+        raise ValueError("epsilon must be finite and positive")
+    if not lags:
+        raise ValueError("lags must not be empty")
     height, width = value.shape[-2:]
     descriptors = []
     work = value.float()
     for dy, dx in lags:
-        dy, dx = int(dy), int(dx)
+        try:
+            dy, dx = int(dy), int(dx)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("lags must contain integer pairs") from exc
+        if dy < 0 or dx < 0:
+            raise ValueError("lags must contain non-negative pairs")
         if dy >= height or dx >= width:
             raise ValueError("lag does not fit inside value")
         first = work[..., : height - dy, : width - dx]
@@ -154,7 +179,7 @@ def local_cosine_descriptor(value: Tensor, lags: Sequence[Lag], epsilon: float =
             first.square().sum(dim=1).sqrt()
             * second.square().sum(dim=1).sqrt()
         )
-        cosine = numerator / denominator.clamp_min(float(epsilon))
+        cosine = numerator / denominator.clamp_min(epsilon_value)
         descriptors.append(cosine.mean(dim=(-2, -1)))
     return torch.stack(descriptors, dim=1)
 
@@ -190,6 +215,8 @@ def apply_frla(
     ):
         raise ValueError("FRLA inputs must be finite")
 
+    base_x0 = pred_original_sample.detach()
+    base_scheduler_update = scheduler_update.detach()
     feature = feature.detach()
     projection = fixed_channel_projection(
         feature.shape[1], seed=config.projection_seed, device=feature.device
@@ -199,7 +226,7 @@ def apply_frla(
 
     # The only differentiable object is a cloned, detached clean latent.
     with torch.enable_grad():
-        latent = pred_original_sample.detach().float().clone().requires_grad_(True)
+        latent = base_x0.float().clone().requires_grad_(True)
         latent_grid = F.interpolate(
             latent, size=(config.grid_size, config.grid_size), mode="area"
         )
@@ -210,7 +237,7 @@ def apply_frla(
         loss_before = per_lag_loss.mean(dim=1)
         gradient = torch.autograd.grad(loss_before.sum(), latent)[0]
         gradient_norm = _per_sample_norm(gradient)
-        scheduler_norm = _per_sample_norm(scheduler_update)
+        scheduler_norm = _per_sample_norm(base_scheduler_update)
         # Normalize the direction so ``eta`` has the same meaning across
         # feature magnitudes and image resolutions.  The subsequent cap still
         # enforces the hard per-sample trust bound.
@@ -225,22 +252,22 @@ def apply_frla(
 
     if config.preserve_moments:
         tangent = _project_fixed_moment_tangent(
-            pred_original_sample.float(), raw_update, config.epsilon
+            base_x0.float(), raw_update, config.epsilon
         )
     else:
         tangent = raw_update
     bounded = cap_update_norm(
         tangent,
-        scheduler_update.float(),
+        base_scheduler_update.float(),
         float(config.max_update_ratio),
         config.epsilon,
     )
     if config.preserve_moments:
         guided_float = _fixed_moment_geodesic(
-            pred_original_sample.float(), bounded, config.epsilon
+            base_x0.float(), bounded, config.epsilon
         )
     else:
-        guided_float = pred_original_sample.float() + bounded
+        guided_float = base_x0.float() + bounded
 
     with torch.no_grad():
         guided_grid = F.interpolate(
@@ -250,15 +277,16 @@ def apply_frla(
             guided_grid, config.lags, config.epsilon
         )
         loss_after = (descriptor_after - target_descriptor).square().mean(dim=1)
-        residual = guided_float - pred_original_sample.float()
+        # Measure the residual after the output cast.  This is the quantity
+        # that will actually be injected into a low-precision pipeline.
+        guided_x0 = guided_float.to(base_x0.dtype).detach()
+        residual = guided_x0.float() - base_x0.float()
         update_ratio = _per_sample_norm(residual) / _per_sample_norm(
-            scheduler_update
+            base_scheduler_update
         ).clamp_min(config.epsilon)
-
-    guided_x0 = guided_float.to(pred_original_sample.dtype)
     return FRLAOutput(
         guided_x0=guided_x0,
-        residual=guided_x0 - pred_original_sample,
+        residual=guided_x0 - base_x0,
         descriptor_before=descriptor_before.detach(),
         descriptor_after=descriptor_after.detach(),
         loss_before=loss_before.detach(),
