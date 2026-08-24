@@ -204,9 +204,9 @@ used only after the action is frozen):
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
   --devices 1,2,3,4 \
   --prompts eval-pipeline/prompts/latent_renderer_train.csv \
-  --out_dir outputs/latent_renderer/lr1_fixed_train_v1 \
+  --out_dir outputs/latent_renderer/lr1_fixed_train_searchseeds_v2 \
   --actions eval-pipeline/configs/latent_renderer_fixed_lr1.yaml \
-  --seeds 0,42,123
+  --seeds 7,19,73
 ```
 
 `latent_renderer_fixed` emits constant six-dimensional coefficients through
@@ -219,7 +219,7 @@ After strict scoring, apply the frozen train-only proxy rule mechanically:
 
 ```bash
 /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/select_fixed_action.py \
-  --run_dir outputs/latent_renderer/lr1_fixed_train_v1 \
+  --run_dir outputs/latent_renderer/lr1_fixed_train_searchseeds_v2 \
   --prompts eval-pipeline/prompts/latent_renderer_train.csv
 ```
 

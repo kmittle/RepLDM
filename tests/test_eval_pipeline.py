@@ -35,6 +35,26 @@ select_fixed_action = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_fixed_action_selector_rejects_final_seed_leakage(self):
+        prompts = pd.DataFrame(
+            [{"index": 0, "TEXT": "train prompt", "split": "train"}]
+        )
+        frame = pd.DataFrame(
+            [{"prompt_index": 0, "prompt": "train prompt", "seed": 42}]
+        )
+        with self.assertRaisesRegex(ValueError, "final-test seeds"):
+            select_fixed_action.validate_train_design(prompts, frame, [0, 42, 123])
+
+    def test_fixed_action_selector_rejects_non_train_prompt_file(self):
+        prompts = pd.DataFrame(
+            [{"index": 0, "TEXT": "validation prompt", "split": "validation"}]
+        )
+        frame = pd.DataFrame(
+            [{"prompt_index": 0, "prompt": "validation prompt", "seed": 7}]
+        )
+        with self.assertRaisesRegex(ValueError, "split=train"):
+            select_fixed_action.validate_train_design(prompts, frame, [0, 42, 123])
+
     def test_fixed_action_selector_applies_proxy_and_guard_rule(self):
         rows = []
         for prompt_index in (0, 1):
@@ -114,6 +134,12 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual([task["action_id"] for task in groups[0]], ["no_ag", "conference_expert"])
 
     def test_latent_renderer_fixed_action_config(self):
+        with open(ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml") as handle:
+            import yaml
+
+            raw_config = yaml.safe_load(handle)
+        self.assertEqual(raw_config["split_seeds"]["train_search"], [7, 19, 73])
+        self.assertEqual(raw_config["split_seeds"]["test_final"], [0, 42, 123])
         actions, cutoffs = generate.load_actions(
             ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml", 50
         )

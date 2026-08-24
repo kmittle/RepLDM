@@ -31,6 +31,33 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def validate_train_design(
+    prompts: pd.DataFrame, frame: pd.DataFrame, forbidden_seeds: Sequence[int]
+) -> None:
+    """Reject split or seed leakage before any action score is selected."""
+    if "split" not in prompts or set(prompts["split"].astype(str)) != {"train"}:
+        raise ValueError("action selection requires a prompt CSV explicitly marked split=train")
+    prompt_ids = set(int(value) for value in prompts["index"])
+    observed_ids = set(int(value) for value in frame["prompt_index"])
+    if observed_ids != prompt_ids:
+        raise ValueError("manifest prompt ids do not exactly match the train split")
+    if "prompt" not in frame:
+        raise ValueError("manifest lacks prompt text required for split verification")
+    expected_text = {
+        int(row["index"]): str(row["TEXT"]) for _, row in prompts.iterrows()
+    }
+    observed_text = frame.groupby("prompt_index")["prompt"].agg(
+        lambda values: set(map(str, values))
+    )
+    if any(observed_text.get(index, set()) != {text} for index, text in expected_text.items()):
+        raise ValueError("manifest prompt text does not exactly match the train split")
+    leaked = sorted(set(int(value) for value in frame["seed"]) & set(forbidden_seeds))
+    if leaked:
+        raise ValueError(
+            f"train selection contains final-test seeds {leaked}; regenerate with search-only seeds"
+        )
+
+
 def _action_order(run_dir: str, frame: pd.DataFrame) -> List[str]:
     config_path = os.path.join(run_dir, "config.json")
     if os.path.exists(config_path):
@@ -213,6 +240,11 @@ def main() -> None:
     parser.add_argument("--candidates", default="", help="comma-separated fixed candidates")
     parser.add_argument("--bootstrap", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--forbidden_seeds",
+        default="0,42,123",
+        help="comma-separated final-test seeds that must not occur in train selection",
+    )
     args = parser.parse_args()
 
     prompts = pd.read_csv(args.prompts)
@@ -226,6 +258,10 @@ def main() -> None:
     frame = frame.merge(scores[score_columns], on="id", how="inner")
     if len(frame) != len(manifest[manifest["prompt_index"].isin(prompt_ids)]):
         raise ValueError("scores are incomplete for the requested split")
+    forbidden_seeds = [
+        int(value) for value in args.forbidden_seeds.split(",") if value
+    ]
+    validate_train_design(prompts, frame, forbidden_seeds)
     config_path = os.path.join(args.run_dir, "config.json")
     action_order = None
     if os.path.exists(config_path):

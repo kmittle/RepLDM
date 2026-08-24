@@ -86,8 +86,10 @@ Each split has 8/4/4 prompts per challenge across six PartiPrompts challenges.
 The manifest and split files must be committed before any image is generated;
 the test file is never used for coefficient or architecture selection. All
 prompts used by S0--S5 and their derivative outputs are excluded. Seeds
-`0,42,123` are reserved for final evaluation and cannot be used to choose
-coefficients. TOPIQ-NR is held out from training; report it with HPSv2, CLIP
+`0,42,123` are reserved for the one final test evaluation and cannot be used to
+choose coefficients. LR-1 uses train seeds `7,19,73` and one validation
+confirmation with seeds `11,29,101`; these sets are disjoint from the final test
+seeds. TOPIQ-NR is held out from training; report it with HPSv2, CLIP
 alignment, ImageReward, patch/detail witnesses, OCR/counting checks, DCT
 statistics, LPIPS/diversity, pixel guards, and a blinded human pairwise test
 before making a TPAMI claim. Use prompt/seed crossed bootstrap intervals,
@@ -124,7 +126,8 @@ diagnostics alongside each paired sidecar.
 
 ### Fixed-action selection rule
 
-This rule is frozen before any LR-1 score is inspected. On the train split, keep
+This rule is frozen before any valid LR-1 score is inspected. On the train split
+with seeds `7,19,73`, keep
 `no_ag` as a candidate and select the action with the largest paired mean
 `HPSv2` delta subject to all of the following: paired `CLIP cosine` delta is not
 below `-0.005`, mean clipped-fraction delta is at most `+0.001`, mean

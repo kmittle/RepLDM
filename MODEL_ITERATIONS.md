@@ -369,3 +369,18 @@ ratio 为 `0.0007790`，moment errors 小于 `1.5e-8`。这仍然只是接线和
 renderer update ratio，再按 YAML 顺序破平。TOPIQ-NR 不参与 train 选择，只在
 一次性的 validation/test 确认中使用；若没有非 no-AG 动作通过 proxy 规则，LR/RL
 路线立即关闭，不得再改指标或幅度。
+
+首次完整 LR-1 运行
+`outputs/latent_renderer/lr1_fixed_train_v1` 生成了 48 prompts × 3 seeds × 10
+actions = 1440 条记录，四张 GPU 各 360 条；全部 block 同卡完整，所有评分有限，
+最大 update ratio 为 `0.012895`，最大 mean/variance error 为
+`2.38e-7/4.77e-7`。但是这次运行使用了 `0,42,123`，与本协议此前已经写明的
+“这些 seed 只保留给 final test，不得用于系数选择”冲突。README 中旧 train 命令
+错误地给出了同一组 seed，这不能消除信息泄漏。因此该 run 和它产生的
+`spectral_low_pos` 选择被登记为 **protocol-invalid**：只保留工程审计价值，不能
+授权 validation、test、学习或 RL，也不能作为论文性能证据。
+
+修正后的、在查看任何合规 train 分数前冻结的 seed 划分为：train search
+`7,19,73`，validation confirmation `11,29,101`，final test `0,42,123`。动作、
+系数、provider、选择规则和质量门槛均保持不变；合规重跑使用新目录
+`outputs/latent_renderer/lr1_fixed_train_searchseeds_v2`。

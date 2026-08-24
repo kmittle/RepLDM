@@ -2,6 +2,10 @@
 # validation, and reserve latent_renderer_test.csv for one final evaluation.
 schema: latent_renderer_actions_v1
 experiment_id: lr1_fixed_basis_search_v1
+split_seeds:
+  train_search: [7, 19, 73]
+  validation_confirmation: [11, 29, 101]
+  test_final: [0, 42, 123]
 latent_renderer_provider:
   feature_block: up_blocks.0
   semantic_layer: up_blocks.0.attentions.0.transformer_blocks.0.attn1
