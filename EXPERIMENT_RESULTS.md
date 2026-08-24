@@ -222,3 +222,41 @@ TOPIQ seed-CV 的全局选择和逐 prompt 选择结果分别为 `-0.002148` 和
 因此 S4 失败，高分辨率例外到此关闭：不再扫描 2048² 下的 scale 或 schedule，也不进入 RL。
 
 如果继续提出候选方法，必须更换“更新方向从哪里来”，而不是继续调整现有动作。具体来说，应停止直接在 raw 四通道 noisy latent 上计算 TFSA 残差，改为从 scheduler 预测的干净样本或 UNet 语义特征中构造空间更新，再以符合 scheduler 轨迹的方式还原下一步 latent。新方法必须先在新的 prompt-disjoint 数据上用固定静态动作证明存在 headroom。若这个静态门槛仍然失败，就应放弃把 Attention Guidance 作为期刊扩展的主轴。
+
+## 11. FreeU 结构 baseline 与反取巧对照（S6，失败）
+
+### 动机和证据边界
+
+S5 和 LR-1 都没有给出可用的固定 latent 更新方向。S6 因而改看 U-Net 自身的
+backbone/skip 结构：FreeU（Si et al., 2023）是已发表的结构重加权 baseline，
+不是本项目的新颖性来源。2502.14831 说明 autoencoder latent 的高频分布可能破坏
+coarse-to-fine 去噪，2502.09509 说明变换一致性可以降低 latent manifold 复杂度；
+它们的实际方法都训练 autoencoder，所以这里只登记为启发和反取巧检查。
+
+### 严格 development 结果
+
+`outputs/freeu_conservative_search_v1` 和
+`outputs/freeu_moment_followup_v1` 各有 384/384 完整配对记录（24 prompts、2
+seeds、8 actions、30 steps、1024² Stage 1），全部 prompt/seed block 固定在一张
+GPU。strict scorer 输出 ImageReward、TOPIQ-NR、HPSv2、CLIP、aesthetic、IQA
+和像素 witness；比较使用 crossed-bootstrap CI、prompt sign-flip 和 Holm correction。
+
+| action | Δ TOPIQ-NR [95% CI] | Δ HPSv2 | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|
+| ordinary backbone-only | `+0.008447 [+0.003323,+0.013826]` | `+0.005473` | `+0.006656` | `+0.018090` |
+| ordinary low-window | `+0.004131 [+0.001053,+0.007595]` | `+0.001488` | `+0.001583` | `+0.005257` |
+| moment backbone-only | `+0.000609 [-0.001100,+0.002540]` | `+0.000506` | `-0.000074` | `-0.000469` |
+| moment low-window | `+0.001445 [-0.000894,+0.003758]` | `-0.000346` | `-0.000042` | `-0.000032` |
+
+普通 FreeU 的 TOPIQ 提升伴随显著 contrast/colorfulness/sharpness、clipping 和
+saturation 增长，属于不可接受的增强捷径。feature-moment controller 把这些 guard
+变化压回零附近，但 TOPIQ、HPSv2、CLIP 和 ImageReward 没有稳定提升。另一个把每步
+latent 矩统计投影回上一步的原型在 smoke 中产生全黑/无效图像，证明约束位置会阻断
+正常去噪；它没有进入正式结果。
+
+### 决策
+
+S6 是 development null result，不能授权 validation、Stage 2、人类盲评、蒸馏或 RL。
+FreeU 保留为论文中的强 baseline 和 reward-hacking 证据，但不再搜索其 scale/window。
+下一轮必须提出新的 scheduler-consistent 更新源，并在新的 prompt-disjoint split 上
+先通过静态 `+0.005` TOPIQ、HPS/CLIP 非劣和像素 guards；否则期刊扩展应诚实报告负结果。

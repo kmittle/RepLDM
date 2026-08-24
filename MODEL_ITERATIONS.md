@@ -422,3 +422,32 @@ reuse this run to train a renderer, distill coefficients, tune a VAE, or run
 final seeds. A future representation-side factorial or RL study requires a
 new registration and a new fixed static action with positive held-out
 headroom; this null result is retained as the complete negative control.
+
+## S6：FreeU 结构干预与 feature-moment 对照（失败）
+
+S5 与 LR-1 都没有提供可用的固定更新方向，因此本轮换用 U-Net 的天然
+backbone/skip 结构。FreeU 是已有方法，这里只把它作为强结构 baseline，并检验
+它是否能在不改变 RepLDM 冻结轨迹原则的前提下提供期刊扩展的软连接。动机还来自
+2502.14831 对 latent 高频成分的分析和 2502.09509 对 latent 变换一致性的讨论；
+两篇工作训练 autoencoder，不等于可以直接在 SDXL 推理时低通 latent。
+
+`outputs/freeu_conservative_search_v1` 是 24 prompts × 2 seeds × 8 actions 的
+384 条 development 记录。普通 backbone-only FreeU 的 TOPIQ-NR 差值为
+`+0.008447 [+0.003323,+0.013826]`，但 clipping 为 `+0.006656`、saturation
+为 `+0.018090`，contrast、colorfulness 和 Laplacian sharpness 也同步增加。
+较弱的 early/low-window 动作 TOPIQ 只有 `+0.004131`，clipping 仍为
+`+0.001583`，所以不满足预先登记的 `+0.005/+0.001/+0.005` 门槛。
+
+为区分结构收益与幅度捷径，`29dcf0f` 加入了 feature-moment FreeU controller：
+它在 U-Net up-block 的 FreeU 变换后匹配每通道 feature mean/RMS，不改 scheduler
+latent 演化，也不增加 UNet 调用。配对 follow-up
+`outputs/freeu_moment_followup_v1` 中，moment backbone-only 的 TOPIQ 差值为
+`+0.000609 [-0.001100,+0.002540]`，clipping `-0.000074`，saturation
+`-0.000469`；moment low-window 为 `+0.001445 [-0.000894,+0.003758]`，
+clipping `-0.000042`，saturation `-0.000032`。因此去掉全局增强捷径后没有质量
+headroom。一个更激进的“每步 latent 投影回上一步矩统计”在 smoke 中生成全黑/无效
+图像，已淘汰，未进入评分。
+
+S6 关闭 FreeU scale/window 搜索、蒸馏和 RL。下一轮若继续，必须更换更新来源，先
+用固定动作验证 scheduler-consistent 的 equivariance 或低频一致性残差；不能把
+FreeU 的代理指标提升包装成方法结果。

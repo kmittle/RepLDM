@@ -1,5 +1,12 @@
 # 实验计划：动态可学习的 Attention Guidance Scale
 
+> **状态修订（2026-08-24）：** 下面的 DRaFT/RL 计划是历史设计，当前不满足进入条件。
+> S5、LR-1 和 S6（FreeU 结构 baseline 及 feature-moment 对照）均未产生通过 guards
+> 的固定动作，因此不得按本文旧计划启动训练。下一轮必须先登记新的
+> scheduler-consistent static operator，并在 prompt-disjoint 数据上通过静态 headroom
+> gate；详见 `MODEL_ITERATIONS.md`、`EXPERIMENT_RESULTS.md` 和
+> `_experiments_expansion/rethinking/freeu_structural.md`。
+
 > 分支：`rl-version` ｜ 定位：RepLDM (NeurIPS 2025) 的**期刊扩展**工作
 > 目标：把手调的 guidance 超参 `(scale, density, decay)` 替换成一个**动态、可学习、(content/prompt)自适应**的控制器，去除人工消融、并提升质量与通用性。
 > 说明：本文件是活文档（living doc），随实验推进更新。行号引用基于改动前的代码，仅作定位用，以符号名为准。
