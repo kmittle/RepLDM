@@ -361,3 +361,11 @@ ratio 为 `0.0007790`，moment errors 小于 `1.5e-8`。这仍然只是接线和
 基底正负方向和均衡正负方向，所有动作共享 provider、NFE、CFG、scheduler
 和 `0.05` trust-region；应先在 train split 选择一个动作，再在 validation
 冻结确认，test 只允许一次最终报告。该 YAML 目前没有任何分数或 RL 权重。
+
+为避免在评分后挑选指标，LR-1 的选择规则已预注册在
+`LATENT_RENDERER_PROTOCOL.md`：train 只以配对 HPSv2 均值选择，并要求 CLIP
+非劣（`-0.005`）、clipped fraction 增量不超过 `+0.001`、saturation 增量不超过
+`+0.005`，以及所有 moment/trust 诊断有限且合规。HPS 区间重叠时先选较小的
+renderer update ratio，再按 YAML 顺序破平。TOPIQ-NR 不参与 train 选择，只在
+一次性的 validation/test 确认中使用；若没有非 no-AG 动作通过 proxy 规则，LR/RL
+路线立即关闭，不得再改指标或幅度。
