@@ -62,6 +62,34 @@ type, CFG, initial-noise seed, actual U-Net call count, wall time, and peak
 memory. Compare at matched actual NFE, not nominal loop steps. DPM/UniPC settings
 are frozen before selection and are never tuned against S8 scores.
 
+## Fresh API-Audit Controls
+
+Four additional arXiv API records tighten the preregistration boundary. MOG/
+Auto-MOG (2603.11509v1) already supplies Riemannian guidance and a dynamic
+energy-balancing schedule. Therefore FRLA must compare fixed-energy MOG,
+Auto-MOG, Euclidean norm-only, and isotropic-shell controls at matched NFE;
+moment retraction or an adaptive energy schedule cannot be presented as the
+novel contribution. RSA-FT (2603.21175v1) already flattens reward gradients
+with parameter/sample perturbations to reduce reward hacking. If online RL is
+run, include ordinary versus flattened-gradient training; regardless of the
+optimizer, stress every learned arm with parameter and generated-image
+perturbations,
+independent native-resolution/patch/color-normalized scores, and blinded human
+preference. A scalar reward increase without these witnesses is a failed gate.
+
+Sol-RL (2604.06916v1) separates FP4/NVFP4 rollout exploration from BF16 policy
+optimization. This is a required precision control for any throughput claim:
+compare BF16-only with FP4-explore/BF16-optimize using matched pool size, seeds,
+NFE, and selection, and report quantization error, throughput, memory, and
+amortized cost. If the required hardware is unavailable, omit the speed claim.
+CIB-Med-1 (2607.16291v1) shows that endpoint target scores can hide
+trajectory-level off-target drift. Before semantic claims, freeze target and
+nuisance axes (color/background/pose/texture/identity/count/layout), measure
+per-step and endpoint target progress plus median and 90th-percentile nuisance
+drift with an evaluator held out from policy training, and compare unconstrained
+FRLA/RL with a drift-constrained arm. These medical-domain axes are a protocol
+template, not evidence of medical transfer.
+
 ## Sequential Gates
 
 1. **Fixed-action gate.** FRLA must first beat no-op and the conference expert
