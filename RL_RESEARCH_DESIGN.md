@@ -59,6 +59,14 @@ one scalar an "invariance" score.
 
 ## Candidate Renderer
 
+The first implementation is frozen in `AttentionGuidance/latent_renderer.py`
+and registered separately in `LATENT_RENDERER_PROTOCOL.md`. It is a
+zero-initialized basis allocator rather than a free-form latent generator:
+this keeps the initial identity, parameter count, residual geometry, and
+scheduler injection auditable before any learned weights or RL are introduced.
+The companion YAML is a registration manifest only and must not be passed to
+the legacy image-generation action loader.
+
 At step `t`, one frozen U-Net evaluation returns noise `epsilon_t` and exposes a
 small set of decoder backbone/skip features (B_t^l,S_t^l), self-attention
 affinity (G_t), and the scheduler's own predicted clean latent

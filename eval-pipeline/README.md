@@ -152,6 +152,28 @@ For each fold, the script selects a global action and one action per prompt on t
 
 `aggregate.py` and `visualize.py` remain available for the legacy scalar sweep. Their plots are descriptive and must not be used for the invalidated cross-device pilot in `EXPERIMENT_RESULTS.md`.
 
+## Latent Renderer Registration
+
+The post-S5 latent-renderer direction is a separate hypothesis. Read
+`LATENT_RENDERER_PROTOCOL.md` and `RL_RESEARCH_DESIGN.md` before running it.
+`configs/latent_renderer_mechanism_audit.yaml` freezes the LR-0 mechanism
+audit and is registration-only; `generate.py` intentionally rejects it. The
+reusable CPU/GPU-safe primitives are in
+`AttentionGuidance/latent_renderer.py`, with focused tests under
+`tests/test_latent_renderer.py`. No RL or renderer checkpoint is authorized
+until the fixed-action LR-1 gate and the search-then-distill comparison pass.
+
+Run the synthetic correctness audit without model weights:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python \
+  eval-pipeline/audit_latent_renderer.py \
+  --output outputs/latent_renderer/lr0_cpu_report.json
+```
+
+The command must report `"passed": true`; its output is engineering evidence
+only and cannot substitute for the prompt-disjoint LR-1 quality experiment.
+
 ## Layout
 
 ```text

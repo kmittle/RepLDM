@@ -136,6 +136,11 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertTrue(torch.equal(first, second))
 
     def test_invalid_action_config_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "registration manifests"):
+            generate.load_actions(
+                ROOT / "eval-pipeline/configs/latent_renderer_mechanism_audit.yaml", 50
+            )
+
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as handle:
             handle.write("actions:\n  - id: bad/action\n    type: none\n")
             handle.flush()

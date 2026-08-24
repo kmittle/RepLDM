@@ -180,6 +180,11 @@ def assign_tasks_to_devices(tasks: list, devices: list, img_dir: str) -> dict:
 def load_actions(path: str, num_inference_steps: int):
     with open(path) as handle:
         config = yaml.safe_load(handle) or {}
+    if config.get("schema") == "latent_renderer_registration_v1":
+        raise ValueError(
+            "latent-renderer registration manifests are not generation action configs; "
+            "run eval-pipeline/audit_latent_renderer.py first"
+        )
     actions = config.get("actions")
     if not isinstance(actions, list) or not actions:
         raise ValueError("action config must contain a non-empty 'actions' list")

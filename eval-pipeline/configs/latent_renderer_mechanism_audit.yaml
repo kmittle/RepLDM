@@ -1,0 +1,84 @@
+# LR-0 registration only. This file is intentionally not accepted by
+# eval-pipeline/generate.py; it freezes the renderer audit before image runs.
+schema: latent_renderer_registration_v1
+experiment_id: lr0_mechanism_audit_v1
+status: registration_only
+parent_boundary: S5_null_closed
+
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  resolution: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  sampler: EulerDiscreteScheduler
+  stage2: false
+  extra_unet_calls: 0
+
+renderer:
+  num_bases: 6
+  basis_order:
+    - reciprocal_semantic_transport
+    - spectral_low
+    - spectral_mid
+    - spectral_high
+    - freeu_backbone_minus_skip
+    - laplacian
+  prompt_feature_dim: 32
+  state_feature_dim: 16
+  timestep_feature_dim: 16
+  coefficient_bound: 1.0
+  max_update_ratio: 0.05
+  preserve_moments: true
+  zero_initialization: true
+
+capacity_controls:
+  - id: fixed_basis
+    architecture: none
+    parameter_count: 0
+  - id: renderer_0p1m
+    hidden_dim: 256
+    depth: 2
+    parameter_count: 91654
+  - id: renderer_0p6m
+    hidden_dim: 512
+    depth: 3
+    parameter_count: 577030
+  - id: renderer_5m
+    hidden_dim: 1536
+    depth: 3
+    parameter_count: 4876806
+  - id: matched_random_renderer
+    initialization: frozen_random
+  - id: extra_unet_call
+    extra_unet_calls: 1
+
+baselines:
+  - no_ag
+  - conference_expert
+  - fixed_basis_search
+  - spectral_only
+  - semantic_only
+  - freeu_only
+  - laplacian_only
+  - matched_random_renderer
+  - extra_unet_call
+
+data:
+  prompt_source: pending_frozen_prompt_manifest
+  excluded_prompt_manifests:
+    - eval-pipeline/prompts/eval_v1.csv
+    - eval-pipeline/prompts/s5_development.csv
+    - eval-pipeline/prompts/s5_smoke.csv
+    - eval-pipeline/prompts/smoke.csv
+    - eval-pipeline/prompts/stage2_smoke.csv
+  selection_rule: hash_and_freeze_before_generation
+  final_seeds: [0, 42, 123]
+
+gates:
+  synthetic_tests: required
+  topiq_delta_minimum: 0.005
+  bootstrap_confidence: 0.95
+  holm_alpha: 0.05
+  max_clipped_delta: 0.001
+  max_saturation_delta: 0.005
+  rl_requires_search_distill_headroom: true

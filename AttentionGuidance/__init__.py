@@ -18,6 +18,18 @@ from .semantic_transport import (
     inject_predicted_clean_update,
     infer_token_grid,
 )
+from .latent_renderer import (
+    LatentRendererConfig,
+    RendererDiagnostics,
+    RendererOutput,
+    StructuralLatentRenderer,
+    build_feature_difference_basis,
+    build_graph_transport_basis,
+    build_laplacian_basis,
+    build_spectral_bases,
+    cap_update_norm,
+    inject_rendered_clean_update,
+)
 
 __all__ = [
     "AttnGuidance",
@@ -38,4 +50,14 @@ __all__ = [
     "fixed_moment_transport",
     "inject_predicted_clean_update",
     "infer_token_grid",
+    "LatentRendererConfig",
+    "RendererDiagnostics",
+    "RendererOutput",
+    "StructuralLatentRenderer",
+    "build_feature_difference_basis",
+    "build_graph_transport_basis",
+    "build_laplacian_basis",
+    "build_spectral_bases",
+    "cap_update_norm",
+    "inject_rendered_clean_update",
 ]
