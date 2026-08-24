@@ -384,3 +384,41 @@ actions = 1440 条记录，四张 GPU 各 360 条；全部 block 同卡完整，
 `7,19,73`，validation confirmation `11,29,101`，final test `0,42,123`。动作、
 系数、provider、选择规则和质量门槛均保持不变；合规重跑使用新目录
 `outputs/latent_renderer/lr1_fixed_train_searchseeds_v2`。
+
+## LR-1：合规固定 renderer 搜索（train-only，null result）
+
+合规重跑在 `outputs/latent_renderer/lr1_fixed_train_searchseeds_v2` 完成了
+48 prompts × 3 seeds (`7,19,73`) × 10 registered actions = `1440/1440`
+records。144 个 prompt/seed block 各自固定在 `cuda:1`--`cuda:4` 的一张卡上，
+PNG 与 sidecar 均完整；strict scorer 的 14 个输出键全部有限。结果盲审计
+`run_audit.json` 通过：block 内 10 个 PNG hash 全异，最大 renderer
+update ratio `0.0112049`，最大绝对 mean/variance error
+`1.19e-7/7.15e-7`。该 run 在新增 `split_role`/input-hash 字段前启动，审计
+因此给出 provenance warning；seeds、action grid、prompt 文本和所有输出哈希
+仍由审计逐项核验。
+
+冻结 selector 只看 train HPSv2，并在任何非 baseline 动作进入候选前要求
+paired mean > 0 且 crossed-bootstrap 95% CI 下界 > 0，同时满足 CLIP、
+clipping、saturation 和 renderer diagnostics guards。结果如下；所有候选
+都通过数值 guards，但所有 HPSv2 CI 都跨零：
+
+| action | Δ HPSv2 | crossed 95% CI | Δ CLIP | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|---:|
+| `semantic_neg` | `+0.000149` | `[-0.000173,+0.000483]` | `-0.000424` | `+0.000301` | `+0.000269` |
+| `spectral_high_pos` | `+0.000088` | `[-0.000292,+0.000488]` | `-0.000242` | `-0.000076` | `-0.000567` |
+| `balanced_pos` | `+0.000132` | `[-0.000212,+0.000533]` | `-0.000331` | `-0.000087` | `-0.000557` |
+| `spectral_mid_pos` | `-0.000011` | `[-0.000356,+0.000326]` | `-0.000154` | `+0.000221` | `-0.000037` |
+| best remaining candidate | ≤ `+0.000000` | lower ≤ `-0.000351` | within guard | within guard | within guard |
+
+The selector therefore returned `no_ag`. The independent descriptive comparison
+also found no TOPIQ-NR action with a positive interval; the largest exploratory
+mean was only `+0.000457` (`spectral_mid_pos`, CI
+`[-0.000418,+0.001450]`). Pixel witnesses showed small action-dependent changes,
+but no quality headroom. This is not a validation or test result: TOPIQ-NR was
+deliberately excluded from selection, and no validation YAML was emitted.
+
+Per the frozen stop rule, LR-1 closes the latent-renderer and RL path. Do not
+reuse this run to train a renderer, distill coefficients, tune a VAE, or run
+final seeds. A future representation-side factorial or RL study requires a
+new registration and a new fixed static action with positive held-out
+headroom; this null result is retained as the complete negative control.

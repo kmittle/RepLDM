@@ -29,6 +29,37 @@
 
 这只是对当前动作算子和当前实验范围的否定性 pilot 结论，不等于证明“Attention Guidance 在所有任务上都无效”。样本只有 12 prompts、3 seeds 和单一 SDXL backbone；S4 虽然评估了最终 2048² 图像，仍然复用了开发 prompts，也没有进行人类偏好盲评。因此这些数值不能被包装成最终 benchmark 结果。
 
+### LR-1 合规 latent-renderer 搜索（独立 null result）
+
+为检验一个小型、结构条件 latent renderer 是否有足够的静态 headroom，另行
+冻结了 48 个 prompt 的 train split、10 个固定六维动作和 seeds `7,19,73`。
+正式目录 `outputs/latent_renderer/lr1_fixed_train_searchseeds_v2` 包含
+`1440/1440` 完整记录；144 个 `(prompt,seed)` block 均单卡完成，严格审计
+通过，最大 trust ratio `0.0112049`，最大绝对 moment errors
+`1.19e-7/7.15e-7`，所有评分键 finite。该 run 仅用于 train-side action
+selection，不是功效确认集。
+
+选择规则在查看结果前已冻结：只用 HPSv2，要求 paired mean 和 crossed
+bootstrap 95% CI 下界都高于 `no_ag` 的零差值，并同时满足 CLIP、clipping、
+saturation 和 renderer finite/moment/trust guards。没有候选满足这一门槛，
+selector 返回 `no_ag`：
+
+| candidate | Δ HPSv2 [95% CI] | Δ CLIP | Δ clipped | Δ saturation |
+|---|---:|---:|---:|---:|
+| `semantic_neg` | `+0.000149 [-0.000173,+0.000483]` | `-0.000424` | `+0.000301` | `+0.000269` |
+| `spectral_high_pos` | `+0.000088 [-0.000292,+0.000488]` | `-0.000242` | `-0.000076` | `-0.000567` |
+| `balanced_pos` | `+0.000132 [-0.000212,+0.000533]` | `-0.000331` | `-0.000087` | `-0.000557` |
+| `spectral_mid_pos` | `-0.000011 [-0.000356,+0.000326]` | `-0.000154` | `+0.000221` | `-0.000037` |
+
+An independent descriptive comparison across the registered train metrics found
+no TOPIQ-NR interval wholly above zero; its largest exploratory mean was only
+`+0.000457` (`spectral_mid_pos`, CI `[-0.000418,+0.001450]`). The action-dependent
+pixel changes therefore do not establish perceptual or structural improvement.
+Because selection returned `no_ag`, the preregistered protocol correctly emits
+no validation configuration, does not use seeds `11,29,101` or `0,42,123`, and
+does not authorize distillation or RL. This is a complete negative LR-1 result,
+not evidence that a later renderer or representation factorial has been tested.
+
 ## 1. 实验规模与数据完整性
 
 | 实验 | 设计 | 证据用途 |
