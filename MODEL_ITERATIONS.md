@@ -10,7 +10,7 @@ This ledger separates hypotheses fixed before generation from conclusions writte
 | S1 | Low/mid/high spectral residual gains | Invalidated | Best action, `mid_only_0.004`, is non-superior to no-AG; seed-CV finds no adaptive headroom. |
 | S2 | Moment-Tangent Attention Guidance (MTAG) | Invalidated | It removes moment drift but does not improve quality or preference. |
 | S3 | Trajectory-Cone Moment Guidance (TCMG) | Invalidated | Cone geometry is active but does not improve quality, preference, or adaptive headroom. |
-| S4 | 2048² Stage-2 target-domain audit | Registered | Test whether the 1024² proxy masked high-resolution headroom before proposing another operator. |
+| S4 | 2048² Stage-2 target-domain audit | Engineering gate passed | Paired Stage-2 noise and normal decode are reproducible; frozen 180-image pilot is authorized. |
 
 S0-S3 evidence is reported in `EXPERIMENT_RESULTS.md`. Their action spaces must not be reused for RL training.
 
@@ -124,3 +124,9 @@ Before batch generation, Stage-2 correctness must pass on `prompts/stage2_smoke.
 The frozen pilot is 12 prompts × 3 seeds × 5 actions = 180 final 2048² images using `configs/stage2_transfer_pilot.yaml`: no-AG, conference expert, raw `0.001`, plain tangent `0.002`, and cone `0.002`. These form a mechanistic ladder fixed from prior evidence; no high-resolution scale search is allowed. Same prompt/seed actions must share a GPU and task-seeded Stage-2 noise.
 
 TOPIQ-NR is primary. A TCMG result can reopen the method only if its gain over no-AG is at least `+0.005`, the 95% CI excludes zero, the within-metric Holm-adjusted test is below `0.05`, and direct paired comparisons also beat expert, raw, and plain tangent. HPSv2 and CLIP cosine must have lower CI bounds above `-0.003` and `-0.005`; clipped fraction and saturation mean deltas must stay below `+0.001` and `+0.005`. Report ImageReward, patch-IR, aesthetic, contrast, colorfulness, sharpness, all failed actions, and a fixed montage. A pass still requires prompt-disjoint confirmation and blinded high-resolution preference/detail crops. If no action passes, close Stage-1 Attention Guidance for this target pipeline before inventing a learned controller.
+
+## S4 Engineering Outcome
+
+Runs `outputs/exp_stage2_transfer/engineering_smoke_v1` and `engineering_smoke_repeat_v1` were produced independently from commit `f18b6b1` on GPU 1. Both completed the normal 2048² encoder/decoder path for all three actions without OOM or device mismatch; observed peak allocation was approximately 21.2 GB. Every output is a valid nonblank 2048² RGB PNG with complete Stage-2 metadata.
+
+Within each run, `no_ag` and `no_ag_repeat` have the same SHA-256 (`3187f72c...0930a55`), while `conference_expert` is distinct (`a513da66...8efddf`). Across fresh processes and output directories, all three action hashes reproduce exactly. The task generator therefore controls both sampling phases, the pipeline remains reentrant after CPU phase offload, and the engineering gate authorizes the already-frozen five-action pilot without changing actions or thresholds.
