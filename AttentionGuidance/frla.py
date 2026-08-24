@@ -81,6 +81,18 @@ class FRLAConfig:
         if not math.isfinite(epsilon) or epsilon <= 0:
             raise ValueError("epsilon must be finite and positive")
 
+    def to_record(self) -> Dict[str, object]:
+        """Return the frozen operator settings in JSON-safe form."""
+        return {
+            "grid_size": int(self.grid_size),
+            "eta": float(self.eta),
+            "projection_seed": int(self.projection_seed),
+            "lags": [[int(dy), int(dx)] for dy, dx in self.lags],
+            "max_update_ratio": float(self.max_update_ratio),
+            "preserve_moments": bool(self.preserve_moments),
+            "epsilon": float(self.epsilon),
+        }
+
 
 @dataclass
 class FRLAOutput:

@@ -32,8 +32,14 @@ generate = load_module("generate", "eval-pipeline/generate.py")
 from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
     RepLDMSDXLPipeline,
     _sample_resample_noise,
+    _reset_frla_diagnostics,
     _reset_latent_renderer_diagnostics,
     _validate_trajectory_correction_generator,
+)
+from AttentionGuidance import (  # noqa: E402
+    FRLAConfig,
+    apply_frla,
+    inject_rendered_clean_update,
 )
 from InferencePipelines.cfg_batch import (  # noqa: E402
     expand_cfg_latents,
@@ -74,6 +80,93 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_frla_dormant_action_normalizes_and_round_trips(self):
+        actions, cutoffs = generate.load_actions(
+            str(ROOT / "eval-pipeline/configs/frla_relational_dormant.yaml"),
+            5,
+        )
+        self.assertEqual(cutoffs, [0.08, 0.25])
+        frla_action = next(action for action in actions if action["type"] == "frla_relational")
+        self.assertFalse(frla_action["selection_eligible"])
+        self.assertEqual(frla_action["frla_feature_source"], "backbone")
+        config, feature_block, feature_source = generate.frla_runtime(frla_action)
+        self.assertIsInstance(config, FRLAConfig)
+        self.assertEqual(feature_block, "up_blocks.0")
+        self.assertEqual(feature_source, "backbone")
+        self.assertEqual(config.to_record(), frla_action["frla_config"])
+
+    def test_frla_diagnostics_reset_and_sidecar_provenance(self):
+        state = type("PipelineState", (), {})()
+        config = FRLAConfig(grid_size=8, lags=((1, 0),))
+        _reset_frla_diagnostics(state, config, "up_blocks.0", "skip")
+        self.assertEqual(state._last_frla_diagnostics, [])
+        self.assertEqual(state._last_frla_config["feature_source"], "skip")
+        self.assertEqual(state._last_frla_config["operator"], config.to_record())
+        self.assertEqual(state._last_frla_config["extra_unet_calls"], 0)
+        self.assertEqual(state._last_frla_config["unet_calls_per_step"], 1)
+        state._last_frla_diagnostics.append({"step_index": 0})
+        sidecar = generate.frla_diagnostics_sidecar(state)
+        self.assertEqual(sidecar["frla_diagnostics"], [{"step_index": 0}])
+        self.assertEqual(sidecar["frla_config"], state._last_frla_config)
+        _reset_frla_diagnostics(state)
+        self.assertIsNone(state._last_frla_diagnostics)
+        self.assertIsNone(state._last_frla_config)
+
+    def test_frla_pipeline_uses_one_forward_capture_and_strict_injection(self):
+        source = inspect.getsource(RepLDMSDXLPipeline.__call__)
+        self.assertIn("frla_capture.capture_forward()", source)
+        self.assertIn("apply_frla(", source)
+        self.assertIn("enforce_post_cast_cap=True", source)
+        self.assertIn("and frla_config is None", source)
+
+    def test_frla_sidecar_audit_checks_operator_and_nfe_provenance(self):
+        torch.manual_seed(19)
+        config = FRLAConfig(grid_size=4, lags=((1, 0),))
+        latent = torch.randn(1, 4, 8, 8)
+        feature = torch.randn(1, 6, 10, 10)
+        scheduler_update = torch.randn_like(latent)
+        output = apply_frla(latent, feature, scheduler_update, config)
+        injection = inject_rendered_clean_update(
+            latent,
+            latent,
+            output.guided_x0,
+            scheduler_update=scheduler_update,
+            max_update_ratio=config.max_update_ratio,
+            enforce_post_cast_cap=True,
+            return_diagnostics=True,
+        )
+        record = {
+            "frla_config": {
+                "operator": config.to_record(),
+                "capture": "single_unet_forward_pre_hook",
+                "extra_unet_calls": 0,
+                "unet_calls_per_step": 1,
+            },
+            "frla_diagnostics": [
+                {
+                    **output.to_record(),
+                    "step_index": 0,
+                    "feature_shape": list(feature.shape),
+                    "feature_dtype": str(feature.dtype),
+                    "unet_calls": 1,
+                    "injection_diagnostics": injection.diagnostics.to_record(),
+                }
+            ],
+        }
+        summary = audit_renderer_run._audit_frla_trajectory(
+            record,
+            config.max_update_ratio,
+            expected_operator=config.to_record(),
+        )
+        self.assertLessEqual(summary["max_frla_update_ratio"], 0.05 + 1e-6)
+        record["frla_config"]["extra_unet_calls"] = 1
+        with self.assertRaises(ValueError):
+            audit_renderer_run._audit_frla_trajectory(
+                record,
+                config.max_update_ratio,
+                expected_operator=config.to_record(),
+            )
+
     def test_renderer_diagnostic_ledger_resets_and_tracks_action_kind(self):
         state = type("PipelineState", (), {})()
         _reset_latent_renderer_diagnostics(state, latent_renderer=object())

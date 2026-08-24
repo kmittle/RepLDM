@@ -54,6 +54,7 @@ if ROOT not in sys.path:
 
 from AttentionGuidance import (
     ConstantGuidanceController,
+    FRLAConfig,
     MOMENT_TANGENT_MODES,
     RESIDUAL_MODES,
     SEMANTIC_TRANSPORT_MODES,
@@ -246,6 +247,7 @@ def load_actions(path: str, num_inference_steps: int):
             "clean_transport",
             "attention_baseline",
             "latent_renderer_fixed",
+            "frla_relational",
             "freeu",
             "trajectory_correction",
             "scheduler_baseline",
@@ -366,6 +368,62 @@ def load_actions(path: str, num_inference_steps: int):
                 "prompt_dim": prompt_dim,
                 "state_dim": state_dim,
             }
+            action["scale"] = 0.0
+        elif action_type == "frla_relational":
+            raw_frla = action.get("frla_config", {}) or {}
+            if not isinstance(raw_frla, dict):
+                raise ValueError(f"{action_id}: frla_config must be a mapping")
+            frla_values = dict(raw_frla)
+            for key in (
+                "grid_size",
+                "eta",
+                "projection_seed",
+                "lags",
+                "max_update_ratio",
+                "preserve_moments",
+                "epsilon",
+            ):
+                if key in action and key not in frla_values:
+                    frla_values[key] = action[key]
+            raw_lags = frla_values.get("lags", FRLAConfig().lags)
+            try:
+                lags = tuple((int(pair[0]), int(pair[1])) for pair in raw_lags)
+            except (TypeError, ValueError, IndexError, OverflowError) as exc:
+                raise ValueError(f"{action_id}: frla_config.lags must contain pairs") from exc
+            preserve_moments = frla_values.get("preserve_moments", True)
+            if not isinstance(preserve_moments, bool):
+                raise ValueError(f"{action_id}: frla_config.preserve_moments must be boolean")
+            try:
+                frla_config = FRLAConfig(
+                    grid_size=frla_values.get("grid_size", 16),
+                    eta=frla_values.get("eta", 0.02),
+                    projection_seed=frla_values.get("projection_seed", 17),
+                    lags=lags,
+                    max_update_ratio=frla_values.get("max_update_ratio", 0.05),
+                    preserve_moments=preserve_moments,
+                    epsilon=frla_values.get("epsilon", 1e-6),
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{action_id}: invalid frla_config: {exc}") from exc
+            feature_block = str(action.get("frla_feature_block", action.get("feature_block", "up_blocks.0")))
+            feature_source = str(action.get("frla_feature_source", action.get("feature_source", "backbone")))
+            if not feature_block:
+                raise ValueError(f"{action_id}: frla_feature_block must be non-empty")
+            if feature_source not in {"backbone", "skip"}:
+                raise ValueError(f"{action_id}: frla_feature_source must be backbone or skip")
+            action["frla_config"] = frla_config.to_record()
+            action["frla_feature_block"] = feature_block
+            action["frla_feature_source"] = feature_source
+            selection_eligible = action.get("selection_eligible", False)
+            if not isinstance(selection_eligible, bool):
+                raise ValueError(f"{action_id}: selection_eligible must be boolean")
+            if selection_eligible and config.get("schema") != "frla_relational_actions_v1":
+                raise ValueError(
+                    f"{action_id}: FRLA selection requires frla_relational_actions_v1"
+                )
+            # The dormant probe remains ineligible by default. A future
+            # registered FRLA action must opt into its own selection protocol.
+            action["selection_eligible"] = selection_eligible
             action["scale"] = 0.0
         elif action_type == "freeu":
             if "parameters" in action and "knots" in action:
@@ -754,6 +812,14 @@ def renderer_diagnostics_sidecar(pipe) -> dict:
     }
 
 
+def frla_diagnostics_sidecar(pipe) -> dict:
+    """Collect dormant FRLA records and capture provenance for one task."""
+    return {
+        "frla_config": getattr(pipe, "_last_frla_config", None),
+        "frla_diagnostics": getattr(pipe, "_last_frla_diagnostics", None),
+    }
+
+
 def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: float):
     """Construct one fixed LR-1 renderer/provider pair for a worker device."""
     if action["type"] != "latent_renderer_fixed":
@@ -784,6 +850,25 @@ def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: flo
     )
     renderer.eval()
     return renderer, provider
+
+
+def frla_runtime(action: dict):
+    """Construct the dormant FRLA operator and its single-forward capture spec."""
+    if action["type"] != "frla_relational":
+        return None, None, None
+    config_record = action.get("frla_config")
+    if not isinstance(config_record, dict):
+        raise ValueError("normalized FRLA action lacks frla_config")
+    config_values = dict(config_record)
+    config_values["lags"] = tuple(
+        (int(pair[0]), int(pair[1])) for pair in config_values.get("lags", [])
+    )
+    config = FRLAConfig(**config_values)
+    return (
+        config,
+        str(action.get("frla_feature_block", "up_blocks.0")),
+        str(action.get("frla_feature_source", "backbone")),
+    )
 
 
 def worker_process(cfg: dict, device: str, task_queue, error_queue):
@@ -822,6 +907,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             baseline_config = attention_baseline_runtime(action)
             freeu_schedule = freeu_runtime(action)
             trajectory_correction = trajectory_correction_runtime(action)
+            frla_config, frla_feature_block, frla_feature_source = frla_runtime(action)
             # The diffusers FreeU implementation stores mutable attributes on
             # every up block.  Clear them before every action to preserve exact
             # paired comparisons, including after a failed task.
@@ -892,6 +978,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         freeu_schedule=freeu_schedule,
                         freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
                         trajectory_correction=trajectory_correction,
+                        frla_config=frla_config,
+                        frla_feature_block=frla_feature_block or "up_blocks.0",
+                        frla_feature_source=frla_feature_source or "backbone",
                     )
             finally:
                 if scheduler_reference:
@@ -946,6 +1035,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             # final-step summary for compatibility), this list preserves the
             # complete scheduler-injection trajectory.
             record.update(renderer_diagnostics_sidecar(pipe))
+            record.update(frla_diagnostics_sidecar(pipe))
             if diagnostics:
                 record.update(diagnostics)
             else:

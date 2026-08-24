@@ -51,6 +51,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
 from AttentionGuidance import (
     AttnGuidance,
+    FRLAConfig,
     GuidanceAction,
     GuidanceController,
     InjectionOutput,
@@ -58,6 +59,7 @@ from AttentionGuidance import (
     RendererCondition,
     RendererObservation,
     StructuralLatentRenderer,
+    StructuralUNetFeatureCapture,
     GuidanceObservation,
     SemanticTransport,
     SemanticTransportConfig,
@@ -66,6 +68,7 @@ from AttentionGuidance import (
     MomentPreservingFreeUController,
     TrajectoryCorrectionConfig,
     apply_ancestral_correction,
+    apply_frla,
 )
 from InferencePipelines.cfg_batch import (
     expand_cfg_latents,
@@ -91,6 +94,28 @@ def _reset_latent_renderer_diagnostics(
     pipeline._last_latent_renderer_provider_diagnostics = None
     pipeline._last_latent_renderer_injection_diagnostics = (
         [] if latent_renderer is not None else None
+    )
+
+
+def _reset_frla_diagnostics(
+    pipeline: Any,
+    frla_config: Optional[FRLAConfig] = None,
+    feature_block: str = "up_blocks.0",
+    feature_source: str = "backbone",
+) -> None:
+    """Reset FRLA records and retain the exact operator/capture provenance."""
+    pipeline._last_frla_diagnostics = [] if frla_config is not None else None
+    pipeline._last_frla_config = (
+        {
+            "operator": frla_config.to_record(),
+            "feature_block": str(feature_block),
+            "feature_source": str(feature_source),
+            "capture": "single_unet_forward_pre_hook",
+            "extra_unet_calls": 0,
+            "unet_calls_per_step": 1,
+        }
+        if frla_config is not None
+        else None
     )
 
 EXAMPLE_DOC_STRING = """
@@ -250,6 +275,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self._last_trajectory_correction = None
         self._last_trajectory_correction_diagnostics = None
         self._last_latent_renderer_injection_diagnostics = None
+        self._last_frla_config = None
+        self._last_frla_diagnostics = None
 
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
 
@@ -861,6 +888,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         freeu_schedule: Optional[FreeUSchedule] = None,
         freeu_preserve_moments: bool = False,
         trajectory_correction: Optional[TrajectoryCorrectionConfig] = None,
+        frla_config: Optional[FRLAConfig] = None,
+        frla_feature_block: str = "up_blocks.0",
+        frla_feature_source: str = "backbone",
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1033,6 +1063,14 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 sampling only. ``mix=0`` is an exact no-op. Strict paired RNG
                 parity requires a single ``torch.Generator``; generator lists
                 are rejected for this intervention.
+            frla_config (`FRLAConfig`, *optional*):
+                Dormant Stage-1 relational latent correction. It reuses one
+                detached feature captured during the ordinary U-Net forward;
+                no additional denoiser evaluation is performed.
+            frla_feature_block (`str`, *optional*, defaults to ``"up_blocks.0"``):
+                U-Net block whose decoder inputs provide the FRLA feature.
+            frla_feature_source (`str`, *optional*, defaults to ``"backbone"``):
+                Select ``"backbone"`` or ``"skip"`` from the captured block.
         
         Examples:
 
@@ -1043,6 +1081,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         # Keep per-invocation renderer injection records isolated from a
         # previous rollout, including calls that fail during input validation.
         _reset_latent_renderer_diagnostics(self)
+        _reset_frla_diagnostics(self)
         
         # 0. Default height and width to unet
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -1093,6 +1132,18 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 "trajectory_correction must be a TrajectoryCorrectionConfig or None"
             )
         _validate_trajectory_correction_generator(generator, trajectory_correction)
+        if frla_config is not None and not isinstance(frla_config, FRLAConfig):
+            if isinstance(frla_config, dict):
+                frla_config = FRLAConfig(**frla_config)
+            else:
+                raise TypeError("frla_config must be an FRLAConfig, mapping, or None")
+        if not isinstance(frla_feature_block, str) or not frla_feature_block:
+            raise ValueError("frla_feature_block must be a non-empty module path")
+        if not isinstance(frla_feature_source, str) or frla_feature_source not in {
+            "backbone",
+            "skip",
+        }:
+            raise ValueError("frla_feature_source must be 'backbone' or 'skip'")
         if not isinstance(freeu_preserve_moments, bool):
             raise TypeError("freeu_preserve_moments must be a bool")
         if freeu_preserve_moments and freeu_schedule is None:
@@ -1113,6 +1164,18 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             raise ValueError(
                 "trajectory correction must be evaluated as a standalone Stage-1 action"
             )
+        if frla_config is not None:
+            if image_lr is not None or height * width > 1024**2:
+                raise ValueError("FRLA is registered for Stage 1 text-to-image denoising only")
+            if (
+                semantic_transport_config is not None
+                or latent_renderer is not None
+                or attn_guidance_controller is not None
+                or attn_guidance_scale > 0
+                or freeu_schedule is not None
+                or trajectory_correction is not None
+            ):
+                raise ValueError("FRLA must be evaluated as a standalone Stage-1 action")
         MomentPreservingFreeUController.clear(self.unet)
         moment_controller = (
             MomentPreservingFreeUController(self.unet)
@@ -1277,6 +1340,21 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             latent_renderer.to(device)
             latent_renderer.eval()
         _reset_latent_renderer_diagnostics(self, latent_renderer)
+        frla_capture = None
+        if frla_config is not None:
+            frla_capture = StructuralUNetFeatureCapture(
+                self.unet,
+                batch_size=latents.shape[0],
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                feature_block=frla_feature_block,
+                attention_layer=None,
+            )
+        _reset_frla_diagnostics(
+            self,
+            frla_config,
+            feature_block=frla_feature_block,
+            feature_source=frla_feature_source,
+        )
         semantic_transport = None
         if semantic_transport_config is not None:
             if height * width > 1024**2:
@@ -1344,11 +1422,14 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         )
                         if capture_forward is not None:
                             renderer_capture = capture_forward()
+                    frla_capture_context = nullcontext()
+                    if frla_capture is not None:
+                        frla_capture_context = frla_capture.capture_forward()
                     with (
                         semantic_transport.capture_forward()
                         if semantic_transport is not None
                         else nullcontext()
-                    ), renderer_capture:
+                    ), renderer_capture, frla_capture_context:
                         noise_pred = self.unet(
                             latent_model_input,
                             t,
@@ -1378,6 +1459,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     if (
                         semantic_transport is None
                         and latent_renderer is None
+                        and frla_config is None
                         and trajectory_correction is None
                     ):
                         latents = self.scheduler.step(
@@ -1482,6 +1564,41 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         self._last_latent_renderer_provider_diagnostics = getattr(
                             latent_renderer_basis_provider, "last_diagnostics", None
                         )
+
+                    if frla_config is not None:
+                        if frla_capture is None:
+                            raise RuntimeError("FRLA feature capture was not initialized")
+                        backbone, skip = frla_capture.conditional_features()
+                        feature = backbone if frla_feature_source == "backbone" else skip
+                        frla_output = apply_frla(
+                            step_output.pred_original_sample,
+                            feature,
+                            denoising_update,
+                            config=frla_config,
+                        )
+                        injection = inject_rendered_clean_update(
+                            step_output.prev_sample,
+                            step_output.pred_original_sample,
+                            frla_output.guided_x0,
+                            scheduler_update=denoising_update,
+                            max_update_ratio=frla_config.max_update_ratio,
+                            enforce_post_cast_cap=True,
+                            return_diagnostics=True,
+                        )
+                        if not isinstance(injection, InjectionOutput):
+                            raise TypeError("FRLA injection must return InjectionOutput")
+                        latents = injection.sample
+                        frla_record = frla_output.to_record()
+                        frla_record.update(
+                            {
+                                "step_index": int(i),
+                                "feature_shape": [int(value) for value in feature.shape],
+                                "feature_dtype": str(feature.dtype),
+                                "unet_calls": 1,
+                                "injection_diagnostics": injection.diagnostics.to_record(),
+                            }
+                        )
+                        self._last_frla_diagnostics.append(frla_record)
 
                     # AttnFusion
                     t_index = num_timesteps - 1 - i

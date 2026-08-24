@@ -1,0 +1,22 @@
+# Dormant FRLA wiring probe. This file is intentionally not part of any
+# registered LR-1 search or validation queue; it only exercises the explicit
+# single-forward operator and its auditable sidecar contract.
+schema: frla_relational_dormant_v1
+experiment_id: frla_relational_wiring_probe_v1
+actions:
+  - id: no_frla
+    type: none
+  - id: frla_probe
+    type: frla_relational
+    selection_eligible: false
+    frla_feature_block: up_blocks.0
+    frla_feature_source: backbone
+    frla_config:
+      grid_size: 16
+      eta: 0.02
+      projection_seed: 17
+      lags: [[1, 0], [0, 1], [1, 1], [2, 0], [0, 2]]
+      max_update_ratio: 0.05
+      preserve_moments: true
+      epsilon: 1.0e-6
+frequency_band_cutoffs: [0.08, 0.25]

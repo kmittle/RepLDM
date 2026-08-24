@@ -3,6 +3,7 @@ from pathlib import Path
 import unittest
 
 import torch
+from torch import nn
 
 from AttentionGuidance.latent_renderer import (
     LatentRendererConfig,
@@ -33,6 +34,38 @@ split_cfg_noise_pred = _cfg_batch.split_cfg_noise_pred
 
 
 class FRLAStructuralAuditTest(unittest.TestCase):
+    def test_capture_hook_reuses_one_forward_and_selects_positive_feature_rows(self):
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, hidden_states, res_hidden_states_tuple=None):
+                self.calls += 1
+                return hidden_states
+
+        class ToyUNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.up_blocks = nn.ModuleList([Block()])
+
+        unet = ToyUNet()
+        capture = StructuralUNetFeatureCapture(
+            unet,
+            batch_size=2,
+            do_classifier_free_guidance=True,
+            feature_block="up_blocks.0",
+            attention_layer=None,
+        )
+        hidden = torch.arange(4 * 2 * 2, dtype=torch.float32).reshape(4, 1, 2, 2)
+        skip = hidden + 100
+        with capture.capture_forward():
+            unet.up_blocks[0](hidden, res_hidden_states_tuple=(skip,))
+        backbone, selected_skip = capture.conditional_features()
+        torch.testing.assert_close(backbone, hidden[2:])
+        torch.testing.assert_close(selected_skip, skip[2:])
+        self.assertEqual(unet.up_blocks[0].calls, 1)
+
     @staticmethod
     def _deterministic_cast_case(dtype, preserve_moments=True, enforce=True):
         """Return one deliberate overrun and one exact no-op sample."""

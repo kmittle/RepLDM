@@ -289,6 +289,14 @@ overrun. Do not select an action from the test split or treat this generation
 command as evidence until the registered TOPIQ-NR and non-inferiority gates
 are evaluated.
 
+`frla_relational` is a dormant Stage-1 wiring probe. It captures one detached
+decoder feature during the ordinary U-Net forward, applies the fixed relational
+gradient operator, and records `frla_config` plus a step-indexed
+`frla_diagnostics` sidecar. The operator is standalone, selection-ineligible,
+and rejects Stage 2 or other interventions. The probe config is
+`eval-pipeline/configs/frla_relational_dormant.yaml`; no quality claim is
+registered from it.
+
 After strict scoring, apply the frozen train-only proxy rule mechanically:
 
 ```bash

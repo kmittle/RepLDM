@@ -127,6 +127,96 @@ def _audit_injection_trajectory(
     }
 
 
+def _finite_nested(values: Any, key: str) -> List[List[float]]:
+    if not isinstance(values, list) or not values or not all(
+        isinstance(row, list) and row for row in values
+    ):
+        raise ValueError(f"FRLA diagnostic {key!r} must be a non-empty matrix")
+    converted = [[float(value) for value in row] for row in values]
+    if not all(math.isfinite(value) for row in converted for value in row):
+        raise ValueError(f"FRLA diagnostic {key!r} contains non-finite values")
+    return converted
+
+
+def _audit_frla_trajectory(
+    record: Dict[str, Any],
+    bound: float,
+    expected_operator: Dict[str, Any] | None = None,
+) -> Dict[str, float]:
+    """Validate one dormant FRLA rollout without judging image quality."""
+    provenance = record.get("frla_config")
+    if not isinstance(provenance, dict):
+        raise ValueError("FRLA capture provenance is missing")
+    operator = provenance.get("operator")
+    if not isinstance(operator, dict):
+        raise ValueError("FRLA operator provenance is missing")
+    if expected_operator is not None:
+        for key, value in expected_operator.items():
+            if operator.get(key) != value:
+                raise ValueError(f"FRLA operator provenance field {key!r} differs from action")
+    if provenance.get("capture") != "single_unet_forward_pre_hook":
+        raise ValueError("FRLA capture provenance is not single-forward")
+    if provenance.get("extra_unet_calls") != 0 or provenance.get("unet_calls_per_step") != 1:
+        raise ValueError("FRLA provenance does not certify one U-Net call per step")
+    trajectory = record.get("frla_diagnostics")
+    if not isinstance(trajectory, list) or not trajectory:
+        raise ValueError("FRLA diagnostics are missing")
+    max_ratio = 0.0
+    injection_summary = {"max_postcast_injection_ratio": 0.0, "max_postcast_injection_overrun": 0.0}
+    for expected_step, step in enumerate(trajectory):
+        if not isinstance(step, dict) or step.get("step_index") != expected_step:
+            raise ValueError("FRLA step indices are not contiguous")
+        feature_shape = step.get("feature_shape")
+        if (
+            not isinstance(feature_shape, list)
+            or len(feature_shape) != 4
+            or not all(isinstance(value, int) and value > 0 for value in feature_shape)
+        ):
+            raise ValueError("FRLA feature shape is invalid")
+        if not isinstance(step.get("feature_dtype"), str):
+            raise ValueError("FRLA feature dtype is missing")
+        if step.get("unet_calls") != 1:
+            raise ValueError("FRLA step does not certify one U-Net call")
+        descriptor_before = _finite_nested(step.get("descriptor_before"), "descriptor_before")
+        descriptor_after = _finite_nested(step.get("descriptor_after"), "descriptor_after")
+        if len(descriptor_before) != len(descriptor_after):
+            raise ValueError("FRLA descriptor batch lengths differ")
+        for key in ("loss_before", "loss_after", "gradient_norm", "update_ratio"):
+            values = _finite_values(step, key)
+            if len(values) != len(descriptor_before):
+                raise ValueError(f"FRLA diagnostic {key!r} batch length differs")
+        ratio = _finite_values(step, "update_ratio")
+        if min(ratio) < 0 or max(ratio) > bound + 1e-6:
+            raise ValueError("FRLA trust bound is violated")
+        injection = step.get("injection_diagnostics")
+        if not isinstance(injection, dict):
+            raise ValueError("FRLA injection diagnostics are missing")
+        nested_record = dict(record)
+        injection_record = dict(injection)
+        injection_record["step_index"] = 0
+        nested_record["latent_renderer_injection_diagnostics"] = [
+            injection_record
+        ]
+        injection_step_summary = _audit_injection_trajectory(
+            nested_record, bound
+        )
+        injection_summary = {
+            "max_postcast_injection_ratio": max(
+                injection_summary["max_postcast_injection_ratio"],
+                injection_step_summary["max_postcast_injection_ratio"],
+            ),
+            "max_postcast_injection_overrun": max(
+                injection_summary["max_postcast_injection_overrun"],
+                injection_step_summary["max_postcast_injection_overrun"],
+            ),
+        }
+        max_ratio = max(max_ratio, max(ratio))
+    return {
+        "max_frla_update_ratio": max_ratio,
+        **injection_summary,
+    }
+
+
 def audit_run(
     run_dir: str | os.PathLike[str],
     prompts_path: str | os.PathLike[str],
@@ -216,6 +306,17 @@ def audit_run(
                     raise ValueError(
                         f"{action_id}: run provider field {key!r} differs from source"
                     )
+        elif registered.get("type") == "frla_relational":
+            expected_frla = registered.get("frla_config", {}) or {}
+            observed_frla = configured.get("frla_config", {}) or {}
+            if not isinstance(expected_frla, dict) or not isinstance(observed_frla, dict):
+                raise ValueError(f"{action_id}: FRLA config must be a mapping")
+            for key, value in expected_frla.items():
+                if observed_frla.get(key) != value:
+                    raise ValueError(f"{action_id}: run FRLA field {key!r} differs from source")
+            for key in ("frla_feature_block", "frla_feature_source"):
+                if key in registered and configured.get(key) != registered.get(key):
+                    raise ValueError(f"{action_id}: run {key} differs from source")
     expected_cutoffs = [float(value) for value in source.get("frequency_band_cutoffs", [])]
     observed_cutoffs = [float(value) for value in config.get("frequency_band_cutoffs", [])]
     if observed_cutoffs != expected_cutoffs:
@@ -250,6 +351,7 @@ def audit_run(
     max_postcast_overrun = 0.0
     max_postcast_injection_ratio = 0.0
     max_postcast_injection_overrun = 0.0
+    max_frla_update_ratio = 0.0
     max_mean_error = 0.0
     max_variance_error = 0.0
     image_hashes: Dict[tuple, str] = {}
@@ -351,9 +453,38 @@ def audit_run(
                 raise ValueError(f"{expected_id}: provider diagnostics are missing")
             _finite_values(provider_diagnostics, "semantic_entropy")
             _finite_values(provider_diagnostics, "basis_rms")
+        elif source_by_id[action_id].get("type") == "frla_relational":
+            action_record = record.get("action", {})
+            operator = action_record.get("frla_config", {}) if isinstance(action_record, dict) else {}
+            bound = float(operator.get("max_update_ratio", 0.05)) if isinstance(operator, dict) else float("nan")
+            if not math.isfinite(bound) or bound < 0:
+                raise ValueError(f"{expected_id}: FRLA trust bound is invalid")
+            frla_summary = _audit_frla_trajectory(
+                record,
+                bound,
+                expected_operator=operator if isinstance(operator, dict) else None,
+            )
+            max_frla_update_ratio = max(
+                max_frla_update_ratio, frla_summary["max_frla_update_ratio"]
+            )
+            max_postcast_injection_ratio = max(
+                max_postcast_injection_ratio,
+                frla_summary["max_postcast_injection_ratio"],
+            )
+            max_postcast_injection_overrun = max(
+                max_postcast_injection_overrun,
+                frla_summary["max_postcast_injection_overrun"],
+            )
+            if (
+                record.get("latent_renderer_diagnostics") is not None
+                or record.get("latent_renderer_provider_diagnostics") is not None
+            ):
+                raise ValueError(f"{expected_id}: FRLA record has stale renderer diagnostics")
         elif (
             record.get("latent_renderer_diagnostics") is not None
             or record.get("latent_renderer_provider_diagnostics") is not None
+            or record.get("frla_diagnostics") is not None
+            or record.get("frla_config") is not None
         ):
             raise ValueError(f"{expected_id}: non-renderer action has stale diagnostics")
 
@@ -385,6 +516,7 @@ def audit_run(
         "devices": sorted({next(iter(values)) for values in block_devices.values()}),
         "required_score_keys": list(required_score_keys),
         "max_update_ratio": max_update_ratio,
+        "max_frla_update_ratio": max_frla_update_ratio,
         "max_postcast_overrun": max_postcast_overrun,
         "max_postcast_injection_ratio": max_postcast_injection_ratio,
         "max_postcast_injection_overrun": max_postcast_injection_overrun,
