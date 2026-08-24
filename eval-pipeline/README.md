@@ -293,6 +293,19 @@ mean deltas. Even a statistical pass returns `qualitative_review_required`:
 the frozen 24-prompt, seed-11 blinded review must still be completed before a
 validation pass or final-test authorization can be recorded.
 
+Create the review package only after the validation run passes the statistical
+gate. Share `montage.png`, the individual pair PNGs, and `review_prompts.csv`;
+keep `review_key.json` private until all reviewers submit their forms:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/make_latent_renderer_blind_montage.py \
+  --run_dir outputs/latent_renderer/lr1_fixed_validation_v1 \
+  --prompts eval-pipeline/prompts/latent_renderer_validation.csv \
+  --frozen_actions eval-pipeline/configs/latent_renderer_validation_lr1.yaml \
+  --output_dir outputs/latent_renderer/lr1_fixed_validation_v1/blind_review
+```
+
 ## Layout
 
 ```text
@@ -307,6 +320,7 @@ select_fixed_action.py   frozen train-only LR-1 action selection
 freeze_latent_renderer_validation.py  one-shot validation config freezer
 audit_latent_renderer_run.py  result-blind design and numerical audit
 evaluate_latent_renderer_validation.py  frozen LR-1 statistical gate
+make_latent_renderer_blind_montage.py  deterministic blinded review package
 aggregate.py             legacy scalar-sweep diagnostics
 visualize.py             legacy montage and witness plots
 prestage_weights.py      one-time scorer weight setup

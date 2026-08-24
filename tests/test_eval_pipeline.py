@@ -47,6 +47,10 @@ evaluate_renderer_validation = load_module(
     "evaluate_latent_renderer_validation",
     "eval-pipeline/evaluate_latent_renderer_validation.py",
 )
+blind_montage = load_module(
+    "make_latent_renderer_blind_montage",
+    "eval-pipeline/make_latent_renderer_blind_montage.py",
+)
 
 
 class EvalPipelineTest(unittest.TestCase):
@@ -450,6 +454,45 @@ class EvalPipelineTest(unittest.TestCase):
         failed_result = evaluate_renderer_validation.evaluate_validation(failed, frozen)
         self.assertFalse(failed_result["statistical_pass"])
         self.assertEqual(failed_result["decision"], "close_lr1")
+
+    def test_blind_montage_is_deterministic_and_hides_action_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            run_dir, prompts_path, _ = self._write_renderer_audit_fixture(root)
+            frozen_path = root / "frozen.yaml"
+            frozen_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "selected_action": "semantic_pos",
+                        "validation_requirements": {
+                            "qualitative_montage": {
+                                "prompt_indices": [0],
+                                "seed": 7,
+                                "actions": ["no_ag", "selected_action"],
+                                "blinding_seed": 123,
+                            }
+                        },
+                    },
+                    sort_keys=False,
+                )
+            )
+            first = root / "blind_a"
+            second = root / "blind_b"
+            result_a = blind_montage.build_blind_package(
+                run_dir, prompts_path, frozen_path, first
+            )
+            result_b = blind_montage.build_blind_package(
+                run_dir, prompts_path, frozen_path, second
+            )
+            self.assertEqual(result_a["pairs"], 1)
+            self.assertEqual(
+                (first / "pair_p0_s7.png").read_bytes(),
+                (second / "pair_p0_s7.png").read_bytes(),
+            )
+            self.assertEqual(result_a["private_file"], "review_key.json")
+            self.assertNotIn("semantic_pos", (first / "review_prompts.csv").read_text())
+            key = json.loads((first / "review_key.json").read_text())
+            self.assertIn(key["pairs"][0]["left_action"], {"no_ag", "semantic_pos"})
 
     def test_latent_renderer_run_audit_accepts_complete_safe_design(self):
         with tempfile.TemporaryDirectory() as temp_dir:

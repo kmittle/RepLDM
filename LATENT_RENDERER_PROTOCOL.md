@@ -165,7 +165,9 @@ action sides assigned from the frozen blinding seed. At least two external
 reviewers are required; the statistical gate only returns
 `qualitative_review_required` and cannot itself authorize final test. This
 small review is a mechanism gate, not a substitute for the larger final-paper
-human study.
+human study. `make_latent_renderer_blind_montage.py` creates the fixed pairs,
+prompt sheet, and a private action key without reading scores; reviewers see
+only anonymous A/B labels and the prompt text.
 
 Every completed train, validation, or test run must first pass
 `eval-pipeline/audit_latent_renderer_run.py`. The audit requires the exact
