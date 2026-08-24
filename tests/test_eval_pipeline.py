@@ -56,6 +56,12 @@ finalize_renderer_validation = load_module(
     "finalize_latent_renderer_validation",
     "eval-pipeline/finalize_latent_renderer_validation.py",
 )
+select_trajectory_correction = load_module(
+    "select_trajectory_correction", "eval-pipeline/select_trajectory_correction.py"
+)
+freeze_trajectory_correction = load_module(
+    "freeze_trajectory_correction", "eval-pipeline/freeze_trajectory_correction_validation.py"
+)
 
 
 class EvalPipelineTest(unittest.TestCase):
@@ -84,6 +90,152 @@ class EvalPipelineTest(unittest.TestCase):
             self.assertTrue(actions[0]["freeu_preserve_moments"])
             schedule = generate.freeu_runtime(actions[0])
             self.assertEqual(schedule.at(1.0).as_tuple(), (0.6, 0.4, 1.1, 1.2))
+
+    def test_trajectory_correction_action_is_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "trajectory.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "actions": [
+                            {
+                                "id": "ancestral_half",
+                                "type": "trajectory_correction",
+                                "mix": 0.5,
+                                "noise_mode": "sqrt",
+                                "max_correction_ratio": 0.2,
+                            }
+                        ]
+                    }
+                )
+            )
+            actions, _ = generate.load_actions(str(path), 4)
+            self.assertEqual(actions[0]["type"], "trajectory_correction")
+            correction = generate.trajectory_correction_runtime(actions[0])
+            self.assertEqual(correction.to_record()["mix"], 0.5)
+            self.assertEqual(correction.to_record()["max_correction_ratio"], 0.2)
+
+    def test_trajectory_correction_registration_rejects_sampling_drift(self):
+        config = ROOT / "eval-pipeline/configs/trajectory_correction_development.yaml"
+        prompts = ROOT / "eval-pipeline/prompts/trajectory_correction_heldout_v1.csv"
+        generate.validate_registered_trajectory_design(
+            str(config),
+            prompts_path=str(prompts),
+            resolution=1024,
+            num_inference_steps=50,
+            guidance_scale=7.5,
+            stage2_enabled=False,
+        )
+        with self.assertRaisesRegex(ValueError, "sampling is registered"):
+            generate.validate_registered_trajectory_design(
+                str(config),
+                prompts_path=str(prompts),
+                resolution=1024,
+                num_inference_steps=30,
+                guidance_scale=7.5,
+                stage2_enabled=False,
+            )
+
+    def test_trajectory_validation_requires_and_filters_frozen_selection(self):
+        config_path = ROOT / "eval-pipeline/configs/trajectory_correction_validation_template.yaml"
+        with self.assertRaisesRegex(ValueError, "selected_action"):
+            generate.load_actions(str(config_path), 50)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "validation.yaml"
+            source = yaml.safe_load(config_path.read_text())
+            source["selected_action"] = "ancestral_mix_050"
+            path.write_text(yaml.safe_dump(source, sort_keys=False))
+            actions, _ = generate.load_actions(str(path), 50)
+            self.assertEqual(
+                [action["id"] for action in actions],
+                ["no_correction", "ancestral_mix_050"],
+            )
+
+    def test_trajectory_selector_applies_primary_and_pixel_gates(self):
+        rows = []
+        for prompt_index in range(8):
+            for seed in (0, 42):
+                for action_id, topiq_delta, clip_delta in (
+                    ("no_correction", 0.0, 0.0),
+                    ("ancestral_mix_050", 0.01, 0.0),
+                    ("ancestral_mix_075", 0.01, 0.002),
+                ):
+                    rows.append(
+                        {
+                            "prompt_index": prompt_index,
+                            "seed": seed,
+                            "action_id": action_id,
+                            "device": "cuda:1",
+                            "topiq_nr": 0.5 + topiq_delta,
+                            "hpsv2": 0.3,
+                            "clip_cosine": 0.3 + clip_delta,
+                            "clipped_fraction": 0.003 if action_id == "ancestral_mix_075" else 0.001,
+                            "mean_saturation": 0.2,
+                            "trajectory_correction_diagnostics": (
+                                None
+                                if action_id == "no_correction"
+                                else [
+                                    {
+                                        "step_index": 0,
+                                        "sigma_from": 1.0,
+                                        "sigma_to": 0.5,
+                                        "sigma_up": 0.25,
+                                        "raw_correction_norm_ratio": 0.1,
+                                        "applied_correction_norm_ratio": 0.1,
+                                    }
+                                ]
+                            ),
+                        }
+                    )
+        frame = pd.DataFrame(rows)
+        result = select_trajectory_correction.select(
+            frame,
+            action_order=["no_correction", "ancestral_mix_050", "ancestral_mix_075"],
+            bootstrap=500,
+            seed=3,
+        )
+        self.assertEqual(result["selected_action"], "ancestral_mix_050")
+        rows_by_action = {row["action"]: row for row in result["rows"]}
+        self.assertTrue(rows_by_action["ancestral_mix_050"]["passes_gate"])
+        self.assertFalse(rows_by_action["ancestral_mix_075"]["passes_gate"])
+
+    def test_trajectory_validation_freezer_requires_passing_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template = root / "template.yaml"
+            template.write_text(
+                yaml.safe_dump(
+                    {
+                        "schema": "trajectory_correction_validation_v1",
+                        "selected_action": None,
+                        "actions": [
+                            {"id": "no_correction", "type": "none"},
+                            {
+                                "id": "ancestral_mix_050",
+                                "type": "trajectory_correction",
+                                "mix": 0.5,
+                                "noise_mode": "sqrt",
+                            },
+                        ],
+                    }
+                )
+            )
+            selection = root / "selection.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "selected_action": "ancestral_mix_050",
+                        "gate": {"primary_metric": "topiq_nr"},
+                        "rows": [{"action": "ancestral_mix_050", "passes_gate": True}],
+                    }
+                )
+            )
+            output = root / "frozen.yaml"
+            frozen = freeze_trajectory_correction.freeze(
+                str(selection), str(template), str(output)
+            )
+            self.assertEqual(frozen["selected_action"], "ancestral_mix_050")
+            self.assertTrue(output.exists())
 
     @staticmethod
     def _registered_validation_inputs():

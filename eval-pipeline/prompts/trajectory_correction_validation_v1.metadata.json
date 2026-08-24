@@ -1,0 +1,484 @@
+{
+  "schema": "repldm-parti-validation-v1",
+  "source_path": "/tmp/parti/PartiPrompts.tsv",
+  "source_commit": "5a657978134374ce28973948331b319adef164bd",
+  "source_sha256": "fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb",
+  "source_row_indexing": "zero-based data rows after TSV header",
+  "source_rows": 1632,
+  "source_unique_normalized_prompts": 1632,
+  "source_internal_duplicate_count": 0,
+  "selection_namespace": "repldm-ancestral-validation-v1",
+  "selection_rule": "Exclude every normalized prompt and source_row present in all repository eval-pipeline/prompts/*.csv (including S7 trajectory_correction_heldout_v1); for each lexicographically sorted Challenge, rank remaining rows by SHA256(\"repldm-ancestral-validation-v1:\" + Challenge + \":\" + zero_based_row_index + \":\" + Prompt), retain the 4 smallest; output sorted by Challenge then source row.",
+  "per_challenge": 4,
+  "challenge_counts": {
+    "Basic": 4,
+    "Complex": 4,
+    "Fine-grained Detail": 4,
+    "Imagination": 4,
+    "Linguistic Structures": 4,
+    "Perspective": 4,
+    "Properties & Positioning": 4,
+    "Quantity": 4,
+    "Simple Detail": 4,
+    "Style & Format": 4,
+    "Writing & Symbols": 4
+  },
+  "eligible_counts": {
+    "Basic": 271,
+    "Complex": 94,
+    "Fine-grained Detail": 292,
+    "Imagination": 149,
+    "Linguistic Structures": 60,
+    "Perspective": 51,
+    "Properties & Positioning": 15,
+    "Quantity": 71,
+    "Simple Detail": 231,
+    "Style & Format": 205,
+    "Writing & Symbols": 72
+  },
+  "existing_prompt_files": [
+    "eval-pipeline/prompts/eval_v1.csv",
+    "eval-pipeline/prompts/latent_renderer_test.csv",
+    "eval-pipeline/prompts/latent_renderer_train.csv",
+    "eval-pipeline/prompts/latent_renderer_validation.csv",
+    "eval-pipeline/prompts/s5_development.csv",
+    "eval-pipeline/prompts/s5_smoke.csv",
+    "eval-pipeline/prompts/smoke.csv",
+    "eval-pipeline/prompts/stage2_smoke.csv",
+    "eval-pipeline/prompts/trajectory_correction_heldout_v1.csv"
+  ],
+  "existing_prompt_file_counts": {
+    "eval-pipeline/prompts/eval_v1.csv": 12,
+    "eval-pipeline/prompts/latent_renderer_test.csv": 24,
+    "eval-pipeline/prompts/latent_renderer_train.csv": 48,
+    "eval-pipeline/prompts/latent_renderer_validation.csv": 24,
+    "eval-pipeline/prompts/s5_development.csv": 12,
+    "eval-pipeline/prompts/s5_smoke.csv": 2,
+    "eval-pipeline/prompts/smoke.csv": 2,
+    "eval-pipeline/prompts/stage2_smoke.csv": 1,
+    "eval-pipeline/prompts/trajectory_correction_heldout_v1.csv": 11
+  },
+  "existing_unique_normalized_prompts": 133,
+  "existing_source_row_count": 121,
+  "excluded_exact_normalized_count": 121,
+  "excluded_source_row_count": 0,
+  "s7_file": "/mnt/miah204/bycao/RepLDM/eval-pipeline/prompts/trajectory_correction_heldout_v1.csv",
+  "s7_prompt_count": 11,
+  "s7_source_rows": [
+    "113",
+    "287",
+    "473",
+    "751",
+    "857",
+    "925",
+    "986",
+    "1101",
+    "1149",
+    "1409",
+    "1548"
+  ],
+  "candidate_count": 44,
+  "candidate_sha256": "232367e83b84641ffdd4ee2973cdb962c5c0e5fbc5a636cffea890b9f8a22f82",
+  "candidate_normalized_overlap_count": 0,
+  "candidate_s7_overlap_count": 0,
+  "candidate_internal_duplicate_count": 0,
+  "generation_note": "Candidate only; no GPU generation launched in this step.",
+  "rows": [
+    {
+      "index": "0",
+      "TEXT": "inertia",
+      "bucket": "basic",
+      "source_row": "15",
+      "source_category": "Abstract",
+      "source_challenge": "Basic",
+      "source_note": "Physics concepts"
+    },
+    {
+      "index": "1",
+      "TEXT": "a statue",
+      "bucket": "basic",
+      "source_row": "131",
+      "source_category": "Artifacts",
+      "source_challenge": "Basic",
+      "source_note": ""
+    },
+    {
+      "index": "2",
+      "TEXT": "a Tyrannosaurus Rex",
+      "bucket": "basic",
+      "source_row": "183",
+      "source_category": "Animals",
+      "source_challenge": "Basic",
+      "source_note": ""
+    },
+    {
+      "index": "3",
+      "TEXT": "a Styracosaurus",
+      "bucket": "basic",
+      "source_row": "186",
+      "source_category": "Animals",
+      "source_challenge": "Basic",
+      "source_note": ""
+    },
+    {
+      "index": "4",
+      "TEXT": "A portrait of a metal statue of a pharaoh wearing steampunk glasses and a leather jacket over a white t-shirt that has a drawing of a space shuttle on it.",
+      "bucket": "complex",
+      "source_row": "284",
+      "source_category": "World Knowledge",
+      "source_challenge": "Complex",
+      "source_note": ""
+    },
+    {
+      "index": "5",
+      "TEXT": "A raccoon wearing formal clothes, wearing a tophat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of Hokusai.",
+      "bucket": "complex",
+      "source_row": "291",
+      "source_category": "Arts",
+      "source_challenge": "Complex",
+      "source_note": ""
+    },
+    {
+      "index": "6",
+      "TEXT": "Anime illustration of the Great Pyramid sitting next to the Parthenon under a blue night sky of roiling energy, exploding yellow stars, and chromatic blue swirls",
+      "bucket": "complex",
+      "source_row": "324",
+      "source_category": "World Knowledge",
+      "source_challenge": "Complex",
+      "source_note": ""
+    },
+    {
+      "index": "7",
+      "TEXT": "an invisible man wearing horn-rimmed glasses and a pearl bead necklase while looking at his phone",
+      "bucket": "complex",
+      "source_row": "341",
+      "source_category": "People",
+      "source_challenge": "Complex",
+      "source_note": ""
+    },
+    {
+      "index": "8",
+      "TEXT": "A teddy bear wearing a motorcycle helmet and cape is driving a speed boat near the Golden Gate Bridge",
+      "bucket": "fine-grained-detail",
+      "source_row": "386",
+      "source_category": "World Knowledge",
+      "source_challenge": "Fine-grained Detail",
+      "source_note": ""
+    },
+    {
+      "index": "9",
+      "TEXT": "a cityscape at night with a full moon",
+      "bucket": "fine-grained-detail",
+      "source_row": "482",
+      "source_category": "Outdoor Scenes",
+      "source_challenge": "Fine-grained Detail",
+      "source_note": ""
+    },
+    {
+      "index": "10",
+      "TEXT": "a cricketer standing next to a wicket",
+      "bucket": "fine-grained-detail",
+      "source_row": "673",
+      "source_category": "People",
+      "source_challenge": "Fine-grained Detail",
+      "source_note": ""
+    },
+    {
+      "index": "11",
+      "TEXT": "a girl getting a kite out of a tree",
+      "bucket": "fine-grained-detail",
+      "source_row": "676",
+      "source_category": "People",
+      "source_challenge": "Fine-grained Detail",
+      "source_note": ""
+    },
+    {
+      "index": "12",
+      "TEXT": "A large city fountain that has milk instead of water. Several cats are leaning into the fountain.",
+      "bucket": "imagination",
+      "source_row": "720",
+      "source_category": "Outdoor Scenes",
+      "source_challenge": "Imagination",
+      "source_note": ""
+    },
+    {
+      "index": "13",
+      "TEXT": "A castle made of tortilla chips, in a river made of salsa. There are tiny burritos walking around the castle",
+      "bucket": "imagination",
+      "source_row": "727",
+      "source_category": "Food & Beverage",
+      "source_challenge": "Imagination",
+      "source_note": ""
+    },
+    {
+      "index": "14",
+      "TEXT": "a tornado with a house carried along at its top",
+      "bucket": "imagination",
+      "source_row": "817",
+      "source_category": "Outdoor Scenes",
+      "source_challenge": "Imagination",
+      "source_note": ""
+    },
+    {
+      "index": "15",
+      "TEXT": "a person with arms like a tree branch",
+      "bucket": "imagination",
+      "source_row": "843",
+      "source_category": "People",
+      "source_challenge": "Imagination",
+      "source_note": ""
+    },
+    {
+      "index": "16",
+      "TEXT": "The mouse the cat watches is jumping in the air.",
+      "bucket": "linguistic-structures",
+      "source_row": "872",
+      "source_category": "Animals",
+      "source_challenge": "Linguistic Structures",
+      "source_note": ""
+    },
+    {
+      "index": "17",
+      "TEXT": "Pneumonoultramicroscopicsilicovolcanoconiosis",
+      "bucket": "linguistic-structures",
+      "source_row": "876",
+      "source_category": "Abstract",
+      "source_challenge": "Linguistic Structures",
+      "source_note": "Longest word: \"a lung disease caused by inhalation of very fine silicate or quartz dust.\""
+    },
+    {
+      "index": "18",
+      "TEXT": "a banana without its peel",
+      "bucket": "linguistic-structures",
+      "source_row": "902",
+      "source_category": "Produce & Plants",
+      "source_challenge": "Linguistic Structures",
+      "source_note": "Negation"
+    },
+    {
+      "index": "19",
+      "TEXT": "a bird landing on a bat",
+      "bucket": "linguistic-structures",
+      "source_row": "904",
+      "source_category": "Animals",
+      "source_challenge": "Linguistic Structures",
+      "source_note": ""
+    },
+    {
+      "index": "20",
+      "TEXT": "Three-quarters front view of a blue 1977 Porsche 911 coming around a curve in a mountain road and looking over a green valley on a cloudy day.",
+      "bucket": "perspective",
+      "source_row": "911",
+      "source_category": "Vehicles",
+      "source_challenge": "Perspective",
+      "source_note": ""
+    },
+    {
+      "index": "21",
+      "TEXT": "Three-quarters front view of a red 1997 Corvette coming around a curve in a mountain road and looking over a green valley on a cloudy day.",
+      "bucket": "perspective",
+      "source_row": "912",
+      "source_category": "Vehicles",
+      "source_challenge": "Perspective",
+      "source_note": ""
+    },
+    {
+      "index": "22",
+      "TEXT": "An aerial view of Ha Long Bay",
+      "bucket": "perspective",
+      "source_row": "941",
+      "source_category": "World Knowledge",
+      "source_challenge": "Perspective",
+      "source_note": ""
+    },
+    {
+      "index": "23",
+      "TEXT": "an extreme close-up view of a capybara sitting in a field",
+      "bucket": "perspective",
+      "source_row": "944",
+      "source_category": "Animals",
+      "source_challenge": "Perspective",
+      "source_note": "DALL-E"
+    },
+    {
+      "index": "24",
+      "TEXT": "a white background with a large blue square",
+      "bucket": "properties-&-positioning",
+      "source_row": "1000",
+      "source_category": "Illustrations",
+      "source_challenge": "Properties & Positioning",
+      "source_note": ""
+    },
+    {
+      "index": "25",
+      "TEXT": "a green pyramid in front of a blue box",
+      "bucket": "properties-&-positioning",
+      "source_row": "1005",
+      "source_category": "Illustrations",
+      "source_challenge": "Properties & Positioning",
+      "source_note": ""
+    },
+    {
+      "index": "26",
+      "TEXT": "a large yellow sphere behind a small purple pyramid",
+      "bucket": "properties-&-positioning",
+      "source_row": "1006",
+      "source_category": "Illustrations",
+      "source_challenge": "Properties & Positioning",
+      "source_note": ""
+    },
+    {
+      "index": "27",
+      "TEXT": "a red swirl above a black dashed line.",
+      "bucket": "properties-&-positioning",
+      "source_row": "1009",
+      "source_category": "Illustrations",
+      "source_challenge": "Properties & Positioning",
+      "source_note": ""
+    },
+    {
+      "index": "28",
+      "TEXT": "four owls standing on a telephone wire",
+      "bucket": "quantity",
+      "source_row": "1034",
+      "source_category": "Animals",
+      "source_challenge": "Quantity",
+      "source_note": ""
+    },
+    {
+      "index": "29",
+      "TEXT": "three violins lying on the floor",
+      "bucket": "quantity",
+      "source_row": "1043",
+      "source_category": "Indoor Scenes",
+      "source_challenge": "Quantity",
+      "source_note": ""
+    },
+    {
+      "index": "30",
+      "TEXT": "five green peppers to the right of two red onions",
+      "bucket": "quantity",
+      "source_row": "1072",
+      "source_category": "Food & Beverage",
+      "source_challenge": "Quantity",
+      "source_note": ""
+    },
+    {
+      "index": "31",
+      "TEXT": "two motorcycles facing each other",
+      "bucket": "quantity",
+      "source_row": "1086",
+      "source_category": "Vehicles",
+      "source_challenge": "Quantity",
+      "source_note": ""
+    },
+    {
+      "index": "32",
+      "TEXT": "a green clock",
+      "bucket": "simple-detail",
+      "source_row": "1146",
+      "source_category": "Artifacts",
+      "source_challenge": "Simple Detail",
+      "source_note": ""
+    },
+    {
+      "index": "33",
+      "TEXT": "a tree growing through a fence",
+      "bucket": "simple-detail",
+      "source_row": "1250",
+      "source_category": "Produce & Plants",
+      "source_challenge": "Simple Detail",
+      "source_note": ""
+    },
+    {
+      "index": "34",
+      "TEXT": "a basketball hoop with a large blue ball stuck in it",
+      "bucket": "simple-detail",
+      "source_row": "1262",
+      "source_category": "Outdoor Scenes",
+      "source_challenge": "Simple Detail",
+      "source_note": ""
+    },
+    {
+      "index": "35",
+      "TEXT": "a full pint of IPA",
+      "bucket": "simple-detail",
+      "source_row": "1279",
+      "source_category": "Food & Beverage",
+      "source_challenge": "Simple Detail",
+      "source_note": ""
+    },
+    {
+      "index": "36",
+      "TEXT": "A photo of a lotus flower made of water. ",
+      "bucket": "style-&-format",
+      "source_row": "1358",
+      "source_category": "Produce & Plants",
+      "source_challenge": "Style & Format",
+      "source_note": ""
+    },
+    {
+      "index": "37",
+      "TEXT": "A photo of a maple leaf made of water. ",
+      "bucket": "style-&-format",
+      "source_row": "1359",
+      "source_category": "Produce & Plants",
+      "source_challenge": "Style & Format",
+      "source_note": ""
+    },
+    {
+      "index": "38",
+      "TEXT": "background pattern with alternating roses and skulls",
+      "bucket": "style-&-format",
+      "source_row": "1504",
+      "source_category": "Illustrations",
+      "source_challenge": "Style & Format",
+      "source_note": ""
+    },
+    {
+      "index": "39",
+      "TEXT": "a painting of a man standing on a street corner",
+      "bucket": "style-&-format",
+      "source_row": "1524",
+      "source_category": "People",
+      "source_challenge": "Style & Format",
+      "source_note": ""
+    },
+    {
+      "index": "40",
+      "TEXT": "A plush monkey fording the Charles River on a log while wearing a Boston Red Sox hat with MIT in the background.",
+      "bucket": "writing-&-symbols",
+      "source_row": "1562",
+      "source_category": "World Knowledge",
+      "source_challenge": "Writing & Symbols",
+      "source_note": ""
+    },
+    {
+      "index": "41",
+      "TEXT": "the word 'mardefly' on a coffee mug",
+      "bucket": "writing-&-symbols",
+      "source_row": "1595",
+      "source_category": "Artifacts",
+      "source_challenge": "Writing & Symbols",
+      "source_note": ""
+    },
+    {
+      "index": "42",
+      "TEXT": "a black t-shirt with the peace sign on it",
+      "bucket": "writing-&-symbols",
+      "source_row": "1611",
+      "source_category": "Artifacts",
+      "source_challenge": "Writing & Symbols",
+      "source_note": ""
+    },
+    {
+      "index": "43",
+      "TEXT": "the word 'START' written in chalk on a sidewalk",
+      "bucket": "writing-&-symbols",
+      "source_row": "1626",
+      "source_category": "Outdoor Scenes",
+      "source_challenge": "Writing & Symbols",
+      "source_note": ""
+    }
+  ]
+}

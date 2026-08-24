@@ -1,0 +1,44 @@
+# Validation confirmation template.  Fill selected_action only after the
+# development gate is complete; do not change the action values or prompts.
+schema: trajectory_correction_validation_v1
+experiment_id: trajectory_correction_validation_v1
+parent_experiment_id: trajectory_correction_development_v1
+selected_action: null
+split_seeds:
+  validation_confirmation: [11, 29, 101]
+source_manifest:
+  prompts: eval-pipeline/prompts/trajectory_correction_validation_v1.csv
+  prompts_sha256: 232367e83b84641ffdd4ee2973cdb962c5c0e5fbc5a636cffea890b9f8a22f82
+  metadata: eval-pipeline/prompts/trajectory_correction_validation_v1.metadata.json
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  resolution: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  stage2: false
+  extra_unet_calls: 0
+  scheduler: EulerDiscreteScheduler
+
+actions:
+  - id: no_correction
+    type: none
+  - id: drift_mix_025
+    type: trajectory_correction
+    mix: 0.25
+    noise_mode: none
+  - id: drift_mix_050
+    type: trajectory_correction
+    mix: 0.50
+    noise_mode: none
+  - id: ancestral_mix_025
+    type: trajectory_correction
+    mix: 0.25
+    noise_mode: sqrt
+  - id: ancestral_mix_050
+    type: trajectory_correction
+    mix: 0.50
+    noise_mode: sqrt
+  - id: ancestral_mix_075
+    type: trajectory_correction
+    mix: 0.75
+    noise_mode: sqrt

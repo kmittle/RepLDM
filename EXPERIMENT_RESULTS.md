@@ -260,3 +260,25 @@ S6 是 development null result，不能授权 validation、Stage 2、人类盲�
 FreeU 保留为论文中的强 baseline 和 reward-hacking 证据，但不再搜索其 scale/window。
 下一轮必须提出新的 scheduler-consistent 更新源，并在新的 prompt-disjoint split 上
 先通过静态 `+0.005` TOPIQ、HPS/CLIP 非劣和像素 guards；否则期刊扩展应诚实报告负结果。
+
+## S7：scheduler-consistent ancestral correction（开发记录）
+
+本轮把更新源换成 Euler scheduler 的解析 ancestral transition，而不是继续调
+attention/FreeU。实现保持冻结 SDXL U-Net、CFG、NFE 和初始 noise；每步记录
+`sigma_from`、`sigma_to`、`sigma_up` 以及 correction/update norm ratio。`mix=0`
+路径在单元测试中保持 PNG 输入张量和 RNG state 不变，未设置 trust cap 时
+`mix=1` 与独立 Euler-Ancestral 计算仅有浮点舍入差异。
+
+4-prompt exploratory probe（不是注册结果）相对 Euler 的 TOPIQ 均值差值为：
+`mix=.25 +0.005616`、`.50 +0.013206`、`.75 +0.021842`、`1.00 +0.024682`。
+逐 prompt 差值范围为 `[-0.026565,+0.065755]`；`.75/1.00` 的部分样本增加
+clipping 和 saturation，故不能据此选择强 mix 或声称收益。
+
+新的 development gate 已冻结为 11 个与仓库旧 prompt 无 normalized-text overlap
+的 PartiPrompts 候选（源 commit `5a657978134374ce28973948331b319adef164bd`）、seeds `[0,42]`、50 steps、1024²、CFG 7.5，并预注册 deterministic drift (`none`，`.25/.50`) 与 stochastic ancestral (`sqrt`，`.25/.50/.75`) 对照。源 TSV 与 prompt hash 记录在
+`eval-pipeline/prompts/trajectory_correction_heldout_v1.metadata.json`。在该 gate
+完成前不允许 renderer/RL；即使 development 通过，也必须在更大的新 validation
+split 上用 crossed prompt/seed bootstrap、prompt sign-flip、Holm correction 和
+TOPIQ/HPSv2/CLIP plus clipping/saturation/contrast/colorfulness/sharpness guards
+复核。源 TSV 与已核验 commit 的 hash 记录在 metadata；若固定 correction 不通过，
+S7 关闭并报告负结果。

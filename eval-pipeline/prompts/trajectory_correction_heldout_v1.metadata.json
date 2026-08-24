@@ -1,0 +1,30 @@
+{
+  "schema": "repldm-parti-heldout-v1",
+  "prompt_csv": "eval-pipeline/prompts/trajectory_correction_heldout_v1.csv",
+  "prompt_csv_sha256": "120ffaeae40cef1e29d1bf77139713b440514314d8b0df6b29dcbe29a078999a",
+  "source_tsv_sha256": "fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb",
+  "requested_source_revision": "5a657978134374ce28973948331b319adef164bd",
+  "requested_revision_available": true,
+  "revision_note": "The source file and revision were verified in the local /tmp/parti clone before freezing this split.",
+  "selection_namespace": "repldm-ancestral-heldout-v1",
+  "selection_rule": "one candidate per Challenge, ranked by SHA-256 after exact normalized-text exclusion against all repository prompt CSV files",
+  "candidate_count": 11,
+  "candidate_source_rows": [113, 287, 473, 751, 857, 925, 986, 1101, 1149, 1409, 1548],
+  "candidate_normalized_overlap_count": 0,
+  "candidate_internal_duplicate_count": 0,
+  "generation_recipe": {
+    "resolution": 1024,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.5,
+    "seeds": [0, 42],
+    "actions": [
+      {"mix": 0.0, "noise_mode": "none", "id": "no_correction"},
+      {"mix": 0.25, "noise_mode": "none", "id": "drift_mix_025"},
+      {"mix": 0.5, "noise_mode": "none", "id": "drift_mix_050"},
+      {"mix": 0.25, "noise_mode": "sqrt", "id": "ancestral_mix_025"},
+      {"mix": 0.5, "noise_mode": "sqrt", "id": "ancestral_mix_050"},
+      {"mix": 0.75, "noise_mode": "sqrt", "id": "ancestral_mix_075"}
+    ],
+    "scheduler": "EulerDiscreteScheduler + explicit ancestral correction"
+  }
+}

@@ -451,3 +451,31 @@ headroom。一个更激进的“每步 latent 投影回上一步矩统计”在 
 S6 关闭 FreeU scale/window 搜索、蒸馏和 RL。下一轮若继续，必须更换更新来源，先
 用固定动作验证 scheduler-consistent 的 equivariance 或低频一致性残差；不能把
 FreeU 的代理指标提升包装成方法结果。
+
+## S7：scheduler-consistent ancestral trajectory correction（开发中）
+
+S5/LR-1/S6 均没有给出可用的固定 latent 更新方向，因此下一候选不再直接改
+attention 或 U-Net feature amplitude，而是利用 Euler scheduler 已有的解析状态。对
+epsilon-prediction 的 Euler step，先计算 ordinary predictor 的 `euler_prev`，再从
+`sigma_from/sigma_to` 构造 `sigma_up`、`sigma_down` 和 ancestral drift；动作只是在
+两者之间做 bounded `mix`，并可按 Euler update norm 做 trust cap。它不增加 UNet
+调用，不改变 CFG、NFE 或初始噪声，`mix=0` 必须不消耗 RNG 并返回原 scheduler
+张量。该接口位于 `AttentionGuidance/ancestral_correction.py`，pipeline 只在
+Stage-1、standalone action 中启用，并把每步 correction/update ratio 写入 sidecar。
+
+动机参考 LC-GRPO（2608.05600）的 predictor-corrector、CreFlow（2605.14274）的
+trajectory correction，以及 path-space 统一视角（2608.14430）。这些工作意味着
+不能把 correction 或 RL estimator 宣称为新颖贡献；本轮只检验 fixed action 是否有
+质量 headroom。
+
+开发配置和 prompt provenance 已冻结在
+`eval-pipeline/configs/trajectory_correction_development.yaml` 与
+`eval-pipeline/prompts/trajectory_correction_heldout_v1.csv`。当前 manifest 只有
+11 个 prompt、2 个 seed，并同时登记 deterministic drift (`noise_mode=none`，mix
+`.25/.50`) 与 stochastic ancestral (`noise_mode=sqrt`，mix `.25/.50/.75`) 对照；源 TSV 与 PartiPrompts commit
+`5a657978134374ce28973948331b319adef164bd` 已在本地 clone 中核验；因此它仍只是
+development，不是 validation/test。4-prompt exploratory probe 的
+TOPIQ 均值差值随 mix 为 `+0.005616/+0.013206/+0.021842/+0.024682`，但 prompt
+范围为 `-0.026565` 到 `+0.065755`，且大 mix 会增加 clipping/saturation。只有在
+更大的新 validation split 上同时通过 TOPIQ、HPSv2/CLIP 和 pixel guards 后，才可
+考虑 state-conditioned renderer；固定 action 失败则关闭该路线，不训练 RL。

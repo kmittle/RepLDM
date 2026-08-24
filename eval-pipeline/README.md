@@ -11,7 +11,7 @@ analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 
 ## Generate
 
-Stage 1 at up to 1024² is the default. A resolution above 1024 requires the explicit `--stage2` opt-in, which enables the repository's high-resolution resampling path and records all phase settings. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, and low/mid/high-frequency actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry.
+Stage 1 at up to 1024² is the default. A resolution above 1024 requires the explicit `--stage2` opt-in, which enables the repository's high-resolution resampling path and records all phase settings. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, low/mid/high-frequency, and standalone `trajectory_correction` actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry. A trajectory correction interpolates an Euler step toward its analytical ancestral transition, supports `mix` in `[0,1]`, and records per-step norm diagnostics; it is Stage-1-only and cannot be combined with another intervention.
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -38,6 +38,51 @@ Stage-2 resampling noise is drawn from the per-task generator, so paired actions
 All actions for one `(prompt, seed)` block run on the same GPU. Blocks use deterministic device placement and deterministic shuffled action order. On resume, an existing sidecar's device takes precedence; an already cross-device block is rejected. A task is complete only when both PNG and JSON exist. Worker and per-task failures make the command fail after preserving completed records.
 
 Keep CFG, `power_calibrate`, model, resolution, negative prompt, and step count fixed within a run. Use a new output directory whenever any of these or the action definitions change.
+
+The scheduler-correction development gate is intentionally small and is not a
+final test. After checking the exact prompt/config hashes, run it with:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 1 --prompts eval-pipeline/prompts/trajectory_correction_heldout_v1.csv \
+  --out_dir outputs/trajectory_correction/development_v1 \
+  --actions eval-pipeline/configs/trajectory_correction_development.yaml \
+  --split_role development --seeds 0,42
+```
+
+Score the resulting manifest with the ordinary `score.py` and compare paired
+actions against `no_correction`; the registered `noise_mode=none` actions are
+the deterministic-drift ablation for the `sqrt` ancestral actions. Do not select a winner or start renderer/RL
+training from this 11-prompt development gate; a larger, separately frozen
+validation split is required.
+
+After scoring, the preregistered S7 gate can be audited with:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/select_trajectory_correction.py \
+  --run_dir outputs/trajectory_correction/development_v2 \
+  --actions eval-pipeline/configs/trajectory_correction_development.yaml
+```
+
+The selector requires a complete paired design and returns `no_correction` when
+no candidate reaches the primary/guard thresholds.
+
+If a candidate passes, freeze the validation action in a new file (the template
+itself is immutable):
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/freeze_trajectory_correction_validation.py \
+  --selection outputs/trajectory_correction/development_v2/trajectory_correction_selection.json \
+  --output eval-pipeline/configs/trajectory_correction_validation_v1.yaml
+```
+
+`configs/trajectory_correction_validation_template.yaml` and
+`prompts/trajectory_correction_validation_v1.csv` are that larger split
+(44 prompts, three confirmation seeds). Keep `selected_action: null` until the
+development report is archived; then freeze the selected development action and
+run the confirmation command with `--split_role validation_confirmation` and
+seeds `11,29,101`. Do not add a new mix or noise mode after looking at those
+validation scores.
 
 `configs/frequency_amplitude_followup.yaml` is explicitly post-hoc: it checks whether the 0.004 pilot simply used too much scalar or mid-band guidance. Treat it as search data and validate any selected amplitude on new prompts.
 

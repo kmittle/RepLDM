@@ -1,0 +1,12 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,source_note
+0,the grand canyon,basic,113,World Knowledge,Basic,
+1,"A photograph of the inside of a subway train. There are raccoons sitting on the seats. One of them is reading a newspaper. The window shows the city in the background.",complex,287,Vehicles,Complex,
+2,a submarine floating past a shark,fine-grained-detail,473,Vehicles,Fine-grained Detail,
+3,"Dogs sitting around a poker table with beer bottles and chips. Their hands are holding cards.",imagination,751,Animals,Imagination,"Description of Dogs Playing Poker"
+4,"The sculpture rolled off the shelf because it wasn't level",linguistic-structures,857,Artifacts,Linguistic Structures,Winograd Schema Challenge
+5,"A smiling sloth is wearing a leather jacket, a cowboy hat, a kilt and a bowtie. The sloth is holding a quarterstaff and a big book. The sloth is standing on grass a few feet in front of a shiny VW van with flowers painted on it. wide-angle lens from below.",perspective,925,World Knowledge,Perspective,
+6,a red cube on top of a blue cube,properties-&-positioning,986,Illustrations,Properties & Positioning,GLIDE
+7,a four-piece band on a stage in front of a small crowd,quantity,1101,People,Quantity,
+8,a baby daikon radish,simple-detail,1149,Produce & Plants,Simple Detail,DALL-E
+9,"a dolphin in an astronaut suit on saturn, high-contrast painting",style-&-format,1409,Animals,Style & Format,DALL-E 2
+10,"Portrait of a tiger wearing a train conductor's hat and holding a skateboard that has a yin-yang symbol on it. marble statue",writing-&-symbols,1548,Animals,Writing & Symbols,

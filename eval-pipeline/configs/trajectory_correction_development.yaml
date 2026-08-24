@@ -1,0 +1,46 @@
+# Development-only fixed scheduler correction search.  This is not a final
+# test registration: this development split is not a final test.
+schema: trajectory_correction_actions_v1
+experiment_id: trajectory_correction_development_v1
+parent_principle: scheduler_consistent_trajectory
+source_manifest:
+  prompts: eval-pipeline/prompts/trajectory_correction_heldout_v1.csv
+  prompts_sha256: 120ffaeae40cef1e29d1bf77139713b440514314d8b0df6b29dcbe29a078999a
+  source_tsv_sha256: fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb
+  requested_revision: 5a657978134374ce28973948331b319adef164bd
+  requested_revision_available: true
+split_seeds:
+  development: [0, 42]
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  resolution: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  stage2: false
+  extra_unet_calls: 0
+  scheduler: EulerDiscreteScheduler
+  noise_mode: sqrt
+
+actions:
+  - id: no_correction
+    type: none
+  - id: drift_mix_025
+    type: trajectory_correction
+    mix: 0.25
+    noise_mode: none
+  - id: drift_mix_050
+    type: trajectory_correction
+    mix: 0.50
+    noise_mode: none
+  - id: ancestral_mix_025
+    type: trajectory_correction
+    mix: 0.25
+    noise_mode: sqrt
+  - id: ancestral_mix_050
+    type: trajectory_correction
+    mix: 0.50
+    noise_mode: sqrt
+  - id: ancestral_mix_075
+    type: trajectory_correction
+    mix: 0.75
+    noise_mode: sqrt

@@ -43,6 +43,11 @@ from .freeu import (
     MomentPreservingFreeUController,
     match_channel_moments,
 )
+from .ancestral_correction import (
+    TrajectoryCorrectionConfig,
+    TrajectoryCorrectionDiagnostics,
+    apply_ancestral_correction,
+)
 
 __all__ = [
     "AttnGuidance",
@@ -84,4 +89,7 @@ __all__ = [
     "FreeUSchedule",
     "MomentPreservingFreeUController",
     "match_channel_moments",
+    "TrajectoryCorrectionConfig",
+    "TrajectoryCorrectionDiagnostics",
+    "apply_ancestral_correction",
 ]

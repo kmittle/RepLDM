@@ -63,6 +63,8 @@ from AttentionGuidance import (
     inject_rendered_clean_update,
     FreeUSchedule,
     MomentPreservingFreeUController,
+    TrajectoryCorrectionConfig,
+    apply_ancestral_correction,
 )
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -211,6 +213,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self._last_guidance_diagnostics = None
         self._last_freeu_schedule = None
         self._last_freeu_preserve_moments = False
+        self._last_trajectory_correction = None
+        self._last_trajectory_correction_diagnostics = None
 
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
 
@@ -821,6 +825,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         latent_renderer_basis_provider: Optional[RendererBasisProvider] = None,
         freeu_schedule: Optional[FreeUSchedule] = None,
         freeu_preserve_moments: bool = False,
+        trajectory_correction: Optional[TrajectoryCorrectionConfig] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -986,6 +991,11 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 backbone/skip transform with per-channel feature moment
                 preservation. This is a diagnostic anti-shortcut constraint and
                 does not add a denoiser evaluation.
+            trajectory_correction (`TrajectoryCorrectionConfig`, *optional*):
+                A bounded, scheduler-consistent interpolation between the
+                ordinary Euler transition and its Euler-Ancestral counterpart.
+                It is registered for Stage 1 Euler-compatible, epsilon-prediction
+                sampling only. ``mix=0`` is an exact no-op.
         
         Examples:
 
@@ -1035,12 +1045,32 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self.lowvram = lowvram
         if freeu_schedule is not None and not isinstance(freeu_schedule, FreeUSchedule):
             raise TypeError("freeu_schedule must be a FreeUSchedule or None")
+        if trajectory_correction is not None and not isinstance(
+            trajectory_correction, TrajectoryCorrectionConfig
+        ):
+            raise TypeError(
+                "trajectory_correction must be a TrajectoryCorrectionConfig or None"
+            )
         if not isinstance(freeu_preserve_moments, bool):
             raise TypeError("freeu_preserve_moments must be a bool")
         if freeu_preserve_moments and freeu_schedule is None:
             raise ValueError("freeu_preserve_moments requires a FreeUSchedule")
         if image_lr is not None and freeu_schedule is not None:
             raise ValueError("FreeU is registered for Stage 1 only")
+        if image_lr is not None and trajectory_correction is not None:
+            raise ValueError("trajectory correction is registered for Stage 1 only")
+        if trajectory_correction is not None and height * width > 1024**2:
+            raise ValueError("trajectory correction is registered for Stage 1 only")
+        if trajectory_correction is not None and (
+            semantic_transport_config is not None
+            or latent_renderer is not None
+            or attn_guidance_controller is not None
+            or attn_guidance_scale > 0
+            or freeu_schedule is not None
+        ):
+            raise ValueError(
+                "trajectory correction must be evaluated as a standalone Stage-1 action"
+            )
         MomentPreservingFreeUController.clear(self.unet)
         moment_controller = (
             MomentPreservingFreeUController(self.unet)
@@ -1051,6 +1081,12 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             freeu_schedule.to_record() if freeu_schedule is not None else None
         )
         self._last_freeu_preserve_moments = bool(freeu_preserve_moments)
+        self._last_trajectory_correction = (
+            trajectory_correction.to_record()
+            if trajectory_correction is not None
+            else None
+        )
+        self._last_trajectory_correction_diagnostics = []
         if self.lowvram:
             self.vae.cpu()
             self.unet.cpu()
@@ -1280,7 +1316,16 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     # Compute the previous noisy sample x_t -> x_t-1. Semantic
                     # transport must consume the scheduler's own x_0 estimate.
                     latents_before_step = latents
-                    if semantic_transport is None and latent_renderer is None:
+                    scheduler_step_index = getattr(self.scheduler, "step_index", None)
+                    if scheduler_step_index is None:
+                        scheduler_step_index = getattr(self.scheduler, "_step_index", None)
+                    if scheduler_step_index is None:
+                        scheduler_step_index = i
+                    if (
+                        semantic_transport is None
+                        and latent_renderer is None
+                        and trajectory_correction is None
+                    ):
                         latents = self.scheduler.step(
                             noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                         )[0]
@@ -1290,6 +1335,21 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         )
                         latents = step_output.prev_sample
                     denoising_update = latents - latents_before_step
+
+                    if trajectory_correction is not None:
+                        latents, correction_diagnostics = apply_ancestral_correction(
+                            scheduler=self.scheduler,
+                            sample=latents_before_step,
+                            pred_original_sample=step_output.pred_original_sample,
+                            euler_prev_sample=step_output.prev_sample,
+                            step_index=int(scheduler_step_index),
+                            config=trajectory_correction,
+                            generator=generator,
+                        )
+                        self._last_trajectory_correction_diagnostics.append(
+                            correction_diagnostics.to_record()
+                        )
+                        denoising_update = latents - latents_before_step
 
                     if semantic_transport is not None:
                         latents = semantic_transport.apply(

@@ -296,3 +296,29 @@ Gate-4 METHOD    : SEARCH-THEN-DISTILL 设为主方法跑 holdout；
 | RISK-13 | 中 | 第二指标与 hack 相关，非独立见证 | colorfulness 相关性 disqualification + 去相关 witness |
 | RISK-14 | 中-高 | content-optimum 可能内容不变(saturation 驱动)，oracle gap≈0 ⇒ 否决自适应 | oracle gap 跨 ≥2 reward，预注册 go/no-go |
 | RISK-15 | 中(定位) | related work 缺失(adaptive-guidance line + GRPO) ⇒ "not novel" | §13.8 补文献 + 差异化 |
+
+## 14. S7 实验漏斗：scheduler-consistent correction
+
+S7 是与 S5/LR-1/S6 不同的固定动作候选。它用 scheduler 的 `sigma` 转移计算
+ancestral drift，并以 `mix` 和可选 trust cap 注入 Euler transition。实现和公式见
+`_experiments_expansion/rethinking/trajectory_correction.md`；相关 predictor-corrector
+和 trajectory-correction 工作只作为动机与竞争基线，不能被写成新 RL 算法。
+
+执行顺序固定如下：
+
+1. 在 development manifest 上只比较 `no_correction`、deterministic drift
+   (`none`, `.25/.50`) 和 stochastic ancestral (`sqrt`, `.25/.50/.75`)，核对 exact
+   `mix=0` parity、sidecar diagnostics 和 finite pixel guards。
+2. 若 development 有信号，重新冻结更大的 prompt-disjoint validation split，先
+   选择一个固定 mix；不得在 validation 上追加 mix、noise mode 或 cap。
+3. 只有固定动作在 validation 同时通过 TOPIQ、HPSv2/CLIP 非劣、clipping/saturation
+   guards、crossed bootstrap、prompt sign-flip 和 Holm gate，才允许设计小型
+   state-conditioned latent renderer。renderer 先 search-then-distill；RL 只有在
+   同一 held-out 协议下胜过固定搜索和蒸馏后才进入。
+4. 任一 gate 失败就关闭 S7，不用更复杂 controller 或写作手段掩盖固定动作没有
+   headroom。
+
+本轮开发 split 使用的 PartiPrompts commit `5a657978134374ce28973948331b319adef164bd`
+和源/prompt hash 已在本地 clone 中核验；它仍只能标为 development，不能当 TPAMI 的
+最终 test。正式 validation/test 必须重新冻结更大的 prompt-disjoint split，并记录
+完整 source/prompt hash。

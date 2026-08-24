@@ -57,6 +57,7 @@ from AttentionGuidance import (
     StructuralUNetBasisProvider,
     build_fixed_coefficient_renderer,
     FreeUSchedule,
+    TrajectoryCorrectionConfig,
 )
 from AttentionGuidance.attention_baselines import installed_attention_baseline
 from InferencePipelines import RepLDMSDXLPipeline
@@ -191,6 +192,20 @@ def load_actions(path: str, num_inference_steps: int):
     actions = config.get("actions")
     if not isinstance(actions, list) or not actions:
         raise ValueError("action config must contain a non-empty 'actions' list")
+    if config.get("schema") == "trajectory_correction_validation_v1":
+        selected_action = str(config.get("selected_action", ""))
+        if not selected_action:
+            raise ValueError(
+                "trajectory-correction validation requires selected_action frozen from development"
+            )
+        selected_ids = {"no_correction", selected_action}
+        actions = [action for action in actions if str(action.get("id")) in selected_ids]
+        if len(actions) != 2 or selected_action not in {
+            str(action.get("id")) for action in actions
+        }:
+            raise ValueError(
+                "selected_action must identify one registered non-baseline action"
+            )
 
     seen = set()
     default_layer = str(
@@ -224,6 +239,7 @@ def load_actions(path: str, num_inference_steps: int):
             "attention_baseline",
             "latent_renderer_fixed",
             "freeu",
+            "trajectory_correction",
         }:
             raise ValueError(f"unsupported action type {action_type!r} for {action_id}")
 
@@ -364,6 +380,26 @@ def load_actions(path: str, num_inference_steps: int):
             action.pop("schedule", None)
             action.pop("preserve_moments", None)
             action["scale"] = 0.0
+        elif action_type == "trajectory_correction":
+            mix = float(action.get("mix", -1.0))
+            if not math.isfinite(mix) or not 0.0 <= mix <= 1.0:
+                raise ValueError(f"{action_id}: mix must be finite and in [0, 1]")
+            noise_mode = str(action.get("noise_mode", "sqrt"))
+            if noise_mode not in {"sqrt", "linear", "none"}:
+                raise ValueError(
+                    f"{action_id}: noise_mode must be sqrt, linear, or none"
+                )
+            max_ratio = action.get("max_correction_ratio")
+            if max_ratio is not None:
+                max_ratio = float(max_ratio)
+                if not math.isfinite(max_ratio) or max_ratio < 0:
+                    raise ValueError(
+                        f"{action_id}: max_correction_ratio must be finite and non-negative"
+                    )
+            action["mix"] = mix
+            action["noise_mode"] = noise_mode
+            action["max_correction_ratio"] = max_ratio
+            action["scale"] = 0.0
 
         residual_mode = str(action.get("residual_mode", "raw"))
         if residual_mode not in RESIDUAL_MODES:
@@ -426,6 +462,65 @@ def validate_split_seed_role(path: str, split_role, seeds) -> None:
         raise ValueError(
             f"--seeds {list(seeds)} do not match {split_role} registered seeds {expected}"
         )
+
+
+def validate_registered_trajectory_design(
+    path: str,
+    *,
+    prompts_path: str,
+    resolution: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    stage2_enabled: bool,
+) -> None:
+    """Reject accidental protocol drift for the frozen S7 development gate."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") not in {
+        "trajectory_correction_actions_v1",
+        "trajectory_correction_validation_v1",
+    }:
+        return
+    if config.get("schema") == "trajectory_correction_validation_v1" and not config.get(
+        "selected_action"
+    ):
+        raise ValueError(
+            "trajectory-correction validation requires selected_action frozen from development"
+        )
+    sampling = config.get("sampling") or {}
+    expected = {
+        "resolution": int(sampling.get("resolution", resolution)),
+        "num_inference_steps": int(
+            sampling.get("num_inference_steps", num_inference_steps)
+        ),
+        "guidance_scale": float(sampling.get("cfg_scale", guidance_scale)),
+        "stage2": bool(sampling.get("stage2", stage2_enabled)),
+    }
+    actual = {
+        "resolution": int(resolution),
+        "num_inference_steps": int(num_inference_steps),
+        "guidance_scale": float(guidance_scale),
+        "stage2": bool(stage2_enabled),
+    }
+    if expected != actual:
+        raise ValueError(
+            "trajectory-correction sampling is registered as "
+            f"{expected}, got {actual}"
+        )
+    source_manifest = config.get("source_manifest") or {}
+    registered_prompts = source_manifest.get("prompts")
+    if registered_prompts is not None:
+        expected_path = os.path.abspath(
+            os.path.join(ROOT, str(registered_prompts))
+        )
+        if os.path.abspath(prompts_path) != expected_path:
+            raise ValueError(
+                "trajectory-correction action config requires prompts file "
+                f"{expected_path}"
+            )
+    expected_hash = source_manifest.get("prompts_sha256")
+    if expected_hash is not None and expected_hash != sha256_file(prompts_path):
+        raise ValueError("trajectory-correction prompt hash does not match registration")
 
 
 def sha256_file(path: str) -> str:
@@ -582,6 +677,17 @@ def freeu_runtime(action: dict):
     )
 
 
+def trajectory_correction_runtime(action: dict):
+    """Translate a normalized trajectory-correction action."""
+    if action["type"] != "trajectory_correction":
+        return None
+    return TrajectoryCorrectionConfig(
+        mix=action["mix"],
+        noise_mode=action["noise_mode"],
+        max_correction_ratio=action.get("max_correction_ratio"),
+    )
+
+
 def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: float):
     """Construct one fixed LR-1 renderer/provider pair for a worker device."""
     if action["type"] != "latent_renderer_fixed":
@@ -645,6 +751,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             clean_config = clean_transport_runtime(action)
             baseline_config = attention_baseline_runtime(action)
             freeu_schedule = freeu_runtime(action)
+            trajectory_correction = trajectory_correction_runtime(action)
             # The diffusers FreeU implementation stores mutable attributes on
             # every up block.  Clear them before every action to preserve exact
             # paired comparisons, including after a failed task.
@@ -699,6 +806,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     latent_renderer_basis_provider=latent_provider,
                     freeu_schedule=freeu_schedule,
                     freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
+                    trajectory_correction=trajectory_correction,
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
@@ -746,6 +854,12 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
                 "freeu_preserve_moments": getattr(pipe, "_last_freeu_preserve_moments", False),
+                "trajectory_correction": getattr(
+                    pipe, "_last_trajectory_correction", None
+                ),
+                "trajectory_correction_diagnostics": getattr(
+                    pipe, "_last_trajectory_correction_diagnostics", None
+                ),
             }
             if diagnostics:
                 record.update(diagnostics)
@@ -845,6 +959,14 @@ def main():
         actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
         try:
             validate_split_seed_role(args.actions, args.split_role, seeds)
+            validate_registered_trajectory_design(
+                args.actions,
+                prompts_path=args.prompts,
+                resolution=args.resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                stage2_enabled=args.stage2,
+            )
             with open(args.actions) as action_handle:
                 action_config = yaml.safe_load(action_handle) or {}
             if (

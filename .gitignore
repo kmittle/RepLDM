@@ -5,6 +5,7 @@ wandb/
 output/
 outputs/
 pretrained_ckpts/
+/_experiments_expansion/
 ###################################################################
 
 # Byte-compiled / optimized / DLL files
