@@ -21,6 +21,44 @@ class LatentRendererInjectionTest(unittest.TestCase):
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(actual.dtype, prev.dtype)
 
+    def test_extended_non_strict_call_matches_legacy_output(self):
+        """Diagnostics must not silently change the default renderer action."""
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            prev, pred, guided, scheduler_update = self._inputs(dtype, batch=2)
+            legacy = inject_rendered_clean_update(prev, pred, guided)
+            extended = inject_rendered_clean_update(
+                prev,
+                pred,
+                guided,
+                scheduler_update=scheduler_update,
+                max_update_ratio=0.1,
+                enforce_post_cast_cap=False,
+                return_diagnostics=True,
+            )
+            self.assertIsInstance(extended, InjectionOutput)
+            self.assertTrue(torch.equal(extended.sample, legacy))
+            self.assertTrue(
+                torch.all(extended.diagnostics.postcast_update_ratio > 0)
+            )
+
+    def test_extended_diagnostics_allow_unbounded_non_strict_configuration(self):
+        prev, pred, guided, scheduler_update = self._inputs(torch.float32, batch=1)
+        result = inject_rendered_clean_update(
+            prev,
+            pred,
+            guided,
+            scheduler_update=scheduler_update,
+            max_update_ratio=None,
+            enforce_post_cast_cap=False,
+            return_diagnostics=True,
+        )
+        self.assertIsInstance(result, InjectionOutput)
+        self.assertTrue(torch.equal(result.sample, prev + guided - pred))
+        self.assertIsNone(result.diagnostics.postcast_overrun)
+        torch.testing.assert_close(
+            result.diagnostics.postcast_update_ratio, torch.ones(1)
+        )
+
     def test_strict_cap_is_per_sample_for_half_precisions(self):
         for dtype in (torch.float16, torch.bfloat16):
             prev, pred, guided, scheduler_update = self._inputs(dtype, batch=2)
@@ -40,6 +78,29 @@ class LatentRendererInjectionTest(unittest.TestCase):
             self.assertTrue(torch.all(diagnostics.postcast_update_ratio <= 0.1 + 1e-5))
             self.assertTrue(torch.all(diagnostics.postcast_overrun <= 1e-7))
             self.assertTrue(torch.all(diagnostics.postcast_cap_applied))
+
+    def test_strict_cap_uses_the_supplied_scheduler_update_per_sample(self):
+        prev, pred, guided, scheduler_update = self._inputs(torch.float32, batch=2)
+        scheduler_update[0].mul_(10.0)
+        scheduler_update[1].mul_(0.1)
+        result = inject_rendered_clean_update(
+            prev,
+            pred,
+            guided,
+            scheduler_update=scheduler_update,
+            max_update_ratio=0.05,
+            enforce_post_cast_cap=True,
+            return_diagnostics=True,
+        )
+        expected_norm = torch.linalg.vector_norm(
+            scheduler_update.flatten(1), dim=-1
+        )
+        torch.testing.assert_close(
+            result.diagnostics.scheduler_update_norm, expected_norm
+        )
+        self.assertTrue(
+            torch.all(result.diagnostics.postcast_update_ratio <= 0.05 + 1e-6)
+        )
 
     def test_zero_scheduler_update_is_exact_identity(self):
         prev = torch.randn(2, 4, 4, 4, dtype=torch.bfloat16)

@@ -735,6 +735,25 @@ def trajectory_correction_runtime(action: dict):
     )
 
 
+def renderer_diagnostics_sidecar(pipe) -> dict:
+    """Collect renderer summaries without retaining live tensor objects."""
+    renderer_diagnostics = getattr(pipe, "_last_latent_renderer_diagnostics", None)
+    return {
+        "latent_renderer_diagnostics": (
+            renderer_diagnostics.to_record()
+            if renderer_diagnostics is not None
+            and hasattr(renderer_diagnostics, "to_record")
+            else None
+        ),
+        "latent_renderer_provider_diagnostics": getattr(
+            pipe, "_last_latent_renderer_provider_diagnostics", None
+        ),
+        "latent_renderer_injection_diagnostics": getattr(
+            pipe, "_last_latent_renderer_injection_diagnostics", None
+        ),
+    }
+
+
 def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: float):
     """Construct one fixed LR-1 renderer/provider pair for a worker device."""
     if action["type"] != "latent_renderer_fixed":
@@ -884,12 +903,6 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 peak_memory = None
             elapsed = time.perf_counter() - start_time
             diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
-            renderer_diagnostics = getattr(
-                pipe, "_last_latent_renderer_diagnostics", None
-            )
-            renderer_provider_diagnostics = getattr(
-                pipe, "_last_latent_renderer_provider_diagnostics", None
-            )
             images[-1].save(png_path)  # lossless PNG
             record = {
                 **task,
@@ -920,13 +933,6 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "git_commit": commit,
                 **cfg["runtime_provenance"],
                 "device": device,
-                "latent_renderer_diagnostics": (
-                    renderer_diagnostics.to_record()
-                    if renderer_diagnostics is not None
-                    and hasattr(renderer_diagnostics, "to_record")
-                    else None
-                ),
-                "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
                 "freeu_preserve_moments": getattr(pipe, "_last_freeu_preserve_moments", False),
                 "trajectory_correction": getattr(
@@ -936,6 +942,10 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     pipe, "_last_trajectory_correction_diagnostics", None
                 ),
             }
+            # Unlike ``latent_renderer_diagnostics`` (which retains the
+            # final-step summary for compatibility), this list preserves the
+            # complete scheduler-injection trajectory.
+            record.update(renderer_diagnostics_sidecar(pipe))
             if diagnostics:
                 record.update(diagnostics)
             else:

@@ -282,7 +282,10 @@ used only after the action is frozen):
 
 `latent_renderer_fixed` emits constant six-dimensional coefficients through
 the same moment/trust-region renderer and records provider diagnostics in each
-sidecar. Do not select an action from the test split or treat this generation
+sidecar. Each renderer sidecar also carries
+`latent_renderer_injection_diagnostics`, a step-indexed record of the final
+post-cast scheduler injection; strict actions must have zero post-cast cap
+overrun. Do not select an action from the test split or treat this generation
 command as evidence until the registered TOPIQ-NR and non-inferiority gates
 are evaluated.
 

@@ -217,6 +217,51 @@ def _finite_renderer_diagnostics(frame: pd.DataFrame, action: str) -> bool:
                     or any(float(value) > 1e-7 for value in strict_overrun)
                 ):
                     return False
+                trajectory = row.get("latent_renderer_injection_diagnostics")
+                if not isinstance(trajectory, list) or not trajectory:
+                    return False
+                bound = float(action_record.get("max_update_ratio", 0.05))
+                for expected_step, step in enumerate(trajectory):
+                    if not isinstance(step, dict):
+                        return False
+                    step_index = step.get("step_index")
+                    if (
+                        isinstance(step_index, bool)
+                        or not isinstance(step_index, int)
+                        or step_index != expected_step
+                    ):
+                        return False
+                    ratio = step.get("postcast_update_ratio")
+                    overrun = step.get("postcast_overrun")
+                    if (
+                        not isinstance(ratio, list)
+                        or not ratio
+                        or not isinstance(overrun, list)
+                        or len(overrun) != len(ratio)
+                    ):
+                        return False
+                    if any(
+                        not math.isfinite(float(value))
+                        or float(value) < 0
+                        or float(value) > bound + 1e-6
+                        for value in ratio
+                    ):
+                        return False
+                    if any(
+                        not math.isfinite(float(value))
+                        or float(value) < 0
+                        or float(value) > 1e-7
+                        for value in overrun
+                    ):
+                        return False
+                    for key in ("postcast_cap_applied", "postcast_noop_fallback"):
+                        flags = step.get(key)
+                        if (
+                            not isinstance(flags, list)
+                            or len(flags) != len(ratio)
+                            or not all(isinstance(value, bool) for value in flags)
+                        ):
+                            return False
     return True
 
 

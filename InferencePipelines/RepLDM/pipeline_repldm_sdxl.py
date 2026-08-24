@@ -53,6 +53,7 @@ from AttentionGuidance import (
     AttnGuidance,
     GuidanceAction,
     GuidanceController,
+    InjectionOutput,
     RendererBasisProvider,
     RendererCondition,
     RendererObservation,
@@ -80,6 +81,17 @@ if is_invisible_watermark_available():
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _reset_latent_renderer_diagnostics(
+    pipeline: Any, latent_renderer: Optional[StructuralLatentRenderer] = None
+) -> None:
+    """Reset renderer summaries and allocate a per-step injection ledger."""
+    pipeline._last_latent_renderer_diagnostics = None
+    pipeline._last_latent_renderer_provider_diagnostics = None
+    pipeline._last_latent_renderer_injection_diagnostics = (
+        [] if latent_renderer is not None else None
+    )
 
 EXAMPLE_DOC_STRING = """
     Examples:
@@ -237,6 +249,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self._last_freeu_preserve_moments = False
         self._last_trajectory_correction = None
         self._last_trajectory_correction_diagnostics = None
+        self._last_latent_renderer_injection_diagnostics = None
 
         add_watermarker = add_watermarker if add_watermarker is not None else is_invisible_watermark_available()
 
@@ -1026,6 +1039,10 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         Returns:
             a `list` with the generated images at each phase.
         """
+
+        # Keep per-invocation renderer injection records isolated from a
+        # previous rollout, including calls that fail during input validation.
+        _reset_latent_renderer_diagnostics(self)
         
         # 0. Default height and width to unet
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -1259,8 +1276,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 raise ValueError("latent_renderer requires text-to-image denoising")
             latent_renderer.to(device)
             latent_renderer.eval()
-        self._last_latent_renderer_diagnostics = None
-        self._last_latent_renderer_provider_diagnostics = None
+        _reset_latent_renderer_diagnostics(self, latent_renderer)
         semantic_transport = None
         if semantic_transport_config is not None:
             if height * width > 1024**2:
@@ -1372,6 +1388,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             noise_pred, t, latents, **trajectory_scheduler_kwargs, return_dict=True
                         )
                         latents = step_output.prev_sample
+                    # This is the ordinary scheduler transition.  Renderer
+                    # trust caps use this reference, before any intervention
+                    # can modify ``latents`` or its diagnostic update.
                     denoising_update = latents - latents_before_step
 
                     if trajectory_correction is not None:
@@ -1420,11 +1439,45 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             state_features=condition.state_features,
                             scheduler_update=denoising_update,
                         )
-                        latents = inject_rendered_clean_update(
-                            step_output.prev_sample,
-                            step_output.pred_original_sample,
-                            rendered.guided_x0,
-                        )
+                        renderer_config = getattr(latent_renderer, "config", None)
+                        if renderer_config is None:
+                            # Third-party renderers may predate the strict
+                            # configuration contract. Keep their historical
+                            # three-argument injection behavior intact.
+                            latents = inject_rendered_clean_update(
+                                step_output.prev_sample,
+                                step_output.pred_original_sample,
+                                rendered.guided_x0,
+                            )
+                        else:
+                            enforce_post_cast_cap = bool(
+                                getattr(
+                                    renderer_config,
+                                    "enforce_post_cast_cap",
+                                    False,
+                                )
+                            )
+                            injection = inject_rendered_clean_update(
+                                step_output.prev_sample,
+                                step_output.pred_original_sample,
+                                rendered.guided_x0,
+                                scheduler_update=denoising_update,
+                                max_update_ratio=getattr(
+                                    renderer_config, "max_update_ratio", None
+                                ),
+                                enforce_post_cast_cap=enforce_post_cast_cap,
+                                return_diagnostics=True,
+                            )
+                            if not isinstance(injection, InjectionOutput):
+                                raise TypeError(
+                                    "strict renderer injection must return InjectionOutput"
+                                )
+                            latents = injection.sample
+                            injection_record = injection.diagnostics.to_record()
+                            injection_record["step_index"] = int(i)
+                            self._last_latent_renderer_injection_diagnostics.append(
+                                injection_record
+                            )
                         self._last_latent_renderer_diagnostics = rendered.diagnostics
                         self._last_latent_renderer_provider_diagnostics = getattr(
                             latent_renderer_basis_provider, "last_diagnostics", None

@@ -1,5 +1,6 @@
 import copy
 import csv
+import inspect
 import json
 import importlib.util
 import math
@@ -29,7 +30,9 @@ def load_module(name, relative_path):
 compare_actions = load_module("compare_actions", "eval-pipeline/compare_actions.py")
 generate = load_module("generate", "eval-pipeline/generate.py")
 from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
+    RepLDMSDXLPipeline,
     _sample_resample_noise,
+    _reset_latent_renderer_diagnostics,
     _validate_trajectory_correction_generator,
 )
 from InferencePipelines.cfg_batch import (  # noqa: E402
@@ -71,6 +74,55 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_renderer_diagnostic_ledger_resets_and_tracks_action_kind(self):
+        state = type("PipelineState", (), {})()
+        _reset_latent_renderer_diagnostics(state, latent_renderer=object())
+        self.assertIsNone(state._last_latent_renderer_diagnostics)
+        self.assertIsNone(state._last_latent_renderer_provider_diagnostics)
+        self.assertEqual(state._last_latent_renderer_injection_diagnostics, [])
+
+        state._last_latent_renderer_diagnostics = object()
+        state._last_latent_renderer_provider_diagnostics = object()
+        state._last_latent_renderer_injection_diagnostics = [{"step_index": 0}]
+        _reset_latent_renderer_diagnostics(state)
+        self.assertIsNone(state._last_latent_renderer_diagnostics)
+        self.assertIsNone(state._last_latent_renderer_provider_diagnostics)
+        self.assertIsNone(state._last_latent_renderer_injection_diagnostics)
+
+    def test_renderer_sidecar_preserves_trajectory_and_non_renderer_nulls(self):
+        class Summary:
+            def to_record(self):
+                return {"update_ratio": [0.01]}
+
+        renderer_pipe = type("RendererPipe", (), {})()
+        renderer_pipe._last_latent_renderer_diagnostics = Summary()
+        renderer_pipe._last_latent_renderer_provider_diagnostics = {
+            "basis_rms": [0.2]
+        }
+        renderer_pipe._last_latent_renderer_injection_diagnostics = [
+            {"step_index": 0, "postcast_update_ratio": [0.01]}
+        ]
+        sidecar = generate.renderer_diagnostics_sidecar(renderer_pipe)
+        self.assertEqual(sidecar["latent_renderer_diagnostics"], {"update_ratio": [0.01]})
+        self.assertEqual(
+            sidecar["latent_renderer_injection_diagnostics"][0]["step_index"], 0
+        )
+
+        no_renderer_pipe = type("NoRendererPipe", (), {})()
+        _reset_latent_renderer_diagnostics(no_renderer_pipe)
+        sidecar = generate.renderer_diagnostics_sidecar(no_renderer_pipe)
+        self.assertIsNone(sidecar["latent_renderer_diagnostics"])
+        self.assertIsNone(sidecar["latent_renderer_provider_diagnostics"])
+        self.assertIsNone(sidecar["latent_renderer_injection_diagnostics"])
+
+    def test_renderer_injection_uses_pre_intervention_scheduler_update(self):
+        source = inspect.getsource(RepLDMSDXLPipeline.__call__)
+        scheduler_update = "denoising_update = latents - latents_before_step"
+        injection_update = "scheduler_update=denoising_update"
+        self.assertIn(scheduler_update, source)
+        self.assertIn(injection_update, source)
+        self.assertLess(source.index(scheduler_update), source.index(injection_update))
+
     def test_cfg_latent_expansion_matches_concatenated_embedding_order(self):
         latents = torch.tensor([[10.0], [20.0]])
         expanded = expand_cfg_latents(latents, enabled=True)

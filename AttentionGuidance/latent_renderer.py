@@ -677,23 +677,26 @@ def inject_rendered_clean_update(
     batch = prev_sample.shape[0]
     # Addition/subtraction in fp16 can round a mathematically zero rendered
     # delta (``guided_x0 == pred_original_sample``) away from the scheduler
-    # sample.  Preserve the identity contract on the opt-in path explicitly;
-    # the legacy three-argument path above remains untouched.
-    zero_render_delta = (
-        (guided_x0 == pred_original_sample).flatten(1).all(dim=1)
-        & torch.isfinite(guided_x0).flatten(1).all(dim=1)
-        & torch.isfinite(pred_original_sample).flatten(1).all(dim=1)
-    )
-    candidate_precast = torch.where(
-        zero_render_delta.reshape((-1, 1, 1, 1)),
-        prev_sample,
-        candidate_precast,
-    )
-    candidate_cast = torch.where(
-        zero_render_delta.reshape((-1, 1, 1, 1)),
-        prev_sample,
-        candidate_cast,
-    )
+    # sample.  Preserve the identity contract only on the strict opt-in path;
+    # the extended diagnostics path with enforcement disabled must remain
+    # byte-compatible with the historical three-argument expression.
+    if enforce_post_cast_cap:
+        zero_render_delta = (
+            (guided_x0 == pred_original_sample).flatten(1).all(dim=1)
+            & torch.isfinite(guided_x0).flatten(1).all(dim=1)
+            & torch.isfinite(pred_original_sample).flatten(1).all(dim=1)
+        )
+        zero_render_mask = zero_render_delta.reshape((-1, 1, 1, 1))
+        candidate_precast = torch.where(
+            zero_render_mask,
+            prev_sample,
+            candidate_precast,
+        )
+        candidate_cast = torch.where(
+            zero_render_mask,
+            prev_sample,
+            candidate_cast,
+        )
     prev_float = prev_sample.float()
     precast_residual = candidate_precast.float() - prev_float
     postcast_residual = candidate_cast.float() - prev_float

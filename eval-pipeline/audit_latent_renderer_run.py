@@ -70,6 +70,63 @@ def _finite_values(record: Dict[str, Any], key: str) -> List[float]:
     return converted
 
 
+def _audit_injection_trajectory(
+    record: Dict[str, Any], bound: float
+) -> Dict[str, float]:
+    """Validate the strict post-cast injection trajectory in one sidecar."""
+    trajectory = record.get("latent_renderer_injection_diagnostics")
+    if not isinstance(trajectory, list) or not trajectory:
+        raise ValueError("strict renderer injection diagnostics are missing")
+
+    max_ratio = 0.0
+    max_overrun = 0.0
+    for expected_step, step in enumerate(trajectory):
+        if not isinstance(step, dict):
+            raise ValueError("strict renderer injection step is not an object")
+        step_index = step.get("step_index")
+        if (
+            isinstance(step_index, bool)
+            or not isinstance(step_index, int)
+            or step_index != expected_step
+        ):
+            raise ValueError("strict renderer injection step indices are not contiguous")
+        ratio = _finite_values(step, "postcast_update_ratio")
+        overrun = _finite_values(step, "postcast_overrun")
+        observed_overrun = _finite_values(step, "observed_postcast_overrun")
+        scheduler_norm = _finite_values(step, "scheduler_update_norm")
+        precast_ratio = _finite_values(step, "precast_update_ratio")
+        for key in ("postcast_cap_applied", "postcast_noop_fallback"):
+            flags = step.get(key)
+            if (
+                not isinstance(flags, list)
+                or not flags
+                or not all(isinstance(value, bool) for value in flags)
+            ):
+                raise ValueError(f"strict renderer injection {key!r} is invalid")
+        lengths = {
+            len(ratio),
+            len(overrun),
+            len(observed_overrun),
+            len(scheduler_norm),
+            len(precast_ratio),
+            len(step["postcast_cap_applied"]),
+            len(step["postcast_noop_fallback"]),
+        }
+        if len(lengths) != 1:
+            raise ValueError("strict renderer injection batch lengths differ")
+        if min(ratio) < 0 or max(ratio) > bound + 1e-6:
+            raise ValueError("strict renderer post-cast trust bound is violated")
+        if min(overrun) < 0 or max(overrun) > 1e-7:
+            raise ValueError("strict renderer post-cast overrun is non-zero")
+        max_ratio = max(max_ratio, max(ratio))
+        max_overrun = max(max_overrun, max(overrun))
+
+    return {
+        "max_postcast_injection_ratio": max_ratio,
+        "max_postcast_injection_overrun": max_overrun,
+    }
+
+
 def audit_run(
     run_dir: str | os.PathLike[str],
     prompts_path: str | os.PathLike[str],
@@ -191,6 +248,8 @@ def audit_run(
     required_score_keys = tuple(required_score_keys)
     max_update_ratio = 0.0
     max_postcast_overrun = 0.0
+    max_postcast_injection_ratio = 0.0
+    max_postcast_injection_overrun = 0.0
     max_mean_error = 0.0
     max_variance_error = 0.0
     image_hashes: Dict[tuple, str] = {}
@@ -274,6 +333,15 @@ def audit_run(
                 ):
                     raise ValueError(f"{expected_id}: strict renderer diagnostic lengths differ")
                 max_postcast_overrun = max(max_postcast_overrun, max(postcast_overrun))
+                injection_summary = _audit_injection_trajectory(record, bound)
+                max_postcast_injection_ratio = max(
+                    max_postcast_injection_ratio,
+                    injection_summary["max_postcast_injection_ratio"],
+                )
+                max_postcast_injection_overrun = max(
+                    max_postcast_injection_overrun,
+                    injection_summary["max_postcast_injection_overrun"],
+                )
             max_mean_error = max(max_mean_error, max(map(abs, mean_error)))
             max_variance_error = max(
                 max_variance_error, max(map(abs, variance_error))
@@ -318,6 +386,8 @@ def audit_run(
         "required_score_keys": list(required_score_keys),
         "max_update_ratio": max_update_ratio,
         "max_postcast_overrun": max_postcast_overrun,
+        "max_postcast_injection_ratio": max_postcast_injection_ratio,
+        "max_postcast_injection_overrun": max_postcast_injection_overrun,
         "max_abs_mean_error": max_mean_error,
         "max_abs_variance_error": max_variance_error,
         "all_action_png_hashes_distinct_within_block": require_distinct_actions,
