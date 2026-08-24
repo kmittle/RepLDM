@@ -48,6 +48,14 @@ from .ancestral_correction import (
     TrajectoryCorrectionDiagnostics,
     apply_ancestral_correction,
 )
+from .frla import (
+    DEFAULT_LAGS,
+    FRLAConfig,
+    FRLAOutput,
+    apply_frla,
+    fixed_channel_projection,
+    local_cosine_descriptor,
+)
 
 __all__ = [
     "AttnGuidance",
@@ -92,4 +100,10 @@ __all__ = [
     "TrajectoryCorrectionConfig",
     "TrajectoryCorrectionDiagnostics",
     "apply_ancestral_correction",
+    "DEFAULT_LAGS",
+    "FRLAConfig",
+    "FRLAOutput",
+    "apply_frla",
+    "fixed_channel_projection",
+    "local_cosine_descriptor",
 ]
