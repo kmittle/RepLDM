@@ -500,3 +500,18 @@ audit 均通过，比较 CSV 与 v4 byte-identical，36 个比较的最小全局
 `p=0.146519`；一个 mutable-scheduler ledger 失败目录和一个双 writer partial 目录
 均已隔离且未评分。该矩阵只支持“原生 ancestral 与 S7 小幅正均值同属普通 sampler
 variation”的归因，不授权 validation、renderer、distillation 或 RL。
+
+## Tuned CFG control：开发集失败，冻结 7.5
+
+为排除 CFG 选择不足这一混杂因素，commit `b0019dc` 授权的唯一 development run
+`outputs/cfg_baselines/development_v1` 完成 12 prompts x 3 seeds x 5 scales =
+`180/180`。manifest 与 strict scores validators 均通过，完整 grid、每步一次 U-Net、
+Euler schedule、PNG/sidecar/score hashes 和 9 个必需指标都满足冻结 contract。
+
+相对 CFG `7.5`，`2.5/5.0/10.0/15.0` 的 TOPIQ-NR 均值分别为
+`-0.056278/-0.015090/+0.003251/+0.004252`；前两者显著退化，后两者 95% CI
+跨零、Holm `p=0.702893`，且高 CFG 的 clipping、saturation、contrast guards
+失败。一次性 selector 返回 `cfg_7p5`、`decision=null_route`，reason 为
+`no_nondefault_scale_passed_the_frozen_gate`。selection JSON SHA-256 为
+`9d7245f1daed41d27b609a75359566dc2e226245ae6569d6c2e4ced45c28214c`。
+后续实验因此固定 CFG `7.5`；该 control 不授权 renderer、蒸馏或 RL。

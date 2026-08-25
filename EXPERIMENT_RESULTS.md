@@ -366,3 +366,29 @@ paired crossed prompt/seed bootstrap（11 prompts x 2 seeds，seed `20260825`，
 `selection_eligible: false`。因此 S7 的 development 结论仍为 null：不运行
 validation、固定 renderer、蒸馏或 RL；若期刊需要 scheduler 对照，只能作为
 匹配 NFE 的描述性 baseline 报告。
+
+## Tuned CFG development control（完成，null result）
+
+为排除“方法收益只是 CFG 未调好”这一替代解释，冻结的 development-only sweep
+在 `outputs/cfg_baselines/development_v1` 完成了 12 prompts x 3 seeds x 5 scales
+(`2.5,5.0,7.5,10.0,15.0`) 的 `180/180` 个同卡配对样本。result-blind manifest
+audit、strict `pixel,clip,hps,iqa` scoring 和 score-state audit 均通过；manifest、
+scores、selection JSON/CSV 的 SHA-256 分别为
+`e7de56da9ce9969ec32c6027f300cc37ed7e2f0aea0e2017e70a2af0ef947927`、
+`32376b9f02c54db9c076a6f5aa83fa5997da504277ff5d92b85e80dab16b4a43`、
+`9d7245f1daed41d27b609a75359566dc2e226245ae6569d6c2e4ced45c28214c` 和
+`aecc029b8e71599fdcfdac6078f178cb04a558e09254e8cd3fe74379f79ffe0e`。
+
+相对冻结 baseline CFG `7.5`，TOPIQ-NR paired mean / crossed 95% CI / Holm p 为：
+
+| CFG | Delta TOPIQ-NR [95% CI] | Holm p | 主要失败项 |
+|---:|---:|---:|---|
+| `2.5` | `-0.056278 [-0.087583,-0.032766]` | `0.001680` | 显著退化，contrast ratio `0.746` |
+| `5.0` | `-0.015090 [-0.028767,-0.004431]` | `0.031290` | 显著退化，contrast ratio `0.910` |
+| `10.0` | `+0.003251 [-0.005497,+0.011151]` | `0.702893` | 低于 `+0.005`，CI 跨零且 clipping/saturation/contrast guards 失败 |
+| `15.0` | `+0.004252 [-0.012796,+0.020892]` | `0.702893` | 低于 `+0.005`，CI 跨零且 clipping/saturation/contrast guards 失败 |
+
+一次性 selector 因 `no_nondefault_scale_passed_the_frozen_gate` 返回
+`selected_action=cfg_7p5`、`decision=null_route`。因此后续 matched-compute 实验固定
+CFG `7.5`；本结果不授权 validation、renderer、蒸馏或 RL，也不能用高 CFG 的正点
+估计声称改善。
