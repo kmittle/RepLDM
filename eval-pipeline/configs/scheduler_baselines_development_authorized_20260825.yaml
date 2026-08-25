@@ -5,10 +5,13 @@ status: authorized
 experiment_id: scheduler_baselines_v1
 authorization:
   reviewer: codex-root-on-user-continuous-queue-authorization
-  reviewed_commit: e622d62705cbf39d68aced64834d9210c0d8d644
+  reviewed_commit: 6d327d0a6027a0c28d7500ea7c817f4b6ffe7b6b
   source_template_sha256: 16edfbf84b768315f14e25ea3230ad2a8749d674129f4f5fc6f54cda6f8c2cfd
   scope: development_only_matched_nfe_references
-  authorized_at_utc: "2026-08-25T07:55:00Z"
+  supersedes_authorization_commit: 9a49efb0977e120464c3f47eea61ef1e95a5ed81
+  prior_aborted_run: outputs/scheduler_baselines/development_v1
+  prior_abort_reason: missing_native_euler_scheduler_provenance_fields
+  authorized_at_utc: "2026-08-25T08:02:00Z"
 source_manifest:
   prompts: eval-pipeline/prompts/trajectory_correction_heldout_v1.csv
   prompts_sha256: 120ffaeae40cef1e29d1bf77139713b440514314d8b0df6b29dcbe29a078999a
