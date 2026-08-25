@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 
+import pandas as pd
 import yaml
 from PIL import Image
 
@@ -85,6 +86,29 @@ class S7ProvenanceTest(unittest.TestCase):
                 provenance.validate_sidecar(
                     record, root, expected_contract_sha256="a" * 64
                 )
+
+    def test_legacy_manifest_consolidation_keeps_partial_resume_semantics(self):
+        prompts = pd.DataFrame([{"index": 0, "TEXT": "a prompt"}])
+        actions = generate.scale_actions([0.0, 0.004])
+        tasks = generate.build_tasks(prompts, [7], actions)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            image_dir = root / "images"
+            image_dir.mkdir()
+            task = tasks[0]
+            (image_dir / f"{task['id']}.png").touch()
+            (image_dir / f"{task['id']}.json").write_text(
+                json.dumps({"id": task["id"], "device": "cuda:0"})
+            )
+            count = generate.consolidate_manifest(
+                str(root),
+                {item["id"] for item in tasks},
+                expected_tasks=tasks,
+                run_contract_sha256=None,
+                strict=False,
+            )
+            self.assertEqual(count, 1)
+            self.assertEqual(len((root / "manifest.jsonl").read_text().splitlines()), 1)
 
     def test_missing_prompt_or_action_cells_are_rejected(self):
         complete = [

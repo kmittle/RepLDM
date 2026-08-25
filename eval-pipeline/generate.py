@@ -1267,19 +1267,20 @@ def consolidate_manifest(
                 record = json.load(f)
             if record.get("id") != stem:
                 raise ValueError(f"sidecar id does not match filename: {fn}")
-            validate_sidecar(
-                record,
-                out_dir,
-                expected_task=expected_task_map.get(stem),
-                expected_contract_sha256=run_contract_sha256,
-            )
+            if run_contract_sha256 is not None:
+                validate_sidecar(
+                    record,
+                    out_dir,
+                    expected_task=expected_task_map.get(stem),
+                    expected_contract_sha256=run_contract_sha256,
+                )
             rows.append(record)
             observed_set.add(stem)
-    if expected_set and observed_set != expected_set:
+    if strict and expected_set and observed_set != expected_set:
         raise ValueError(
             f"incomplete manifest: {len(expected_set - observed_set)} missing sidecars"
         )
-    if expected_tasks:
+    if expected_tasks and run_contract_sha256 is not None:
         validate_design_rows(
             rows,
             expected_action_ids=sorted({task["action_id"] for task in expected_tasks}),
@@ -1416,6 +1417,12 @@ def main():
         actions_sha256=cfg["actions_sha256"],
     )
     cfg["run_contract_sha256"] = json_sha256(cfg["run_contract"])
+    # Only registered S7 runs require strict sidecar/contract validation on
+    # resume. Existing exploratory sweeps predate this contract and must keep
+    # their original PNG+JSON completion semantics.
+    resume_contract_sha256 = (
+        cfg["run_contract_sha256"] if trajectory_registered else None
+    )
 
     tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)
     expected_ids = {task["id"] for task in tasks}
@@ -1440,14 +1447,14 @@ def main():
         task
         for task in tasks
         if not task_is_complete(
-            task, img_dir, run_contract_sha256=cfg["run_contract_sha256"]
+            task, img_dir, run_contract_sha256=resume_contract_sha256
         )
     ]
     device_tasks = assign_tasks_to_devices(
         tasks,
         devices,
         img_dir,
-        run_contract_sha256=cfg["run_contract_sha256"],
+        run_contract_sha256=resume_contract_sha256,
     )
     worker_count = len(device_tasks)
     print(f"{len(prompts)} prompts x {len(seeds)} seeds x {len(actions)} actions = {len(tasks)} tasks; "
@@ -1485,7 +1492,7 @@ def main():
                 args.out_dir,
                 expected_ids,
                 expected_tasks=tasks,
-                run_contract_sha256=cfg["run_contract_sha256"],
+                run_contract_sha256=resume_contract_sha256,
                 strict=trajectory_registered,
             )
             examples = ", ".join(task_id for task_id, _ in task_failures[:5])
@@ -1499,7 +1506,7 @@ def main():
         args.out_dir,
         expected_ids,
         expected_tasks=tasks,
-        run_contract_sha256=cfg["run_contract_sha256"],
+        run_contract_sha256=resume_contract_sha256,
         strict=trajectory_registered,
     )
     print(f"manifest.jsonl written with {n} records -> {os.path.join(args.out_dir, 'manifest.jsonl')}", flush=True)
