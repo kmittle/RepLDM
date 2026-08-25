@@ -7,6 +7,7 @@ import json
 import math
 import os
 import struct
+import zlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
@@ -172,6 +173,9 @@ def _png_dimensions(path: Path) -> tuple[int, int]:
     chunk_length = struct.unpack(">I", header[8:12])[0]
     if header[12:16] != b"IHDR" or chunk_length != 13:
         raise ValueError(f"PNG lacks a valid IHDR: {path}")
+    expected_crc = struct.unpack(">I", header[29:33])[0]
+    if zlib.crc32(header[12:29]) & 0xFFFFFFFF != expected_crc:
+        raise ValueError(f"PNG IHDR checksum is invalid: {path}")
     width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
         ">IIBBBBB", header[16:29]
     )
