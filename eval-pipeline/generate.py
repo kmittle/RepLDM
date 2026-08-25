@@ -988,6 +988,17 @@ def scheduler_baseline_runtime(action: dict, base_scheduler):
     return scheduler_class.from_config(base_scheduler.config, **scheduler_kwargs)
 
 
+def native_scheduler_runtime(base_scheduler):
+    """Construct a clean copy of the model's native scheduler.
+
+    RepLDM's pipeline mutates scheduler state in ``set_timesteps`` and during
+    stepping.  Registered matched-NFE blocks must not share that state across
+    actions, otherwise provenance (and potentially paired noise scaling) can
+    depend on execution order.
+    """
+    return type(base_scheduler).from_config(base_scheduler.config)
+
+
 def scheduler_provenance_record(
     action: dict,
     *,
@@ -1297,20 +1308,31 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 else nullcontext()
             )
             scheduler_reference = action["type"] == "scheduler_baseline"
-            scheduler_name = base_scheduler_name
-            active_scheduler_hash = base_scheduler_hash
-            active_scheduler_hash_v2 = base_scheduler_hash_v2
-            active_scheduler_order = int(getattr(base_scheduler, "order", 1))
-            active_solver_order = base_scheduler.config.get("solver_order")
-            active_init_noise_sigma = float(base_scheduler.init_noise_sigma)
-            if scheduler_reference:
-                pipe.scheduler = scheduler_baseline_runtime(action, base_scheduler)
-                scheduler_name = type(pipe.scheduler).__name__
-                active_scheduler_hash = scheduler_config_sha256(pipe.scheduler)
-                active_scheduler_hash_v2 = scheduler_config_sha256_v2(pipe.scheduler)
-                active_scheduler_order = int(getattr(pipe.scheduler, "order", 1))
-                active_solver_order = pipe.scheduler.config.get("solver_order")
-                active_init_noise_sigma = float(pipe.scheduler.init_noise_sigma)
+            # A registered matrix isolates every action from the mutable
+            # scheduler state left by the previous pipeline call.  In
+            # particular, Euler's ``init_noise_sigma`` property changes after
+            # ``set_timesteps`` for the legacy SDXL scheduler config.
+            scheduler_isolated = bool(cfg.get("scheduler_baseline_registered"))
+            scheduler_runtime = None
+            if scheduler_isolated:
+                scheduler_runtime = (
+                    scheduler_baseline_runtime(action, base_scheduler)
+                    if scheduler_reference
+                    else native_scheduler_runtime(base_scheduler)
+                )
+                pipe.scheduler = scheduler_runtime
+            elif scheduler_reference:
+                scheduler_runtime = scheduler_baseline_runtime(action, base_scheduler)
+                pipe.scheduler = scheduler_runtime
+            active_scheduler = (
+                scheduler_runtime if scheduler_runtime is not None else base_scheduler
+            )
+            scheduler_name = type(active_scheduler).__name__
+            active_scheduler_hash = scheduler_config_sha256(active_scheduler)
+            active_scheduler_hash_v2 = scheduler_config_sha256_v2(active_scheduler)
+            active_scheduler_order = int(getattr(active_scheduler, "order", 1))
+            active_solver_order = active_scheduler.config.get("solver_order")
+            active_init_noise_sigma = float(active_scheduler.init_noise_sigma)
             try:
                 with baseline_context:
                     images = pipe(
@@ -1342,7 +1364,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         trajectory_correction=trajectory_correction,
                     )
             finally:
-                if scheduler_reference:
+                if scheduler_runtime is not None:
                     pipe.scheduler = base_scheduler
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
