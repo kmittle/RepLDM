@@ -9,6 +9,8 @@ import os
 
 import yaml
 
+from s7_provenance import sha256_file as provenance_sha256_file
+
 
 def sha256_file(path: str) -> str:
     digest = hashlib.sha256()
@@ -64,6 +66,57 @@ def freeze(
     source_actions = {
         str(action.get("id")): action for action in source.get("actions", [])
     }
+    selected_spec = source_actions.get(selected)
+    if not isinstance(selected_spec, dict):
+        raise ValueError("selected action is absent from development registration")
+    if selected_spec.get("type") != "trajectory_correction":
+        raise ValueError("only trajectory_correction actions may be frozen for S7 validation")
+    if not bool(selected_spec.get("selection_eligible", True)):
+        raise ValueError("selected action is not selection_eligible")
+    selected_rows = [
+        row for row in selection.get("rows", []) if str(row.get("action")) == selected
+    ]
+    if not selected_rows or not all(row.get("selection_eligible") is True for row in selected_rows):
+        raise ValueError("selected action is not marked selection_eligible in the gate report")
+
+    # A selection is only admissible when it is bound to the exact development
+    # run that the queue is about to validate.  Hashes alone are insufficient:
+    # the same action YAML can be reused by an unrelated run.
+    required_provenance = (
+        "run_dir",
+        "config_sha256",
+        "run_contract_sha256",
+        "manifest_sha256",
+        "scores_sha256",
+        "selector_version",
+        "selector_script_sha256",
+        "selector_git_commit",
+    )
+    for key in required_provenance:
+        if not provenance.get(key):
+            raise ValueError(f"selection provenance is missing {key!r}")
+    run_dir = os.path.abspath(str(provenance["run_dir"]))
+    selection_abs = os.path.abspath(selection_path)
+    if os.path.dirname(selection_abs) != run_dir:
+        raise ValueError("selection provenance run_dir does not contain selection file")
+    config_path = os.path.join(run_dir, "config.json")
+    manifest_path = os.path.join(run_dir, "manifest.jsonl")
+    scores_path = os.path.join(run_dir, "scores.jsonl")
+    for path in (config_path, manifest_path, scores_path):
+        if not os.path.isfile(path):
+            raise ValueError(f"development provenance file is missing: {path}")
+    if provenance["config_sha256"] != provenance_sha256_file(config_path):
+        raise ValueError("selection provenance config hash is stale")
+    if provenance["manifest_sha256"] != provenance_sha256_file(manifest_path):
+        raise ValueError("selection provenance manifest hash is stale")
+    if provenance["scores_sha256"] != provenance_sha256_file(scores_path):
+        raise ValueError("selection provenance scores hash is stale")
+    with open(config_path) as handle:
+        run_config = json.load(handle)
+    if run_config.get("run_contract_sha256") != provenance["run_contract_sha256"]:
+        raise ValueError("selection provenance run contract is stale")
+    if run_config.get("actions_sha256") != source_hash:
+        raise ValueError("development run config action hash differs from source")
     template_actions = {
         str(action.get("id")): action for action in template.get("actions", [])
     }
@@ -84,6 +137,14 @@ def freeze(
         "development_actions_sha256": source_hash,
         "selected_action": selected,
         "development_gate": selection.get("gate"),
+        "development_run_dir": run_dir,
+        "run_config_sha256": provenance["config_sha256"],
+        "run_contract_sha256": provenance["run_contract_sha256"],
+        "manifest_sha256": provenance["manifest_sha256"],
+        "scores_sha256": provenance["scores_sha256"],
+        "selector_version": provenance["selector_version"],
+        "selector_script_sha256": provenance["selector_script_sha256"],
+        "selector_git_commit": provenance["selector_git_commit"],
     }
     if os.path.abspath(output_path) == os.path.abspath(template_path):
         raise ValueError("write a new validation file; do not overwrite the template")

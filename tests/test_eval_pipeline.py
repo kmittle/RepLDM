@@ -493,16 +493,34 @@ class EvalPipelineTest(unittest.TestCase):
                     }
                 )
             )
-            selection = root / "selection.json"
+            run_dir = root / "development"
+            run_dir.mkdir()
+            (run_dir / "manifest.jsonl").write_text("")
+            (run_dir / "scores.jsonl").write_text("")
+            run_contract = "a" * 64
+            run_config = {
+                "actions_sha256": freeze_trajectory_correction.sha256_file(str(source)),
+                "run_contract_sha256": run_contract,
+            }
+            (run_dir / "config.json").write_text(json.dumps(run_config))
+            selection = run_dir / "selection.json"
             selection_provenance = {
-                "actions_sha256": freeze_trajectory_correction.sha256_file(str(source))
+                "actions_sha256": freeze_trajectory_correction.sha256_file(str(source)),
+                "run_dir": str(run_dir),
+                "config_sha256": freeze_trajectory_correction.sha256_file(str(run_dir / "config.json")),
+                "run_contract_sha256": run_contract,
+                "manifest_sha256": freeze_trajectory_correction.sha256_file(str(run_dir / "manifest.jsonl")),
+                "scores_sha256": freeze_trajectory_correction.sha256_file(str(run_dir / "scores.jsonl")),
+                "selector_version": "test",
+                "selector_script_sha256": "b" * 64,
+                "selector_git_commit": "test-commit",
             }
             selection.write_text(
                 json.dumps(
                     {
                         "selected_action": "ancestral_mix_050",
                         "gate": {"primary_metric": "topiq_nr"},
-                        "rows": [{"action": "ancestral_mix_050", "passes_gate": True}],
+                        "rows": [{"action": "ancestral_mix_050", "passes_gate": True, "selection_eligible": True}],
                         "provenance": selection_provenance,
                     }
                 )

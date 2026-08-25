@@ -260,10 +260,26 @@ manifest_complete() {
     [ "$(awk 'NF { n++ } END { print n+0 }' "$1")" = "$2" ]
 }
 
+run_complete() {
+    kind=$1; run_dir=$2; actions=$3; prompts=$4; seeds=$5; expected=$6
+    [ -f "$run_dir/config.json" ] || return 1
+    [ -f "$run_dir/manifest.jsonl" ] || return 1
+    if [ "$kind" = scores ] && [ ! -f "$run_dir/scores.jsonl" ]; then
+        return 1
+    fi
+    count=$(
+        "$EVAL_PYTHON" "$ROOT/eval-pipeline/validate_trajectory_run.py" \
+          --run-dir "$run_dir" --actions "$actions" --prompts "$prompts" \
+          --seeds "$seeds" --kind "$kind" 2>/dev/null
+    ) || return 1
+    [ "$count" = "$expected" ]
+}
+
 validation_action_matches() {
-    "$EVAL_PYTHON" - "$1" "$2" "$DEV_RUN_DIR/trajectory_correction_selection.json" "$DEV_ACTIONS" <<'PY'
+    "$EVAL_PYTHON" - "$1" "$2" "$DEV_RUN_DIR/trajectory_correction_selection.json" "$DEV_ACTIONS" "$DEV_RUN_DIR" <<'PY'
 import hashlib
 import json
+import os
 import sys
 import yaml
 
@@ -275,6 +291,22 @@ with open(sys.argv[3]) as handle:
     selection = json.load(handle)
 with open(sys.argv[4], "rb") as handle:
     actions_hash = hashlib.sha256(handle.read()).hexdigest()
+with open(sys.argv[4]) as handle:
+    source = yaml.safe_load(handle) or {}
+selected = str(sys.argv[2])
+source_by_id = {str(action.get("id")): action for action in source.get("actions", [])}
+selected_spec = source_by_id.get(selected) or {}
+run_dir = os.path.abspath(sys.argv[5])
+config_path = os.path.join(run_dir, "config.json")
+manifest_path = os.path.join(run_dir, "manifest.jsonl")
+scores_path = os.path.join(run_dir, "scores.jsonl")
+def digest(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+run_config = {}
+if os.path.isfile(config_path):
+    with open(config_path) as handle:
+        run_config = json.load(handle)
 provenance = value.get("selection_provenance") or {}
 selection_provenance = selection.get("provenance") or {}
 valid = (
@@ -284,6 +316,20 @@ valid = (
     and provenance.get("selected_action") == sys.argv[2]
     and provenance.get("development_actions_sha256") == actions_hash
     and selection_provenance.get("actions_sha256") == actions_hash
+    and selected_spec.get("type") == "trajectory_correction"
+    and bool(selected_spec.get("selection_eligible", True))
+    and os.path.abspath(str(selection_provenance.get("run_dir", ""))) == run_dir
+    and os.path.abspath(str(provenance.get("development_run_dir", ""))) == run_dir
+    and provenance.get("run_config_sha256") == digest(config_path)
+    and provenance.get("manifest_sha256") == digest(manifest_path)
+    and provenance.get("scores_sha256") == digest(scores_path)
+    and provenance.get("run_contract_sha256") == run_config.get("run_contract_sha256")
+    and selection_provenance.get("run_config_sha256") == provenance.get("run_config_sha256")
+    and selection_provenance.get("manifest_sha256") == provenance.get("manifest_sha256")
+    and selection_provenance.get("scores_sha256") == provenance.get("scores_sha256")
+    and selection_provenance.get("selector_version")
+    and selection_provenance.get("selector_script_sha256")
+    and selection_provenance.get("selector_git_commit")
 )
 raise SystemExit(0 if valid else 1)
 PY
@@ -296,7 +342,13 @@ registered_development_config() {
     [ -f "$run_dir/config.json" ] || return 1
     jq -e --arg actions "$actions_sha" --arg prompts "$prompts_sha" \
       '.actions_sha256 == $actions and .prompts_sha256 == $prompts and
-       .split_role == "development" and (.seeds | map(tonumber)) == [0,42]' \
+       .split_role == "development" and (.seeds | map(tonumber)) == [0,42] and
+       .trajectory_registered == true and
+       .action_schema == "trajectory_correction_actions_v1" and
+       .registered_sampling.model == "stabilityai/stable-diffusion-xl-base-1.0" and
+       .registered_sampling.scheduler == "EulerDiscreteScheduler" and
+       .registered_sampling.extra_unet_calls == 0 and
+       (.run_contract_sha256 | type) == "string" and (.run_contract_sha256 | length) == 64' \
       "$run_dir/config.json" >/dev/null
 }
 
@@ -386,20 +438,20 @@ main() {
        ! registered_development_config "$DEV_RUN_DIR"; then
         write_null_route development_config_mismatch 1; return 1
     fi
-    if [ "$DRY_RUN" -eq 1 ] || ! manifest_complete "$DEV_RUN_DIR/manifest.jsonl" "$EXPECTED_DEV_TASKS"; then
+    if [ "$DRY_RUN" -eq 1 ] || ! run_complete manifest "$DEV_RUN_DIR" "$DEV_ACTIONS" "$DEV_PROMPTS" "0,42" "$EXPECTED_DEV_TASKS"; then
         wait_existing; wait_gpu; mkdir -p "$DEV_RUN_DIR"
         run_stage development_generation "$GEN_PYTHON" "$ROOT/eval-pipeline/generate.py" \
           --devices "$GPU" --prompts "$DEV_PROMPTS" --out_dir "$DEV_RUN_DIR" \
           --actions "$DEV_ACTIONS" --split_role development --seeds 0,42 || return $?
     fi
-    if [ "$DRY_RUN" -eq 0 ] && ! manifest_complete "$DEV_RUN_DIR/manifest.jsonl" "$EXPECTED_DEV_TASKS"; then
+    if [ "$DRY_RUN" -eq 0 ] && ! run_complete manifest "$DEV_RUN_DIR" "$DEV_ACTIONS" "$DEV_PROMPTS" "0,42" "$EXPECTED_DEV_TASKS"; then
         write_null_route incomplete_development_manifest 1; return 1
     fi
     if [ "$DRY_RUN" -eq 0 ] && ! registered_development_config "$DEV_RUN_DIR"; then
         write_null_route development_config_missing 1; return 1
     fi
 
-    if [ "$DRY_RUN" -eq 1 ] || ! manifest_complete "$DEV_RUN_DIR/scores.jsonl" "$EXPECTED_DEV_TASKS"; then
+    if [ "$DRY_RUN" -eq 1 ] || ! run_complete scores "$DEV_RUN_DIR" "$DEV_ACTIONS" "$DEV_PROMPTS" "0,42" "$EXPECTED_DEV_TASKS"; then
         wait_existing; wait_gpu
         run_stage development_scoring "$EVAL_PYTHON" "$ROOT/eval-pipeline/score.py" \
           --run_dir "$DEV_RUN_DIR" --device "$GPU" --strict || return $?
@@ -437,16 +489,16 @@ main() {
         fi
     fi
 
-    if ! manifest_complete "$VAL_RUN_DIR/manifest.jsonl" "$EXPECTED_VAL_TASKS"; then
+    if ! run_complete manifest "$VAL_RUN_DIR" "$VAL_ACTIONS" "$VAL_PROMPTS" "11,29,101" "$EXPECTED_VAL_TASKS"; then
         wait_existing; wait_gpu; mkdir -p "$VAL_RUN_DIR"
         run_stage validation_generation "$GEN_PYTHON" "$ROOT/eval-pipeline/generate.py" \
           --devices "$GPU" --prompts "$VAL_PROMPTS" --out_dir "$VAL_RUN_DIR" \
           --actions "$VAL_ACTIONS" --split_role validation_confirmation --seeds 11,29,101 || return $?
     fi
-    if ! manifest_complete "$VAL_RUN_DIR/manifest.jsonl" "$EXPECTED_VAL_TASKS"; then
+    if ! run_complete manifest "$VAL_RUN_DIR" "$VAL_ACTIONS" "$VAL_PROMPTS" "11,29,101" "$EXPECTED_VAL_TASKS"; then
         write_null_route incomplete_validation_manifest 1; return 1
     fi
-    if [ ! -f "$VAL_RUN_DIR/scores.jsonl" ] || ! manifest_complete "$VAL_RUN_DIR/scores.jsonl" "$EXPECTED_VAL_TASKS"; then
+    if ! run_complete scores "$VAL_RUN_DIR" "$VAL_ACTIONS" "$VAL_PROMPTS" "11,29,101" "$EXPECTED_VAL_TASKS"; then
         wait_existing; wait_gpu
         run_stage validation_scoring "$EVAL_PYTHON" "$ROOT/eval-pipeline/score.py" \
           --run_dir "$VAL_RUN_DIR" --device "$GPU" --strict || return $?

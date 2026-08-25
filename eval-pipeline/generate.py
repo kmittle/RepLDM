@@ -65,6 +65,14 @@ from AttentionGuidance import (
 )
 from AttentionGuidance.attention_baselines import installed_attention_baseline
 from InferencePipelines import RepLDMSDXLPipeline
+from s7_provenance import (
+    PROVENANCE_SCHEMA,
+    action_sha256,
+    image_sha256,
+    json_sha256,
+    validate_design_rows,
+    validate_sidecar,
+)
 
 DEFAULT_CACHE_DIR = "/mnt/miah204/bycao/RepLDM/pretrained_ckpts"
 DEFAULT_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -72,6 +80,10 @@ DEFAULT_NEG = "blurry, ugly, duplicate, poorly drawn, deformed, mosaic"
 FRLA_SELECTION_SCHEMAS = {
     "frla_relational_actions_v1",
     "frla_relational_validation_v1",
+}
+TRAJECTORY_SCHEMAS = {
+    "trajectory_correction_actions_v1",
+    "trajectory_correction_validation_v1",
 }
 
 
@@ -96,6 +108,7 @@ def build_tasks(prompts: pd.DataFrame, seeds, actions, legacy_scale_ids: bool = 
                     "action_id": action["id"],
                     "action_type": action["type"],
                     "action": action,
+                    "action_sha256": action_sha256(action),
                 }
                 if "scale" in action:
                     task["scale"] = float(action["scale"])
@@ -126,9 +139,32 @@ def group_tasks_by_pair(tasks):
     return list(groups.values())
 
 
-def task_is_complete(task: dict, img_dir: str) -> bool:
+def task_is_complete(
+    task: dict,
+    img_dir: str,
+    *,
+    run_contract_sha256: str | None = None,
+) -> bool:
     stem = os.path.join(img_dir, task["id"])
-    return os.path.exists(stem + ".png") and os.path.exists(stem + ".json")
+    if not (os.path.exists(stem + ".png") and os.path.exists(stem + ".json")):
+        return False
+    # Legacy, non-registered sweeps predate the S7 provenance contract.  Keep
+    # their resume behavior unchanged; registered runs always pass a contract
+    # hash and take the strict path below.
+    if run_contract_sha256 is None:
+        return True
+    try:
+        with open(stem + ".json") as handle:
+            record = json.load(handle)
+        validate_sidecar(
+            record,
+            os.path.dirname(img_dir),
+            expected_task=task,
+            expected_contract_sha256=run_contract_sha256,
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return True
 
 
 def recorded_group_device(task_group: list, img_dir: str):
@@ -155,7 +191,13 @@ def recorded_group_device(task_group: list, img_dir: str):
     return next(iter(devices), None)
 
 
-def assign_tasks_to_devices(tasks: list, devices: list, img_dir: str) -> dict:
+def assign_tasks_to_devices(
+    tasks: list,
+    devices: list,
+    img_dir: str,
+    *,
+    run_contract_sha256: str | None = None,
+) -> dict:
     """Assign pending tasks without changing block placement on resume.
 
     The fallback round-robin index is computed over all blocks, not only the
@@ -175,7 +217,13 @@ def assign_tasks_to_devices(tasks: list, devices: list, img_dir: str) -> dict:
         )
         for execution_rank, task in enumerate(ordered_group):
             task["execution_rank"] = execution_rank
-        pending = [task for task in ordered_group if not task_is_complete(task, img_dir)]
+        pending = [
+            task
+            for task in ordered_group
+            if not task_is_complete(
+                task, img_dir, run_contract_sha256=run_contract_sha256
+            )
+        ]
         if not pending:
             continue
         device = recorded_device or devices[group_index % len(devices)]
@@ -564,6 +612,9 @@ def validate_registered_trajectory_design(
     num_inference_steps: int,
     guidance_scale: float,
     stage2_enabled: bool,
+    model_name: str | None = None,
+    scheduler_name: str | None = None,
+    extra_unet_calls: int | None = None,
 ) -> None:
     """Reject accidental protocol drift for the frozen S7 development gate."""
     with open(path) as handle:
@@ -580,13 +631,63 @@ def validate_registered_trajectory_design(
             "trajectory-correction validation requires selected_action frozen from development"
         )
     sampling = config.get("sampling") or {}
+    if not isinstance(sampling, dict):
+        raise ValueError("trajectory-correction sampling must be a mapping")
+    registered_model = sampling.get("model")
+    registered_scheduler = sampling.get("scheduler")
+    registered_extra_calls = sampling.get("extra_unet_calls")
+    if not isinstance(registered_model, str) or not registered_model:
+        raise ValueError("trajectory-correction registration must declare sampling.model")
+    if not isinstance(registered_scheduler, str) or not registered_scheduler:
+        raise ValueError(
+            "trajectory-correction registration must declare sampling.scheduler"
+        )
+    if isinstance(registered_extra_calls, bool) or not isinstance(
+        registered_extra_calls, int
+    ):
+        raise ValueError(
+            "trajectory-correction registration must declare integer extra_unet_calls"
+        )
+    if registered_extra_calls != 0:
+        raise ValueError(
+            "trajectory-correction actions require extra_unet_calls == 0"
+        )
+    if model_name is not None and str(model_name) != registered_model:
+        raise ValueError(
+            f"trajectory-correction model is registered as {registered_model!r}, "
+            f"got {model_name!r}"
+        )
+    if scheduler_name is not None and str(scheduler_name) != registered_scheduler:
+        raise ValueError(
+            f"trajectory-correction scheduler is registered as {registered_scheduler!r}, "
+            f"got {scheduler_name!r}"
+        )
+    if extra_unet_calls is not None and int(extra_unet_calls) != registered_extra_calls:
+        raise ValueError(
+            "trajectory-correction extra_unet_calls differs from registration"
+        )
+    registered_noise_mode = sampling.get("noise_mode")
+    if registered_noise_mode is not None and str(registered_noise_mode) not in {
+        "sqrt",
+        "linear",
+        "none",
+    }:
+        raise ValueError("trajectory-correction sampling.noise_mode is invalid")
+    for action in config.get("actions", []):
+        if action.get("type") != "trajectory_correction":
+            continue
+        mode = str(action.get("noise_mode", "sqrt"))
+        if mode not in {"sqrt", "linear", "none"}:
+            raise ValueError(
+                f"trajectory-correction action {action.get('id')!r} has invalid noise_mode"
+            )
     expected = {
         "resolution": int(sampling.get("resolution", resolution)),
         "num_inference_steps": int(
             sampling.get("num_inference_steps", num_inference_steps)
         ),
         "guidance_scale": float(sampling.get("cfg_scale", guidance_scale)),
-        "stage2": bool(sampling.get("stage2", stage2_enabled)),
+        "stage2": sampling.get("stage2", stage2_enabled),
     }
     actual = {
         "resolution": int(resolution),
@@ -594,6 +695,8 @@ def validate_registered_trajectory_design(
         "guidance_scale": float(guidance_scale),
         "stage2": bool(stage2_enabled),
     }
+    if not isinstance(expected["stage2"], bool):
+        raise ValueError("trajectory-correction registration sampling.stage2 must be boolean")
     if expected != actual:
         raise ValueError(
             "trajectory-correction sampling is registered as "
@@ -613,6 +716,42 @@ def validate_registered_trajectory_design(
     expected_hash = source_manifest.get("prompts_sha256")
     if expected_hash is not None and expected_hash != sha256_file(prompts_path):
         raise ValueError("trajectory-correction prompt hash does not match registration")
+
+
+def generation_contract(
+    cfg: dict,
+    *,
+    actions: list,
+    seeds: list[int],
+    prompts_sha256: str,
+    actions_sha256: str | None,
+) -> dict:
+    """Return the immutable fields that define a resumable generation run."""
+    return {
+        "schema": PROVENANCE_SCHEMA,
+        "action_schema": cfg.get("action_schema"),
+        "actions_sha256": actions_sha256,
+        "actions": actions,
+        "prompts_sha256": prompts_sha256,
+        "seeds": [int(value) for value in seeds],
+        "model_name": cfg["model_name"],
+        "resolution": int(cfg["resolution"]),
+        "num_inference_steps": int(cfg["num_inference_steps"]),
+        "guidance_scale": float(cfg["guidance_scale"]),
+        "negative_prompt": cfg["negative_prompt"],
+        "power_calibrate": int(cfg["power_calibrate"]),
+        "stage_name": cfg["stage_name"],
+        "stage2_enabled": bool(cfg["stage2_enabled"]),
+        "models_to_cpu": bool(cfg["models_to_cpu"]),
+        "multi_encoder": bool(cfg["multi_encoder"]),
+        "multi_decoder": bool(cfg["multi_decoder"]),
+        "num_resample_timesteps": int(cfg["num_resample_timesteps"]),
+        "init_rates": list(cfg["init_rates"]),
+        "frequency_band_cutoffs": list(cfg["frequency_band_cutoffs"]),
+        "split_role": cfg.get("split_role"),
+        "git_commit": cfg.get("git_commit"),
+        "runtime_provenance": cfg.get("runtime_provenance", {}),
+    }
 
 
 def sha256_file(path: str) -> str:
@@ -885,6 +1024,18 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
     base_scheduler = pipe.scheduler
     base_scheduler_name = type(base_scheduler).__name__
     base_scheduler_hash = scheduler_config_sha256(base_scheduler)
+    registered_sampling = cfg.get("registered_sampling") or {}
+    if cfg.get("trajectory_registered"):
+        expected_scheduler = str(registered_sampling.get("scheduler", ""))
+        if base_scheduler_name != expected_scheduler:
+            raise RuntimeError(
+                "trajectory-correction run loaded the wrong scheduler: "
+                f"registered {expected_scheduler!r}, got {base_scheduler_name!r}"
+            )
+        if str(cfg.get("model_name")) != str(registered_sampling.get("model")):
+            raise RuntimeError("trajectory-correction model differs from registration")
+        if int(registered_sampling.get("extra_unet_calls", -1)) != 0:
+            raise RuntimeError("trajectory-correction requires zero extra U-Net calls")
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
@@ -995,10 +1146,29 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             else:
                 peak_memory = None
             elapsed = time.perf_counter() - start_time
+            observed_unet_calls = [
+                int(value)
+                for value in getattr(pipe, "_last_unet_calls_per_step", [])
+            ]
+            if trajectory_correction is not None:
+                if len(observed_unet_calls) != cfg["num_inference_steps"] or any(
+                    value != 1 for value in observed_unet_calls
+                ):
+                    raise RuntimeError(
+                        "trajectory correction requires exactly one U-Net call per Stage-1 step"
+                    )
+            observed_extra_unet_calls = max(
+                (value - 1 for value in observed_unet_calls), default=0
+            )
             diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
             images[-1].save(png_path)  # lossless PNG
+            generated_image_sha256 = image_sha256(png_path)
             record = {
                 **task,
+                "provenance_schema": PROVENANCE_SCHEMA,
+                "run_contract_sha256": cfg["run_contract_sha256"],
+                "config_sha256": cfg["run_contract_sha256"],
+                "image_sha256": generated_image_sha256,
                 "image_path": os.path.relpath(png_path, cfg["out_dir"]),
                 "height": cfg["resolution"], "width": cfg["resolution"],
                 "num_inference_steps": cfg["num_inference_steps"],
@@ -1024,6 +1194,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "active_scheduler_config_sha256": active_scheduler_hash,
                 "scheduler_reference": scheduler_reference,
                 "git_commit": commit,
+                "registered_sampling": registered_sampling or None,
+                "extra_unet_calls": observed_extra_unet_calls,
+                "unet_calls_per_step": observed_unet_calls,
                 **cfg["runtime_provenance"],
                 "device": device,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
@@ -1068,19 +1241,50 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
     print(f"[{device}] done, generated {n_done} images", flush=True)
 
 
-def consolidate_manifest(out_dir: str, expected_ids=None):
+def consolidate_manifest(
+    out_dir: str,
+    expected_ids=None,
+    *,
+    expected_tasks=None,
+    run_contract_sha256: str | None = None,
+    strict: bool = False,
+):
     img_dir = os.path.join(out_dir, "images")
     rows = []
+    expected_task_map = {
+        str(task["id"]): task for task in (expected_tasks or [])
+    }
+    expected_set = set(expected_ids or expected_task_map)
+    observed_set = set()
     for fn in sorted(os.listdir(img_dir)):
         if fn.endswith(".json"):
             stem = fn[:-5]
-            if expected_ids is not None and stem not in expected_ids:
+            if expected_set and stem not in expected_set:
+                if strict:
+                    raise ValueError(f"unexpected sidecar for unregistered task: {fn}")
                 continue
             with open(os.path.join(img_dir, fn)) as f:
                 record = json.load(f)
             if record.get("id") != stem:
                 raise ValueError(f"sidecar id does not match filename: {fn}")
+            validate_sidecar(
+                record,
+                out_dir,
+                expected_task=expected_task_map.get(stem),
+                expected_contract_sha256=run_contract_sha256,
+            )
             rows.append(record)
+            observed_set.add(stem)
+    if expected_set and observed_set != expected_set:
+        raise ValueError(
+            f"incomplete manifest: {len(expected_set - observed_set)} missing sidecars"
+        )
+    if expected_tasks:
+        validate_design_rows(
+            rows,
+            expected_action_ids=sorted({task["action_id"] for task in expected_tasks}),
+            expected_seeds=sorted({int(task["seed"]) for task in expected_tasks}),
+        )
     with open(os.path.join(out_dir, "manifest.jsonl"), "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
@@ -1134,6 +1338,7 @@ def main():
         ap.error("--seeds must not contain duplicates")
     if args.actions and args.scales:
         ap.error("--actions and --scales are mutually exclusive")
+    action_config = {}
     if args.actions:
         actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
         try:
@@ -1145,6 +1350,7 @@ def main():
                 num_inference_steps=args.num_inference_steps,
                 guidance_scale=args.guidance_scale,
                 stage2_enabled=args.stage2,
+                model_name=args.model_name,
             )
             with open(args.actions) as action_handle:
                 action_config = yaml.safe_load(action_handle) or {}
@@ -1195,12 +1401,54 @@ def main():
         "runtime_provenance": runtime_provenance(),
         **stage_settings,
     }
+    action_schema = action_config.get("schema") if args.actions else None
+    trajectory_registered = action_schema in TRAJECTORY_SCHEMAS
+    cfg["action_schema"] = action_schema
+    cfg["trajectory_registered"] = trajectory_registered
+    cfg["registered_sampling"] = (
+        dict(action_config.get("sampling") or {}) if trajectory_registered else {}
+    )
+    cfg["run_contract"] = generation_contract(
+        cfg,
+        actions=actions,
+        seeds=seeds,
+        prompts_sha256=cfg["prompts_sha256"],
+        actions_sha256=cfg["actions_sha256"],
+    )
+    cfg["run_contract_sha256"] = json_sha256(cfg["run_contract"])
 
     tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)
     expected_ids = {task["id"] for task in tasks}
     img_dir = os.path.join(args.out_dir, "images")
-    todo = [task for task in tasks if not task_is_complete(task, img_dir)]
-    device_tasks = assign_tasks_to_devices(tasks, devices, img_dir)
+    config_path = os.path.join(args.out_dir, "config.json")
+    if trajectory_registered and os.path.exists(config_path):
+        try:
+            with open(config_path) as handle:
+                previous_config = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            ap.error(f"cannot read existing run config: {exc}")
+        if previous_config.get("run_contract_sha256") != cfg["run_contract_sha256"]:
+            ap.error(
+                "existing trajectory-correction run config differs from the requested "
+                "model/scheduler/action/sampling contract; use a new output directory"
+            )
+    elif trajectory_registered and not os.path.exists(config_path) and os.listdir(img_dir):
+        ap.error(
+            "trajectory-correction artifacts exist without config.json; use a new output directory"
+        )
+    todo = [
+        task
+        for task in tasks
+        if not task_is_complete(
+            task, img_dir, run_contract_sha256=cfg["run_contract_sha256"]
+        )
+    ]
+    device_tasks = assign_tasks_to_devices(
+        tasks,
+        devices,
+        img_dir,
+        run_contract_sha256=cfg["run_contract_sha256"],
+    )
     worker_count = len(device_tasks)
     print(f"{len(prompts)} prompts x {len(seeds)} seeds x {len(actions)} actions = {len(tasks)} tasks; "
           f"{len(tasks) - len(todo)} already done, {len(todo)} to generate on {worker_count} GPU(s).", flush=True)
@@ -1233,7 +1481,13 @@ def main():
             except Exception:
                 break
         if worker_failures or task_failures:
-            n = consolidate_manifest(args.out_dir, expected_ids)
+            n = consolidate_manifest(
+                args.out_dir,
+                expected_ids,
+                expected_tasks=tasks,
+                run_contract_sha256=cfg["run_contract_sha256"],
+                strict=trajectory_registered,
+            )
             examples = ", ".join(task_id for task_id, _ in task_failures[:5])
             raise RuntimeError(
                 f"generation failed: workers={worker_failures}, "
@@ -1241,7 +1495,13 @@ def main():
                 f"preserved {n} completed records for resume"
             )
 
-    n = consolidate_manifest(args.out_dir, expected_ids)
+    n = consolidate_manifest(
+        args.out_dir,
+        expected_ids,
+        expected_tasks=tasks,
+        run_contract_sha256=cfg["run_contract_sha256"],
+        strict=trajectory_registered,
+    )
     print(f"manifest.jsonl written with {n} records -> {os.path.join(args.out_dir, 'manifest.jsonl')}", flush=True)
 
 
