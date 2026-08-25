@@ -226,7 +226,9 @@ The sequence is fixed before viewing test images:
   to validate each renderer basis.
 * **Training split:** prompt-disjoint train/validation/test sets stratified by
   complex composition, quantity, text, perspective, and fine detail. Seeds
-  `0,42,123` are never used for policy selection on the final test set.
+  `0,42,123` are development-consumed; freeze entirely new final seeds before
+  any output from the new method is generated, and never use them for policy
+  or architecture selection.
 * **Capacity/compute controls:** fixed basis, 0.1M/1M/5M renderers, a random
   convolutional renderer with matched parameters, a full-UNet LoRA upper
   bound, and an equal-cost extra-UNet-call baseline. Keep NFE, resolution,
