@@ -85,6 +85,7 @@ from s7_provenance import (
     action_sha256,
     image_sha256,
     json_sha256,
+    resolve_frequency_band_cutoffs,
     validate_design_rows,
     validate_run_contract,
     validate_sidecar,
@@ -1035,9 +1036,7 @@ def load_actions(path: str, num_inference_steps: int):
                 )
         normalized.append(action)
 
-    cutoffs = [float(value) for value in config.get("frequency_band_cutoffs", [0.08, 0.25])]
-    if len(cutoffs) != 2 or not 0 < cutoffs[0] < cutoffs[1] < 0.5:
-        raise ValueError("frequency_band_cutoffs must satisfy 0 < low < mid < 0.5")
+    cutoffs = resolve_frequency_band_cutoffs(config)
     return normalized, cutoffs
 
 

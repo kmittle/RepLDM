@@ -32,7 +32,7 @@ from scorer_provenance import (
     registered_scorer_provenance_contract,
     validate_hardened_score_rows,
 )
-from s7_provenance import validate_run_contract
+from s7_provenance import resolve_frequency_band_cutoffs, validate_run_contract
 
 
 DEFAULT_SCORE_KEYS = (
@@ -1162,8 +1162,8 @@ def audit_run(
                     raise ValueError(
                         f"{score.get('id')}: scorer row is not bound to the run contract"
                     )
-    expected_cutoffs = [float(value) for value in source.get("frequency_band_cutoffs", [])]
-    observed_cutoffs = [float(value) for value in config.get("frequency_band_cutoffs", [])]
+    expected_cutoffs = resolve_frequency_band_cutoffs(source)
+    observed_cutoffs = resolve_frequency_band_cutoffs(config)
     if observed_cutoffs != expected_cutoffs:
         raise ValueError("run frequency-band cutoffs differ from source")
 

@@ -76,6 +76,41 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_frequency_cutoff_resolver_matches_generator_and_auditor(self):
+        cases = (
+            ({}, [0.08, 0.25]),
+            ({"frequency_band_cutoffs": [0.1, 0.2]}, [0.1, 0.2]),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as temp_dir:
+                action_path = pathlib.Path(temp_dir) / "actions.yaml"
+                payload = {
+                    "schema": "fixture",
+                    "actions": [{"id": "none", "type": "none"}],
+                    **fields,
+                }
+                action_path.write_text(yaml.safe_dump(payload, sort_keys=False))
+                _, generated = generate.load_actions(action_path, 3)
+                audited = audit_renderer_run.resolve_frequency_band_cutoffs(payload)
+                self.assertEqual(generated, expected)
+                self.assertEqual(audited, expected)
+
+    def test_frequency_cutoff_resolver_rejects_invalid_explicit_values(self):
+        invalid_values = (
+            [],
+            [0.1],
+            [0.2, 0.1],
+            [0.0, 0.2],
+            [0.1, 0.5],
+            [0.1, float("nan")],
+            "0.1,0.2",
+        )
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid):
+                payload = {"frequency_band_cutoffs": invalid}
+                with self.assertRaises(ValueError):
+                    audit_renderer_run.resolve_frequency_band_cutoffs(payload)
+
     def test_score_device_normalizes_numeric_gpu_indices(self):
         self.assertEqual(score.resolve_device("7", cuda_available=True), "cuda:7")
         self.assertEqual(
@@ -1054,6 +1089,74 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual(report["records"], 2)
         self.assertEqual(report["blocks"], 1)
         self.assertAlmostEqual(report["max_update_ratio"], 0.01)
+
+    def test_latent_renderer_audit_uses_registered_default_frequency_cutoffs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                temp_dir
+            )
+            source = yaml.safe_load(source_path.read_text())
+            source.pop("frequency_band_cutoffs")
+            source_path.write_text(yaml.safe_dump(source, sort_keys=False))
+            report = audit_renderer_run.audit_run(
+                run_dir,
+                prompts_path,
+                source_path,
+                split_role="train_search",
+            )
+        self.assertTrue(report["passed"])
+
+    def test_latent_renderer_audit_rejects_default_cutoff_drift(self):
+        for observed in ([0.07, 0.25], []):
+            with self.subTest(observed=observed), tempfile.TemporaryDirectory() as temp_dir:
+                run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                    temp_dir
+                )
+                source = yaml.safe_load(source_path.read_text())
+                source.pop("frequency_band_cutoffs")
+                source_path.write_text(yaml.safe_dump(source, sort_keys=False))
+                config_path = run_dir / "config.json"
+                config = json.loads(config_path.read_text())
+                config["frequency_band_cutoffs"] = observed
+                config_path.write_text(json.dumps(config))
+                with self.assertRaisesRegex(ValueError, "frequency_band_cutoffs|cutoffs"):
+                    audit_renderer_run.audit_run(
+                        run_dir,
+                        prompts_path,
+                        source_path,
+                        split_role="train_search",
+                    )
+
+    def test_latent_renderer_audit_honors_explicit_frequency_cutoffs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                temp_dir
+            )
+            source = yaml.safe_load(source_path.read_text())
+            source["frequency_band_cutoffs"] = [0.1, 0.2]
+            source_path.write_text(yaml.safe_dump(source, sort_keys=False))
+            config_path = run_dir / "config.json"
+            config = json.loads(config_path.read_text())
+            config["frequency_band_cutoffs"] = [0.1, 0.2]
+            config_path.write_text(json.dumps(config))
+            self.assertTrue(
+                audit_renderer_run.audit_run(
+                    run_dir,
+                    prompts_path,
+                    source_path,
+                    split_role="train_search",
+                )["passed"]
+            )
+
+            config["frequency_band_cutoffs"] = [0.1, 0.25]
+            config_path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "cutoffs differ"):
+                audit_renderer_run.audit_run(
+                    run_dir,
+                    prompts_path,
+                    source_path,
+                    split_role="train_search",
+                )
 
     def test_latent_renderer_run_audit_rejects_duplicate_action_images(self):
         with tempfile.TemporaryDirectory() as temp_dir:

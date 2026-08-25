@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 
 PROVENANCE_SCHEMA = "s7_trajectory_provenance_v1"
+DEFAULT_FREQUENCY_BAND_CUTOFFS = (0.08, 0.25)
 
 # Keep this list synchronized with generate.generation_contract().  The
 # contract intentionally excludes operational paths and device placement while
@@ -42,6 +43,24 @@ RUN_CONTRACT_KEYS = (
     "git_commit",
     "runtime_provenance",
 )
+
+
+def resolve_frequency_band_cutoffs(source: Mapping[str, Any]) -> list[float]:
+    """Resolve and validate the shared action-schema frequency cutoffs."""
+    raw = source.get("frequency_band_cutoffs", DEFAULT_FREQUENCY_BAND_CUTOFFS)
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise ValueError("frequency_band_cutoffs must contain exactly two values")
+    if len(raw) != 2:
+        raise ValueError("frequency_band_cutoffs must contain exactly two values")
+    try:
+        cutoffs = [float(value) for value in raw]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("frequency_band_cutoffs must be numeric") from exc
+    if not all(math.isfinite(value) for value in cutoffs) or not (
+        0 < cutoffs[0] < cutoffs[1] < 0.5
+    ):
+        raise ValueError("frequency_band_cutoffs must satisfy 0 < low < mid < 0.5")
+    return cutoffs
 
 
 def canonical_json(value: Any) -> str:
