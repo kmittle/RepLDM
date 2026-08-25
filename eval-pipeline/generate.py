@@ -71,6 +71,7 @@ from s7_provenance import (
     image_sha256,
     json_sha256,
     validate_design_rows,
+    validate_run_contract,
     validate_sidecar,
 )
 
@@ -1434,6 +1435,10 @@ def main():
                 previous_config = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             ap.error(f"cannot read existing run config: {exc}")
+        try:
+            validate_run_contract(previous_config)
+        except ValueError as exc:
+            ap.error(f"existing trajectory-correction run config is invalid: {exc}")
         if previous_config.get("run_contract_sha256") != cfg["run_contract_sha256"]:
             ap.error(
                 "existing trajectory-correction run config differs from the requested "

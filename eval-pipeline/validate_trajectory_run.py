@@ -14,6 +14,7 @@ from s7_provenance import (
     action_sha256,
     sha256_file,
     validate_design_rows,
+    validate_run_contract,
     validate_scores_against_manifest,
     validate_sidecar,
 )
@@ -31,6 +32,7 @@ def validate(run_dir, actions_path, prompts_path, seeds, kind):
     with open(actions_path) as handle:
         actions_config = yaml.safe_load(handle) or {}
     prompts = pd.read_csv(prompts_path)
+    contract_hash = validate_run_contract(config)
     action_ids = [str(action.get("id", "")) for action in config.get("actions", [])]
     if not action_ids or len(action_ids) != len(set(action_ids)):
         raise ValueError("run config has no unique action list")
@@ -76,9 +78,6 @@ def validate(run_dir, actions_path, prompts_path, seeds, kind):
     expected_seeds = [int(value) for value in seeds]
     manifest_path = os.path.join(run_dir, "manifest.jsonl")
     manifest = load_jsonl(manifest_path)
-    contract_hash = config.get("run_contract_sha256")
-    if not isinstance(contract_hash, str) or len(contract_hash) != 64:
-        raise ValueError("run config lacks run_contract_sha256")
     validate_design_rows(
         manifest,
         expected_action_ids=action_ids,

@@ -27,6 +27,7 @@ from s7_provenance import (  # noqa: E402
     PROVENANCE_SCHEMA,
     image_sha256,
     validate_design_rows,
+    validate_run_contract,
     validate_scores_against_manifest,
     validate_sidecar,
 )
@@ -80,6 +81,7 @@ def main():
         row.get("provenance_schema") == PROVENANCE_SCHEMA for row in manifest
     )
     if s7_run:
+        contract_hash = validate_run_contract(run_config)
         action_ids = [str(action.get("id")) for action in run_config.get("actions", [])]
         seeds = [int(value) for value in run_config.get("seeds", [])]
         validate_design_rows(
@@ -87,9 +89,6 @@ def main():
             expected_action_ids=action_ids or None,
             expected_seeds=seeds or None,
         )
-        contract_hash = run_config.get("run_contract_sha256")
-        if not isinstance(contract_hash, str) or len(contract_hash) != 64:
-            raise RuntimeError("S7 run config lacks run_contract_sha256")
         for row in manifest:
             if row.get("provenance_schema") != PROVENANCE_SCHEMA:
                 raise RuntimeError(f"{row.get('id')}: missing S7 provenance schema")
