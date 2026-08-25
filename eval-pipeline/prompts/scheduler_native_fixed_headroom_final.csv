@@ -1,0 +1,23 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,source_note,split
+0,a Christmas tree,basic,153,Artifacts,Basic,,final
+1,U.S. 101,basic,46,World Knowledge,Basic,Simple numbers but challenging,final
+2,a woman using a sledgehammer to smash an ice sculpture of a goose,complex,382,People,Complex,,final
+3,a photograph of a fiddle next to a basketball on a ping pong table,complex,345,Artifacts,Complex,,final
+4,a young girl wearing a tiara and frilly dress,fine-grained-detail,684,People,Fine-grained Detail,,final
+5,a yellow diamond-shaped sign with a wooly mammoth silhouette,fine-grained-detail,614,Artifacts,Fine-grained Detail,,final
+6,blue apples on a tree with yellow leaves,imagination,804,Produce & Plants,Imagination,,final
+7,the moon with a smiling face,imagination,816,Outdoor Scenes,Imagination,,final
+8,a bookshelf without any books on it,linguistic-structures,850,Artifacts,Linguistic Structures,Negation,final
+9,supercalifragilisticexpialidocious,linguistic-structures,874,Abstract,Linguistic Structures,Mary Poppins described it as the word to use “when you have nothing to say.”,final
+10,"A photo of a frog reading the newspaper named ""Toaday"" written on it. There is a frog printed on the newspaper too.",perspective,918,Animals,Perspective,,final
+11,a close-up of the eyes of an owl,perspective,960,Animals,Perspective,,final
+12,a red circle on top of a blue square,properties-and-positioning,988,Illustrations,Properties & Positioning,,final
+13,a green pepper to the left of a red pepper,properties-and-positioning,1010,Food & Beverage,Properties & Positioning,,final
+14,a pile of toy cars,quantity,1067,Artifacts,Quantity,,final
+15,a parade with cars and people waving,quantity,1092,People,Quantity,,final
+16,a peaceful lakeside landscape,simple-detail,1180,Outdoor Scenes,Simple Detail,,final
+17,a yellow wall with two framed sketches,simple-detail,1259,Indoor Scenes,Simple Detail,,final
+18,a stained glass window of a panda eating bamboo,style-and-format,1430,Artifacts,Style & Format,GLIDE,final
+19,"an abstract painting of three squares in blue, red and white",style-and-format,1472,Arts,Style & Format,,final
+20,a laptop with a maze sticker on it,writing-and-symbols,1582,Artifacts,Writing & Symbols,,final
+21,a coffee mug with an ankh symbol on it,writing-and-symbols,1608,Artifacts,Writing & Symbols,,final

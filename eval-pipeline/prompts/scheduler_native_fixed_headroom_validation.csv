@@ -1,0 +1,23 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,source_note,split
+0,a lizard,basic,221,Animals,Basic,,validation
+1,a coffee mug,basic,134,Artifacts,Basic,,validation
+2,The Millennium Wheel next to the Statue of Liberty. The Sagrada Familia church is also visible.,complex,316,World Knowledge,Complex,,validation
+3,"A smiling sloth wearing a leather jacket, a cowboy hat, a kilt and a bowtie. The sloth is holding a quarterstaff and a big book. A shiny VW van with a cityscape painted on it and parked on grass.",complex,301,World Knowledge,Complex,,validation
+4,a tennis court that is very wet from lots of rain,fine-grained-detail,623,Outdoor Scenes,Fine-grained Detail,,validation
+5,a pickup truck going up a mountain switchback,fine-grained-detail,601,Vehicles,Fine-grained Detail,,validation
+6,a hamster dragon,imagination,764,Animals,Imagination,,validation
+7,two cats doing research,imagination,778,Animals,Imagination,,validation
+8,A tourist is looking at a whale using a binocular,linguistic-structures,887,People,Linguistic Structures,Syntactic Ambiguities,validation
+9,The sculpture rolled off the shelf because it wasn't anchored,linguistic-structures,858,Artifacts,Linguistic Structures,Winograd Schema Challenge,validation
+10,trees seen through a car window on a rainy day,perspective,963,Outdoor Scenes,Perspective,,validation
+11,a three quarters view of a man getting into a car,perspective,977,People,Perspective,,validation
+12,a red block to the left of a blue pyramid,properties-and-positioning,995,Illustrations,Properties & Positioning,,validation
+13,a white background with a large blue circle,properties-and-positioning,998,Illustrations,Properties & Positioning,,validation
+14,three chairs,quantity,1029,Artifacts,Quantity,,validation
+15,a family of four walking at the beach with waves covering their feet,quantity,1097,People,Quantity,,validation
+16,a room with two chairs and a painting,simple-detail,1217,Indoor Scenes,Simple Detail,,validation
+17,A Google map highlighting Vietnam,simple-detail,1112,World Knowledge,Simple Detail,,validation
+18,A funny Rube Goldberg machine made out of paper,style-and-format,1370,World Knowledge,Style & Format,,validation
+19,a painting of a fox in the style of starry night,style-and-format,1429,Arts,Style & Format,GLIDE,validation
+20,a t-shirt with 'Archaelogy Rocks!' written on it,writing-and-symbols,1610,Artifacts,Writing & Symbols,,validation
+21,a series of musical notes on a computer screen,writing-and-symbols,1631,Artifacts,Writing & Symbols,,validation

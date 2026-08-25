@@ -1,0 +1,12 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,source_note,split
+0,cash,basic,173,Artifacts,Basic,,smoke
+1,"A raccoon wearing formal clothes, wearing a top hat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of Vincent Van Gogh.",complex,298,Arts,Complex,,smoke
+2,milk pouring from a glass into a bowl,fine-grained-detail,517,Food & Beverage,Fine-grained Detail,,smoke
+3,a full pitcher of beer with an elephant's trunk in it,imagination,822,Food & Beverage,Imagination,,smoke
+4,a fish without eyes,linguistic-structures,899,Animals,Linguistic Structures,Negation,smoke
+5,three quarters view of a rusty old red pickup truck with white doors and a smashed windshield,perspective,936,Vehicles,Perspective,,smoke
+6,a red sphere on top of a yellow box,properties-and-positioning,992,Illustrations,Properties & Positioning,,smoke
+7,two red balls on a table,quantity,1061,Artifacts,Quantity,,smoke
+8,a cat reading a comic book,simple-detail,1183,Animals,Simple Detail,,smoke
+9,a cloud in the shape of a teacup,style-and-format,1481,Outdoor Scenes,Style & Format,,smoke
+10,"a cartoon of a dog saying ""I see what you did there""",writing-and-symbols,1575,Animals,Writing & Symbols,,smoke

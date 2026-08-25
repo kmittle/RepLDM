@@ -1,0 +1,34 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,source_note,split
+0,an eagle,basic,110,Animals,Basic,,development
+1,a yellow box,basic,122,Illustrations,Basic,,development
+2,inspiration,basic,51,Abstract,Basic,,development
+3,a racoon detective using a microscope while riding in a train,complex,346,Animals,Complex,,development
+4,"A set of 2x2 emoji icons with happy, angry, surprised and sobbing faces. The emoji icons look like macaroons. All of the macaroons are wearing cowboy hats.",complex,279,Illustrations,Complex,,development
+5,"A raccoon wearing formal clothes, wearing a tophat and holding a cane. The raccoon is holding a garbage bag. Oil painting in the style of abstract cubism.",complex,289,Arts,Complex,,development
+6,a bird and its reflection in a fountain,fine-grained-detail,490,Outdoor Scenes,Fine-grained Detail,,development
+7,"a baby penguin wearing a blue hat, red gloves, green shirt, and yellow pants",fine-grained-detail,444,Animals,Fine-grained Detail,DALL-E,development
+8,a long wooden bench in front of a brick wall,fine-grained-detail,464,Artifacts,Fine-grained Detail,,development
+9,a giraffe imitating a turtle,imagination,757,Animals,Imagination,DALL-E,development
+10,a horse chasing a cat,imagination,786,Animals,Imagination,,development
+11,A city in 4-dimensional space-time,imagination,728,Abstract,Imagination,,development
+12,An aerial view of Ha Long Bay without any boats,linguistic-structures,890,World Knowledge,Linguistic Structures,Negation,development
+13,A man sips a latte and a woman a beer.,linguistic-structures,868,Food & Beverage,Linguistic Structures,,development
+14,A boy holds and a girl paints a piece of wood.,linguistic-structures,870,People,Linguistic Structures,,development
+15,a close-up of a margarita,perspective,950,Food & Beverage,Perspective,,development
+16,an aerial view of the Great Wall,perspective,968,World Knowledge,Perspective,,development
+17,a corgi’s head,perspective,940,Animals,Perspective,,development
+18,a yellow swirl next to a blue dashed line.,properties-and-positioning,1008,Illustrations,Properties & Positioning,,development
+19,A green heart with shadow,properties-and-positioning,985,Illustrations,Properties & Positioning,VQ-Diffusion,development
+20,a brown trash bin to the left of a blue recycling bin,properties-and-positioning,1011,Artifacts,Properties & Positioning,,development
+21,two cats,quantity,1037,Animals,Quantity,,development
+22,the hands of a single person holding a basketball,quantity,1019,People,Quantity,,development
+23,two chairs,quantity,1028,Artifacts,Quantity,,development
+24,a horse reading a book,simple-detail,1184,Animals,Simple Detail,,development
+25,a pumpkin with a candle in it,simple-detail,1188,Produce & Plants,Simple Detail,,development
+26,a glass of orange juice,simple-detail,1276,Food & Beverage,Simple Detail,,development
+27,a map of Italy,style-and-format,1462,World Knowledge,Style & Format,,development
+28,A photo of an Athenian vase with a painting of toucans playing basketball in the style of Egyptian hieroglyphics,style-and-format,1389,World Knowledge,Style & Format,,development
+29,"trying to find my way in a big confusing world, abstract oil painting",style-and-format,1364,Arts,Style & Format,,development
+30,"the saying ""BE EXCELLENT TO EACH OTHER"" on a rough wall with a graffiti image of a green alien wearing a tuxedo.",writing-and-symbols,1541,Outdoor Scenes,Writing & Symbols,,development
+31,a store front with 'AwesomePurchase' written on it,writing-and-symbols,1613,Outdoor Scenes,Writing & Symbols,,development
+32,the word 'START' written on a street surface,writing-and-symbols,1623,Illustrations,Writing & Symbols,,development

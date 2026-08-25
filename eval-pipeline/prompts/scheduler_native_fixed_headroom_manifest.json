@@ -1,0 +1,1093 @@
+{
+  "counts": {
+    "development": 33,
+    "final": 22,
+    "smoke": 11,
+    "validation": 22
+  },
+  "counts_per_challenge": {
+    "development": 3,
+    "final": 2,
+    "smoke": 1,
+    "validation": 2
+  },
+  "csv_sha256": {
+    "scheduler_native_fixed_headroom_development.csv": "065a86b95200eb89dc367ffe0f9f8c2d0a64fdab827e4004a1b629b169a6173f",
+    "scheduler_native_fixed_headroom_final.csv": "dd4dd54488c10b6254aa7edf9183219f2ac841603b16e149bf938b4d0f1bbe14",
+    "scheduler_native_fixed_headroom_smoke.csv": "60a3bf278689165bcb7a4bdf1f18c7ab91d8bf7a77eb287369a60fe40b6ef4e1",
+    "scheduler_native_fixed_headroom_validation.csv": "928d3d3ea5cb4df39b86d78803028b9fb238ac8a57201737f7f59d00ee9b7a18"
+  },
+  "excluded_normalized_text_count": 177,
+  "excluded_normalized_texts_sha256": "22c84444b134f21a3dbbef70ce90e46a82821fb272929ef1270b76dd45536a68",
+  "excluded_repository_prompt_files": [
+    {
+      "explicit_source_row_count": 0,
+      "path": "eval-pipeline/prompts/eval_v1.csv",
+      "row_count": 12,
+      "sha256": "61ff7418b40581be7312a27a771a9f7ffee4e752e68759693d132c084227a4ef",
+      "unique_normalized_text_count": 12
+    },
+    {
+      "explicit_source_row_count": 24,
+      "path": "eval-pipeline/prompts/latent_renderer_test.csv",
+      "row_count": 24,
+      "sha256": "5ce5f20a2103e72f293a56063e4793a03fadba75e729347082f3dcdd2efde699",
+      "unique_normalized_text_count": 24
+    },
+    {
+      "explicit_source_row_count": 48,
+      "path": "eval-pipeline/prompts/latent_renderer_train.csv",
+      "row_count": 48,
+      "sha256": "c0451eeb215b08f99c1932e9a3f2b89a2173c68c2dda1d41d937ecf2b60afcea",
+      "unique_normalized_text_count": 48
+    },
+    {
+      "explicit_source_row_count": 24,
+      "path": "eval-pipeline/prompts/latent_renderer_validation.csv",
+      "row_count": 24,
+      "sha256": "6ae2ec66045a6ee517d3350b1f10978cc818e40eb0287379d7542bc07207b6f3",
+      "unique_normalized_text_count": 24
+    },
+    {
+      "explicit_source_row_count": 12,
+      "path": "eval-pipeline/prompts/s5_development.csv",
+      "row_count": 12,
+      "sha256": "cf9ae37f2c066e5a35712e2aaf6ea637d85281dc7cd2b104fbc07fe1d8e5201e",
+      "unique_normalized_text_count": 12
+    },
+    {
+      "explicit_source_row_count": 2,
+      "path": "eval-pipeline/prompts/s5_smoke.csv",
+      "row_count": 2,
+      "sha256": "469ba0e8801c1a0a7e37f373275f7d8eb973795d7494fa2fdeb66d0cd680fd21",
+      "unique_normalized_text_count": 2
+    },
+    {
+      "explicit_source_row_count": 0,
+      "path": "eval-pipeline/prompts/smoke.csv",
+      "row_count": 2,
+      "sha256": "58dc54dd7f4af3a73e4976d1d229f904b4159df6e409541c1d5a81a744c378e9",
+      "unique_normalized_text_count": 2
+    },
+    {
+      "explicit_source_row_count": 0,
+      "path": "eval-pipeline/prompts/stage2_smoke.csv",
+      "row_count": 1,
+      "sha256": "fc530bb4ffcc3a0947e7ac69b6a5f425d0d0c3a5a3c7eeb9b527f61c9b3b4e50",
+      "unique_normalized_text_count": 1
+    },
+    {
+      "explicit_source_row_count": 11,
+      "path": "eval-pipeline/prompts/trajectory_correction_heldout_v1.csv",
+      "row_count": 11,
+      "sha256": "120ffaeae40cef1e29d1bf77139713b440514314d8b0df6b29dcbe29a078999a",
+      "unique_normalized_text_count": 11
+    },
+    {
+      "explicit_source_row_count": 44,
+      "path": "eval-pipeline/prompts/trajectory_correction_validation_v1.csv",
+      "row_count": 44,
+      "sha256": "232367e83b84641ffdd4ee2973cdb962c5c0e5fbc5a636cffea890b9f8a22f82",
+      "unique_normalized_text_count": 44
+    }
+  ],
+  "excluded_source_rows": [
+    15,
+    113,
+    131,
+    183,
+    186,
+    280,
+    284,
+    286,
+    287,
+    291,
+    292,
+    293,
+    295,
+    297,
+    310,
+    324,
+    325,
+    331,
+    341,
+    356,
+    357,
+    359,
+    360,
+    361,
+    367,
+    370,
+    376,
+    378,
+    386,
+    388,
+    408,
+    417,
+    424,
+    450,
+    473,
+    482,
+    495,
+    510,
+    549,
+    555,
+    576,
+    589,
+    619,
+    636,
+    637,
+    648,
+    649,
+    656,
+    673,
+    676,
+    677,
+    687,
+    720,
+    727,
+    751,
+    817,
+    843,
+    857,
+    872,
+    876,
+    902,
+    904,
+    909,
+    910,
+    911,
+    912,
+    913,
+    921,
+    923,
+    925,
+    928,
+    929,
+    937,
+    939,
+    941,
+    943,
+    944,
+    946,
+    949,
+    952,
+    955,
+    957,
+    967,
+    971,
+    973,
+    978,
+    979,
+    980,
+    981,
+    982,
+    984,
+    986,
+    987,
+    989,
+    990,
+    991,
+    993,
+    994,
+    996,
+    997,
+    999,
+    1000,
+    1002,
+    1003,
+    1005,
+    1006,
+    1007,
+    1009,
+    1012,
+    1022,
+    1023,
+    1024,
+    1030,
+    1034,
+    1036,
+    1041,
+    1042,
+    1043,
+    1045,
+    1051,
+    1054,
+    1060,
+    1072,
+    1074,
+    1076,
+    1079,
+    1083,
+    1084,
+    1086,
+    1098,
+    1099,
+    1101,
+    1146,
+    1149,
+    1250,
+    1262,
+    1279,
+    1358,
+    1359,
+    1409,
+    1504,
+    1524,
+    1545,
+    1547,
+    1548,
+    1549,
+    1555,
+    1562,
+    1564,
+    1566,
+    1567,
+    1571,
+    1574,
+    1586,
+    1590,
+    1592,
+    1595,
+    1597,
+    1604,
+    1605,
+    1611,
+    1616,
+    1621,
+    1625,
+    1626
+  ],
+  "excluded_source_rows_sha256": "d9a9c09a4c7b62e381e466cee01b9da52b6e4e160026efca215cfa45720fffe5",
+  "normalization_rule": "Unicode NFKC, collapse whitespace, then casefold",
+  "schema": "scheduler_native_fixed_headroom_prompt_manifest_v1",
+  "seed_registration": {
+    "namespace": "repldm-scheduler-native-fixed-headroom-v1-seeds",
+    "observed_generated_seeds": [
+      0,
+      7,
+      19,
+      42,
+      73,
+      123
+    ],
+    "observed_seed_scan": "outputs/**/config.json top-level seeds, manifest.jsonl seed fields, and images/*.json seed fields, audited 2026-08-25",
+    "prior_registered_or_reserved_seeds": [
+      11,
+      29,
+      101
+    ],
+    "retired_seed_inventory_sha256": "525233bab9562e0ae4cca053e0c2f07dec9d5786141480db34cda616bc144f5d",
+    "retired_seeds": [
+      0,
+      7,
+      11,
+      19,
+      29,
+      42,
+      73,
+      101,
+      123
+    ],
+    "selection_rule": "for each split and counter starting at zero, compute SHA256(namespace:split:counter), map the first 8 hex digits with & 0x7fffffff, and take the first non-retired globally unique seeds",
+    "splits": {
+      "development": [
+        {
+          "counter": 0,
+          "seed": 1932556753,
+          "selection_digest": "f33079d150b1007822a84341ea28e60b02c7ea708631ce984d7a75aa6528b8c0"
+        },
+        {
+          "counter": 1,
+          "seed": 1065503757,
+          "selection_digest": "bf824c0d52425d764950c233922daaed1753fb295826c30f6ba80f56a30a9979"
+        },
+        {
+          "counter": 2,
+          "seed": 201635682,
+          "selection_digest": "8c04b7628241661f96eb455b17036d7ee35dde0c2845c80624313366ae86d599"
+        }
+      ],
+      "final": [
+        {
+          "counter": 0,
+          "seed": 1134005626,
+          "selection_digest": "c3978d7abf08a58a023afeecbc250e751a697aecae96b10ff5030ae74303d198"
+        },
+        {
+          "counter": 1,
+          "seed": 1510693625,
+          "selection_digest": "5a0b5af94b5b9e35cb90a9707fb5d502fcbc9e4834b850fa03d1c1c43f932b1d"
+        },
+        {
+          "counter": 2,
+          "seed": 1730014245,
+          "selection_digest": "e71dec2525fc076404675a0da21eaebfccc301e9ff6b3d962d52587285a701c7"
+        }
+      ],
+      "smoke": [
+        {
+          "counter": 0,
+          "seed": 1798464083,
+          "selection_digest": "eb32625369614c2ca8fbf3313e25d9bee44d3657b1db295c3ba42fd13e0ab615"
+        }
+      ],
+      "validation": [
+        {
+          "counter": 0,
+          "seed": 1071459191,
+          "selection_digest": "bfdd2b77fd1b1cfb03b3001d8f37a923d2197cfc0615befee5c8387f13c3e8f2"
+        },
+        {
+          "counter": 1,
+          "seed": 1417413784,
+          "selection_digest": "d47c04985a2833ec73ea4bcd1fdc32767202ed4be037e41211d1c63dad7f5be5"
+        },
+        {
+          "counter": 2,
+          "seed": 649810593,
+          "selection_digest": "26bb52a1cf2dd2ea58b9a0553a4398740ae60a94082a2b401865a0d60554d70f"
+        }
+      ]
+    }
+  },
+  "selection_namespace": "repldm-scheduler-native-fixed-headroom-v1",
+  "selection_rule": "exclude every normalized TEXT and explicit or text-derived source_row from the listed repository CSV snapshot; globally deduplicate source prompts by normalized text using the lowest source_row; within each Challenge sort SHA256(namespace:prompt:Challenge:source_row:normalized_prompt), then assign ranks 0 smoke, 1-3 development, 4-5 validation, and 6-7 final",
+  "source": {
+    "challenge_count": 11,
+    "challenges": [
+      "Basic",
+      "Complex",
+      "Fine-grained Detail",
+      "Imagination",
+      "Linguistic Structures",
+      "Perspective",
+      "Properties & Positioning",
+      "Quantity",
+      "Simple Detail",
+      "Style & Format",
+      "Writing & Symbols"
+    ],
+    "file": "PartiPrompts.tsv",
+    "file_sha256": "fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb",
+    "repository": "https://github.com/google-research/parti",
+    "revision": "5a657978134374ce28973948331b319adef164bd",
+    "revision_verified_by_builder": true,
+    "row_count": 1632
+  },
+  "splits": {
+    "development": [
+      {
+        "category": "Animals",
+        "challenge": "Basic",
+        "prompt_sha256": "8003bf4652f88082b200bb93472a21adb41897c42edbed5e5e03db550a96d16e",
+        "rank_within_challenge": 1,
+        "selection_digest": "02617a39eb867236690c01130aa98557fc849e5578854b6a006cddcca4405a56",
+        "source_row": 110
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Basic",
+        "prompt_sha256": "74d216518e0beb93011b7f2c232f701c549541b3913a78da95c8909e15865499",
+        "rank_within_challenge": 2,
+        "selection_digest": "02b7fdceff71093aaf90492d02bb4e3acdf1cff6f4c74dd474ca1c8939245476",
+        "source_row": 122
+      },
+      {
+        "category": "Abstract",
+        "challenge": "Basic",
+        "prompt_sha256": "be2c9ce17278c9311853dd3769e394cde004258b23e1ed82a9a18c0fe8302319",
+        "rank_within_challenge": 3,
+        "selection_digest": "036462e0fc9c03a4a5657db3d3ef01ef15e644da8b98a1d72ee94e567d7ae34f",
+        "source_row": 51
+      },
+      {
+        "category": "Animals",
+        "challenge": "Complex",
+        "prompt_sha256": "00253d45e3d6226c524a472184925b5854e0ff9e044defaab12c7665f37cf74d",
+        "rank_within_challenge": 1,
+        "selection_digest": "0227dcddc5ac60aeb2fa7a8ba7649694eb26ffbb9153bbb898891607427c7eaa",
+        "source_row": 346
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Complex",
+        "prompt_sha256": "93094353a04b7bf210e394e81fe9eef56708ed5b0ab0453dbe13f6e6993a21f7",
+        "rank_within_challenge": 2,
+        "selection_digest": "02ad9f7b96726f4dadd3861a27bbc12cc793bf701e48fbd2d122af45034b1382",
+        "source_row": 279
+      },
+      {
+        "category": "Arts",
+        "challenge": "Complex",
+        "prompt_sha256": "88e8e358e77caa5babcd64de6ab55a76dffb3f43d758aad0d5774593438c08b4",
+        "rank_within_challenge": 3,
+        "selection_digest": "06a35a52e8c7e522cd64af38b1d1907a4152b27ce01158e55eec80fa76f8996c",
+        "source_row": 289
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "7223a6ac907c0c79dcdca7d08cbc2403b024fbcb4de388d03479eabfbc87301c",
+        "rank_within_challenge": 1,
+        "selection_digest": "007094722348fd9a39e8f440c22d56b09f40a53b004d483a79e1328deaaf1544",
+        "source_row": 490
+      },
+      {
+        "category": "Animals",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "fec8edd2883a340904d8bd6c6c9c40e4d80efdd6f09c0b9c95a82e1a250cb2c6",
+        "rank_within_challenge": 2,
+        "selection_digest": "008857c8490f7ccadeaefee023fe2f7c564593440b5de5ff4f8f75ff31dcbf63",
+        "source_row": 444
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "983c07a7e2048afa33c5d02e9cdf6042a8663dd076d867307adb73be7e81f6fa",
+        "rank_within_challenge": 3,
+        "selection_digest": "00e37814ca8e8495b7969cdbf7b52fada1b953c0ebd435ace8ea58086bd46f64",
+        "source_row": 464
+      },
+      {
+        "category": "Animals",
+        "challenge": "Imagination",
+        "prompt_sha256": "caad09dc52f8d7ee4aabe6b94b5716e24d96f93bdb6375f61ce7db7c35d4c0df",
+        "rank_within_challenge": 1,
+        "selection_digest": "0196249da0c81b9197f359f50aa004275d90759b15074df29af1cf084196bd68",
+        "source_row": 757
+      },
+      {
+        "category": "Animals",
+        "challenge": "Imagination",
+        "prompt_sha256": "2fe9d72285c0694bbf66050f6bdd79bde184b21fa72770587ae96295eae82c76",
+        "rank_within_challenge": 2,
+        "selection_digest": "0b775515f1336017c3b085db5c78fb62148392d93ace9392bcc0139ebd2ad5ea",
+        "source_row": 786
+      },
+      {
+        "category": "Abstract",
+        "challenge": "Imagination",
+        "prompt_sha256": "faeeac409841f4d9a4b530b75dba59d61731e533f767fb78dd38387e40cefe33",
+        "rank_within_challenge": 3,
+        "selection_digest": "0bbee9dad31282da724f5a00a9e7962d77be9ae3b335e8d068a6dcd0d18e9733",
+        "source_row": 728
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "6131edcbc5ed299817bc1bb5c42e7c85d31a39e3f7230dbd2ea18669092366d7",
+        "rank_within_challenge": 1,
+        "selection_digest": "08d15ea66e2bb66dea358ae9cff9feb8d986faa56b5b2dd99614910c1aa49618",
+        "source_row": 890
+      },
+      {
+        "category": "Food & Beverage",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "7d8286b549622be8a852c25dbd723e7ea4cda5c66312640ba16b81edc3e6e450",
+        "rank_within_challenge": 2,
+        "selection_digest": "0c42332d279c60dbc8cdcfb411d425205cf59413a18284876d2c0ca0611f9614",
+        "source_row": 868
+      },
+      {
+        "category": "People",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "b2ed74e6e904035bdad88400b93cba33771815156c7e5329834a29d5f12097f8",
+        "rank_within_challenge": 3,
+        "selection_digest": "0ee237ed3b2fe1033513ee6939b441112c0f54d41cb62a3bcc26bde2bb9136a7",
+        "source_row": 870
+      },
+      {
+        "category": "Food & Beverage",
+        "challenge": "Perspective",
+        "prompt_sha256": "dfba9842053b4505c729d6c21bd675b27751aa7f4ad135b384103114acaddabc",
+        "rank_within_challenge": 1,
+        "selection_digest": "0a7fa202f210b0b1d02260d4cfd13f4fd77b05b94e251113391f37b1c87823f1",
+        "source_row": 950
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Perspective",
+        "prompt_sha256": "5a0d9637bc2c6130389bc76aef2e430cd386cb8ac95ff012ca25229ef7f2fc69",
+        "rank_within_challenge": 2,
+        "selection_digest": "0b92cc9455169b5348624865b1a25c9e485c0db1c27b67f4dab56e2eb4dfa1bc",
+        "source_row": 968
+      },
+      {
+        "category": "Animals",
+        "challenge": "Perspective",
+        "prompt_sha256": "b48bcfe730589c02fea2f7a8957e4c57b4fb5af263b0377608ca35d2be555591",
+        "rank_within_challenge": 3,
+        "selection_digest": "0e23c0a06a9243d2154ff3eb87efc6727bc5e24080d53ac156691c2aba81b56d",
+        "source_row": 940
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "2f47d5a17a4b5db8a7750e119e7b63817f5af5108b5d6a61046b90cc3005a2d0",
+        "rank_within_challenge": 1,
+        "selection_digest": "3551b176cc04c8863089911805e90cdb1287302ce04fe1a05d87027dbb24ffd5",
+        "source_row": 1008
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "09ad6dfa427ac68b29c6f6aab92c1f2d90290c0f0a44b6dd91a7830cfad5280d",
+        "rank_within_challenge": 2,
+        "selection_digest": "464dc877cbe371e5d31b619a8cce1795e6b46e28153ef8a0e4b712762228ab9d",
+        "source_row": 985
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "95a80326b541784c172dfd04845c4eefcb3c82e709faff928edc39ed823d6ffa",
+        "rank_within_challenge": 3,
+        "selection_digest": "a5deb1a874a85bd3417fa52f204df219f37d9d4b42ebd3975c78fb6ab88cef1f",
+        "source_row": 1011
+      },
+      {
+        "category": "Animals",
+        "challenge": "Quantity",
+        "prompt_sha256": "b0b4cf68949f41e33a3e3275a09e29660e737af5259b261218a63410015e412d",
+        "rank_within_challenge": 1,
+        "selection_digest": "0326a91f3ad3b690fc636f8a0b7bbe87073a2d155f048a4cb90f8e086738af26",
+        "source_row": 1037
+      },
+      {
+        "category": "People",
+        "challenge": "Quantity",
+        "prompt_sha256": "c2558b48ac5dc1fcc149711fa3ab08ba5d18a50291f2b8ae162a9586305f3402",
+        "rank_within_challenge": 2,
+        "selection_digest": "046460d567ca61870f8f69dde378d6b4b6c00923d5ebd92d89d524d32a788f24",
+        "source_row": 1019
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Quantity",
+        "prompt_sha256": "d35b16dcdc66900ab1ce058798aa8328b33e26a98fb81ab393f12c882e9a41bf",
+        "rank_within_challenge": 3,
+        "selection_digest": "088f55a3e4235c407c4fb7908acb3eb08790eefb981d1c0cd6d3b782b88baf61",
+        "source_row": 1028
+      },
+      {
+        "category": "Animals",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "6b86b39b7c5ed39cad9d9dc805cc0496a063cecd831aa3970b18c7b34c29db45",
+        "rank_within_challenge": 1,
+        "selection_digest": "02b8087d1ea708154b39df0a0989b8d0cb854e91934dfd9785237f9f0ccd686b",
+        "source_row": 1184
+      },
+      {
+        "category": "Produce & Plants",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "84675d5391b20b488e5dd1cf15debc80f5e89cc2dad9b82f5ff92292fe624b20",
+        "rank_within_challenge": 2,
+        "selection_digest": "066e0ff1a1d6124e26f8c6c333bcb35ad3ee1c38f1004b038e7ad185b7382f94",
+        "source_row": 1188
+      },
+      {
+        "category": "Food & Beverage",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "6b1b0dc944d8bc12371de8aa547b33c48b5b80fbbd132a9e5bf7b42ce0b8e3e4",
+        "rank_within_challenge": 3,
+        "selection_digest": "067ea1bd055df1b27fbc3989f58ea7372f547269e3b1065eeae51583ecd63059",
+        "source_row": 1276
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Style & Format",
+        "prompt_sha256": "67a1ade9d6fc388a47270c183953b44d1abdee8cd379ceb1dda2f4457d4b0447",
+        "rank_within_challenge": 1,
+        "selection_digest": "03692f26ba7a2d622418fbf16be3bcab16071cba99125317c6df55aa101ae57b",
+        "source_row": 1462
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Style & Format",
+        "prompt_sha256": "6cad0395fe14a598bbe761576992296e47a2fc567beb5053fa4c9c656c41e5d7",
+        "rank_within_challenge": 2,
+        "selection_digest": "04dccb13a8ce448ebea8af68ea60ba0489e4dc005f8b083be625c6ce2268b188",
+        "source_row": 1389
+      },
+      {
+        "category": "Arts",
+        "challenge": "Style & Format",
+        "prompt_sha256": "61625a599e86c46544e9a6dd0765a2c70a44f782fa9abcd558777bf4d259bd62",
+        "rank_within_challenge": 3,
+        "selection_digest": "059cbc04b9b0df62f6003f8ad63fbcc7a20969c888ac5dd7c8501d12d11beecf",
+        "source_row": 1364
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "d07743a171456c1d67a3124043b98bd5ff09523f1559aa577ed3e3a1c1a0ab71",
+        "rank_within_challenge": 1,
+        "selection_digest": "0312519202505adb7aff567cc5441d22649c83ce16de26d855c4b5d40ffaa08a",
+        "source_row": 1541
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "19422eedf6a1eeefd1ebf926e8c0eb4d07bfd2aac5f754a673788532bf15ff3d",
+        "rank_within_challenge": 2,
+        "selection_digest": "08d166337aed383f82676c133b633029ea914176eda79d5da46bcc3b4ba0ad34",
+        "source_row": 1613
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "02b50571241361fdcbea88ef024c8c1f4009e0201912a43b70041ca4f1fb58ff",
+        "rank_within_challenge": 3,
+        "selection_digest": "08fe5de2a9c3bb9009ecd54e6e75e7aedd5bd8aa7082bc63ba2e2ffca4f86bbd",
+        "source_row": 1623
+      }
+    ],
+    "final": [
+      {
+        "category": "Artifacts",
+        "challenge": "Basic",
+        "prompt_sha256": "cd79c85b54523beff822d456b4e2fe24098b2e8e397ab37053c0da3fcf71c423",
+        "rank_within_challenge": 6,
+        "selection_digest": "04e74e2febe8f3264c311de03d3a89d9d3062a6fa82d3a315e10ad6f501b5bde",
+        "source_row": 153
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Basic",
+        "prompt_sha256": "8bd4e44d0bc6c78635372b6af9685d7889ce9db45c25d840b327a0b5d3fa73ea",
+        "rank_within_challenge": 7,
+        "selection_digest": "051033247059c64ad36d37cd4becd880fd09097e611eb26422f515ef59cc5c0a",
+        "source_row": 46
+      },
+      {
+        "category": "People",
+        "challenge": "Complex",
+        "prompt_sha256": "6113ea874de1ab080d858b576ffae1cca82052e3fabff9e0f9918301df50a11d",
+        "rank_within_challenge": 6,
+        "selection_digest": "1bb0db114cd80b0871c5b1fdc7d6162910e6529cbdc9106a22dec7d35bc56821",
+        "source_row": 382
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Complex",
+        "prompt_sha256": "02cbe86ee3ad30f907af601e062b582eb2b7adc07c20ab3072685e83694aaef3",
+        "rank_within_challenge": 7,
+        "selection_digest": "1bce1cb198557bc3c90e1a9dd70927b99af0ff45d9931bd485324fd06aa9e31c",
+        "source_row": 345
+      },
+      {
+        "category": "People",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "aedd982008e9d0bd0741f3634df62b00d8a07172ee8930f16a2b5da12a6478b7",
+        "rank_within_challenge": 6,
+        "selection_digest": "0395f7357a81ed1c163e6ba87cb7255c133c32c77539e8de603b2af35e4393eb",
+        "source_row": 684
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "f0e6537ebc763f88729e1e9c2384212d7c6fa9b5a9b7ed3c0d4cfbb9cbf29158",
+        "rank_within_challenge": 7,
+        "selection_digest": "0641d40b186e51ef5003a5ac5568a36a3d37d25d69cf9c4edebccf69cc733105",
+        "source_row": 614
+      },
+      {
+        "category": "Produce & Plants",
+        "challenge": "Imagination",
+        "prompt_sha256": "1ac1beaeaa5ab76d2ea5d3559191e6ce9f44b7fe20431e941fcca7ec6d5c1a4c",
+        "rank_within_challenge": 6,
+        "selection_digest": "0c7ca05da9d5c521e636c6254acf625b9ae9365bf8a36246dc3badbebd6fc76c",
+        "source_row": 804
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Imagination",
+        "prompt_sha256": "ad45a61c9f4a6d4cfad887a86b77a956d9ef682dade73cb24daceb921a36c5f7",
+        "rank_within_challenge": 7,
+        "selection_digest": "0ca26c29af41fb6fea20d809da34d1520f43d1d27133b3b74b4fbe168cbd5242",
+        "source_row": 816
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "e79f1b3d8be6a7bb1b48f08a211238f1fd8c2dc237b00d716a74773ebee2ce6f",
+        "rank_within_challenge": 6,
+        "selection_digest": "195b7a144c5c356b0dd82da8e4aa6327fff9aaf421df27a358a2350f45e346b8",
+        "source_row": 850
+      },
+      {
+        "category": "Abstract",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "c1111e162eb6d424f42b1b970b98780963ee494bac8ae1f3ad2ef42f426ab3cc",
+        "rank_within_challenge": 7,
+        "selection_digest": "1af08dbdde94970ad834ffb27c8ed7d0e118244d790f091bf114f9948974edc7",
+        "source_row": 874
+      },
+      {
+        "category": "Animals",
+        "challenge": "Perspective",
+        "prompt_sha256": "b9bfabdba318a0140419aac0228322f687b33e2c85743f44e7e5627d2c0c7a88",
+        "rank_within_challenge": 6,
+        "selection_digest": "233e305338df61efb31625c285068ffb2cbf78657f73f1718236383f76784635",
+        "source_row": 918
+      },
+      {
+        "category": "Animals",
+        "challenge": "Perspective",
+        "prompt_sha256": "7e4c38bd342c1ef9579aac6c5b1a30403ac5873685285970a5fac4c248ec8f8a",
+        "rank_within_challenge": 7,
+        "selection_digest": "2bc6543d37a7895146b34d2e2db8dca22769de03fecdd13974cc2839b0bc4cf8",
+        "source_row": 960
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "de3ae04f279d18689e63cf2f4e359661aac874dfc0f93bdd049687d76c3068fb",
+        "rank_within_challenge": 6,
+        "selection_digest": "b641a84d92262e79173cf820c51c6e9dd5cffcaf63f970e84ce08f8534ff1a6c",
+        "source_row": 988
+      },
+      {
+        "category": "Food & Beverage",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "fa09c29ce734e9f1b4e271c099666edd243caa9c35361766f9f2bae474bbc150",
+        "rank_within_challenge": 7,
+        "selection_digest": "b8d34158a6156b1f7bb339b2213e540562f98f3f77633635751c91b8bee4fd80",
+        "source_row": 1010
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Quantity",
+        "prompt_sha256": "3abfe30cfcdb709a7376e3d036d9ef0aac97882a06ca04fd883d7b7b9b83aa04",
+        "rank_within_challenge": 6,
+        "selection_digest": "1635a74f1dba7bef57c0ed69b40390aab04a3386659d994e5303ba501b243f79",
+        "source_row": 1067
+      },
+      {
+        "category": "People",
+        "challenge": "Quantity",
+        "prompt_sha256": "c0cc714dd67dddd8d42a56a08f90a4340f564fa597c0a0edb34f2fde75dcded8",
+        "rank_within_challenge": 7,
+        "selection_digest": "1641209a273a4c14a1bffbe0a940ad54416df688f1ef5c306f024b17b8283ccd",
+        "source_row": 1092
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "96eacb8eb52a6f56ca00de035b7d8faa7606567f089e6a1f06ac52d7cd1f17b6",
+        "rank_within_challenge": 6,
+        "selection_digest": "0a0847b072e2a08ef6a2d751ac76f564958ce170e623432b17517b1de4812edc",
+        "source_row": 1180
+      },
+      {
+        "category": "Indoor Scenes",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "1dea92ee98d24cd1743539da628fb57810ed4d6e4a654ce0af9b98fec8aa4387",
+        "rank_within_challenge": 7,
+        "selection_digest": "0a884f51a1b3d5f7f1ee275d5236cc3d1d2db5c2d73d06e4be00fb2437bd78ee",
+        "source_row": 1259
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Style & Format",
+        "prompt_sha256": "189c053f2b613590355b657164119ebba3727b1c350010bdf084d72e13badc01",
+        "rank_within_challenge": 6,
+        "selection_digest": "08fba385b016917446b9f7486b6003bb45edb95b3a22c9265d86575143d47b0d",
+        "source_row": 1430
+      },
+      {
+        "category": "Arts",
+        "challenge": "Style & Format",
+        "prompt_sha256": "93808dffded93b10f5a03798d377278ece0bca3b5c8f498852dd94b20ffc6d60",
+        "rank_within_challenge": 7,
+        "selection_digest": "0967d9727d5c212e54458452887e603538bde98dff8612fffb03033b107c2933",
+        "source_row": 1472
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "9f2af573c9215c7496cff032fe1f2e365a1424bec3cdcb78174b39b011c55c04",
+        "rank_within_challenge": 6,
+        "selection_digest": "25c0b96907a3337bd4fbc8fe47062114f57ae202bae07f56cf00055c9375090c",
+        "source_row": 1582
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "2740b41b55c59086c5ba3a0497c486e9aabae5ff01a0255dbe71aef615e6c147",
+        "rank_within_challenge": 7,
+        "selection_digest": "2682f281f7412bd78496c5aaab58987103ef2c552ddf56fed536c56bd0e6bee1",
+        "source_row": 1608
+      }
+    ],
+    "smoke": [
+      {
+        "category": "Artifacts",
+        "challenge": "Basic",
+        "prompt_sha256": "ab0fcec08e18a7bccda1e81df4974e3434fcd36000518f7e776fb85495b5a494",
+        "rank_within_challenge": 0,
+        "selection_digest": "01e542bf20aaad55fd4d592a5fa71c01ebe6c282f98b4ffd5b48494ae085264d",
+        "source_row": 173
+      },
+      {
+        "category": "Arts",
+        "challenge": "Complex",
+        "prompt_sha256": "3e8077068f772ef4575bca047988e7e66ef8eb39f29d7a6e7aeb23807855439d",
+        "rank_within_challenge": 0,
+        "selection_digest": "0072fe6bde24e6373cfe7cd5d0876c822a68ac97409fe59b63c5309b1e5af971",
+        "source_row": 298
+      },
+      {
+        "category": "Food & Beverage",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "2b5dbdc054840f2299ef36aae099612c677bf3cd3c603d97bf38d02e073cb2de",
+        "rank_within_challenge": 0,
+        "selection_digest": "0042086e328f09ab33bac5a3e9d8265609d968ba2db4a6544812db0fda56d8a8",
+        "source_row": 517
+      },
+      {
+        "category": "Food & Beverage",
+        "challenge": "Imagination",
+        "prompt_sha256": "2b8d3dd759f96641d076cdfb9ce7de80d3a032d23f924d655ff36dfb6d25db2a",
+        "rank_within_challenge": 0,
+        "selection_digest": "00c9335b21898b7702910f03ee1bd1fbc24251aa6305686198bb8083810f5ce7",
+        "source_row": 822
+      },
+      {
+        "category": "Animals",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "8975400c666a458fb937e3ba71f41afe133af73f08b3ac1bdd50dfe88ab261e3",
+        "rank_within_challenge": 0,
+        "selection_digest": "08ab4ba90853d752d37087fd22799d54d813f0a785d5d0234f544eb893219ccc",
+        "source_row": 899
+      },
+      {
+        "category": "Vehicles",
+        "challenge": "Perspective",
+        "prompt_sha256": "97108f7bb257a60e70f12e0bcef6e446ff0af6a9a6dd1f873491f44120ca602d",
+        "rank_within_challenge": 0,
+        "selection_digest": "0556fdaf32568c45856db05513474b2e9f9f8bcaf1a2dff72457de9673c15ce5",
+        "source_row": 936
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "d31292c2abd649aa7deafd6501832fd8271a9011c98bc40fcaf18f2c60e3f4fb",
+        "rank_within_challenge": 0,
+        "selection_digest": "0e9b59858871ad7ed94f8dd223beaa962f7cd9cbbba81491c7cbb51c219e7217",
+        "source_row": 992
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Quantity",
+        "prompt_sha256": "acaad97319de29199047afc195aa8f2450a714b557326f3bee3d1a8a4d7d92ab",
+        "rank_within_challenge": 0,
+        "selection_digest": "0096c3818d8440b16f87cdf30224239360dea24e88f5b40a21097f7743f375fa",
+        "source_row": 1061
+      },
+      {
+        "category": "Animals",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "4549b99c3d22b53bf1867dcf42132f9029c4cef3433b2a68269a304297184ba8",
+        "rank_within_challenge": 0,
+        "selection_digest": "01d17ebd8aaa4363f0eafcb3886110ac3177eee92b820fc969943bf457a67ff7",
+        "source_row": 1183
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Style & Format",
+        "prompt_sha256": "c448943f1d75e946e3a95dec8d3fb537e7b6f573474c4a3ef9ff92a6b9c5cdde",
+        "rank_within_challenge": 0,
+        "selection_digest": "025372ae31a4faa89bdc3f8f237728de9ecb7040099eb3f6038daff89984d390",
+        "source_row": 1481
+      },
+      {
+        "category": "Animals",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "6d99a9b29f853b06b0d5521a58062c5c0d2ed2f000cfe0bf652d47b5710195b0",
+        "rank_within_challenge": 0,
+        "selection_digest": "01cda047e8c9b29e4a118736bab097bbac999566fbd8730016ef9fa179dc8834",
+        "source_row": 1575
+      }
+    ],
+    "validation": [
+      {
+        "category": "Animals",
+        "challenge": "Basic",
+        "prompt_sha256": "294e25a427837ab7d68b1e909f31f69d0a4dc025beb3fd989e8416c44fb4bb03",
+        "rank_within_challenge": 4,
+        "selection_digest": "037083a45fbc208c467a4d5138faf8de9f4cd9d666a2a5234810d2406ef83139",
+        "source_row": 221
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Basic",
+        "prompt_sha256": "f21416eee8f2e4fe8cc8e8d87a38a572f724e43a104c4333b9bcf345dfb49e2f",
+        "rank_within_challenge": 5,
+        "selection_digest": "04b74cfcdfa60ec09419be730b689375b6de23c26cf8472fe1249725e0193bdb",
+        "source_row": 134
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Complex",
+        "prompt_sha256": "39e31eedb6d3eef1793ab08ea6e3b2ba54dfccbc78c09b43341b0d142c321bd7",
+        "rank_within_challenge": 4,
+        "selection_digest": "0eb5911e7410bf7275ff1812b044272b47271272a8f502dd643ce7dbb5c50151",
+        "source_row": 316
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Complex",
+        "prompt_sha256": "b9381003217583245fd2303efaf114c5d81daddb69ab40241cc85b2387f263d6",
+        "rank_within_challenge": 5,
+        "selection_digest": "124efcf8ae3ba0c22d3f660f5b6936e5a31190a56f41494ca0f2e8d44378ba96",
+        "source_row": 301
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "ff784ccb11854c4e3909f3c2d727a4402ae28f6b4708ad0baf1ec58d4cc45405",
+        "rank_within_challenge": 4,
+        "selection_digest": "01b601c321974b01f4175733105b634cf69a6b491e19153695f337f128250138",
+        "source_row": 623
+      },
+      {
+        "category": "Vehicles",
+        "challenge": "Fine-grained Detail",
+        "prompt_sha256": "6398557a57240ecbc34aef32bb66bd477b5323e0ac14f5ceeecbbb2e6176651b",
+        "rank_within_challenge": 5,
+        "selection_digest": "020fc7a03ba1ff48ae417f7574721a9d9e48bcfa505fc9f7a97fca4ca8ae8680",
+        "source_row": 601
+      },
+      {
+        "category": "Animals",
+        "challenge": "Imagination",
+        "prompt_sha256": "f6c07ef04143467fab405b330b20a0190417428cd77abec6d58a28dc1c37fdd4",
+        "rank_within_challenge": 4,
+        "selection_digest": "0bc4befd541e726bf428752c8b662f448e8d167f5b79ad8808962f64e36f865e",
+        "source_row": 764
+      },
+      {
+        "category": "Animals",
+        "challenge": "Imagination",
+        "prompt_sha256": "5379e51c08c7748dc1b333bae0c7ce87a80670dcda47706447e386156e89201a",
+        "rank_within_challenge": 5,
+        "selection_digest": "0bd3d5b31d8b79d36888bef865183c3fab60483d33c9f4e6cf3f78c8e5b2b20d",
+        "source_row": 778
+      },
+      {
+        "category": "People",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "434d6276223467cf2e4b575a14bdec2dd8b4a15f4d5bc9e8fe4fe50c105e775d",
+        "rank_within_challenge": 4,
+        "selection_digest": "15ef41298d7a37f3647db11d5b9a27967666ef00341fbb50e2505ab31ca6b951",
+        "source_row": 887
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Linguistic Structures",
+        "prompt_sha256": "9b7df05e20e5152fde9f088526c1dbca978a447fb6ee0b8542af62d201bb9126",
+        "rank_within_challenge": 5,
+        "selection_digest": "16291ff2179eae951cda80e2a95cb438c12307d14e81dfcf5537df47aa83aeb4",
+        "source_row": 858
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Perspective",
+        "prompt_sha256": "0076bca1badb728b0a894844a56c88c178170ea83da8e30e9631e5b766528fb0",
+        "rank_within_challenge": 4,
+        "selection_digest": "0fd94f49efe1ea8c8682ea89ae73ee23ab601e0b8206eec4000892e121be9851",
+        "source_row": 963
+      },
+      {
+        "category": "People",
+        "challenge": "Perspective",
+        "prompt_sha256": "4d486d310964acf26f4141b7a19f9f0721eee7055a8e95689390f09487f0cc14",
+        "rank_within_challenge": 5,
+        "selection_digest": "18b2e326bf4506f205fd16d45a4873b30b98a5307376a0eb7662899ccae9186c",
+        "source_row": 977
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "2c844a8fcfd2696070c53dc05ecc70ddfe82541a5059554bf2bd82ee1e8d2a12",
+        "rank_within_challenge": 4,
+        "selection_digest": "af81e372644b69dd6498da245a5c80fddaa44f655221e1fd276d7fa2210830e4",
+        "source_row": 995
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "prompt_sha256": "8f3f6da836f4b5b461450e2eb1a127b4ff12ac4b033aa563a05a413c40077375",
+        "rank_within_challenge": 5,
+        "selection_digest": "b38639df367632b2edf137a08c111ac3ba7324d782fbe7372325294f31c9cada",
+        "source_row": 998
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Quantity",
+        "prompt_sha256": "bb33b9da2c26babf4b9a52407b6c6485c063c08f55da42b3b69af68274145d1b",
+        "rank_within_challenge": 4,
+        "selection_digest": "10121f5821c976097345b78f523496574331f296a4e8fbeef3901b3a06cc107b",
+        "source_row": 1029
+      },
+      {
+        "category": "People",
+        "challenge": "Quantity",
+        "prompt_sha256": "57bd906f4fa7cef626edc1db89acb36d102af5a26e746119f5315ed7bd079df8",
+        "rank_within_challenge": 5,
+        "selection_digest": "145065b42f2687bcd95c0610f0c5b945ee0966d3a2f0d1fae2020cb496dda7ac",
+        "source_row": 1097
+      },
+      {
+        "category": "Indoor Scenes",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "c4ef24e6a0f85dce337453e8f2ad816b08638596fb961137f7ea72043c105fec",
+        "rank_within_challenge": 4,
+        "selection_digest": "07e5c3749e9d189fbe1f7685b0e35106f41eda0b1ace214af46ec888e1e5b07e",
+        "source_row": 1217
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Simple Detail",
+        "prompt_sha256": "5b43b350803d6671da24c02e7f70c4c82c37f997402719eecb472e3a2bc537cb",
+        "rank_within_challenge": 5,
+        "selection_digest": "09a3ded6078648c5fcebc4694fe32941c4a9d7ae20aa77930da5830bfc468a67",
+        "source_row": 1112
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Style & Format",
+        "prompt_sha256": "42accc4d2bdf53837f08f45d06da8a8b64d7ffe83283e7db617e37312c5bdc4e",
+        "rank_within_challenge": 4,
+        "selection_digest": "081d312e620ff296ce06282ee1601c49f4abb8f49988798093fc8bd505cd72bb",
+        "source_row": 1370
+      },
+      {
+        "category": "Arts",
+        "challenge": "Style & Format",
+        "prompt_sha256": "ca8c392d084e690aa8585690f0b0d0c0c0764b42699280b3f3f6670805137d71",
+        "rank_within_challenge": 5,
+        "selection_digest": "088a3103c77710d4e67efb4e7680d0469421b3262a59b155b955cd1c45611129",
+        "source_row": 1429
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "661580900b82f701aa09e17a953d86e256a4c221bb85c5bd98a74e9b66f1e178",
+        "rank_within_challenge": 4,
+        "selection_digest": "093c57222cd3e5601b6a9a5c71984eaaef4ef1d8e7b1840969b51df94d4b7cf0",
+        "source_row": 1610
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Writing & Symbols",
+        "prompt_sha256": "245968a78481425ceb8153c6816938bc7b1c30ae17c93d07dfaa3f1644b292ad",
+        "rank_within_challenge": 5,
+        "selection_digest": "09f6e25ceac25ecd246a772a75900b9e597c389631e74e31d712ef6a3f1f5735",
+        "source_row": 1631
+      }
+    ]
+  },
+  "status": "registration_only_not_authorized"
+}

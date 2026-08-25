@@ -1,0 +1,93 @@
+# Registration-only wiring smoke. generate.py rejects this schema, and no GPU
+# or quality run is authorized by this file.
+schema: latent_renderer_registration_v1
+registration_schema: scheduler_native_fixed_headroom_actions_v1
+experiment_id: scheduler_native_fixed_headroom_smoke_v1
+status: registration_only_not_authorized
+authorization:
+  gpu_generation: false
+  scoring: false
+  method_selection: false
+  executable_yaml_required: true
+
+source_manifest:
+  path: eval-pipeline/prompts/scheduler_native_fixed_headroom_manifest.json
+  sha256: 5373acf08f0e28d586732909f38787f8180a5d12c1ed58c2e1881134c10b6d5f
+  prompts: eval-pipeline/prompts/scheduler_native_fixed_headroom_smoke.csv
+  prompts_sha256: 60a3bf278689165bcb7a4bdf1f18c7ab91d8bf7a77eb287369a60fe40b6ef4e1
+  expected_prompt_count: 11
+  expected_challenges: 11
+split_role: smoke
+split_seeds:
+  smoke: [1798464083]
+
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  model_revision: 462165984030d82259a11f4367a4eed129e94a7b
+  resolution: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  guidance_rescale: 0.0
+  scheduler: EulerDiscreteScheduler
+  prediction_type: epsilon
+  scheduler_churn: 0.0
+  stage2: false
+  extra_unet_calls: 0
+
+# This is deliberately the historical provider. It always captures UNet
+# features/QK and constructs all six bases, even when only one coefficient is
+# nonzero. These actions are wiring ablations, not non-attention methods.
+latent_renderer_provider:
+  implementation: StructuralUNetBasisProvider
+  provenance_id: historical_all_six_bases_v1
+  provider_role: historical_provider_smoke_only
+  scheduler_mapping: euler_clean_endpoint
+  basis_normalization: match_rms
+  feature_block: up_blocks.0
+  semantic_layer: up_blocks.0.attentions.0.transformer_blocks.0.attn1
+  semantic_mode: reciprocal_semantic
+  semantic_topk: 16
+  permutation_seed: 1729
+  prompt_dim: 0
+  state_dim: 0
+  basis_order:
+    - reciprocal_semantic_transport
+    - spectral_low
+    - spectral_mid
+    - spectral_high
+    - freeu_backbone_minus_skip
+    - laplacian
+  known_limitation: constructs_all_bases_and_registers_qk_hook_for_every_nonzero_probe
+
+renderer_contract:
+  coefficient_bound: 1.0
+  probe_coefficient: 0.01
+  max_update_ratio: 0.05
+  preserve_moments: true
+  expected_unet_calls_per_step: 1
+  expected_step_diagnostics: 50
+
+actions:
+  - id: no_op
+    type: none
+    role: nominal_scheduler_baseline
+  - id: historical_zero_identity
+    type: latent_renderer_fixed
+    role: wiring_identity_control
+    coefficients: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  - id: historical_spectral_low_probe
+    type: latent_renderer_fixed
+    role: historical_provider_wiring_probe
+    coefficients: [0.0, 0.01, 0.0, 0.0, 0.0, 0.0]
+  - id: historical_laplacian_probe
+    type: latent_renderer_fixed
+    role: historical_provider_wiring_probe
+    coefficients: [0.0, 0.0, 0.0, 0.0, 0.0, 0.01]
+
+stop_rule:
+  quality_claims_allowed: false
+  action_selection_allowed: false
+  require_no_op_zero_png_hash_identity: true
+  require_finite_complete_per_step_diagnostics: true
+  require_runtime_mapping: euler_clean_endpoint
+  require_runtime_basis_normalization: match_rms
