@@ -988,6 +988,29 @@ def scheduler_baseline_runtime(action: dict, base_scheduler):
     return scheduler_class.from_config(base_scheduler.config, **scheduler_kwargs)
 
 
+def scheduler_provenance_record(
+    action: dict,
+    *,
+    include: bool,
+    base_config_sha256_v2: str,
+    active_config_sha256_v2: str,
+    order: int,
+    solver_order,
+    init_noise_sigma: float,
+) -> dict:
+    """Return the versioned scheduler ledger for registered reference runs."""
+    if not include:
+        return {}
+    return {
+        "scheduler_config_sha256_v2": base_config_sha256_v2,
+        "active_scheduler_config_sha256_v2": active_config_sha256_v2,
+        "scheduler_kwargs": dict(action.get("scheduler_kwargs", {})),
+        "scheduler_order": int(order),
+        "scheduler_solver_order": solver_order,
+        "scheduler_init_noise_sigma": float(init_noise_sigma),
+    }
+
+
 def validate_final_test_authorization(
     authorization_path: str, actions_path: str, seeds
 ) -> None:
@@ -1357,17 +1380,16 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             )
             images[-1].save(png_path)  # lossless PNG
             generated_image_sha256 = image_sha256(png_path)
-            scheduler_reference_provenance = (
-                {
-                    "scheduler_config_sha256_v2": base_scheduler_hash_v2,
-                    "active_scheduler_config_sha256_v2": active_scheduler_hash_v2,
-                    "scheduler_kwargs": dict(action.get("scheduler_kwargs", {})),
-                    "scheduler_order": active_scheduler_order,
-                    "scheduler_solver_order": active_solver_order,
-                    "scheduler_init_noise_sigma": active_init_noise_sigma,
-                }
-                if scheduler_reference
-                else {}
+            scheduler_reference_provenance = scheduler_provenance_record(
+                action,
+                include=bool(
+                    scheduler_reference or cfg.get("scheduler_baseline_registered")
+                ),
+                base_config_sha256_v2=base_scheduler_hash_v2,
+                active_config_sha256_v2=active_scheduler_hash_v2,
+                order=active_scheduler_order,
+                solver_order=active_solver_order,
+                init_noise_sigma=active_init_noise_sigma,
             )
             record = {
                 **task,

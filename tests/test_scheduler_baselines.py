@@ -214,6 +214,36 @@ class SchedulerBaselineTest(unittest.TestCase):
             scheduler = generate.scheduler_baseline_runtime(action, base)
             self.assertEqual(scheduler.config.get("solver_order"), 2, name)
 
+    def test_registered_euler_baseline_records_native_scheduler_provenance(self):
+        record = generate.scheduler_provenance_record(
+            {"id": "no_correction", "type": "none"},
+            include=True,
+            base_config_sha256_v2="base-hash",
+            active_config_sha256_v2="active-hash",
+            order=1,
+            solver_order=None,
+            init_noise_sigma=14.5,
+        )
+        self.assertEqual(record["scheduler_kwargs"], {})
+        self.assertEqual(record["scheduler_order"], 1)
+        self.assertIsNone(record["scheduler_solver_order"])
+        self.assertEqual(record["scheduler_init_noise_sigma"], 14.5)
+        self.assertEqual(
+            record["active_scheduler_config_sha256_v2"], "active-hash"
+        )
+        self.assertEqual(
+            generate.scheduler_provenance_record(
+                {},
+                include=False,
+                base_config_sha256_v2="base-hash",
+                active_config_sha256_v2="active-hash",
+                order=1,
+                solver_order=None,
+                init_noise_sigma=1.0,
+            ),
+            {},
+        )
+
     def test_v2_hash_is_stable_when_default_metadata_order_changes(self):
         class FakeScheduler:
             def __init__(self, values):
