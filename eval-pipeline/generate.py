@@ -48,6 +48,12 @@ import yaml
 import diffusers
 from diffusers import EulerAncestralDiscreteScheduler
 
+# Keep optional classes lazy so legacy environments that predate UniPC still
+# run non-scheduler actions and fail with a clear action-validation error only
+# when a missing reference is requested.
+DPMSolverMultistepScheduler = getattr(diffusers, "DPMSolverMultistepScheduler", None)
+UniPCMultistepScheduler = getattr(diffusers, "UniPCMultistepScheduler", None)
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -85,6 +91,52 @@ TRAJECTORY_SCHEMAS = {
     "trajectory_correction_actions_v1",
     "trajectory_correction_validation_v1",
 }
+
+# Keep this map explicit: scheduler names come from experiment YAML and must
+# never be resolved through eval/importlib. The kwargs are part of the action
+# hash after load_actions normalizes them.
+SCHEDULER_BASELINE_CLASSES = {
+    "EulerAncestralDiscreteScheduler": EulerAncestralDiscreteScheduler,
+}
+if DPMSolverMultistepScheduler is not None:
+    SCHEDULER_BASELINE_CLASSES["DPMSolverMultistepScheduler"] = DPMSolverMultistepScheduler
+if UniPCMultistepScheduler is not None:
+    SCHEDULER_BASELINE_CLASSES["UniPCMultistepScheduler"] = UniPCMultistepScheduler
+SCHEDULER_BASELINE_DEFAULT_KWARGS = {
+    "EulerAncestralDiscreteScheduler": {},
+    "DPMSolverMultistepScheduler": {
+        "solver_order": 2,
+        "algorithm_type": "dpmsolver++",
+        "solver_type": "midpoint",
+        "lower_order_final": True,
+    },
+    "UniPCMultistepScheduler": {
+        "solver_order": 2,
+        "predict_x0": True,
+        "solver_type": "bh2",
+        "lower_order_final": True,
+    },
+}
+SCHEDULER_BASELINE_ALLOWED_KWARGS = {
+    "EulerAncestralDiscreteScheduler": set(),
+    "DPMSolverMultistepScheduler": {
+        "solver_order",
+        "algorithm_type",
+        "solver_type",
+        "lower_order_final",
+    },
+    "UniPCMultistepScheduler": {
+        "solver_order",
+        "predict_x0",
+        "solver_type",
+        "lower_order_final",
+    },
+}
+
+
+def _require_int(value, *, action_id: str, field: str, expected: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        raise ValueError(f"{action_id}: {field} must be integer {expected}")
 
 
 def task_id(prompt_index: int, seed: int, action: dict, legacy_scale_id: bool = False) -> str:
@@ -466,11 +518,58 @@ def load_actions(path: str, num_inference_steps: int):
             scheduler_class = str(
                 action.get("scheduler_class", "EulerAncestralDiscreteScheduler")
             )
-            if scheduler_class != "EulerAncestralDiscreteScheduler":
+            if scheduler_class not in SCHEDULER_BASELINE_CLASSES:
                 raise ValueError(
-                    f"{action_id}: only EulerAncestralDiscreteScheduler is registered"
+                    f"{action_id}: unsupported scheduler baseline {scheduler_class!r}; "
+                    f"choose one of {sorted(SCHEDULER_BASELINE_CLASSES)}"
                 )
+            supplied_kwargs = action.get("scheduler_kwargs", {}) or {}
+            if not isinstance(supplied_kwargs, dict):
+                raise ValueError(f"{action_id}: scheduler_kwargs must be a mapping")
+            unknown_kwargs = set(supplied_kwargs) - SCHEDULER_BASELINE_ALLOWED_KWARGS[
+                scheduler_class
+            ]
+            if unknown_kwargs:
+                raise ValueError(
+                    f"{action_id}: unsupported {scheduler_class} kwargs: "
+                    f"{sorted(unknown_kwargs)}"
+                )
+            scheduler_kwargs = dict(SCHEDULER_BASELINE_DEFAULT_KWARGS[scheduler_class])
+            scheduler_kwargs.update(supplied_kwargs)
+            if scheduler_class == "DPMSolverMultistepScheduler":
+                _require_int(
+                    scheduler_kwargs["solver_order"],
+                    action_id=action_id,
+                    field="DPM++ solver_order",
+                    expected=2,
+                )
+                if not isinstance(scheduler_kwargs["algorithm_type"], str):
+                    raise ValueError(f"{action_id}: DPM++ algorithm_type must be a string")
+                if scheduler_kwargs["algorithm_type"] != "dpmsolver++":
+                    raise ValueError(f"{action_id}: only deterministic dpmsolver++ is registered")
+                if not isinstance(scheduler_kwargs["solver_type"], str):
+                    raise ValueError(f"{action_id}: DPM++ solver_type must be a string")
+                if scheduler_kwargs["solver_type"] not in {"midpoint", "heun"}:
+                    raise ValueError(f"{action_id}: DPM++ solver_type must be midpoint or heun")
+                if not isinstance(scheduler_kwargs["lower_order_final"], bool):
+                    raise ValueError(f"{action_id}: lower_order_final must be boolean")
+            elif scheduler_class == "UniPCMultistepScheduler":
+                _require_int(
+                    scheduler_kwargs["solver_order"],
+                    action_id=action_id,
+                    field="UniPC solver_order",
+                    expected=2,
+                )
+                if not isinstance(scheduler_kwargs["predict_x0"], bool):
+                    raise ValueError(f"{action_id}: predict_x0 must be boolean")
+                if not isinstance(scheduler_kwargs["solver_type"], str):
+                    raise ValueError(f"{action_id}: UniPC solver_type must be a string")
+                if scheduler_kwargs["solver_type"] not in {"bh1", "bh2"}:
+                    raise ValueError(f"{action_id}: UniPC solver_type must be bh1 or bh2")
+                if not isinstance(scheduler_kwargs["lower_order_final"], bool):
+                    raise ValueError(f"{action_id}: lower_order_final must be boolean")
             action["scheduler_class"] = scheduler_class
+            action["scheduler_kwargs"] = scheduler_kwargs
             # Reference actions are reported but never selected by the fixed
             # correction gate unless explicitly marked eligible.
             action["selection_eligible"] = bool(action.get("selection_eligible", False))
@@ -537,6 +636,159 @@ def validate_split_seed_role(path: str, split_role, seeds) -> None:
         raise ValueError(
             f"--seeds {list(seeds)} do not match {split_role} registered seeds {expected}"
         )
+
+
+def validate_scheduler_baseline_authorization(path: str) -> None:
+    """Require an explicit human authorization for scheduler reference runs."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != "scheduler_baselines_v1":
+        return
+    if config.get("status") != "authorized":
+        raise ValueError(
+            "scheduler_baselines_v1 is CPU-audited but not authorized; "
+            "a reviewer must freeze status: authorized before generation"
+        )
+    authorization = config.get("authorization")
+    if not isinstance(authorization, dict):
+        raise ValueError(
+            "authorized scheduler baseline config requires an authorization mapping"
+        )
+    if not str(authorization.get("reviewer", "")).strip():
+        raise ValueError("authorized scheduler baseline config requires authorization.reviewer")
+    if not str(authorization.get("reviewed_commit", "")).strip():
+        raise ValueError(
+            "authorized scheduler baseline config requires authorization.reviewed_commit"
+        )
+
+
+def validate_scheduler_baseline_design(
+    path: str,
+    *,
+    prompts_path: str,
+    actions: list,
+    seeds: list,
+    model_name: str,
+    resolution: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    stage2_enabled: bool,
+) -> None:
+    """Reject sampling, provenance, and design drift in a frozen manifest."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != "scheduler_baselines_v1":
+        return
+    sampling = config.get("sampling")
+    if not isinstance(sampling, dict):
+        raise ValueError("scheduler_baselines_v1 requires a sampling mapping")
+    expected_sampling = {
+        "model": model_name,
+        "base_scheduler": "EulerDiscreteScheduler",
+        "resolution": int(resolution),
+        "num_inference_steps": int(num_inference_steps),
+        "cfg_scale": float(guidance_scale),
+        "stage2": bool(stage2_enabled),
+        "extra_unet_calls": 0,
+        "initialization": "scheduler_native_init_sigma",
+    }
+    for key, observed in expected_sampling.items():
+        registered = sampling.get(key)
+        if isinstance(observed, float):
+            same = isinstance(registered, (int, float)) and float(registered) == observed
+        else:
+            same = registered == observed
+        if not same:
+            raise ValueError(
+                f"scheduler baseline sampling.{key} differs: "
+                f"registered {registered!r}, observed {observed!r}"
+            )
+    source = config.get("source_manifest")
+    if not isinstance(source, dict):
+        raise ValueError("scheduler_baselines_v1 requires a source_manifest mapping")
+    registered_prompts = source.get("prompts")
+    if not isinstance(registered_prompts, str) or not registered_prompts:
+        raise ValueError("scheduler baseline source_manifest.prompts is required")
+    registered_abs = os.path.abspath(os.path.join(ROOT, registered_prompts))
+    actual_abs = os.path.abspath(prompts_path)
+    if registered_abs != actual_abs:
+        raise ValueError(
+            "scheduler baseline prompt path differs: "
+            f"registered {registered_abs!r}, observed {actual_abs!r}"
+        )
+    registered_prompt_hash = source.get("prompts_sha256")
+    if registered_prompt_hash != sha256_file(prompts_path):
+        raise ValueError("scheduler baseline prompt SHA-256 differs from registration")
+    design = config.get("design")
+    if not isinstance(design, dict):
+        raise ValueError("scheduler_baselines_v1 requires a design count mapping")
+    prompts = pd.read_csv(prompts_path)
+    observed = {
+        "prompt_count": len(prompts),
+        "action_count": len(actions),
+        "seed_count": len(seeds),
+        "task_count": len(prompts) * len(actions) * len(seeds),
+    }
+    expected = {
+        "prompt_count": int(design.get("expected_prompt_count", -1)),
+        "action_count": int(design.get("expected_action_count", -1)),
+        "seed_count": int(design.get("expected_seed_count", -1)),
+        "task_count": int(design.get("expected_task_count", -1)),
+    }
+    for key in ("prompt_count", "action_count", "seed_count", "task_count"):
+        if observed[key] != expected[key]:
+            raise ValueError(
+                f"scheduler baseline design {key} differs: "
+                f"registered {expected[key]}, observed {observed[key]}"
+            )
+    expected_action_ids = design.get("action_ids")
+    observed_action_ids = [str(action.get("id")) for action in actions]
+    if expected_action_ids != observed_action_ids:
+        raise ValueError(
+            "scheduler baseline action IDs differ: "
+            f"registered {expected_action_ids!r}, observed {observed_action_ids!r}"
+        )
+    if any(bool(action.get("selection_eligible", True)) for action in actions):
+        raise ValueError("scheduler baseline references must all be selection-ineligible")
+    expected_types = {
+        "no_correction": ("none", None, {}),
+        "euler_ancestral_reference": (
+            "scheduler_baseline",
+            "EulerAncestralDiscreteScheduler",
+            {},
+        ),
+        "dpmpp_2m_reference": (
+            "scheduler_baseline",
+            "DPMSolverMultistepScheduler",
+            SCHEDULER_BASELINE_DEFAULT_KWARGS["DPMSolverMultistepScheduler"],
+        ),
+        "unipc_2_reference": (
+            "scheduler_baseline",
+            "UniPCMultistepScheduler",
+            SCHEDULER_BASELINE_DEFAULT_KWARGS["UniPCMultistepScheduler"],
+        ),
+    }
+    for action in actions:
+        action_id = str(action.get("id"))
+        expected_type, expected_class, expected_kwargs = expected_types.get(
+            action_id, (None, None, None)
+        )
+        if action.get("type") != expected_type:
+            raise ValueError(f"scheduler baseline action {action_id!r} has wrong type")
+        if expected_class is not None and action.get("scheduler_class") != expected_class:
+            raise ValueError(f"scheduler baseline action {action_id!r} has wrong class")
+        if dict(action.get("scheduler_kwargs", {})) != dict(expected_kwargs):
+            raise ValueError(f"scheduler baseline action {action_id!r} has wrong kwargs")
+    expected_hashes = design.get("action_sha256")
+    if not isinstance(expected_hashes, dict):
+        raise ValueError("scheduler baseline design requires action_sha256 mapping")
+    for action in actions:
+        action_id = str(action.get("id"))
+        expected_hash = expected_hashes.get(action_id)
+        if expected_hash != action_sha256(action):
+            raise ValueError(
+                f"scheduler baseline action hash differs for {action_id!r}"
+            )
 
 
 def validate_registered_trajectory_design(
@@ -698,10 +950,42 @@ def sha256_file(path: str) -> str:
 
 
 def scheduler_config_sha256(scheduler) -> str:
-    """Hash the JSON-normalized scheduler config for paired provenance."""
+    """Hash the legacy JSON-normalized scheduler config.
+
+    Keep this byte-for-byte compatible with existing S7 sidecars. New
+    scheduler-baseline records additionally use ``scheduler_config_sha256_v2``
+    below, which canonicalizes diffusers bookkeeping.
+    """
     config = getattr(scheduler, "config", {})
     payload = json.dumps(dict(config), sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def scheduler_config_sha256_v2(scheduler) -> str:
+    """Hash effective scheduler config with stable default bookkeeping."""
+    config = dict(getattr(scheduler, "config", {}))
+    if isinstance(config.get("_use_default_values"), list):
+        config["_use_default_values"] = sorted(config["_use_default_values"])
+    payload = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def scheduler_baseline_runtime(action: dict, base_scheduler):
+    """Construct one registered scheduler baseline from the base config."""
+    if action.get("type") != "scheduler_baseline":
+        return None
+    base_name = type(base_scheduler).__name__
+    if base_name != "EulerDiscreteScheduler":
+        raise ValueError(
+            "scheduler baselines require an EulerDiscreteScheduler base, "
+            f"got {base_name}"
+        )
+    scheduler_class_name = str(action.get("scheduler_class", ""))
+    scheduler_class = SCHEDULER_BASELINE_CLASSES.get(scheduler_class_name)
+    if scheduler_class is None:
+        raise ValueError(f"unsupported scheduler baseline {scheduler_class_name!r}")
+    scheduler_kwargs = dict(action.get("scheduler_kwargs", {}))
+    return scheduler_class.from_config(base_scheduler.config, **scheduler_kwargs)
 
 
 def validate_final_test_authorization(
@@ -912,6 +1196,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
     base_scheduler = pipe.scheduler
     base_scheduler_name = type(base_scheduler).__name__
     base_scheduler_hash = scheduler_config_sha256(base_scheduler)
+    base_scheduler_hash_v2 = scheduler_config_sha256_v2(base_scheduler)
     registered_sampling = cfg.get("registered_sampling") or {}
     if cfg.get("trajectory_registered"):
         expected_scheduler = str(registered_sampling.get("scheduler", ""))
@@ -924,6 +1209,17 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             raise RuntimeError("trajectory-correction model differs from registration")
         if int(registered_sampling.get("extra_unet_calls", -1)) != 0:
             raise RuntimeError("trajectory-correction requires zero extra U-Net calls")
+    if cfg.get("scheduler_baseline_registered"):
+        expected_scheduler = str(registered_sampling.get("base_scheduler", ""))
+        if base_scheduler_name != expected_scheduler:
+            raise RuntimeError(
+                "scheduler-baseline run loaded the wrong base scheduler: "
+                f"registered {expected_scheduler!r}, got {base_scheduler_name!r}"
+            )
+        if str(cfg.get("model_name")) != str(registered_sampling.get("model")):
+            raise RuntimeError("scheduler-baseline model differs from registration")
+        if int(registered_sampling.get("extra_unet_calls", -1)) != 0:
+            raise RuntimeError("scheduler-baseline requires zero extra U-Net calls")
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
@@ -980,17 +1276,18 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             scheduler_reference = action["type"] == "scheduler_baseline"
             scheduler_name = base_scheduler_name
             active_scheduler_hash = base_scheduler_hash
+            active_scheduler_hash_v2 = base_scheduler_hash_v2
+            active_scheduler_order = int(getattr(base_scheduler, "order", 1))
+            active_solver_order = base_scheduler.config.get("solver_order")
+            active_init_noise_sigma = float(base_scheduler.init_noise_sigma)
             if scheduler_reference:
-                if scheduler_name != "EulerDiscreteScheduler":
-                    raise ValueError(
-                        "EulerAncestralDiscreteScheduler reference requires an "
-                        f"EulerDiscreteScheduler base, got {scheduler_name}"
-                    )
-                pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
-                    base_scheduler.config
-                )
+                pipe.scheduler = scheduler_baseline_runtime(action, base_scheduler)
                 scheduler_name = type(pipe.scheduler).__name__
                 active_scheduler_hash = scheduler_config_sha256(pipe.scheduler)
+                active_scheduler_hash_v2 = scheduler_config_sha256_v2(pipe.scheduler)
+                active_scheduler_order = int(getattr(pipe.scheduler, "order", 1))
+                active_solver_order = pipe.scheduler.config.get("solver_order")
+                active_init_noise_sigma = float(pipe.scheduler.init_noise_sigma)
             try:
                 with baseline_context:
                     images = pipe(
@@ -1041,6 +1338,13 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     raise RuntimeError(
                         "trajectory correction requires exactly one U-Net call per Stage-1 step"
                     )
+            if cfg.get("scheduler_baseline_registered"):
+                if len(observed_unet_calls) != cfg["num_inference_steps"] or any(
+                    value != 1 for value in observed_unet_calls
+                ):
+                    raise RuntimeError(
+                        "scheduler baselines require exactly one U-Net call per step"
+                    )
             observed_extra_unet_calls = max(
                 (value - 1 for value in observed_unet_calls), default=0
             )
@@ -1053,6 +1357,18 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             )
             images[-1].save(png_path)  # lossless PNG
             generated_image_sha256 = image_sha256(png_path)
+            scheduler_reference_provenance = (
+                {
+                    "scheduler_config_sha256_v2": base_scheduler_hash_v2,
+                    "active_scheduler_config_sha256_v2": active_scheduler_hash_v2,
+                    "scheduler_kwargs": dict(action.get("scheduler_kwargs", {})),
+                    "scheduler_order": active_scheduler_order,
+                    "scheduler_solver_order": active_solver_order,
+                    "scheduler_init_noise_sigma": active_init_noise_sigma,
+                }
+                if scheduler_reference
+                else {}
+            )
             record = {
                 **task,
                 "provenance_schema": PROVENANCE_SCHEMA,
@@ -1104,6 +1420,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "trajectory_correction_diagnostics": getattr(
                     pipe, "_last_trajectory_correction_diagnostics", None
                 ),
+                **scheduler_reference_provenance,
             }
             if diagnostics:
                 record.update(diagnostics)
@@ -1235,7 +1552,21 @@ def main():
     if args.actions:
         actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
         try:
+            with open(args.actions) as action_handle:
+                action_config = yaml.safe_load(action_handle) or {}
+            validate_scheduler_baseline_authorization(args.actions)
             validate_split_seed_role(args.actions, args.split_role, seeds)
+            validate_scheduler_baseline_design(
+                args.actions,
+                prompts_path=args.prompts,
+                actions=actions,
+                seeds=seeds,
+                model_name=args.model_name,
+                resolution=args.resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                stage2_enabled=args.stage2,
+            )
             validate_registered_trajectory_design(
                 args.actions,
                 prompts_path=args.prompts,
@@ -1245,8 +1576,6 @@ def main():
                 stage2_enabled=args.stage2,
                 model_name=args.model_name,
             )
-            with open(args.actions) as action_handle:
-                action_config = yaml.safe_load(action_handle) or {}
             if (
                 args.split_role == "test_final"
                 and action_config.get("schema") == "latent_renderer_actions_v1"
@@ -1296,10 +1625,14 @@ def main():
     }
     action_schema = action_config.get("schema") if args.actions else None
     trajectory_registered = action_schema in TRAJECTORY_SCHEMAS
+    scheduler_baseline_registered = action_schema == "scheduler_baselines_v1"
     cfg["action_schema"] = action_schema
     cfg["trajectory_registered"] = trajectory_registered
+    cfg["scheduler_baseline_registered"] = scheduler_baseline_registered
     cfg["registered_sampling"] = (
-        dict(action_config.get("sampling") or {}) if trajectory_registered else {}
+        dict(action_config.get("sampling") or {})
+        if trajectory_registered or scheduler_baseline_registered
+        else {}
     )
     cfg["run_contract"] = generation_contract(
         cfg,
@@ -1309,18 +1642,17 @@ def main():
         actions_sha256=cfg["actions_sha256"],
     )
     cfg["run_contract_sha256"] = json_sha256(cfg["run_contract"])
-    # Only registered S7 runs require strict sidecar/contract validation on
-    # resume. Existing exploratory sweeps predate this contract and must keep
-    # their original PNG+JSON completion semantics.
-    resume_contract_sha256 = (
-        cfg["run_contract_sha256"] if trajectory_registered else None
-    )
+    # Registered S7 and scheduler-reference runs require strict sidecar/
+    # contract validation on resume. Existing exploratory sweeps predate this
+    # contract and must keep their original PNG+JSON completion semantics.
+    registered_run = trajectory_registered or scheduler_baseline_registered
+    resume_contract_sha256 = cfg["run_contract_sha256"] if registered_run else None
 
     tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)
     expected_ids = {task["id"] for task in tasks}
     img_dir = os.path.join(args.out_dir, "images")
     config_path = os.path.join(args.out_dir, "config.json")
-    if trajectory_registered and os.path.exists(config_path):
+    if registered_run and os.path.exists(config_path):
         try:
             with open(config_path) as handle:
                 previous_config = json.load(handle)
@@ -1329,15 +1661,15 @@ def main():
         try:
             validate_run_contract(previous_config)
         except ValueError as exc:
-            ap.error(f"existing trajectory-correction run config is invalid: {exc}")
+            ap.error(f"existing registered run config is invalid: {exc}")
         if previous_config.get("run_contract_sha256") != cfg["run_contract_sha256"]:
             ap.error(
                 "existing trajectory-correction run config differs from the requested "
                 "model/scheduler/action/sampling contract; use a new output directory"
             )
-    elif trajectory_registered and not os.path.exists(config_path) and os.listdir(img_dir):
+    elif registered_run and not os.path.exists(config_path) and os.listdir(img_dir):
         ap.error(
-            "trajectory-correction artifacts exist without config.json; use a new output directory"
+            "registered artifacts exist without config.json; use a new output directory"
         )
     todo = [
         task

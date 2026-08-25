@@ -1,0 +1,60 @@
+# Draft reference matrix. This file freezes the action count and development
+# seeds but does not authorize a GPU run or any method selection.
+schema: scheduler_baselines_v1
+status: cpu_audited_not_authorized
+experiment_id: scheduler_baselines_v1
+source_manifest:
+  prompts: eval-pipeline/prompts/trajectory_correction_heldout_v1.csv
+  prompts_sha256: 120ffaeae40cef1e29d1bf77139713b440514314d8b0df6b29dcbe29a078999a
+  source_tsv_sha256: fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb
+  requested_revision: 5a657978134374ce28973948331b319adef164bd
+split_seeds:
+  development: [0, 42]
+design:
+  expected_prompt_count: 11
+  expected_action_count: 4
+  expected_seed_count: 2
+  expected_task_count: 88
+  action_ids: [no_correction, euler_ancestral_reference, dpmpp_2m_reference, unipc_2_reference]
+  action_sha256:
+    no_correction: b1c0f3e4bcf6ffc43a38f1b99d1f0a0fa2aa17db99b3e88dbc2d158691e29ad9
+    euler_ancestral_reference: 0d6a53ad62e3c7c2a4229f556452b91a15d3bb6a14fc22e3b4436f114b6d444a
+    dpmpp_2m_reference: 29e0931c856177f8bc03e85131315f3b36b9a59cc54501b409a82139461ce5bc
+    unipc_2_reference: d17b7a702ec0a428d44feb40332f2b4d43bb9d688e7dc9686296e6d037847693
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  base_scheduler: EulerDiscreteScheduler
+  resolution: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  stage2: false
+  extra_unet_calls: 0
+  initialization: scheduler_native_init_sigma
+actions:
+  # Deterministic Euler is already the no_correction path; do not duplicate it.
+  - id: no_correction
+    type: none
+    selection_eligible: false
+  - id: euler_ancestral_reference
+    type: scheduler_baseline
+    scheduler_class: EulerAncestralDiscreteScheduler
+    scheduler_kwargs: {}
+    selection_eligible: false
+  - id: dpmpp_2m_reference
+    type: scheduler_baseline
+    scheduler_class: DPMSolverMultistepScheduler
+    scheduler_kwargs:
+      solver_order: 2
+      algorithm_type: dpmsolver++
+      solver_type: midpoint
+      lower_order_final: true
+    selection_eligible: false
+  - id: unipc_2_reference
+    type: scheduler_baseline
+    scheduler_class: UniPCMultistepScheduler
+    scheduler_kwargs:
+      solver_order: 2
+      predict_x0: true
+      solver_type: bh2
+      lower_order_final: true
+    selection_eligible: false
