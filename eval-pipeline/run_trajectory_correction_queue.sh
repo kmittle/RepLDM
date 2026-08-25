@@ -378,12 +378,15 @@ find_gpu() {
 wait_existing() {
     [ "$DRY_RUN" -eq 1 ] && return 0
     while :; do
-        # Wait for every independently launched S7 stage that targets the
-        # development run.  Keep the queue's own inspection helpers out of the
-        # result: their awk source contains the same path expressions.
-        pids=$(ps -eo pid=,comm=,args= | awk -v self="$$" '
+        # Wait for every independently launched S7 stage that targets either
+        # registered run.  Match the active paths rather than a versioned
+        # literal so a resumed queue cannot overlap a v3/v4 run.  Keep the
+        # queue's own inspection helpers out of the result: their awk source
+        # contains the same path expressions.
+        pids=$(ps -eo pid=,comm=,args= | awk -v self="$$" \
+          -v dev="$DEV_RUN_DIR" -v val="$VAL_RUN_DIR" '
           $1 == self {next}
-          $0 !~ /development_v2/ {next}
+          index($0, dev) == 0 && index($0, val) == 0 {next}
           $0 !~ /eval-pipeline\/(generate|score|select_trajectory_correction)\.py/ {next}
           $0 ~ /run_trajectory_correction_queue\.sh/ {next}
           $2 ~ /^(awk|ps|rg|grep|sed)$/ {next}
