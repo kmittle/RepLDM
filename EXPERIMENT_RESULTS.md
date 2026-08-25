@@ -303,6 +303,12 @@ queue 复用了逐项 hash 校验通过的生成结果，没有重生成或改�
 | ancestral `.50` | `+0.009080 [-0.013590,+0.031788]` | `0.802120` | `-0.001703` | `+0.031279` |
 | ancestral `.75` | `+0.006077 [-0.017856,+0.035169]` | `0.802120` | `+0.002120` | `+0.036013` |
 
+逐步 diagnostics 还显示，`.25/.50/.75` stochastic actions 的平均
+correction/scheduler-update norm ratio 分别为 `2.289/3.250/3.984`，最大达到
+`5.062`；对应 action 没有注册 `max_correction_ratio`。因此它们只是在
+`mix in [0,1]` 上有界，并不是小幅 trust-region correction。正向 TOPIQ 均值不能
+与这种大幅随机注入分离，也是不能把它解释为结构改进的额外原因。
+
 Selector 严格返回 `no_correction`。drift-only correction 是显著的大幅退化；三
 个 stochastic mixes 虽有正均值，但 CI 全部跨零、Holm 显著性失败，并伴随更高
 saturation。它们与原生 Euler-Ancestral 的不确定正均值一致，更像普通 sampler
