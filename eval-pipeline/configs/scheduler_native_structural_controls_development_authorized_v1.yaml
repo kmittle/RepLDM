@@ -1,0 +1,311 @@
+# Independently authorized executable for the scheduler-native structural controls.
+# The design body is byte-derived from the frozen registration identified below.
+schema: scheduler_native_structural_controls_actions_v1
+registration_schema: scheduler_native_structural_controls_v1
+experiment_id: scheduler_native_structural_controls_development_v1
+status: authorized_development
+authorization:
+  reviewer: experiment_infra_audit
+  reviewed_commit: 639c57d523fefac0cf338f751facfe81109c66fd
+  source_template: eval-pipeline/configs/scheduler_native_structural_controls_development_registration_v1.yaml
+  source_template_sha256: dc8f0333d89e5815f560a0de75fa17d99869ef1da251bed95dac075b901024b6
+  scope: development_only_baseline_calibration
+  gpu_generation: true
+  scoring: true
+  method_selection: false
+  result_access_before_freeze: false
+
+registration_source:
+  path: eval-pipeline/configs/scheduler_native_structural_controls_development_registration_v1.yaml
+  sha256: dc8f0333d89e5815f560a0de75fa17d99869ef1da251bed95dac075b901024b6
+
+implementation_source:
+  reviewed_commit: 639c57d523fefac0cf338f751facfe81109c66fd
+  files:
+    AttentionGuidance/__init__.py: 85a777e36a74ce23f1dfe2e0248e864a23b57b90bacb1b52e1509b6e9c2a4275
+    AttentionGuidance/ancestral_correction.py: 9f2209dbd2a8902d1256b9d4cc49f0f3246feb05b608563cebcf3483d9d5a3d3
+    AttentionGuidance/attention_baselines.py: 0342d4d5dacfcc1bf7430979862a468bb78f824048a8f3568b2902557a1b8ead
+    AttentionGuidance/attention_guidance.py: 7d415befefac640c44769ea8378568dddf3f7a81cbe94379961f4dc72ba70358
+    AttentionGuidance/controller.py: d7ed5bfafc8e383a0dd1fb7ba222a3481dc5e9a23394b9fa2e8b23a7915c08a8
+    AttentionGuidance/freeu.py: cac5be8e1a0a788ad8c7e43a3ca12b3d5a7a90aa2f2d62ca22fdebda13a97f46
+    AttentionGuidance/latent_renderer.py: 70ce273082612385b2ce2e327dac172ebd7c82355c1eb26f86cc7ad54fc8adb2
+    AttentionGuidance/semantic_transport.py: 78b56ff791249a4ca001547c76a4add1a4589b7a01a4b5676e9b49d7ff60d852
+    AttentionGuidance/types.py: c615a171dd20d524f5f40fb97b0036e5ed5d92ecb06e7b8419cd3d88572eb043
+    InferencePipelines/FreeScale/pipeline_freescale_sdxl.py: 89078f636e93ac670d8fbc805bd544a9994a99d8586001b1ebdcaac93941ae8c
+    InferencePipelines/FreeScale/scale_attention.py: 526f39fecfa62a60286bbce7e0b1007e76b5bb1957398116f4f2228215547802
+    InferencePipelines/__init__.py: b4cedb3db8ba97583eef331cbb77855c7f6205abb0f36fac6ff67fe6ac6ece3d
+    InferencePipelines/cfg_batch.py: 54869812c069c5e1ff08bceb8851fa7c0679e5d326c926946fbaaa0e61fcd9ec
+    InferencePipelines/RepLDM/pipeline_repldm_sdxl.py: 86ce4d91a96ce420491b8f889c30046dd8d65459081450708374611cce0d4571
+    InferencePipelines/RepLDM/pipeline_repldm_sdxl_controlnet.py: 1f0271cd6aecc6038fb149a9237089a6786fd7a87cee8b4e8f8b760c1c2b5aee
+    eval-pipeline/generate.py: d71e164ebfa86022d3daa5003a868c239a99ecb4bc82a532ad8969d07f43d9fc
+    eval-pipeline/generation_environment.py: 98c3adf1a4d444732015fd9584d0e92e73802038bd99f2b60e02528b5337acf0
+    eval-pipeline/s7_provenance.py: 0890ef76abdc5694ebe3eb329d4bd7c582e6271cdbe1d2ee54c621f299c0b52c
+
+environment_lock:
+  path: eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml
+  sha256: 8f7b38ccb770880537f5080b1d3b4eb426a294458ea644ec8a4ef6b61f771da4
+
+source_manifest:
+  path: eval-pipeline/prompts/scheduler_native_fixed_headroom_manifest.json
+  sha256: 5373acf08f0e28d586732909f38787f8180a5d12c1ed58c2e1881134c10b6d5f
+  prompts: eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv
+  prompts_sha256: 065a86b95200eb89dc367ffe0f9f8c2d0a64fdab827e4004a1b629b169a6173f
+  expected_prompt_count: 33
+  expected_challenges: 11
+split_role: development
+split_seeds:
+  engineering_smoke: [1798464083]
+  development: [1932556753, 1065503757, 201635682]
+
+engineering_smoke:
+  role: engineering_only
+  engineering_only: true
+  prompts: eval-pipeline/prompts/scheduler_native_fixed_headroom_smoke.csv
+  prompts_sha256: 60a3bf278689165bcb7a4bdf1f18c7ab91d8bf7a77eb287369a60fe40b6ef4e1
+  expected_prompt_count: 11
+  expected_challenges: 11
+  seeds: [1798464083]
+  action_count: 8
+  expected_task_count: 88
+  require_all_actions_distinct_within_block: true
+  quality_scoring: false
+  formal_matrix_evidence: false
+  quality_claim_allowed: false
+  method_selection_allowed: false
+
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  model_revision: 462165984030d82259a11f4367a4eed129e94a7b
+  pipeline: RepLDMSDXLPipeline
+  resolution: 1024
+  num_inference_steps: 50
+  default_cfg_scale: 7.5
+  cfg_source: action.cfg_scale
+  cfg_pipeline_argument: guidance_scale
+  negative_prompt: blurry, ugly, duplicate, poorly drawn, deformed, mosaic
+  power_calibrate: 0
+  guidance_rescale: 0.0
+  scheduler: EulerDiscreteScheduler
+  prediction_type: epsilon
+  scheduler_churn: 0.0
+  initialization: scheduler_native_init_sigma
+  stage2: false
+  extra_unet_calls: 0
+  torch_dtype: float16
+  variant: fp16
+  local_files_only: true
+  low_vram: false
+  batch_size: 1
+  num_images_per_prompt: 1
+  attention_mask_policy: none
+
+scheduler_runtime:
+  config_sha256_v2: 6bf0509f22d8d3a06d6493c2291af8655f6f74846b2d2eae3cf71b5cda000102
+  num_inference_steps: 50
+  schedule_sha256: 302d2452f411bf3eea64f8dd3530e232b95c23aed7b818ed6697982a4428c144
+  construction_init_noise_sigma: 14.648818969726562
+  effective_init_noise_sigma: 13.158469200134277
+
+frequency_band_cutoffs: [0.08, 0.25]
+
+scoring:
+  required_schema: repldm_scorer_provenance_v1
+  registered_scorer_provenance_sha256: 9c6858b1825c599a60be33282d99ffd4a8f75ac0ecf0fc8071bb97ad16eb61b9
+
+execution_order:
+  version: action-order-v1
+  grouping: [prompt_index, seed]
+  digest: sha256
+  input: "action-order-v1:{prompt_index}:{seed}:{action_id}"
+  sort: ascending_raw_digest
+  single_device_per_group: true
+
+failure_policy: shared_abort_after_first_task_error
+
+analysis_implementation:
+  schema: structural_control_analysis_implementation_v1
+  files:
+    AttentionGuidance/__init__.py: "85a777e36a74ce23f1dfe2e0248e864a23b57b90bacb1b52e1509b6e9c2a4275"
+    eval-pipeline/audit_latent_renderer_run.py: "f7dd7fa526058ab312ae7d8c9e529ca8d3dcf410bcae3a237d15dcf4a2ee9e52"
+    eval-pipeline/audit_structural_control_run.py: "8a7983f4953e9e668fe773c6011a35b07f4c9264d6abde43535f413fba1426ae"
+    eval-pipeline/compare_actions.py: "0120abe08402563f0493da5c4cac8c0bac91a79ac372b3d0eb9e1fb770b9e756"
+    eval-pipeline/evaluate_structural_control_run.py: "ac8d18fc07cdaa14c702159e67ce74683296764c75be8cb34b7c83678e342c50"
+    eval-pipeline/generate.py: "d71e164ebfa86022d3daa5003a868c239a99ecb4bc82a532ad8969d07f43d9fc"
+    eval-pipeline/generation_environment.py: "98c3adf1a4d444732015fd9584d0e92e73802038bd99f2b60e02528b5337acf0"
+    eval-pipeline/s7_provenance.py: "0890ef76abdc5694ebe3eb329d4bd7c582e6271cdbe1d2ee54c621f299c0b52c"
+    eval-pipeline/scorer_provenance.py: "c5d3fa8eb74bf858efac73192c52264dba15220dcf99e374054d6c3896e94a5a"
+
+design:
+  role: development_only_baseline_calibration
+  prompt_count: 33
+  seed_count: 3
+  action_count: 8
+  expected_task_count: 792
+  paired_block_policy: one_prompt_seed_block_per_gpu
+  method_selection: false
+  confirmation: false
+  reuse_scope: same_development_split_as_headroom_screen
+
+actions:
+  - id: no_op_cfg7p5
+    type: none
+    role: nominal_reference
+    cfg_scale: 7.5
+
+  - id: cfg_only_5
+    type: none
+    role: matched_cfg_reference_for_attention_baselines
+    cfg_scale: 5.0
+
+  - id: conference_tfsa
+    type: legacy
+    role: conference_method_reference
+    scale: 0.004
+    delay_steps: 3
+    decay: [cosine, 0.0, 3]
+    cfg_scale: 7.5
+
+  - id: freeu_diffusers_historical
+    type: freeu
+    role: historical_surrogate_reference
+    implementation: diffusers_constant_v1
+    implementation_diffusers_version: 0.32.1
+    parameters: [0.6, 0.4, 1.1, 1.2]
+    expected_operator_calls_per_step: 9
+    expected_resolution_idx_call_counts_per_step: [3, 3, 3]
+    expected_hidden_channel_call_counts_per_step: {"1280": 4, "640": 3, "320": 2}
+    expected_resolution_channel_call_counts_per_step: {"0:1280": 3, "1:1280": 1, "1:640": 2, "2:640": 1, "2:320": 2}
+    expected_operator_effect_call_counts_per_step: {b1_s1: 3, b2_s2: 3, no_op: 3}
+    cfg_scale: 7.5
+
+  - id: freeu_diffusers_paper_parameters
+    type: freeu
+    role: matched_constant_paper_parameters
+    implementation: diffusers_constant_v1
+    implementation_diffusers_version: 0.32.1
+    parameters: [0.9, 0.2, 1.3, 1.4]
+    expected_operator_calls_per_step: 9
+    expected_resolution_idx_call_counts_per_step: [3, 3, 3]
+    expected_hidden_channel_call_counts_per_step: {"1280": 4, "640": 3, "320": 2}
+    expected_resolution_channel_call_counts_per_step: {"0:1280": 3, "1:1280": 1, "1:640": 2, "2:640": 1, "2:320": 2}
+    expected_operator_effect_call_counts_per_step: {b1_s1: 3, b2_s2: 3, no_op: 3}
+    cfg_scale: 7.5
+
+  - id: freeu_paper_adaptive
+    type: freeu
+    role: pinned_paper_operator
+    implementation: paper_adaptive_3676d36
+    implementation_diffusers_version: 0.32.1
+    source_commit: 3676d3652a44101f9cca030c33f82756dab249d7
+    parameters: [0.9, 0.2, 1.3, 1.4]
+    expected_operator_calls_per_step: 9
+    expected_resolution_idx_call_counts_per_step: [3, 3, 3]
+    expected_hidden_channel_call_counts_per_step: {"1280": 4, "640": 3, "320": 2}
+    expected_resolution_channel_call_counts_per_step: {"0:1280": 3, "1:1280": 1, "1:640": 2, "2:640": 1, "2:320": 2}
+    expected_operator_effect_call_counts_per_step: {b1_s1: 4, b2_s2: 3, no_op: 2}
+    cfg_scale: 7.5
+
+  - id: pladis_operator_port
+    type: attention_baseline
+    role: pinned_operator_port_not_upstream_environment
+    attention_baseline: pladis
+    implementation: pladis_operator_port_248b9d1
+    source_commit: 248b9d15701c08094c47dc90b4ae24afbf5cf7a9
+    upstream_diffusers_version: 0.33.1
+    port_diffusers_version: 0.32.1
+    alpha: 1.5
+    baseline_scale: 2.0
+    applied_layers: [up, down]
+    probability_dtype: query
+    expected_processor_group_counts: {up: 36, down: 24}
+    expected_processor_count: 60
+    expected_processor_names_sha256: 2d66ed06dfc07e6d0b0d7ce1a8d39bd262c5e5e86b5d1947e1e412f5b6fe8c8f
+    attention_mask_policy: none
+    cfg_scale: 5.0
+
+  - id: gag_eq13_reimplementation
+    type: attention_baseline
+    role: paper_derived_reimplementation_not_official_code
+    attention_baseline: gag
+    implementation: gag_eq13_reimplementation_2603.02531v2
+    paper_id: 2603.02531v2
+    official_code_available: false
+    implementation_origin: independent_reimplementation
+    equations: [12, 13]
+    alpha_source: inferred_from_pladis
+    layer_policy_source: inherited_from_pladis
+    paper_license: CC-BY-4.0
+    software_license: Apache-2.0
+    alpha: 1.5
+    baseline_scale: 10.0
+    eta: 15.0
+    zeta: 0.0
+    applied_layers: [up, down]
+    probability_dtype: query
+    expected_processor_group_counts: {up: 36, down: 24}
+    expected_processor_count: 60
+    expected_processor_names_sha256: 2d66ed06dfc07e6d0b0d7ce1a8d39bd262c5e5e86b5d1947e1e412f5b6fe8c8f
+    attention_mask_policy: none
+    cfg_scale: 5.0
+
+analysis:
+  primary_metric: topiq_nr
+  point_estimate_screen_delta: 0.005
+  inference:
+    crossed_prompt_seed_bootstrap: 10000
+    confidence_level: 0.95
+    prompt_level_sign_flips: 100000
+    random_seed: 2026
+    generalization_unit: prompt_after_seed_mean
+  multiplicity_families:
+    freeu_vs_no_op:
+      reference: no_op_cfg7p5
+      treatments:
+        - freeu_diffusers_historical
+        - freeu_diffusers_paper_parameters
+        - freeu_paper_adaptive
+      holm_alpha: 0.05
+      point_estimate_screen_delta: 0.005
+    freeu_mechanism_contrasts:
+      holm_alpha: 0.05
+      point_estimate_screen_delta: 0.005
+      contrasts:
+        - id: paper_parameter_delta_within_constant_operator
+          treatment: freeu_diffusers_paper_parameters
+          reference: freeu_diffusers_historical
+        - id: adaptive_operator_delta_at_paper_parameters
+          treatment: freeu_paper_adaptive
+          reference: freeu_diffusers_paper_parameters
+    attention_vs_cfg5:
+      reference: cfg_only_5
+      treatments: [pladis_operator_port, gag_eq13_reimplementation]
+      holm_alpha: 0.05
+      point_estimate_screen_delta: 0.005
+  descriptive_contrasts:
+    - id: conference_method_vs_nominal_cfg7p5
+      treatment: conference_tfsa
+      reference: no_op_cfg7p5
+      confirmatory: false
+  noninferiority_guards:
+    hpsv2_ci_lower_min_delta: -0.005
+    clip_cosine_ci_lower_min_delta: -0.005
+    clipped_fraction_ci_upper_max_delta: 0.001
+    mean_saturation_ci_upper_max_delta: 0.005
+    contrast_geometric_ratio_interval: [0.95, 1.05]
+  report:
+    - every_registered_action_including_failures
+    - paired_deltas_and_confidence_intervals
+    - hpsv2_and_clip_noninferiority
+    - clipping_saturation_contrast_colorfulness_and_sharpness
+    - latency_peak_memory_and_unet_calls
+    - equal_nfe_does_not_imply_equal_compute
+    - prompt_median_win_probability_and_sign_consistency
+    - per_seed_leave_one_seed_out_and_leave_one_prompt_out_effects
+    - every_guard_for_every_action_without_selective_omission
+  interpretation:
+    - no_action_can_authorize_method_selection_or_rl
+    - freeu_matched_contrasts_do_not_form_a_complete_factorial
+    - pladis_and_gag_are_only_operator_matched_against_cfg_only_5
+    - pladis_is_an_operator_port_not_an_upstream_environment_reproduction
+    - gag_is_a_paper_derived_reimplementation_without_verified_author_code
+    - point_estimate_screen_delta_is_not_a_lower_bound_on_true_effect
