@@ -14,7 +14,7 @@ bindings:
   evaluator_path: eval-pipeline/evaluate_scheduler_native_fixed_headroom_development.py
   evaluator_sha256: 9539e6e170730da81f086cf14216018e4cc72e3d1fb8466a87750f063e5292ef
   auditor_path: eval-pipeline/audit_latent_renderer_run.py
-  auditor_sha256: 3af0e25a82fa1306d6da0a68ef9afaa7c62fcdbce8cbe3aa5e4e015dde4edef1
+  auditor_sha256: f7dd7fa526058ab312ae7d8c9e529ca8d3dcf410bcae3a237d15dcf4a2ee9e52
   actions_path: eval-pipeline/configs/scheduler_native_fixed_headroom_actions_v1.yaml
   actions_sha256: 9b64c5773b6b4494507036b677193d1e596665ce92393434802a9e01c01f3393
   source_template_sha256: aa42ab90e9dfc7993d0d8e5e0dcbcdfd80e3426cb3400c33dd3d2db1122fdb61
