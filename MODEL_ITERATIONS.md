@@ -452,7 +452,7 @@ S6 关闭 FreeU scale/window 搜索、蒸馏和 RL。下一轮若继续，必须
 用固定动作验证 scheduler-consistent 的 equivariance 或低频一致性残差；不能把
 FreeU 的代理指标提升包装成方法结果。
 
-## S7：scheduler-consistent ancestral trajectory correction（开发中）
+## S7：scheduler-consistent ancestral trajectory correction（开发失败，已关闭）
 
 S5/LR-1/S6 均没有给出可用的固定 latent 更新方向，因此下一候选不再直接改
 attention 或 U-Net feature amplitude，而是利用 Euler scheduler 已有的解析状态。对
@@ -481,3 +481,22 @@ TOPIQ 均值差值随 mix 为 `+0.005616/+0.013206/+0.021842/+0.024682`，但 pr
 范围为 `-0.026565` 到 `+0.065755`，且大 mix 会增加 clipping/saturation。只有在
 更大的新 validation split 上同时通过 TOPIQ、HPSv2/CLIP 和 pixel guards 后，才可
 考虑 state-conditioned renderer；固定 action 失败则关闭该路线，不训练 RL。
+
+注册 development 最终完成 `154/154` 并由 selector 返回 `no_correction`。drift
+`.25/.50` 的 TOPIQ-NR 分别退化 `-0.281956/-0.349739`；stochastic `.25/.50/.75`
+只有 `+0.007299/+0.009080/+0.006077` 的不确定均值，95% CI 全部跨零且 Holm
+显著性失败。其平均 correction/scheduler-update ratio 为
+`2.289/3.250/3.984`，最大 `5.062`，未满足“小幅 trust-region correction”的机制
+解释。
+
+随后在 `outputs/scheduler_baselines/development_v5` 完成同 prompt/seed、同 50 NFE
+的 Euler、Euler-Ancestral、DPM++ 2M 和 UniPC 2 描述性矩阵。v4 只记录构造态
+sigma，因缺少实际 schedule ledger 而降级为 preliminary；v5 记录 construction/
+effective sigma、完整 50/51 timestep/sigma 序列及其 hash，且 88 张 PNG 与 v4
+逐项相同。Euler-Ancestral
+相对 Euler 的 TOPIQ-NR 为 `+0.010171 [-0.014775,+0.039858]`；DPM++ 和 UniPC
+分别为 `-0.014917/-0.009976`，也没有质量一致性。v5 的 manifest 与 strict-score
+audit 均通过，比较 CSV 与 v4 byte-identical，36 个比较的最小全局 Holm
+`p=0.146519`；一个 mutable-scheduler ledger 失败目录和一个双 writer partial 目录
+均已隔离且未评分。该矩阵只支持“原生 ancestral 与 S7 小幅正均值同属普通 sampler
+variation”的归因，不授权 validation、renderer、distillation 或 RL。

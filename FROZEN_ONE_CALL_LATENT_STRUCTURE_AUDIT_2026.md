@@ -62,6 +62,29 @@ but its original evaluation is not SDXL. [Readout Guidance,
 2312.02150](https://arxiv.org/abs/2312.02150) is an important pre-window
 precedent for training small readout heads on frozen diffusion features.
 
+## Reproduction Readiness and Canonicality
+
+Repository availability is not sufficient evidence of a paper-faithful
+baseline. The following source audit was frozen on 2026-08-25 before any new
+quality result was observed:
+
+| Baseline | Pinned implementation evidence | Current decision |
+|---|---|---|
+| Tuned CFG | Native RepLDM operation; no artifact or dependency. Use the same frozen backbone, scheduler, NFE, and prompt/seed blocks. | **GO.** Freeze a development-only scale grid and selection rule; evaluate the selected scale only on later prompt- and seed-disjoint data. |
+| SPA | Author MIT repository [`26f3b3b9`](https://github.com/SonyResearch/SPA/tree/26f3b3b9aad9d49242e730a4ee85d96c51d41215) includes SDXL code and a LAION-fitted prior. The paper uses DDIM 30 steps, `(eta,a)=(0.2,5)`, and a pre-sampler correction; its script uses 50 steps, `(0.2,3)`, and subtracts the gradient from the completed `x_(t-1)`. | **Qualified GO only as pinned official-code behavior.** Run an independent paired DDIM comparison and name the paper/script/placement differences. Do not call it an exact paper reproduction or transplant it silently to Euler. |
+| FreSca | Author MIT repository [`02e1939d`](https://github.com/WikiChao/FreSca/tree/02e1939d8d697e66fa7ae3d9e7461aefef0bbd86) provides only a generic CFG operator. Its center-row/column cutoff and default `0.2` differ from the paper's radial cumulative-energy `r0=0.9`; there is no runnable SDXL path. | **Operator-only.** A local port must be labelled as such and cannot stand in for the reported SDXL result. |
+| FDG | No author repository. Diffusers v0.35.0 has an Apache-2.0 Laplacian-pyramid guider, but it operates on raw model predictions in its modular SDXL path; the paper requires conversion to `x0` and reports multiple incompatible SDXL scale triplets. | **No-go as a paper result.** First implement and unit-test the complete prediction-type round trip; a diffusers port is only a prediction-space surrogate. |
+| DUNE | No author repository, commit, or license. The paper fixes `p=0.9`, EMA `gamma=0.7`, SDXL `kappa=0.3`, a three-step warm-up, and an early 40% phase, but does not identify an exact hook or executable U-Net operator. | **No-go.** A paper-derived approximation is not a faithful baseline. |
+| MOG/Auto-MOG | Repository [`a2a3a649`](https://github.com/zexiJia/MoG/tree/a2a3a649de22971c8f5fe0c821ca8bde0d9c0f88) contains Apache-2.0 code, but is not linked by arXiv v1. It uses `lambda_perp=5`, clamp `[1,20]`, and no feature hook; the paper uses anisotropy `10`, clamp `[0,50]`, and a combined score/feature metric. | **No-go for paper Auto-MOG.** Repository behavior may be reported only as a separately named surrogate. |
+| Guidance Interval / APG | Guidance Interval's Apache-2.0 author code does not implement its reported SDXL path. APG has no author repository; the diffusers guider acts on noise predictions with defaults that differ from the paper's SDXL `x0` configuration. | **No-go as direct SDXL reproductions.** Transparent local ports require frozen equations, prediction coordinates, and unit parity before GPU use. |
+
+The installed generation environment uses diffusers `0.32.1` and has no
+`kornia`; upgrading to the v0.35 guider stack would also change the transformers
+contract. Therefore baseline code must be vendored or independently implemented
+with source/license attribution and tensor-level parity tests, not introduced by
+an environment-wide upgrade. Missing faithful baselines block a learned-method
+claim; they do not authorize weak approximations merely to keep a GPU occupied.
+
 ## What Structural Papers Do and Do Not Establish
 
 [Improving the Diffusability of Autoencoders,

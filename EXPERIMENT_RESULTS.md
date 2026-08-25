@@ -315,3 +315,54 @@ saturation。它们与原生 Euler-Ancestral 的不确定正均值一致，更�
 随机性而非可归因的 correction 收益。因此 validation seeds `[11,29,101]` 未使用，
 S7 不授权 renderer、蒸馏或 RL。后续 matched-NFE DPM++/UniPC 矩阵仅用于确认
 sampler 归因，全部 action 都禁止参与方法选择。
+
+### S7 matched-NFE scheduler attribution（完成）
+
+`outputs/scheduler_baselines/development_v1` 因缺少原生 Euler scheduler provenance
+而在生成前关闭。`development_v2` 生成了完整的 `88/88` 图像，但最终 provenance
+audit 拒绝评分：`no_correction` 只有首条 sidecar 记录了构造态
+`scheduler_init_noise_sigma=14.648818969726562`，
+其余 21 条记录为 pipeline `set_timesteps` 后残留的 `13.158469200134277`。
+图像使用的 50-step 采样路径一致，但 sidecar 依赖 action execution order，故该
+目录不产生分数。修复 `bb1f1f0` 让 registered matrix 的每个 action 从冻结 base
+config fresh-clone scheduler，并加入 fresh-state regression test；11 项 scheduler
+测试和 `compileall` 均通过。随后一次双 writer 竞态产生的
+`development_v3_race_abort_20260825` 仅保留为审计证据（20 个 partial files），
+不参与任何统计。
+
+`outputs/scheduler_baselines/development_v4` 虽完成并评分 `88/88`，但只登记了
+construction-state sigma，缺少实际 50-step schedule，故降级为 preliminary、非最终
+run。commit `a97e4fa` 的唯一 owner run
+`outputs/scheduler_baselines/development_v5` 随后完成同一
+`11 prompts x 2 seeds x 4 actions = 88` 设计；88 张 PNG 与 v4 逐 ID hash 完全
+相同。v5 contract、manifest、scores 和 score log SHA-256 分别为
+`ca060cf4c67598c7916561693c4fb2eef5f5c96bda8cbfbd195e45c6fa3ef438`、
+`d6e7edb55ec2714cf92bb1b4941351acd5fe638d1257c804174ffad67350d419`、
+`f278aea5ca6053d96b85e665c2689d9cc6bcac97bfba3c1926767462f4a0349d` 和
+`29a066f4187905324d1da72fa02891be20d842c79785697bab9854a369721f17`。
+
+result-blind manifest audit 和 strict-score audit 均为 `pass`，其 SHA-256 分别为
+`3d07bb3d9cd404fce4775e03a739a0aeda3b560b3774d1d65ddd955ce100a01f` 与
+`a30509eb525cd6c2b354af3645e6365c83a952bf4f1a6d744ed775aec44fa2c4`。
+它们验证完整 crossed grid、PNG/sidecar/action hash、每步一次 U-Net、finite scores、
+construction/effective sigma、50 timesteps、51 sigmas 和完整 schedule hash；
+`no_correction` 的 22 个重叠 PNG 也与 S7 baseline 逐项相同。
+
+paired crossed prompt/seed bootstrap（11 prompts x 2 seeds，seed `20260825`，
+10000 resamples，100000 prompt sign flips；全局 Holm）相对 `no_correction` 的关键
+结果如下：
+
+| reference | Δ TOPIQ-NR [95% CI] | Δ HPSv2 | Δ CLIP cosine | Δ saturation |
+|---|---:|---:|---:|---:|
+| Euler-Ancestral | `+0.010171 [-0.014775,+0.039858]` | `+0.002447` | `-0.000089` | `+0.040791` |
+| DPM++ 2M (order 2) | `-0.014917 [-0.031125,+0.002706]` | `-0.006120` | `+0.006936 [+0.002131,+0.012718]` | `-0.016677` |
+| UniPC 2 (order 2) | `-0.009976 [-0.022776,+0.007999]` | `-0.006714` | `+0.004605` | `-0.014736` |
+
+所有 TOPIQ/HPSv2 区间都跨零或偏向退化，Euler-Ancestral 的 TOPIQ 均值没有
+显著性；DPM++ 的 CLIP 上升伴随 TOPIQ/HPSv2 下降，属于 sampler attribution，
+不是 latent correction 的证据。v5 的 `action_comparisons.csv` SHA-256 为
+`08017c9748717c8404f492253ee325723271bac2020b40d25dd9ce75eb28bbfb`，与 v4
+逐字节相同；36 个比较的最小全局 Holm `p=0.146519`。所有 scheduler actions 仍是
+`selection_eligible: false`。因此 S7 的 development 结论仍为 null：不运行
+validation、固定 renderer、蒸馏或 RL；若期刊需要 scheduler 对照，只能作为
+匹配 NFE 的描述性 baseline 报告。

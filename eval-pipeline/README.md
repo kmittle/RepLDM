@@ -71,6 +71,24 @@ After scoring, the preregistered S7 gate can be audited with:
 The selector requires a complete paired design and returns `no_correction` when
 no candidate reaches the primary/guard thresholds.
 
+Matched-NFE scheduler controls are descriptive and never selection-eligible.
+Validate their complete effective schedules before scoring, then validate score
+provenance after strict scoring:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/validate_scheduler_baseline_run.py \
+  --run-dir outputs/scheduler_baselines/development_v5 \
+  --actions eval-pipeline/configs/scheduler_baselines_development_authorized_20260825.yaml \
+  --prompts eval-pipeline/prompts/trajectory_correction_heldout_v1.csv \
+  --kind manifest --output outputs/scheduler_baselines/development_v5/run_audit_manifest.json
+```
+
+Repeat with `--kind scores` and a distinct output after `score.py --strict`.
+The validator rejects an incomplete grid, stale PNG or score hashes, action or
+contract drift, non-finite metrics, extra U-Net calls, and missing or mutated
+timestep/sigma schedules.
+
 If a candidate passes, freeze the validation action in a new file (the template
 itself is immutable):
 
