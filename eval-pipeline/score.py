@@ -23,6 +23,13 @@ sys.path.insert(0, THIS)
 import yaml  # noqa: E402
 import scorers  # noqa: E402,F401  (import registers all metrics)
 from scorers.base import REGISTRY  # noqa: E402
+from s7_provenance import (  # noqa: E402
+    PROVENANCE_SCHEMA,
+    image_sha256,
+    validate_design_rows,
+    validate_scores_against_manifest,
+    validate_sidecar,
+)
 
 
 def load_jsonl(path):
@@ -30,6 +37,16 @@ def load_jsonl(path):
         return []
     with open(path) as f:
         return [json.loads(l) for l in f if l.strip()]
+
+
+def _unique_rows(rows, label):
+    result = {}
+    for row in rows:
+        row_id = str(row.get("id", ""))
+        if not row_id or row_id in result:
+            raise ValueError(f"{label} contains duplicate or empty id {row_id!r}")
+        result[row_id] = row
+    return result
 
 
 def main():
@@ -51,8 +68,46 @@ def main():
     params = dict(cfg.get("params", {}))
 
     manifest = load_jsonl(os.path.join(args.run_dir, "manifest.jsonl"))
+    if not manifest:
+        raise RuntimeError("manifest.jsonl is empty or missing")
+    manifest_by_id = _unique_rows(manifest, "manifest")
+    run_config_path = os.path.join(args.run_dir, "config.json")
+    run_config = {}
+    if os.path.isfile(run_config_path):
+        with open(run_config_path) as handle:
+            run_config = json.load(handle)
+    s7_run = bool(run_config.get("trajectory_registered")) or any(
+        row.get("provenance_schema") == PROVENANCE_SCHEMA for row in manifest
+    )
+    if s7_run:
+        action_ids = [str(action.get("id")) for action in run_config.get("actions", [])]
+        seeds = [int(value) for value in run_config.get("seeds", [])]
+        validate_design_rows(
+            manifest,
+            expected_action_ids=action_ids or None,
+            expected_seeds=seeds or None,
+        )
+        contract_hash = run_config.get("run_contract_sha256")
+        if not isinstance(contract_hash, str) or len(contract_hash) != 64:
+            raise RuntimeError("S7 run config lacks run_contract_sha256")
+        for row in manifest:
+            if row.get("provenance_schema") != PROVENANCE_SCHEMA:
+                raise RuntimeError(f"{row.get('id')}: missing S7 provenance schema")
+            validate_sidecar(
+                row,
+                args.run_dir,
+                expected_contract_sha256=contract_hash,
+            )
     scores_path = os.path.join(args.run_dir, "scores.jsonl")
-    existing = {r["id"]: r for r in load_jsonl(scores_path)}
+    existing_rows = load_jsonl(scores_path)
+    existing = _unique_rows(existing_rows, "scores")
+    if s7_run and existing_rows:
+        try:
+            validate_scores_against_manifest(manifest, existing_rows)
+        except ValueError:
+            # Old or stale rows are discarded and recomputed below.  Keeping
+            # them would silently attach metrics to a replaced image.
+            existing = {}
 
     # instantiate scorers (validate weights first; skip cleanly if missing/broken)
     active = []
@@ -84,8 +139,18 @@ def main():
         return
 
     need_keys = {k for _, sc in active for k, _ in sc.OUTPUT_KEYS}
-    todo = [r for r in manifest
-            if not (r["id"] in existing and need_keys.issubset(existing[r["id"]].keys()))]
+    def score_is_current(row):
+        if row["id"] not in existing or not need_keys.issubset(existing[row["id"]].keys()):
+            return False
+        if not s7_run:
+            return True
+        score = existing[row["id"]]
+        return (
+            score.get("image_sha256") == row.get("image_sha256")
+            and score.get("run_contract_sha256") == row.get("run_contract_sha256")
+        )
+
+    todo = [r for r in manifest if not score_is_current(r)]
     print(f"{len(manifest)} images; {len(todo)} to (re)score with {[n for n, _ in active]}", flush=True)
 
     def flush():
@@ -98,7 +163,10 @@ def main():
 
     from PIL import Image
     for i, r in enumerate(todo):
-        img = Image.open(os.path.join(args.run_dir, r["image_path"])).convert("RGB")
+        image_path = os.path.join(args.run_dir, r["image_path"])
+        if s7_run and image_sha256(image_path) != r.get("image_sha256"):
+            raise RuntimeError(f"{r['id']}: image changed after manifest validation")
+        img = Image.open(image_path).convert("RGB")
         metadata_keys = (
             "id", "prompt_index", "bucket", "seed", "scale", "action_id",
             "action_type", "band_scales", "image_path",
@@ -106,6 +174,15 @@ def main():
         rec = existing.get(
             r["id"], {key: r[key] for key in metadata_keys if key in r}
         )
+        if s7_run:
+            rec.update(
+                {
+                    "provenance_schema": PROVENANCE_SCHEMA,
+                    "image_sha256": r["image_sha256"],
+                    "run_contract_sha256": r["run_contract_sha256"],
+                    "action_sha256": r.get("action_sha256"),
+                }
+            )
         for name, sc in active:
             scorer_keys = {key for key, _ in sc.OUTPUT_KEYS}
             if scorer_keys.issubset(rec):
@@ -123,6 +200,8 @@ def main():
             flush()
             print(f"  scored {i + 1}/{len(todo)}", flush=True)
     flush()
+    if s7_run:
+        validate_scores_against_manifest(manifest, [existing[row["id"]] for row in manifest])
     print(f"scores -> {scores_path}", flush=True)
 
 

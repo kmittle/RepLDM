@@ -1036,6 +1036,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self._last_freeu_preserve_moments = False
         self._last_trajectory_correction = None
         self._last_trajectory_correction_diagnostics = []
+        self._last_unet_calls_total = 0
+        self._last_unet_calls_per_step = []
         self._last_latent_renderer_diagnostics = None
         self._last_latent_renderer_provider_diagnostics = None
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -1309,6 +1311,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             print("### Phase 1 Denoising ###")
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
+                    unet_calls_this_step = 0
     
                     if self.lowvram:
                         self.vae.cpu()
@@ -1343,6 +1346,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         if semantic_transport is not None
                         else nullcontext()
                     ), renderer_capture:
+                        unet_calls_this_step += 1
+                        self._last_unet_calls_total += 1
                         noise_pred = self.unet(
                             latent_model_input,
                             t,
@@ -1351,6 +1356,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             added_cond_kwargs=added_cond_kwargs,
                             return_dict=False,
                         )[0]
+                    self._last_unet_calls_per_step.append(unet_calls_this_step)
     
                     # perform guidance
                     if do_classifier_free_guidance:
@@ -1645,6 +1651,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             # print("### Phase 2 Denoising ###")
             with self.progress_bar(total=len(resampled_timesteps)) as progress_bar:
                 for i, t in enumerate(resampled_timesteps):
+                    unet_calls_this_step = 0
                     if self.lowvram:
                         self.vae.cpu()
                         self.unet.to(device)
@@ -1655,6 +1662,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                     # predict the noise residual
                     added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                    unet_calls_this_step += 1
+                    self._last_unet_calls_total += 1
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
@@ -1663,6 +1672,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         added_cond_kwargs=added_cond_kwargs,
                         return_dict=False,
                     )[0]
+                    self._last_unet_calls_per_step.append(unet_calls_this_step)
                     # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = split_cfg_noise_pred(noise_pred)
