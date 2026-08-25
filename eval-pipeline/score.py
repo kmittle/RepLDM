@@ -50,6 +50,16 @@ def _unique_rows(rows, label):
     return result
 
 
+def resolve_device(device, cuda_available):
+    """Normalize CLI GPU indices to the Torch ``cuda:N`` device form."""
+    value = str(device).strip()
+    if value.isdecimal():
+        value = f"cuda:{value}"
+    if value != "cpu" and not cuda_available:
+        return "cpu"
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", required=True)
@@ -64,7 +74,11 @@ def main():
 
     cfg = yaml.safe_load(open(args.config))
     import torch
-    device = args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu"
+    device = resolve_device(args.device, torch.cuda.is_available())
+    try:
+        torch.device(device)
+    except (RuntimeError, TypeError) as exc:
+        ap.error(f"invalid --device {args.device!r}: {exc}")
     metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
     params = dict(cfg.get("params", {}))
 

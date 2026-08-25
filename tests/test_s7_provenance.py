@@ -440,6 +440,7 @@ class S7ProvenanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result, queue_dir = self._run_queue_dry_run(tmp, "ancestral_mix_050")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("--device cuda:3 --strict", result.stdout)
             state = json.loads((queue_dir / "state.json").read_text())
             self.assertEqual(state["stage"], "validation_queue")
             self.assertEqual(state["status"], "awaiting_review")

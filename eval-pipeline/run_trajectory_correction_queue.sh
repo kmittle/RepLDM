@@ -457,7 +457,7 @@ main() {
     if [ "$DRY_RUN" -eq 1 ] || ! run_complete scores "$DEV_RUN_DIR" "$DEV_ACTIONS" "$DEV_PROMPTS" "0,42" "$EXPECTED_DEV_TASKS"; then
         wait_existing; wait_gpu
         run_stage development_scoring "$EVAL_PYTHON" "$ROOT/eval-pipeline/score.py" \
-          --run_dir "$DEV_RUN_DIR" --device "$GPU" --strict || return $?
+          --run_dir "$DEV_RUN_DIR" --device "cuda:$GPU" --strict || return $?
     fi
     if [ "$DRY_RUN" -eq 1 ] || [ ! -f "$DEV_RUN_DIR/trajectory_correction_selection.json" ]; then
         wait_existing
@@ -504,7 +504,7 @@ main() {
     if ! run_complete scores "$VAL_RUN_DIR" "$VAL_ACTIONS" "$VAL_PROMPTS" "11,29,101" "$EXPECTED_VAL_TASKS"; then
         wait_existing; wait_gpu
         run_stage validation_scoring "$EVAL_PYTHON" "$ROOT/eval-pipeline/score.py" \
-          --run_dir "$VAL_RUN_DIR" --device "$GPU" --strict || return $?
+          --run_dir "$VAL_RUN_DIR" --device "cuda:$GPU" --strict || return $?
     fi
     write_state complete awaiting_review validation_scored_pending_review true
     log "validation scores complete; awaiting review, no RL stage started"

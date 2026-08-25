@@ -28,6 +28,7 @@ def load_module(name, relative_path):
 
 compare_actions = load_module("compare_actions", "eval-pipeline/compare_actions.py")
 generate = load_module("generate", "eval-pipeline/generate.py")
+score = load_module("score", "eval-pipeline/score.py")
 from InferencePipelines.RepLDM.pipeline_repldm_sdxl import (  # noqa: E402
     _sample_resample_noise,
     _validate_trajectory_correction_generator,
@@ -71,6 +72,14 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
+    def test_score_device_normalizes_numeric_gpu_indices(self):
+        self.assertEqual(score.resolve_device("7", cuda_available=True), "cuda:7")
+        self.assertEqual(
+            score.resolve_device("cuda:3", cuda_available=True), "cuda:3"
+        )
+        self.assertEqual(score.resolve_device("cpu", cuda_available=True), "cpu")
+        self.assertEqual(score.resolve_device("7", cuda_available=False), "cpu")
+
     def test_cfg_latent_expansion_matches_concatenated_embedding_order(self):
         latents = torch.tensor([[10.0], [20.0]])
         expanded = expand_cfg_latents(latents, enabled=True)
