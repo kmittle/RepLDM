@@ -249,7 +249,8 @@ c_t = 1 - mean_i H(A_i) / log(N).
 
 把 scheduler 返回的 `x_0` 按面积缩小到 attention 网格，计算 `d = upsample(W x_0 - x_0)`，再按 latent 通道把 `d` 投影到固定均值、固定方差的切空间。随后用固定角度 `theta * c_t` 在球面上移动，结果叫 `guided_x_0`。
 
-scheduler 侧只允许下面这一种接法：
+scheduler 侧当时登记了下面的接法；文末 scheduler-coordinate 审计已撤回其
+clean-endpoint 解释，并将它重标为 legacy post-step nudge：
 
 ```text
 step_output = scheduler.step(...)
@@ -257,7 +258,9 @@ u = guided_x_0 - step_output.pred_original_sample
 latents = step_output.prev_sample + u.
 ```
 
-scheduler 使用 Euler 和 epsilon prediction。S5 不得自己重新计算 `x_0`，也不得自己重写 Euler step，因为 fp16 下这样做的误差最高可到 `0.03125`。`theta=0` 必须精确复现 no-AG。整个算子不做 backpropagation，也不增加 UNet evaluation。
+scheduler 使用 Euler 和 epsilon prediction。该实现保持 `theta=0` 精确复现 no-AG，
+不做 backpropagation，也不增加 UNet evaluation；但后续审计证明非零位移需要在
+step 前重建原生 prediction，不能用上面的单位增益公式表达 clean-`x0` 更新。
 
 ## S5：固定数据与对照
 
@@ -515,3 +518,21 @@ Euler schedule、PNG/sidecar/score hashes 和 9 个必需指标都满足冻结 c
 `no_nondefault_scale_passed_the_frozen_gate`。selection JSON SHA-256 为
 `9d7245f1daed41d27b609a75359566dc2e226245ae6569d6c2e4ced45c28214c`。
 后续实验因此固定 CFG `7.5`；该 control 不授权 renderer、蒸馏或 RL。
+
+这次 CFG development 已使用 `0,42,123`，所以 LR-1 旧协议将它们保留为 final
+seeds 的约束已失效；新方法必须冻结一组全新、未参与任何 selection 的 final seeds。
+
+## Scheduler-coordinate 审计：旧 clean-`x0` 解释撤回
+
+审计证明 S5/LR-1 的 `prev_sample + (guided_x0 - pred_original_sample)` 是可复现的
+单位增益 post-step latent nudge，而不是固定当前状态下的 Euler clean-endpoint
+更新。无 churn Euler 的精确 gain 为 `1 - sigma_next/sigma`；冻结 50-step schedule
+首步 gain `0.110085`，旧路径相对放大 `9.0839x`，中位 `12.8398x`，最大
+`15.7706x`。因此 S5 semantic arms 与两个 LR-1 目录只保留为该 legacy operator
+的负结果，不能再支持 scheduler-consistent 机制结论，也不能作为新 renderer/RL 的
+监督数据。
+
+新的 Euler-native 路径必须在 scheduler 前重建原生 epsilon/sample/v prediction，
+只调用一次 `scheduler.step`，记录全部 50 步的 gain/applied ratio/moment diagnostics，
+并对 DPM multistep fail closed。零 renderer 必须逐位复现 baseline。完成这些门槛、
+冻结 fresh prompts/seeds 与 scorer/checkpoint provenance 之前，不允许质量搜索或 RL。

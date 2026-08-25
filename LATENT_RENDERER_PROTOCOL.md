@@ -1,8 +1,11 @@
 # Latent Renderer Protocol
 
-Status: registration-only, independent of the failed S5 Attention Guidance
-extension. This document freezes the first mechanism audit; it does not
-authorize RL training or reuse S5 images as supervision.
+Status: historical registration for the completed LR-1 post-step latent-nudge
+study, independent of the failed S5 Attention Guidance extension. A later
+scheduler audit found that this document's original unit-gain clean-latent
+interpretation was incorrect. The images remain evidence for the registered
+operator, but this document does not authorize a scheduler-native rerun, RL
+training, or reuse of S5/LR-1 images as supervision.
 
 ## Hypothesis and Scope
 
@@ -32,16 +35,28 @@ spatial head. The coefficient-only model is a required control, not the main
 neural-renderer claim. The renderer produces `guided_x0` by projecting the
 combined residual to the fixed-mean/fixed-variance tangent space, applying a
 scheduler-update trust-region cap, and using the sphere geodesic. The next
-latent is always
+latent in the completed LR-1 runs was
 
 ```text
 prev_sample + (guided_x0 - pred_original_sample)
 ```
 
-so the scheduler remains the source of the diffusion transition. The default
-renderer is zero-initialized, uses no extra UNet call, has a `0.05` update-norm
-ratio cap, and preserves channel moments. Every run records coefficients,
-norm ratios, moment errors, parameters, FLOPs, latency, and peak memory.
+This is a reproducible unit-gain **post-step latent nudge**, not an exact map of
+a changed clean endpoint through Euler. With current state fixed and churn off,
+the exact Euler displacement is
+
+```text
+(1 - sigma_next / sigma) * (guided_x0 - pred_original_sample).
+```
+
+Production scheduler-native integration must reconstruct the scheduler's native
+model output from `guided_x0` before calling `scheduler.step` exactly once. The
+frozen 50-step schedule gives a first-step gain of `0.110085`; the old unit map
+therefore amplified the intended first-step effect by `9.0839x` (median
+`12.8398x`, maximum `15.7706x`). Multistep schedulers are unsupported until
+their model-output history is updated coherently. The historical renderer was
+zero-initialized, used no extra UNet call, capped the recorded post-step nudge,
+and preserved channel moments.
 
 ## Sequential Gates
 
@@ -89,26 +104,31 @@ test       eval-pipeline/prompts/latent_renderer_test.csv        (24 rows)
 Each split has 8/4/4 prompts per challenge across six PartiPrompts challenges.
 The manifest and split files must be committed before any image is generated;
 the test file is never used for coefficient or architecture selection. All
-prompts used by S0--S5 and their derivative outputs are excluded. Seeds
-`0,42,123` are reserved for the one final test evaluation and cannot be used to
-choose coefficients. LR-1 uses train seeds `7,19,73` and one validation
-confirmation with seeds `11,29,101`; these sets are disjoint from the final test
-seeds. TOPIQ-NR is held out from training; report it with HPSv2, CLIP
+prompts used by S0--S5 and their derivative outputs are excluded. This
+historical protocol reserved `0,42,123` for final test and used train seeds
+`7,19,73` plus validation seeds `11,29,101`. The final test was never run, but
+the later tuned-CFG development sweep consumed `0,42,123`; they are permanently
+development-exposed and cannot serve as final seeds for a new method. TOPIQ-NR
+is held out from training; report it with HPSv2, CLIP
 alignment, ImageReward, patch/detail witnesses, OCR/counting checks, DCT
 statistics, LPIPS/diversity, pixel guards, and a blinded human pairwise test
 before making a TPAMI claim. Use prompt/seed crossed bootstrap intervals,
 prompt sign-flip tests, and within-family Holm correction.
 
 Any non-finite output, violated moment or trust bound, missing paired record,
-or failure of LR-1 closes the learned/RL path. No angle, top-k, reward, or
-controller sweep may be used to overturn a failed gate.
+or failure of LR-1 closed this legacy action family and its learned/RL path. No
+angle, top-k, reward, or controller sweep may overturn that result. A corrected
+scheduler-native family requires a separately frozen operator, fresh prompts,
+per-step scheduler-coordinate diagnostics, and a new static headroom gate.
 
 ## Implementation Boundary
 
-`AttentionGuidance/latent_renderer.py` contains only the reusable basis
-construction, constrained renderer, diagnostics, and scheduler-safe injection
-primitives. It is not wired into default generation, and no checkpoint or RL
-training result is claimed by this registration. The frozen YAML companion is
+`AttentionGuidance/latent_renderer.py` contains the reusable basis construction,
+constrained renderer, diagnostics, the historical unit-gain injection, and the
+separately audited Euler conversion primitives. Legacy behavior remains the
+default for reproducibility; a native run must opt in explicitly and fail closed
+for other schedulers. No checkpoint or RL training result is claimed by this
+registration. The frozen YAML companion is
 `eval-pipeline/configs/latent_renderer_mechanism_audit.yaml`.
 
 The inference hook is exercised by

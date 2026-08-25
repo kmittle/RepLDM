@@ -52,6 +52,8 @@ cannot substitute for a positive causal interaction, transfer, or human evidence
 | [Guidance Interval, 2404.07724](https://arxiv.org/abs/2404.07724), [CFG++, 2406.08070](https://arxiv.org/abs/2406.08070), and [APG, 2410.02416](https://arxiv.org/abs/2410.02416) | Restrict guidance to useful noise levels, constrain CFG toward the data manifold, or decompose/rescale/momentum-filter its parallel and orthogonal components. They support SDXL or SDXL-Lightning and add little tensor cost (C0). | A timestep schedule, projection, rescaling, momentum, or manifold language is not sufficient novelty. Tune these controls on the same development budget. |
 | [MOG/Auto-MOG, 2603.11509v1](https://arxiv.org/abs/2603.11509v1) | Applies closed-form Riemannian preconditioning and dynamic guidance-energy balancing to existing CFG quantities. SDXL latency is reported as `1.01x-1.08x` (C0). | Match actual CFG outputs, energy, and NFE. Moment retraction, tangent projection, trust caps, and adaptive strength are constraints or baselines, not contributions alone. |
 | [Noise Level Correction, 2412.05488v3](https://arxiv.org/abs/2412.05488v3) | Trains a correction network on features from a frozen U-Net encoder and adjusts the sampler noise level. ImageNet uses a 234M corrector versus a 2109M denoiser; Algorithm 1 evaluates it in the sampling loop and the paper reports about 6% overhead (C1). It is not an SDXL result. | A smaller network around a frozen denoiser and learned scheduler-state correction are occupied. Include its lookup-table analogue and a prompt/timestep-only scalar MLP before attributing gains to structural features. |
+| [Diffusion Controller, 2603.06981v1](https://arxiv.org/abs/2603.06981v1) | Freezes SD1.4 and adds a 12M latent U-Net side network to the pretrained score at every step; it trains with SFT, HPSv2 reward-weighted loss, or PPO (C1). Evaluation sweeps the side-network strength and reports the best HPSv2 result. | This directly occupies frozen-backbone latent side correction and reward/RL training. Include DiffCon-style structured and naive free-residual upper bounds, freeze inference strength before test, and use independent metrics plus human evaluation. |
+| [Hierarchical Variational Policies, 2605.21661v1](https://arxiv.org/abs/2605.21661v1) | Keeps the denoiser fixed and learns an initial-noise policy plus Gaussian per-step additive latent controls. Its inverse-problem controllers are 51M/92M DiTs (C1). | Per-step latent control and deterministic/stochastic policies are occupied. Any claim here must rest on sub-1M structure constraints, exact scheduler coordinates, open-domain SDXL evidence, and equal reward-query/compute controls. |
 | [SHIFT, 2604.09213v1](https://arxiv.org/abs/2604.09213v1) and [CAT, 2603.03163v1](https://arxiv.org/abs/2603.03163v1) | SHIFT adds contrastively estimated, state-gated directions to FLUX text/intermediate activations. CAT uses a zero-output-initialized residual MLP plus geometry-aware gating for Z-Image safety steering. Both intervene during the ordinary forward (C0/C1), but target DiT/AR concept control. | Activation vectors, nonlinear transport, state gating, and zero-init residual maps are not firsts. Treat them as architecture/task-adjacent controls, not evidence of SDXL quality improvement. |
 | [LaRender, 2508.07647v1](https://arxiv.org/abs/2508.07647v1) | Performs literal training-free latent rendering on SDXL through object masks, an occlusion graph, and cross-attention compositing. | The term "latent renderer" is occupied. LaRender is an attention- and layout-specific boundary, not a generic-quality baseline for prompts without object graphs. |
 | [Representation Guidance, 2601.22468v1](https://arxiv.org/abs/2601.22468v1), [DIAMOND, 2602.00883v1](https://arxiv.org/abs/2602.00883v1), [DiffRGD, 2606.28417v2](https://arxiv.org/abs/2606.28417v2), and [PG-MAP, 2606.22958v1](https://arxiv.org/abs/2606.22958v1) | Use a pretrained representation projector/encoder and latent gradients, clean-latent artifact gradients, spherical inner-loop RGD, or MAP optimization (CX). Their original tasks and backbones differ. | These are equal-quality or equal-wall-time upper bounds, never matched one-call baselines. Report every encoder, decode, backward, and inner iteration. |
@@ -78,24 +80,29 @@ quality result was observed:
 | MOG/Auto-MOG | Repository [`a2a3a649`](https://github.com/zexiJia/MoG/tree/a2a3a649de22971c8f5fe0c821ca8bde0d9c0f88) contains Apache-2.0 code, but is not linked by arXiv v1. It uses `lambda_perp=5`, clamp `[1,20]`, and no feature hook; the paper uses anisotropy `10`, clamp `[0,50]`, and a combined score/feature metric. | **No-go for paper Auto-MOG.** Repository behavior may be reported only as a separately named surrogate. |
 | Guidance Interval / APG | Guidance Interval's Apache-2.0 author code does not implement its reported SDXL path. APG has no author repository; the diffusers guider acts on noise predictions with defaults that differ from the paper's SDXL `x0` configuration. | **No-go as direct SDXL reproductions.** Transparent local ports require frozen equations, prediction coordinates, and unit parity before GPU use. |
 
-The installed generation environment uses diffusers `0.32.1` and has no
-`kornia`; upgrading to the v0.35 guider stack would also change the transformers
-contract. Therefore baseline code must be vendored or independently implemented
-with source/license attribution and tensor-level parity tests, not introduced by
-an environment-wide upgrade. Missing faithful baselines block a learned-method
-claim; they do not authorize weak approximations merely to keep a GPU occupied.
+The installed generation environment uses Python `3.11.10`, torch `2.5.1`,
+diffusers `0.32.1`, transformers `4.47.1`, and has no `kornia`; the package files
+still declare the older diffusers `~0.21.4` stack. Until an exact evaluation lock
+is committed, sidecar runtime versions are authoritative and this mismatch is a
+reproduction blocker. Upgrading to the v0.35 guider stack would also change the
+transformers contract. Therefore baseline code must be vendored or independently
+implemented with source/license attribution and tensor-level parity tests, not
+introduced by an environment-wide upgrade. Missing faithful baselines block a
+learned-method claim; they do not authorize weak approximations merely to keep a
+GPU occupied.
 
 ## What Structural Papers Do and Do Not Establish
 
 [Improving the Diffusability of Autoencoders,
 2502.14831v3](https://arxiv.org/abs/2502.14831v3) identifies excess latent
-high-frequency energy and fine-tunes AE scale equivariance to restore a more
-diffusion-friendly frequency profile. [EQ-VAE,
+high-frequency energy, but its main intervention is a downsampled
+RGB/latent decoder reconstruction loss that encourages scale equivariance, not
+a direct DCT penalty. [EQ-VAE,
 2502.09509v3](https://arxiv.org/abs/2502.09509v3) fine-tunes pretrained AEs so
-scaling and rotation act more equivariantly in latent space. These results make
-spectral and equivariant structure plausible mechanisms, but they change the
-representation on which a generator is trained; they do not validate a frozen
-SDXL inference residual.
+scaling and rotation act equivariantly rather than invariantly in latent space.
+Both works retrain the downstream generator on the changed representation.
+These results make spectral and equivariant structure plausible mechanisms;
+they do not validate a frozen SDXL inference residual or a test-time low-pass.
 
 [iREPA, 2512.10794v1](https://arxiv.org/abs/2512.10794v1) finds pairwise patch
 self-similarity more predictive of representation-aligned generation than global

@@ -392,3 +392,38 @@ scores、selection JSON/CSV 的 SHA-256 分别为
 `selected_action=cfg_7p5`、`decision=null_route`。因此后续 matched-compute 实验固定
 CFG `7.5`；本结果不授权 validation、renderer、蒸馏或 RL，也不能用高 CFG 的正点
 估计声称改善。
+
+这次 development sweep 同时消耗了旧 LR-1 协议曾保留给 final test 的 seeds
+`0,42,123`。旧 LR-1 final test 从未运行，但这些 seed 已不再 unseen；任何新方法
+必须在生成前冻结全新的、与所有 development/selection run 不相交的 final seeds。
+
+## Scheduler-coordinate audit：S5/LR-1 机制重标
+
+后验代码审计发现，S5 与 LR-1 把 `guided_x0 - pred_original_sample` 以单位增益
+加到 Euler 的 `prev_sample`。固定当前 `x_t`、无 churn 时，干净端点位移的精确
+Euler 映射应乘
+
+```text
+g_t = 1 - sigma_next / sigma_t.
+```
+
+冻结 50-step SDXL schedule 的首步 `g_t=0.110085`，所以单位映射在首步相对正确
+作用放大 `9.0839x`；全程中位放大 `12.8398x`，最大 `15.7706x`，仅最后
+`sigma_next=0` 的一步单位增益正确。因此以下结果保留为 **post-step latent-nudge**
+实验，但撤回其 scheduler-native clean-`x0` 机制解释：
+
+- `outputs/exp_s5/development_12prompt_3seed_v2` 的 semantic transport arms；
+- `outputs/latent_renderer/lr1_fixed_train_v1`；
+- `outputs/latent_renderer/lr1_fixed_train_searchseeds_v2`。
+
+这些目录的 no-AG、CFG、conference Attention Guidance、scheduler references 和
+其他未声称 clean-endpoint 映射的对照不受此特定错误影响。LR-1 的 null result 仍
+关闭原单位增益动作族，但不能否定一个重新注册的 Euler-native 算子。新算子必须在
+`scheduler.step` 前把 guided clean endpoint 转回原生 prediction，保持每步一次
+U-Net/一次 scheduler call，逐步记录 gain、applied update ratio 和 moment errors，
+并对 DPM multistep fail closed。不得用旧图训练或选择新 controller。
+
+另外，现有 score artifacts 的 hash 能证明结果未被改写，却尚未完整绑定 scorer
+源码、依赖版本、模型 revision、checkpoint hash 和预处理版本。该 provenance 缺口
+必须在任何新的质量 run 前修复；已完成 CFG null 因其专用 selector 强制完整配对，
+不受通用比较脚本可能静默 `dropna` 的问题影响。

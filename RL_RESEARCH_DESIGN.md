@@ -1,9 +1,9 @@
 # Structural Latent Rendering: RL Research Design
 
 This document is a proposal for the journal extension. It does not change the
-registered S5 experiment or authorize an RL run. The first decision gate is
-the S5 static result; a policy or a larger network must not be used to rescue a
-failed Attention Guidance hypothesis.
+registered S5 experiment or authorize an RL run. The first decision gate is a
+fresh scheduler-native static result; a policy or a larger network must not be
+used to rescue the failed S5 or legacy LR-1 action families.
 
 ## Positioning
 
@@ -37,6 +37,13 @@ must not be written as a successful continuation of Attention Guidance.
   DRM/SGPO, and recent path-space diffusion-RL work cover sparse attention,
   extra denoiser calls, schedules, and policy optimization. They must be
   baselines or explicit scope boundaries, not components of a novelty claim.
+* **Diffusion Controller (arXiv:2603.06981)** already freezes a diffusion
+  backbone and trains a 12M latent U-Net side network for per-step structured
+  score correction with SFT, reward-weighted learning, or PPO. **HVP
+  (arXiv:2605.21661)** learns initial-noise and per-step additive control
+  policies around a frozen denoiser. Therefore neither a latent side network,
+  frozen-backbone reward training, nor per-step RL is a novelty claim. A
+  DiffCon-style free residual head and LoRA/DRaFT are required upper bounds.
 
 The 2026 full-text audit tightens this boundary further. The unified path-space
 view (arXiv:2608.14430) treats reverse-trajectory gradients and forward reward
@@ -55,12 +62,13 @@ Two additional overlaps are important for the word "renderer": **LaRender
 object-wise cross-attention features in latent space, using masks and an
 occlusion graph. **SATeCo (arXiv:2403.17000)** freezes a pretrained UNet/VAE
 and trains small spatial/temporal feature adapters. The proposed method is not
-the first latent renderer or the first frozen-backbone adapter: it is a
-different, narrower object that renders a bounded residual for the scheduler
-transition from self-attention and decoder structure, without object masks,
-extra prompt branches, or a second denoiser call. LaRender-style compositing,
-FreeU, and matched random adapters must be included wherever their task is
-well-defined.
+the first latent renderer, frozen-backbone adapter, or learned diffusion
+controller. Its only defensible target is a sub-1M bounded residual in exact
+scheduler coordinates whose structural mechanism is causally verified.
+Non-attention latent/frequency descriptors are primary; self-attention and
+decoder features are ablations because their semantic graph cost is substantial.
+LaRender-style compositing, FreeU, DiffCon-style residuals, and matched random
+adapters must be included wherever their task is well-defined.
 
 The second supplied paper is also more precisely described as **equivariance**
 regularization: EQ-VAE asks transformed inputs to produce correspondingly
@@ -114,41 +122,43 @@ The companion YAML is a registration manifest only and must not be passed to
 the legacy image-generation action loader.
 
 The inference-only pipeline hook is now explicit: a
-`RendererBasisProvider` receives one ordinary scheduler transition and returns
-`RendererCondition`. `StructuralUNetBasisProvider` is the first concrete
-provider. It captures `up_blocks.0` backbone/skip inputs plus
-`up_blocks.0.attentions.0.transformer_blocks.0.attn1` Q/K during that same
-forward, uses deterministic group-mean channel reduction, and emits the six
-registered bases in a fixed order. It is mutually exclusive with the old
-guidance paths and limited to Stage 1. The structural cached-SDXL smoke
-reproduces the no-renderer hash with the zero renderer and changes it with a
-fixed non-zero probe; this validates plumbing only, not image quality or
-learned behavior.
+`RendererBasisProvider` consumes tensors from one ordinary denoiser forward and
+returns `RendererCondition`. `StructuralUNetBasisProvider` is the historical
+attention/decoder implementation; its Q/K graph is now an ablation rather than
+the default learned path. It is mutually exclusive with the old guidance paths
+and limited to Stage 1. Cached-SDXL smokes reproduce the no-renderer hash with a
+zero renderer and change it with a fixed non-zero probe; this validates plumbing
+only, not image quality or learned behavior.
 
 At step `t`, one frozen U-Net evaluation returns noise `epsilon_t` and exposes a
 small set of decoder backbone/skip features (B_t^l,S_t^l), self-attention
-affinity (G_t), and the scheduler's own predicted clean latent
-\(\hat x_0^t\). Let \(\bar x_{t-1}\) be the scheduler output before rendering.
-The renderer sees only these tensors and normalized timestep/prompt features:
+affinity (G_t), and the scheduler's predicted clean latent \(\hat x_0^t\). The
+renderer sees only detached structural tensors and normalized timestep/prompt
+features; let \(\bar x_{t-1}\) denote the ordinary Euler output:
 
 ```text
 z_t = R_phi(x_t, x0_hat_t, B_t, S_t, G_t, t, pooled_text)
 y_t = MomentGeodesic(x0_hat_t, z_t, theta_t)
-x_{t-1} = xbar_{t-1} + (y_t - x0_hat_t)
+g_t = 1 - sigma_next / sigma_t
+x_{t-1} = xbar_{t-1} + g_t * (y_t - x0_hat_t)
 ```
 
-`MomentGeodesic` is the existing fixed-mean/fixed-variance tangent operation,
-not an unconstrained post-hoc clip. A per-step norm budget is enforced before
-the geodesic map and is reported as a scheduler-update ratio. The renderer is
-latent-space only; it is not a second VAE decoder and never predicts pixels.
+The displayed gain is exact for no-churn Euler with the current state fixed.
+Production reconstructs the native epsilon/sample/v prediction and invokes
+`scheduler.step` once; DPM multistep methods fail closed because their history
+must contain the guided output. `MomentGeodesic` is the existing
+fixed-mean/fixed-variance operation, not an unconstrained post-hoc clip. The
+per-step cap and diagnostics are measured after scheduler mapping. The renderer
+is latent-space only; it is not a second VAE decoder and never predicts pixels.
 
 The primary implementation should be a **basis renderer**, which limits the
 learned output to bounded coefficients over interpretable bases:
 
-1. reciprocal semantic transport of \(\hat x_0^t\);
-2. low/mid/high DCT residuals;
-3. a FreeU-style backbone-minus-skip feature projection; and
-4. a local Laplacian/edge residual.
+1. low/mid/high DCT or Fourier residuals of \(\hat x_0^t\);
+2. low/high bands of the native scheduler update;
+3. a local Laplacian/edge residual; and
+4. reciprocal semantic transport and FreeU-style feature differences as
+   explicit attention/decoder ablations.
 
 A depthwise 3x3 latent stem, low-rank 1x1 feature adapters, and a FiLM/timestep
 head should fit 0.1M, 1M, and 5M parameter variants. A free-form four-channel
