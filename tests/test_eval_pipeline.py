@@ -7,6 +7,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -50,6 +51,9 @@ freeze_validation = load_module(
 )
 audit_renderer_run = load_module(
     "audit_latent_renderer_run", "eval-pipeline/audit_latent_renderer_run.py"
+)
+scorer_provenance = load_module(
+    "scorer_provenance_test", "eval-pipeline/scorer_provenance.py"
 )
 evaluate_renderer_validation = load_module(
     "evaluate_latent_renderer_validation",
@@ -418,7 +422,45 @@ class EvalPipelineTest(unittest.TestCase):
         return source, template, selection
 
     @staticmethod
-    def _write_renderer_audit_fixture(root, *, duplicate_images=False):
+    def _native_renderer_ledger(steps=3):
+        if steps <= 0:
+            raise ValueError("test ledger requires a positive step count")
+        sigma_pairs = [
+            (float(steps - step_index), float(steps - step_index - 1))
+            for step_index in range(steps)
+        ]
+        provider = {
+            "semantic_entropy": [0.5],
+            "basis_rms": [0.25],
+        }
+        records = []
+        for step_index, (sigma_from, sigma_to) in enumerate(sigma_pairs):
+            records.append(
+                {
+                    "step_index": step_index,
+                    "scheduler_step_index": step_index,
+                    "timestep": float(steps - step_index),
+                    "sigma_from": sigma_from,
+                    "sigma_to": sigma_to,
+                    "prediction_type": "epsilon",
+                    "raw_update_norm": [0.2],
+                    "bounded_update_norm": [0.1],
+                    "scheduler_update_norm": [1.0],
+                    "update_ratio": [0.1],
+                    "mean_error": [0.0],
+                    "variance_error": [0.0],
+                    "clean_update_gain": [1.0 - sigma_to / sigma_from],
+                    "applied_update_norm": [0.01],
+                    "applied_update_ratio": [0.01],
+                    "provider_diagnostics": copy.deepcopy(provider),
+                }
+            )
+        return records
+
+    @staticmethod
+    def _write_renderer_audit_fixture(
+        root, *, duplicate_images=False, native=False
+    ):
         root = pathlib.Path(root)
         run_dir = root / "run"
         image_dir = run_dir / "images"
@@ -432,6 +474,13 @@ class EvalPipelineTest(unittest.TestCase):
             "prompt_dim": 0,
             "state_dim": 0,
         }
+        if native:
+            provider.update(
+                {
+                    "scheduler_mapping": "euler_clean_endpoint",
+                    "basis_normalization": "match_rms",
+                }
+            )
         source = {
             "schema": "latent_renderer_actions_v1",
             "experiment_id": "fixture",
@@ -467,6 +516,7 @@ class EvalPipelineTest(unittest.TestCase):
             json.dumps(
                 {
                     "resolution": 8,
+                    "num_inference_steps": 3,
                     "split_role": "train_search",
                     "seeds": [7],
                     "actions": configured_actions,
@@ -484,16 +534,34 @@ class EvalPipelineTest(unittest.TestCase):
             Image.new("RGB", (8, 8), color=color).save(image_path)
             diagnostics = None
             provider_diagnostics = None
+            step_diagnostics = None
             if action["type"] == "latent_renderer_fixed":
-                diagnostics = {
-                    "update_ratio": [0.01],
-                    "mean_error": [0.0],
-                    "variance_error": [0.0],
-                }
                 provider_diagnostics = {
                     "semantic_entropy": [0.5],
                     "basis_rms": [0.25],
                 }
+                if native:
+                    step_diagnostics = EvalPipelineTest._native_renderer_ledger()
+                    diagnostics = {
+                        key: copy.deepcopy(value)
+                        for key, value in step_diagnostics[-1].items()
+                        if key
+                        not in {
+                            "step_index",
+                            "scheduler_step_index",
+                            "timestep",
+                            "sigma_from",
+                            "sigma_to",
+                            "prediction_type",
+                            "provider_diagnostics",
+                        }
+                    }
+                else:
+                    diagnostics = {
+                        "update_ratio": [0.01],
+                        "mean_error": [0.0],
+                        "variance_error": [0.0],
+                    }
             manifest.append(
                 {
                     "id": row_id,
@@ -508,10 +576,66 @@ class EvalPipelineTest(unittest.TestCase):
                     "device": "cuda:1",
                     "latent_renderer_diagnostics": diagnostics,
                     "latent_renderer_provider_diagnostics": provider_diagnostics,
+                    "latent_renderer_scheduler_mapping": (
+                        "euler_clean_endpoint"
+                        if action["type"] == "latent_renderer_fixed" and native
+                        else None
+                    ),
+                    "latent_renderer_step_diagnostics": step_diagnostics,
+                    "num_inference_steps": 3,
+                    "scheduler_name": "EulerDiscreteScheduler",
+                    "unet_calls_per_step": [1, 1, 1],
+                    "extra_unet_calls": 0,
                 }
             )
             score = {"id": row_id}
             score.update({key: 0.1 for key in audit_renderer_run.DEFAULT_SCORE_KEYS})
+            if native:
+                checkpoint_files = []
+                provenance = {
+                    "schema": scorer_provenance.SCORER_PROVENANCE_SCHEMA,
+                    "metrics": ["fixture"],
+                    "config_params": {},
+                    "runtime": {
+                        "device": "cpu",
+                        "python_implementation": "CPython",
+                        "python_version": "3.11.0",
+                        "torch_version": "2.5.1",
+                        "cuda_runtime_version": None,
+                        "cudnn_version": None,
+                        "cuda_device": None,
+                        "runner_package_versions": {},
+                    },
+                    "shared_preprocessing": {},
+                    "implementation": {
+                        "score_runner": {"sha256": "1" * 64},
+                        "scorer_base": {"sha256": "2" * 64},
+                    },
+                    "scorers": [
+                        {
+                            "name": "fixture",
+                            "class": "tests.FixtureScorer",
+                            "plugin_source": {"sha256": "0" * 64},
+                            "supporting_sources": [],
+                            "package_versions": {},
+                            "models": [],
+                            "checkpoints": {
+                                "schema": scorer_provenance.CHECKPOINT_MANIFEST_SCHEMA,
+                                "files": checkpoint_files,
+                                "files_sha256": scorer_provenance.json_sha256(
+                                    checkpoint_files
+                                ),
+                            },
+                            "preprocessing": {},
+                            "parameters": {},
+                            "output_keys": [],
+                        }
+                    ],
+                }
+                score["scorer_provenance"] = provenance
+                score["scorer_provenance_sha256"] = (
+                    scorer_provenance.json_sha256(provenance)
+                )
             scores.append(score)
         (run_dir / "manifest.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in manifest)
@@ -944,6 +1068,115 @@ class EvalPipelineTest(unittest.TestCase):
                     split_role="train_search",
                 )
 
+    def test_native_renderer_run_audit_accepts_complete_step_ledger(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                temp_dir, native=True
+            )
+            report = audit_renderer_run.audit_run(
+                run_dir,
+                prompts_path,
+                source_path,
+                split_role="train_search",
+            )
+        self.assertTrue(report["passed"])
+        self.assertAlmostEqual(report["max_update_ratio"], 0.01)
+
+    def test_native_renderer_run_audit_rejects_incomplete_ledger_and_nfe(self):
+        for mutation, message in (
+            (
+                lambda row: row["latent_renderer_step_diagnostics"].pop(),
+                "must contain 3 steps",
+            ),
+            (
+                lambda row: row.__setitem__("unet_calls_per_step", [1, 2, 1]),
+                "one-UNet-call",
+            ),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temp_dir:
+                run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                    temp_dir, native=True
+                )
+                manifest_path = run_dir / "manifest.jsonl"
+                rows = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+                renderer_row = next(
+                    row for row in rows if row["action_type"] == "latent_renderer_fixed"
+                )
+                mutation(renderer_row)
+                manifest_path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows)
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    audit_renderer_run.audit_run(
+                        run_dir,
+                        prompts_path,
+                        source_path,
+                        split_role="train_search",
+                    )
+
+    def test_native_renderer_run_audit_rejects_mapping_and_normalization_drift(self):
+        for target, value, message in (
+            ("config", "legacy_l2_to_rms", "basis_normalization"),
+            ("sidecar", "legacy_unit", "runtime scheduler mapping"),
+        ):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temp_dir:
+                run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                    temp_dir, native=True
+                )
+                if target == "config":
+                    config_path = run_dir / "config.json"
+                    config = json.loads(config_path.read_text())
+                    renderer_action = next(
+                        action
+                        for action in config["actions"]
+                        if action["type"] == "latent_renderer_fixed"
+                    )
+                    renderer_action["latent_renderer_provider"][
+                        "basis_normalization"
+                    ] = value
+                    config_path.write_text(json.dumps(config))
+                else:
+                    manifest_path = run_dir / "manifest.jsonl"
+                    rows = [
+                        json.loads(line)
+                        for line in manifest_path.read_text().splitlines()
+                    ]
+                    renderer_row = next(
+                        row
+                        for row in rows
+                        if row["action_type"] == "latent_renderer_fixed"
+                    )
+                    renderer_row["latent_renderer_scheduler_mapping"] = value
+                    manifest_path.write_text(
+                        "".join(json.dumps(row) + "\n" for row in rows)
+                    )
+                with self.assertRaisesRegex(ValueError, message):
+                    audit_renderer_run.audit_run(
+                        run_dir,
+                        prompts_path,
+                        source_path,
+                        split_role="train_search",
+                    )
+
+    def test_native_renderer_run_audit_requires_uniform_scorer_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
+                temp_dir, native=True
+            )
+            scores_path = run_dir / "scores.jsonl"
+            rows = [json.loads(line) for line in scores_path.read_text().splitlines()]
+            rows[-1]["scorer_provenance_sha256"] = "f" * 64
+            scores_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+            with self.assertRaisesRegex(ValueError, "hash drifted"):
+                audit_renderer_run.audit_run(
+                    run_dir,
+                    prompts_path,
+                    source_path,
+                    split_role="train_search",
+                )
+
     def test_frequency_action_config_and_task_metadata(self):
         actions, cutoffs = generate.load_actions(
             ROOT / "eval-pipeline/configs/frequency_action_pilot.yaml", 50
@@ -970,12 +1203,284 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertEqual(cutoffs, [0.08, 0.25])
         self.assertEqual(len(actions), 10)
         fixed = next(action for action in actions if action["id"] == "semantic_pos")
+        self.assertFalse(generate.has_scheduler_native_renderer(actions))
         self.assertEqual(fixed["type"], "latent_renderer_fixed")
         self.assertEqual(fixed["coefficients"], [0.08, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.assertEqual(fixed["latent_renderer_provider"]["semantic_topk"], 16)
+        self.assertEqual(
+            fixed["latent_renderer_provider"]["scheduler_mapping"], "legacy_unit"
+        )
+        self.assertEqual(
+            fixed["latent_renderer_provider"]["basis_normalization"],
+            "legacy_l2_to_rms",
+        )
         prompts = pd.DataFrame([{"index": 3, "TEXT": "test prompt"}])
         tasks = generate.build_tasks(prompts, [0], actions[:2])
         self.assertEqual(tasks[1]["action_type"], "latent_renderer_fixed")
+
+    def test_native_renderer_config_normalization_and_runtime_propagation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "native.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "latent_renderer_provider": {},
+                        "actions": [
+                            {
+                                "id": "native",
+                                "type": "latent_renderer_fixed",
+                                "coefficients": [0.01, 0, 0, 0, 0, 0],
+                                "provider": {
+                                    "scheduler_mapping": "euler_clean_endpoint",
+                                    "basis_normalization": "match_rms",
+                                },
+                            }
+                        ],
+                    }
+                )
+            )
+            actions, _ = generate.load_actions(str(path), 3)
+        action = actions[0]
+        provider_config = action["latent_renderer_provider"]
+        self.assertEqual(provider_config["scheduler_mapping"], "euler_clean_endpoint")
+        self.assertEqual(provider_config["basis_normalization"], "match_rms")
+        self.assertTrue(generate.has_scheduler_native_renderer(actions))
+
+        fake_provider = mock.sentinel.provider
+        fake_pipe = mock.Mock(unet=mock.sentinel.unet)
+        with mock.patch.object(
+            generate,
+            "StructuralUNetBasisProvider",
+            return_value=fake_provider,
+        ):
+            renderer, provider = generate.latent_renderer_runtime(
+                action, fake_pipe, "cpu", 7.5
+            )
+        self.assertEqual(renderer.config.basis_normalization, "match_rms")
+        kwargs = generate.latent_renderer_pipeline_kwargs(
+            action, renderer, provider
+        )
+        self.assertIs(kwargs["latent_renderer"], renderer)
+        self.assertIs(kwargs["latent_renderer_basis_provider"], fake_provider)
+        self.assertEqual(
+            kwargs["latent_renderer_scheduler_mapping"], "euler_clean_endpoint"
+        )
+        euler = type("EulerDiscreteScheduler", (), {})()
+        self.assertEqual(
+            generate.validate_latent_renderer_scheduler(action, euler),
+            "euler_clean_endpoint",
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly EulerDiscreteScheduler"):
+            generate.validate_latent_renderer_scheduler(action, object())
+
+    def test_native_provider_action_level_aliases_override_shared_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "native_alias.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "required_provider": {
+                            "implementation": "LazyLatentStructureBasisProvider",
+                            "provenance_id": "shared-default",
+                            "scheduler_mapping": "euler_clean_endpoint",
+                            "basis_normalization": "match_rms",
+                        },
+                        "actions": [
+                            {
+                                "id": "spectral",
+                                "type": "latent_renderer_fixed",
+                                "provider_provenance_id": "action-specific",
+                                "requested_bases": ["reciprocal_semantic_transport"],
+                                "required_hook_names": [
+                                    "up_blocks.0.attentions.0.transformer_blocks.0.attn1_qk"
+                                ],
+                                "coefficients": [0.01, 0, 0, 0, 0, 0],
+                            }
+                        ],
+                    }
+                )
+            )
+            actions, _ = generate.load_actions(str(path), 3)
+        provider = actions[0]["latent_renderer_provider"]
+        self.assertEqual(provider["implementation"], generate.LAZY_LATENT_STRUCTURE_PROVIDER_ID)
+        self.assertEqual(provider["provider_id"], "action-specific")
+        self.assertEqual(provider["provider_provenance_id"], "action-specific")
+        self.assertEqual(provider["requested_bases"], ["semantic"])
+
+    def test_native_provider_nested_alias_overrides_shared_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "native_nested_alias.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "required_provider": {
+                            "provenance_id": "shared-default",
+                            "scheduler_mapping": "euler_clean_endpoint",
+                            "basis_normalization": "match_rms",
+                        },
+                        "actions": [
+                            {
+                                "id": "spectral",
+                                "type": "latent_renderer_fixed",
+                                "provider": {
+                                    "provider_provenance_id": "nested-specific",
+                                    "requested_bases": ["spectral_low"],
+                                    "required_hook_names": [],
+                                },
+                                "coefficients": [0.0, 0.01, 0, 0, 0, 0],
+                            }
+                        ],
+                    }
+                )
+            )
+            actions, _ = generate.load_actions(str(path), 3)
+        provider = actions[0]["latent_renderer_provider"]
+        self.assertEqual(provider["provider_id"], "nested-specific")
+        self.assertEqual(provider["provider_provenance_id"], "nested-specific")
+
+    def test_native_provider_rejects_null_or_conflicting_provenance(self):
+        cases = (
+            {
+                "provider_provenance_id": None,
+            },
+            {
+                "provider": {
+                    "provider_id": "nested-a",
+                    "provider_provenance_id": "nested-b",
+                },
+            },
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as temp_dir:
+                path = pathlib.Path(temp_dir) / "invalid_provider.yaml"
+                action = {
+                    "id": "invalid",
+                    "type": "latent_renderer_fixed",
+                    "coefficients": [0.01, 0, 0, 0, 0, 0],
+                }
+                action.update(overrides)
+                path.write_text(
+                    yaml.safe_dump(
+                        {
+                            "required_provider": {
+                                "scheduler_mapping": "euler_clean_endpoint",
+                                "basis_normalization": "match_rms",
+                            },
+                            "actions": [action],
+                        }
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    generate.load_actions(str(path), 3)
+
+    def test_native_provider_rejects_structural_subset_before_runtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "structural_subset.yaml"
+            path.write_text(
+                yaml.safe_dump(
+                    {
+                        "required_provider": {
+                            "implementation": "StructuralUNetBasisProvider",
+                            "scheduler_mapping": "euler_clean_endpoint",
+                            "basis_normalization": "match_rms",
+                        },
+                        "actions": [
+                            {
+                                "id": "subset",
+                                "type": "latent_renderer_fixed",
+                                "requested_bases": ["spectral_low"],
+                                "required_hook_names": [],
+                                "coefficients": [0.0, 0.01, 0, 0, 0, 0],
+                            }
+                        ],
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "structural_unet_basis_v1"):
+                generate.load_actions(str(path), 3)
+
+    def test_renderer_config_rejects_unknown_mapping_and_normalization(self):
+        for field, value, message in (
+            ("scheduler_mapping", "dpm_post_step", "scheduler_mapping"),
+            ("basis_normalization", "unit", "basis_normalization"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp_dir:
+                path = pathlib.Path(temp_dir) / "invalid.yaml"
+                path.write_text(
+                    yaml.safe_dump(
+                        {
+                            "latent_renderer_provider": {field: value},
+                            "actions": [
+                                {
+                                    "id": "invalid",
+                                    "type": "latent_renderer_fixed",
+                                    "coefficients": [0.01, 0, 0, 0, 0, 0],
+                                }
+                            ],
+                        }
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    generate.load_actions(str(path), 3)
+
+    def test_native_renderer_sidecar_contract_is_json_safe_and_complete(self):
+        ledger = self._native_renderer_ledger(steps=50)
+        last_diagnostics = {
+            key: copy.deepcopy(value)
+            for key, value in ledger[-1].items()
+            if key
+            not in {
+                "step_index",
+                "scheduler_step_index",
+                "timestep",
+                "sigma_from",
+                "sigma_to",
+                "prediction_type",
+                "provider_diagnostics",
+            }
+        }
+        pipe = mock.Mock()
+        pipe._last_latent_renderer_scheduler_mapping = "euler_clean_endpoint"
+        pipe._last_latent_renderer_diagnostics = last_diagnostics
+        pipe._last_latent_renderer_provider_diagnostics = copy.deepcopy(
+            ledger[-1]["provider_diagnostics"]
+        )
+        pipe._last_latent_renderer_step_diagnostics = ledger
+        action = {
+            "type": "latent_renderer_fixed",
+            "max_update_ratio": 0.05,
+            "latent_renderer_provider": {
+                "scheduler_mapping": "euler_clean_endpoint"
+            },
+        }
+        fields = generate.latent_renderer_sidecar_fields(
+            action, pipe, [1] * 50, 50
+        )
+        self.assertEqual(fields["latent_renderer_scheduler_mapping"], "euler_clean_endpoint")
+        self.assertEqual(len(fields["latent_renderer_step_diagnostics"]), 50)
+        json.dumps(fields, allow_nan=False)
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one U-Net call"):
+            generate.latent_renderer_sidecar_fields(
+                action, pipe, [1] * 49 + [2], 50
+            )
+        invalid_ledger = copy.deepcopy(ledger)
+        invalid_ledger[0]["applied_update_ratio"] = [0.051]
+        pipe._last_latent_renderer_step_diagnostics = invalid_ledger
+        with self.assertRaisesRegex(RuntimeError, "applied trust bound"):
+            generate.latent_renderer_sidecar_fields(
+                action, pipe, [1] * 50, 50
+            )
+        pipe._last_latent_renderer_step_diagnostics = ledger
+        stale_pipe = mock.Mock()
+        stale_pipe._last_latent_renderer_diagnostics = None
+        stale_pipe._last_latent_renderer_provider_diagnostics = None
+        stale_pipe._last_latent_renderer_scheduler_mapping = None
+        stale_pipe._last_latent_renderer_step_diagnostics = [{}]
+        with self.assertRaisesRegex(RuntimeError, "stale renderer diagnostics"):
+            generate.latent_renderer_sidecar_fields(
+                {"type": "none"}, stale_pipe, [1, 1, 1], 3
+            )
 
     def test_latent_renderer_split_seeds_are_enforced(self):
         path = ROOT / "eval-pipeline/configs/latent_renderer_fixed_lr1.yaml"

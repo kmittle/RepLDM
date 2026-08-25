@@ -5,9 +5,10 @@ under scorers/, each decoupled from Sana), and writes scores.jsonl. Each metric 
 declared in a yaml config (configs/eval_common.yaml). Weights are validated up front
 so a missing metric is SKIPPED with a warning instead of crashing the run.
 
-Resume is ADDITIVE: a row is recomputed only if it lacks an enabled metric's columns,
-and existing columns are preserved — so you can add CLIP/HPSv2/aesthetic to an already-
-scored run without redoing ImageReward. Output is rewritten atomically every 50 images.
+Resume is additive when enabled metrics and their execution provenance still match.
+Strict runs bind source, package/runtime, model asset, and preprocessing metadata;
+any drift invalidates the row before old columns can be reused. Output is rewritten
+atomically every 50 images.
 
   /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/score.py \
       --run_dir outputs/exp_spectral_headroom/pilot --device cuda:0 --strict
@@ -27,7 +28,14 @@ sys.path.insert(0, THIS)
 
 import yaml  # noqa: E402
 import scorers  # noqa: E402,F401  (import registers all metrics)
+import scorers.base as scorer_base  # noqa: E402
 from scorers.base import REGISTRY  # noqa: E402
+from scorer_provenance import (  # noqa: E402
+    SCORER_PROVENANCE_SCHEMA,
+    build_scorer_provenance,
+    registered_scorer_provenance_contract,
+    validate_hardened_score_rows,
+)
 from s7_provenance import (  # noqa: E402
     PROVENANCE_SCHEMA,
     image_sha256,
@@ -94,6 +102,33 @@ def finite_numeric(value):
         and isinstance(value, (int, float))
         and math.isfinite(float(value))
     )
+
+
+def required_scorer_provenance_schema(cfg, run_config, cli_required=False):
+    """Resolve an optional fail-closed provenance requirement."""
+    requested = []
+    provenance_config = cfg.get("scorer_provenance")
+    if provenance_config is not None:
+        if not isinstance(provenance_config, dict) or set(provenance_config) != {
+            "required_schema"
+        }:
+            raise RuntimeError(
+                "scorer_provenance config must contain only required_schema"
+            )
+        requested.append(provenance_config.get("required_schema"))
+    run_requirement = run_config.get("required_scorer_provenance_schema")
+    if run_requirement is not None:
+        requested.append(run_requirement)
+    if cli_required:
+        requested.append(SCORER_PROVENANCE_SCHEMA)
+    if not requested:
+        return None
+    if any(value != SCORER_PROVENANCE_SCHEMA for value in requested):
+        raise RuntimeError(
+            f"unsupported scorer provenance requirement; expected "
+            f"{SCORER_PROVENANCE_SCHEMA!r}"
+        )
+    return SCORER_PROVENANCE_SCHEMA
 
 
 @contextmanager
@@ -208,7 +243,14 @@ def main():
         "--strict", action="store_true",
         help="fail if any requested scorer cannot load or score an image",
     )
+    ap.add_argument(
+        "--require-scorer-provenance",
+        action="store_true",
+        help="require the hardened scorer provenance schema (implies --strict)",
+    )
     args = ap.parse_args()
+    if args.require_scorer_provenance:
+        args.strict = True
 
     with scoring_output_lock(args.run_dir):
         return _score_run(args, ap)
@@ -237,12 +279,20 @@ def _score_run(args, ap):
     if os.path.isfile(run_config_path):
         with open(run_config_path) as handle:
             run_config = json.load(handle)
+    required_provenance_schema = required_scorer_provenance_schema(
+        cfg,
+        run_config,
+        getattr(args, "require_scorer_provenance", False),
+    )
+    if required_provenance_schema is not None and not args.strict:
+        raise RuntimeError("hardened scorer provenance requires --strict")
     s7_run = any(
         run_config.get(flag) is True
         for flag in (
             "trajectory_registered",
             "scheduler_baseline_registered",
             "cfg_baseline_registered",
+            "native_renderer_registered",
         )
     ) or any(
         row.get("provenance_schema") == PROVENANCE_SCHEMA for row in manifest
@@ -310,6 +360,53 @@ def _score_run(args, ap):
         print("no active scorers; nothing to do", flush=True)
         return
 
+    scorer_provenance = None
+    scorer_provenance_sha256 = None
+    if args.strict:
+        scorer_provenance, scorer_provenance_sha256 = build_scorer_provenance(
+            active,
+            params=params,
+            device=device,
+            runner_path=__file__,
+            base_path=scorer_base.__file__,
+            source_root=THIS,
+        )
+    registered_scorer_contract = None
+    registered_scorer_hash = None
+    for registration in (cfg, run_config):
+        candidate_contract, candidate_hash = registered_scorer_provenance_contract(
+            registration
+        )
+        if candidate_contract is not None:
+            if (
+                registered_scorer_contract is not None
+                and candidate_contract != registered_scorer_contract
+            ):
+                raise RuntimeError("registered scorer provenance contracts disagree")
+            registered_scorer_contract = candidate_contract
+        if candidate_hash is not None:
+            if (
+                registered_scorer_hash is not None
+                and candidate_hash != registered_scorer_hash
+            ):
+                raise RuntimeError("registered scorer provenance hashes disagree")
+            registered_scorer_hash = candidate_hash
+    if registered_scorer_hash is not None:
+        if scorer_provenance is None:
+            raise RuntimeError(
+                "a registered scorer provenance contract requires --strict"
+            )
+        if scorer_provenance_sha256 != registered_scorer_hash:
+            raise RuntimeError(
+                "loaded scorer provenance differs from the registered contract"
+            )
+        if registered_scorer_contract is not None and (
+            scorer_provenance != registered_scorer_contract
+        ):
+            raise RuntimeError(
+                "loaded scorer provenance differs from the registered payload"
+            )
+
     output_keys = [key for _, scorer in active for key, _ in scorer.OUTPUT_KEYS]
     if len(output_keys) != len(set(output_keys)):
         raise RuntimeError("active scorers declare duplicate output keys")
@@ -320,28 +417,34 @@ def _score_run(args, ap):
         )
 
     def score_provenance_is_current(row, score):
-        if not s7_run:
-            return True
-        if (
-            score.get("image_sha256") != row.get("image_sha256")
-            or score.get("run_contract_sha256") != row.get("run_contract_sha256")
-        ):
-            return False
-        if registered_scoring is not None:
-            return (
+        if s7_run:
+            if (
+                score.get("image_sha256") != row.get("image_sha256")
+                or score.get("run_contract_sha256")
+                != row.get("run_contract_sha256")
+            ):
+                return False
+            if registered_scoring is not None and not (
                 score.get("scoring_contract") == registered_scoring
                 and score.get("scoring_contract_sha256")
                 == registered_scoring_sha256
+            ):
+                return False
+        if scorer_provenance is not None:
+            return (
+                score.get("scorer_provenance") == scorer_provenance
+                and score.get("scorer_provenance_sha256")
+                == scorer_provenance_sha256
             )
         return True
 
     def score_is_current(row):
         if row["id"] not in existing or not need_keys.issubset(existing[row["id"]].keys()):
             return False
-        if not s7_run:
-            return True
         score = existing[row["id"]]
-        return score_provenance_is_current(row, score) and all(
+        if not score_provenance_is_current(row, score):
+            return False
+        return not (args.strict or s7_run) or all(
             finite_numeric(score.get(key)) for key in need_keys
         )
 
@@ -355,7 +458,7 @@ def _score_run(args, ap):
                     out.write(
                         json.dumps(
                             existing[r["id"]],
-                            allow_nan=registered_scoring is None,
+                            allow_nan=not args.strict and registered_scoring is None,
                         )
                         + "\n"
                     )
@@ -392,10 +495,17 @@ def _score_run(args, ap):
                         "scoring_contract_sha256": registered_scoring_sha256,
                     }
                 )
+        if scorer_provenance is not None:
+            rec.update(
+                {
+                    "scorer_provenance": scorer_provenance,
+                    "scorer_provenance_sha256": scorer_provenance_sha256,
+                }
+            )
         for name, sc in active:
             scorer_keys = {key for key, _ in sc.OUTPUT_KEYS}
             if scorer_keys.issubset(rec) and (
-                not s7_run
+                not (args.strict or s7_run)
                 or all(finite_numeric(rec.get(key)) for key in scorer_keys)
             ):
                 continue
@@ -409,10 +519,10 @@ def _score_run(args, ap):
                     raise ValueError(
                         f"{name} returned fields outside its registered output contract"
                     )
-                if s7_run and any(
+                if (args.strict or s7_run) and any(
                     not finite_numeric(scored.get(key)) for key in scorer_keys
                 ):
-                    raise ValueError(f"{name} returned non-finite registered scores")
+                    raise ValueError(f"{name} returned non-finite strict scores")
                 rec.update(scored)
             except Exception as e:
                 print(f"[warn] {name} failed on {r['id']}: {e}", flush=True)
@@ -427,6 +537,14 @@ def _score_run(args, ap):
     flush()
     if s7_run:
         validate_scores_against_manifest(manifest, [existing[row["id"]] for row in manifest])
+    if scorer_provenance is not None:
+        validate_hardened_score_rows(
+            [existing[row["id"]] for row in manifest],
+            required_schema=required_provenance_schema
+            or SCORER_PROVENANCE_SCHEMA,
+            expected_sha256=registered_scorer_hash,
+            expected_contract=registered_scorer_contract,
+        )
     print(f"scores -> {scores_path}", flush=True)
 
 

@@ -62,13 +62,20 @@ if ROOT not in sys.path:
 
 from AttentionGuidance import (
     ConstantGuidanceController,
+    LAZY_LATENT_STRUCTURE_BASIS_NAMES,
+    LAZY_LATENT_STRUCTURE_PROVIDER_ID,
     MOMENT_TANGENT_MODES,
+    LazyLatentStructureBasisProvider,
+    LATENT_STRUCTURE_PROVIDER_IMPLEMENTATION_ALIASES,
     RESIDUAL_MODES,
     SEMANTIC_TRANSPORT_MODES,
     StructuralUNetBasisProvider,
     build_fixed_coefficient_renderer,
     FreeUSchedule,
     TrajectoryCorrectionConfig,
+    latent_structure_required_hook_names,
+    normalize_latent_structure_bases,
+    normalize_latent_structure_provider_implementation,
 )
 from AttentionGuidance.attention_baselines import installed_attention_baseline
 from InferencePipelines import RepLDMSDXLPipeline
@@ -94,6 +101,18 @@ TRAJECTORY_SCHEMAS = {
     "trajectory_correction_validation_v1",
 }
 CFG_BASELINE_SCHEMA = "cfg_baselines_v1"
+LATENT_RENDERER_SCHEDULER_MAPPINGS = {
+    "legacy_unit",
+    "euler_clean_endpoint",
+}
+LATENT_RENDERER_BASIS_NORMALIZATIONS = {
+    "legacy_l2_to_rms",
+    "match_rms",
+}
+# Keep the old module symbol patchable for downstream tests and launchers while
+# selecting the lazy implementation by default.  A monkeypatch of either name
+# can therefore inject a test provider without changing the runtime contract.
+_DEFAULT_STRUCTURAL_PROVIDER_CLASS = StructuralUNetBasisProvider
 CFG_BASELINE_ACTION_SCALES = {
     "cfg_2p5": 2.5,
     "cfg_5p0": 5.0,
@@ -322,6 +341,16 @@ def scale_actions(scales):
     ]
 
 
+def has_scheduler_native_renderer(actions) -> bool:
+    """Return whether a matrix needs the strict native-renderer run contract."""
+    return any(
+        action.get("type") == "latent_renderer_fixed"
+        and action.get("latent_renderer_provider", {}).get("scheduler_mapping")
+        == "euler_clean_endpoint"
+        for action in actions
+    )
+
+
 def group_tasks_by_pair(tasks):
     """Keep every action for a (prompt, seed) pair on one worker/device."""
     groups = {}
@@ -369,6 +398,7 @@ def worker_resume_contract_sha256(cfg: dict) -> str | None:
         cfg.get("trajectory_registered")
         or cfg.get("scheduler_baseline_registered")
         or cfg.get("cfg_baseline_registered")
+        or cfg.get("native_renderer_registered")
     )
     return cfg["run_contract_sha256"] if registered else None
 
@@ -506,7 +536,14 @@ def load_actions(path: str, num_inference_steps: int):
     default_topk = int(config.get("semantic_transport_topk", 16))
     if default_topk <= 0:
         raise ValueError("semantic_transport_topk must be positive")
-    provider_defaults = config.get("latent_renderer_provider", {}) or {}
+    if "latent_renderer_provider" in config:
+        provider_defaults = config.get("latent_renderer_provider")
+        if provider_defaults is None:
+            raise ValueError("latent_renderer_provider cannot be null")
+    else:
+        provider_defaults = config.get("required_provider", {})
+    if provider_defaults is None:
+        raise ValueError("required_provider cannot be null")
     if not isinstance(provider_defaults, dict):
         raise ValueError("latent_renderer_provider must be a mapping")
     normalized = []
@@ -604,9 +641,12 @@ def load_actions(path: str, num_inference_steps: int):
             action["scale"] = 0.0
         elif action_type == "latent_renderer_fixed":
             coefficients = [float(value) for value in action.get("coefficients", [])]
-            if len(coefficients) != 6 or not all(math.isfinite(value) for value in coefficients):
+            if len(coefficients) != len(LAZY_LATENT_STRUCTURE_BASIS_NAMES) or not all(
+                math.isfinite(value) for value in coefficients
+            ):
                 raise ValueError(
-                    f"{action_id}: latent_renderer_fixed requires six finite coefficients"
+                    f"{action_id}: latent_renderer_fixed requires six finite coefficients "
+                    "in canonical basis order"
                 )
             coefficient_bound = float(
                 action.get("coefficient_bound", provider_defaults.get("coefficient_bound", 1.0))
@@ -618,7 +658,65 @@ def load_actions(path: str, num_inference_steps: int):
                     f"{action_id}: coefficients must be strictly inside coefficient_bound"
                 )
             provider = dict(provider_defaults)
-            provider.update(action.get("provider", {}) or {})
+            raw_provider_overrides = action.get("provider")
+            if raw_provider_overrides is None and "provider" in action:
+                raise ValueError(f"{action_id}: provider cannot be null")
+            provider_overrides = raw_provider_overrides or {}
+            if not isinstance(provider_overrides, dict):
+                raise ValueError(f"{action_id}: provider must be a mapping")
+            for mapping, label in (
+                (provider_defaults, "defaults"),
+                (provider_overrides, "provider"),
+                (action, "action"),
+            ):
+                for key in (
+                    "implementation",
+                    "provider_id",
+                    "provider_provenance_id",
+                    "provenance_id",
+                    "requested_bases",
+                    "required_hook_names",
+                    "scheduler_mapping",
+                    "basis_normalization",
+                ):
+                    if key in mapping and mapping[key] is None:
+                        raise ValueError(f"{action_id}: {label}.{key} cannot be null")
+
+            def _provider_ids(mapping, label):
+                if not isinstance(mapping, dict):
+                    return []
+                values = []
+                for key in ("provider_id", "provider_provenance_id", "provenance_id"):
+                    if key not in mapping:
+                        continue
+                    value = mapping[key]
+                    if value is None or not str(value):
+                        raise ValueError(
+                            f"{action_id}: {label}.{key} must be a non-empty string"
+                        )
+                    values.append(str(value))
+                if values and any(value != values[0] for value in values[1:]):
+                    raise ValueError(
+                        f"{action_id}: {label} provider provenance id fields disagree"
+                    )
+                return values
+
+            default_provider_id_candidates = _provider_ids(provider_defaults, "defaults")
+            nested_provider_id_candidates = _provider_ids(provider_overrides, "provider")
+            action_provider_id_candidates = _provider_ids(action, "action")
+            provider.update(provider_overrides)
+            for key in (
+                "implementation",
+                "provider_id",
+                "provider_provenance_id",
+                "provenance_id",
+                "requested_bases",
+                "required_hook_names",
+                "scheduler_mapping",
+                "basis_normalization",
+            ):
+                if key in action:
+                    provider[key] = action[key]
             semantic_mode = str(provider.get("semantic_mode", "reciprocal_semantic"))
             if semantic_mode not in {
                 "clean_tfsa",
@@ -641,6 +739,106 @@ def load_actions(path: str, num_inference_steps: int):
                 "semantic_layer",
                 "up_blocks.0.attentions.0.transformer_blocks.0.attn1",
             )
+            semantic_layer = None if semantic_layer is None else str(semantic_layer)
+            # Basis and hook requests are accepted at action level for compact
+            # grids, with the provider mapping retained as a shared default.
+            requested_bases_raw = action.get(
+                "requested_bases", provider.get("requested_bases")
+            )
+            try:
+                requested_bases = normalize_latent_structure_bases(
+                    requested_bases_raw
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{action_id}: invalid requested_bases: {exc}"
+                ) from exc
+            expected_hook_names = latent_structure_required_hook_names(
+                requested_bases,
+                semantic_layer=semantic_layer,
+                feature_block=feature_block,
+            )
+            raw_hook_names = action.get(
+                "required_hook_names", provider.get("required_hook_names")
+            )
+            if raw_hook_names is None:
+                required_hook_names = expected_hook_names
+            else:
+                if isinstance(raw_hook_names, str) or not isinstance(
+                    raw_hook_names, (list, tuple)
+                ):
+                    raise ValueError(
+                        f"{action_id}: required_hook_names must be a list"
+                    )
+                required_hook_names = tuple(str(value) for value in raw_hook_names)
+                if required_hook_names != expected_hook_names:
+                    raise ValueError(
+                        f"{action_id}: required_hook_names do not match requested_bases"
+                    )
+            implementation = str(
+                action.get(
+                    "implementation",
+                    provider.get("implementation", LAZY_LATENT_STRUCTURE_PROVIDER_ID),
+                )
+            )
+            implementation = normalize_latent_structure_provider_implementation(
+                implementation
+            )
+            if implementation not in {
+                LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+                "structural_unet_basis_v1",
+            }:
+                raise ValueError(f"{action_id}: unsupported provider implementation")
+            if (
+                implementation == "structural_unet_basis_v1"
+                and tuple(requested_bases) != tuple(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+            ):
+                raise ValueError(
+                    f"{action_id}: structural_unet_basis_v1 requires all six canonical "
+                    "bases; use the lazy provider for requested subsets"
+                )
+            default_provider_id = (
+                LAZY_LATENT_STRUCTURE_PROVIDER_ID
+                if implementation == LAZY_LATENT_STRUCTURE_PROVIDER_ID
+                else "structural_unet_basis_v1"
+            )
+            provider_id_candidates = (
+                action_provider_id_candidates
+                if action_provider_id_candidates
+                else nested_provider_id_candidates
+                if nested_provider_id_candidates
+                else default_provider_id_candidates
+            )
+            if any(not value for value in provider_id_candidates):
+                raise ValueError(
+                    f"{action_id}: provider provenance id must be non-empty"
+                )
+            if provider_id_candidates and any(
+                value != provider_id_candidates[0]
+                for value in provider_id_candidates[1:]
+            ):
+                raise ValueError(f"{action_id}: provider provenance id fields disagree")
+            provider_id = (
+                provider_id_candidates[0]
+                if provider_id_candidates
+                else default_provider_id
+            )
+            scheduler_mapping = str(
+                provider.get("scheduler_mapping", "legacy_unit")
+            )
+            if scheduler_mapping not in LATENT_RENDERER_SCHEDULER_MAPPINGS:
+                raise ValueError(
+                    f"{action_id}: scheduler_mapping must be legacy_unit or "
+                    "euler_clean_endpoint"
+                )
+            basis_normalization = str(
+                provider.get("basis_normalization", "legacy_l2_to_rms")
+            )
+            if basis_normalization not in LATENT_RENDERER_BASIS_NORMALIZATIONS:
+                raise ValueError(
+                    f"{action_id}: basis_normalization must be legacy_l2_to_rms "
+                    "or match_rms"
+                )
             action["coefficients"] = coefficients
             action["coefficient_bound"] = coefficient_bound
             action["max_update_ratio"] = float(
@@ -653,12 +851,19 @@ def load_actions(path: str, num_inference_steps: int):
                 raise ValueError(f"{action_id}: max_update_ratio must be non-negative")
             action["latent_renderer_provider"] = {
                 "feature_block": feature_block,
-                "semantic_layer": None if semantic_layer is None else str(semantic_layer),
+                "semantic_layer": semantic_layer,
                 "semantic_mode": semantic_mode,
                 "semantic_topk": semantic_topk,
                 "permutation_seed": int(provider.get("permutation_seed", 1729)),
                 "prompt_dim": prompt_dim,
                 "state_dim": state_dim,
+                "provider_id": provider_id,
+                "provider_provenance_id": provider_id,
+                "implementation": implementation,
+                "requested_bases": list(requested_bases),
+                "required_hook_names": list(required_hook_names),
+                "scheduler_mapping": scheduler_mapping,
+                "basis_normalization": basis_normalization,
             }
             action["scale"] = 0.0
         elif action_type == "freeu":
@@ -1792,25 +1997,421 @@ def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: flo
         coefficient_bound=action["coefficient_bound"],
         max_update_ratio=action["max_update_ratio"],
         preserve_moments=True,
+        basis_normalization=action["latent_renderer_provider"][
+            "basis_normalization"
+        ],
     ).to(device)
     provider_config = action["latent_renderer_provider"]
-    provider = StructuralUNetBasisProvider(
-        pipe.unet,
-        batch_size=1,
-        do_classifier_free_guidance=float(
-            action.get("cfg_scale", guidance_scale)
-        ) > 1.0,
-        latent_channels=4,
-        semantic_mode=provider_config["semantic_mode"],
-        semantic_topk=provider_config["semantic_topk"],
-        semantic_layer=provider_config["semantic_layer"],
-        feature_block=provider_config["feature_block"],
-        permutation_seed=provider_config["permutation_seed"],
-        prompt_dim=provider_config["prompt_dim"],
-        state_dim=provider_config["state_dim"],
+    implementation = normalize_latent_structure_provider_implementation(
+        provider_config.get("implementation", LAZY_LATENT_STRUCTURE_PROVIDER_ID)
     )
+    common_kwargs = {
+        "batch_size": 1,
+        "do_classifier_free_guidance": float(
+            action.get("cfg_scale", guidance_scale)
+        )
+        > 1.0,
+        "latent_channels": 4,
+        "semantic_mode": provider_config["semantic_mode"],
+        "semantic_topk": provider_config["semantic_topk"],
+        "semantic_layer": provider_config["semantic_layer"],
+        "feature_block": provider_config["feature_block"],
+        "permutation_seed": provider_config["permutation_seed"],
+        "prompt_dim": provider_config["prompt_dim"],
+        "state_dim": provider_config["state_dim"],
+    }
+    if implementation == LAZY_LATENT_STRUCTURE_PROVIDER_ID:
+        # ``StructuralUNetBasisProvider`` remains a patchable compatibility
+        # symbol for older launchers/tests.  The registered implementation is
+        # lazy unless that symbol has explicitly been replaced.
+        provider_class = LazyLatentStructureBasisProvider
+        if StructuralUNetBasisProvider is not _DEFAULT_STRUCTURAL_PROVIDER_CLASS:
+            provider_class = StructuralUNetBasisProvider
+        provider = provider_class(
+            pipe.unet,
+            **common_kwargs,
+            requested_bases=provider_config["requested_bases"],
+            required_hook_names=provider_config["required_hook_names"],
+            scheduler_mapping=provider_config["scheduler_mapping"],
+            basis_normalization=provider_config["basis_normalization"],
+            provider_id=provider_config["provider_id"],
+            provider_provenance_id=provider_config.get(
+                "provider_provenance_id", provider_config["provider_id"]
+            ),
+        )
+    elif implementation == "structural_unet_basis_v1":
+        provider = StructuralUNetBasisProvider(
+            pipe.unet,
+            **common_kwargs,
+            requested_bases=provider_config["requested_bases"],
+            required_hook_names=provider_config["required_hook_names"],
+            scheduler_mapping=provider_config["scheduler_mapping"],
+            basis_normalization=provider_config["basis_normalization"],
+            provider_id=provider_config["provider_id"],
+            provider_provenance_id=provider_config.get(
+                "provider_provenance_id", provider_config["provider_id"]
+            ),
+        )
+    else:
+        raise ValueError(f"unsupported latent renderer provider implementation {implementation!r}")
     renderer.eval()
     return renderer, provider
+
+
+def latent_renderer_pipeline_kwargs(action: dict, renderer, provider) -> dict:
+    """Return the complete renderer kwargs passed to one pipeline invocation."""
+    if action["type"] != "latent_renderer_fixed":
+        if renderer is not None or provider is not None:
+            raise ValueError("non-renderer action received latent renderer runtime objects")
+        return {
+            "latent_renderer": None,
+            "latent_renderer_basis_provider": None,
+            "latent_renderer_scheduler_mapping": "legacy_unit",
+        }
+    if renderer is None or provider is None:
+        raise ValueError("latent renderer action is missing runtime objects")
+    provider_config = action.get("latent_renderer_provider")
+    if not isinstance(provider_config, dict):
+        raise ValueError("latent renderer action lacks normalized provider config")
+    mapping = str(provider_config.get("scheduler_mapping", ""))
+    if mapping not in LATENT_RENDERER_SCHEDULER_MAPPINGS:
+        raise ValueError("latent renderer action has invalid scheduler_mapping")
+    return {
+        "latent_renderer": renderer,
+        "latent_renderer_basis_provider": provider,
+        "latent_renderer_scheduler_mapping": mapping,
+    }
+
+
+def validate_latent_renderer_scheduler(action: dict, scheduler) -> str | None:
+    """Fail before sampling when a native renderer has the wrong scheduler."""
+    if action["type"] != "latent_renderer_fixed":
+        return None
+    provider_config = action.get("latent_renderer_provider")
+    if not isinstance(provider_config, dict):
+        raise RuntimeError("latent renderer action lacks normalized provider config")
+    mapping = str(provider_config.get("scheduler_mapping", ""))
+    if mapping not in LATENT_RENDERER_SCHEDULER_MAPPINGS:
+        raise RuntimeError("latent renderer scheduler mapping is not registered")
+    if (
+        mapping == "euler_clean_endpoint"
+        and type(scheduler).__name__ != "EulerDiscreteScheduler"
+    ):
+        raise RuntimeError(
+            "euler_clean_endpoint requires exactly EulerDiscreteScheduler"
+        )
+    return mapping
+
+
+def _json_safe_record(value, *, label: str) -> dict:
+    if value is None:
+        raise RuntimeError(f"{label} are missing")
+    if hasattr(value, "to_record"):
+        value = value.to_record()
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} must be a mapping")
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} are not JSON-safe") from exc
+
+
+def _finite_diagnostic_values(record: dict, key: str, *, step_index: int) -> list[float]:
+    values = record.get(key)
+    if not isinstance(values, list) or len(values) != 1:
+        raise RuntimeError(
+            f"native renderer step {step_index} field {key!r} must contain "
+            "one batch value"
+        )
+    converted = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in converted):
+        raise RuntimeError(
+            f"native renderer step {step_index} field {key!r} is non-finite"
+        )
+    return converted
+
+
+def _validate_provider_diagnostics_contract(
+    provider_diagnostics: dict,
+    provider_contract: dict,
+    *,
+    step_index: int,
+) -> None:
+    """Require the complete normalized provider contract at every step."""
+    expected_provider_fields = {
+        "implementation": provider_contract.get(
+            "implementation", LAZY_LATENT_STRUCTURE_PROVIDER_ID
+        ),
+        "provider_id": provider_contract.get("provider_id"),
+        "provider_provenance_id": provider_contract.get(
+            "provider_provenance_id", provider_contract.get("provider_id")
+        ),
+        "requested_bases": provider_contract.get("requested_bases"),
+        "constructed_bases": provider_contract.get("requested_bases"),
+        "registered_hook_names": provider_contract.get("required_hook_names", []),
+        "required_hook_names": provider_contract.get("required_hook_names", []),
+        "scheduler_mapping": provider_contract.get("scheduler_mapping"),
+        "basis_normalization": provider_contract.get("basis_normalization"),
+    }
+    for key, expected in expected_provider_fields.items():
+        if expected is None:
+            continue
+        observed = provider_diagnostics.get(key)
+        if observed != expected:
+            raise RuntimeError(
+                f"scheduler-native renderer step {step_index} provider field {key!r} drifted"
+            )
+    basis_rms = provider_diagnostics.get("basis_rms")
+    if (
+        not isinstance(basis_rms, list)
+        or len(basis_rms) != 1
+        or not isinstance(basis_rms[0], list)
+        or len(basis_rms[0]) != len(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+    ):
+        raise RuntimeError(
+            f"scheduler-native renderer step {step_index} basis_rms must have shape (1, 6)"
+        )
+    values = [float(value) for value in basis_rms[0]]
+    if not all(math.isfinite(value) and value >= 0 for value in values):
+        raise RuntimeError(
+            f"scheduler-native renderer step {step_index} basis_rms is invalid"
+        )
+    requested = set(provider_contract.get("requested_bases") or [])
+    for index, name in enumerate(LAZY_LATENT_STRUCTURE_BASIS_NAMES):
+        if name not in requested and values[index] != 0.0:
+            raise RuntimeError(
+                f"scheduler-native renderer step {step_index} unrequested basis {name!r} is non-zero"
+            )
+
+
+def validate_native_renderer_step_diagnostics(
+    records,
+    num_inference_steps: int,
+    *,
+    max_update_ratio: float,
+    schedule_provenance: dict | None = None,
+    provider_contract: dict | None = None,
+) -> list[dict]:
+    """Validate the complete scheduler-native per-step renderer ledger."""
+    expected_steps = int(num_inference_steps)
+    if not isinstance(records, list) or len(records) != expected_steps:
+        raise RuntimeError(
+            "scheduler-native renderer diagnostics must contain exactly one "
+            "record per denoising step"
+        )
+    try:
+        normalized = json.loads(json.dumps(records, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "scheduler-native renderer diagnostics are not JSON-safe"
+        ) from exc
+    if schedule_provenance is not None:
+        expected_timesteps = schedule_provenance.get("scheduler_timesteps")
+        expected_sigmas = schedule_provenance.get("scheduler_sigmas")
+        expected_hash = schedule_provenance.get("scheduler_schedule_sha256")
+        payload = {
+            "timesteps": expected_timesteps,
+            "sigmas": expected_sigmas,
+        }
+        if (
+            not isinstance(expected_timesteps, list)
+            or not isinstance(expected_sigmas, list)
+            or len(expected_timesteps) != expected_steps
+            or len(expected_sigmas) != expected_steps + 1
+            or expected_hash != json_sha256(payload)
+        ):
+            raise RuntimeError("registered native scheduler schedule provenance is invalid")
+        for schedule_index, schedule_record in enumerate(normalized):
+            if not math.isclose(
+                float(schedule_record["timestep"]),
+                float(expected_timesteps[schedule_index]),
+                rel_tol=1e-6,
+                abs_tol=1e-5,
+            ) or not math.isclose(
+                float(schedule_record["sigma_from"]),
+                float(expected_sigmas[schedule_index]),
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ) or not math.isclose(
+                float(schedule_record["sigma_to"]),
+                float(expected_sigmas[schedule_index + 1]),
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ):
+                raise RuntimeError(
+                    f"scheduler-native renderer step {schedule_index} differs from the registered schedule"
+                )
+    for expected_index, record in enumerate(normalized):
+        if not isinstance(record, dict):
+            raise RuntimeError("scheduler-native renderer step record must be a mapping")
+        if record.get("step_index") != expected_index:
+            raise RuntimeError("scheduler-native renderer step indices are incomplete")
+        if record.get("scheduler_step_index") != expected_index:
+            raise RuntimeError("scheduler-native scheduler step indices drifted")
+        try:
+            timestep = float(record["timestep"])
+            sigma_from = float(record["sigma_from"])
+            sigma_to = float(record["sigma_to"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} lacks sigma provenance"
+            ) from exc
+        if not all(math.isfinite(value) for value in (timestep, sigma_from, sigma_to)):
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} has non-finite provenance"
+            )
+        if sigma_from <= 0 or sigma_to < 0 or sigma_to > sigma_from:
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} has invalid sigma order"
+            )
+        if record.get("prediction_type") not in {
+            "epsilon",
+            "sample",
+            "v_prediction",
+        }:
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} has invalid prediction type"
+            )
+        gain = _finite_diagnostic_values(
+            record, "clean_update_gain", step_index=expected_index
+        )
+        applied_ratio = _finite_diagnostic_values(
+            record, "applied_update_ratio", step_index=expected_index
+        )
+        mean_error = _finite_diagnostic_values(
+            record, "mean_error", step_index=expected_index
+        )
+        variance_error = _finite_diagnostic_values(
+            record, "variance_error", step_index=expected_index
+        )
+        expected_gain = 1.0 - sigma_to / sigma_from
+        if not 0 < gain[0] <= 1 or not math.isclose(
+            gain[0], expected_gain, rel_tol=1e-6, abs_tol=1e-7
+        ):
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} has invalid clean gain"
+            )
+        if applied_ratio[0] < 0 or applied_ratio[0] > max_update_ratio + 1e-6:
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} violates the applied trust bound"
+            )
+        if abs(mean_error[0]) > 1e-4:
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} violates mean preservation"
+            )
+        if abs(variance_error[0]) > 1e-3:
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} violates variance preservation"
+            )
+        provider_diagnostics = record.get("provider_diagnostics")
+        if not isinstance(provider_diagnostics, dict):
+            raise RuntimeError(
+                f"scheduler-native renderer step {expected_index} lacks provider diagnostics"
+            )
+        if provider_contract is not None:
+            _validate_provider_diagnostics_contract(
+                provider_diagnostics,
+                provider_contract,
+                step_index=expected_index,
+            )
+    return normalized
+
+
+def latent_renderer_sidecar_fields(
+    action: dict,
+    pipe,
+    observed_unet_calls: list[int],
+    num_inference_steps: int,
+    *,
+    schedule_provenance: dict | None = None,
+) -> dict:
+    """Build and validate renderer-specific sidecar provenance."""
+    if action["type"] != "latent_renderer_fixed":
+        if any(
+            getattr(pipe, field, None) is not None
+            for field in (
+                "_last_latent_renderer_diagnostics",
+                "_last_latent_renderer_provider_diagnostics",
+                "_last_latent_renderer_scheduler_mapping",
+            )
+        ) or getattr(pipe, "_last_latent_renderer_step_diagnostics", None) not in (
+            None,
+            [],
+        ):
+            raise RuntimeError("non-renderer action retained stale renderer diagnostics")
+        return {
+            "latent_renderer_scheduler_mapping": None,
+            "latent_renderer_diagnostics": None,
+            "latent_renderer_provider_diagnostics": None,
+            "latent_renderer_step_diagnostics": None,
+        }
+
+    expected_mapping = action["latent_renderer_provider"]["scheduler_mapping"]
+    runtime_mapping = getattr(
+        pipe, "_last_latent_renderer_scheduler_mapping", None
+    )
+    if runtime_mapping != expected_mapping:
+        raise RuntimeError("pipeline latent renderer scheduler mapping drifted")
+    diagnostics = _json_safe_record(
+        getattr(pipe, "_last_latent_renderer_diagnostics", None),
+        label="latent renderer diagnostics",
+    )
+    provider_diagnostics = _json_safe_record(
+        getattr(pipe, "_last_latent_renderer_provider_diagnostics", None),
+        label="latent renderer provider diagnostics",
+    )
+    provider_config = action.get("latent_renderer_provider", {})
+    if not isinstance(provider_config, dict):
+        raise RuntimeError("latent renderer action has invalid provider config")
+    # New lazy-provider actions carry an explicit mechanism contract.  Keep
+    # legacy sidecars readable when these fields were not present in their
+    # frozen action, but enforce exact propagation for every normalized action.
+    contract_present = any(
+        key in provider_config
+        for key in (
+            "implementation",
+            "provider_id",
+            "provider_provenance_id",
+            "requested_bases",
+            "required_hook_names",
+        )
+    )
+    provider_contract = provider_config if contract_present else None
+    if provider_contract is not None:
+        _validate_provider_diagnostics_contract(
+            provider_diagnostics,
+            provider_contract,
+            step_index=-1,
+        )
+    step_diagnostics = None
+    if expected_mapping == "euler_clean_endpoint":
+        validate_one_unet_call_per_step(
+            observed_unet_calls,
+            num_inference_steps,
+            run_label="scheduler-native latent renderer",
+        )
+        step_diagnostics = validate_native_renderer_step_diagnostics(
+            getattr(pipe, "_last_latent_renderer_step_diagnostics", None),
+            num_inference_steps,
+            max_update_ratio=float(action["max_update_ratio"]),
+            provider_contract=provider_contract,
+            schedule_provenance=schedule_provenance,
+        )
+        for key, value in diagnostics.items():
+            if step_diagnostics[-1].get(key) != value:
+                raise RuntimeError(
+                    "last-step renderer diagnostics differ from the native ledger"
+                )
+        if step_diagnostics[-1].get("provider_diagnostics") != provider_diagnostics:
+            raise RuntimeError(
+                "last-step provider diagnostics differ from the native ledger"
+            )
+    return {
+        "latent_renderer_scheduler_mapping": runtime_mapping,
+        "latent_renderer_diagnostics": diagnostics,
+        "latent_renderer_provider_diagnostics": provider_diagnostics,
+        "latent_renderer_step_diagnostics": step_diagnostics,
+    }
 
 
 def worker_process(cfg: dict, device: str, task_queue, error_queue):
@@ -1822,12 +2423,14 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
         "cache_dir": cfg["cache_dir"],
         "local_files_only": True,
     }
-    if cfg.get("cfg_baseline_registered"):
+    if cfg.get("cfg_baseline_registered") or cfg.get("native_renderer_registered"):
         model_revision = str(registered_sampling.get("model_revision", ""))
-        if model_revision != CFG_BASELINE_MODEL_REVISION:
+        if cfg.get("cfg_baseline_registered") and model_revision != CFG_BASELINE_MODEL_REVISION:
             raise RuntimeError("CFG-baseline model revision differs from registration")
+        if cfg.get("native_renderer_registered") and not model_revision:
+            raise RuntimeError("scheduler-native run lacks a registered model revision")
         if cfg.get("model_revision") != model_revision:
-            raise RuntimeError("CFG-baseline run config has model revision drift")
+            raise RuntimeError("registered run config has model revision drift")
         load_kwargs["revision"] = model_revision
     pipe = RepLDMSDXLPipeline.from_pretrained(
         cfg["model_name"],
@@ -1886,6 +2489,22 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             cfg.get("scheduler_runtime"),
             config_sha256_v2=base_scheduler_hash_v2,
         )
+    if cfg.get("native_renderer_registered"):
+        expected_scheduler = str(registered_sampling.get("scheduler", ""))
+        if expected_scheduler != "EulerDiscreteScheduler":
+            raise RuntimeError(
+                "scheduler-native registration must name EulerDiscreteScheduler"
+            )
+        if base_scheduler_name != expected_scheduler:
+            raise RuntimeError(
+                "scheduler-native renderer run requires EulerDiscreteScheduler"
+            )
+        if str(cfg.get("model_name")) != str(registered_sampling.get("model", "")):
+            raise RuntimeError("scheduler-native model differs from registration")
+        if int(registered_sampling.get("extra_unet_calls", -1)) != 0:
+            raise RuntimeError("scheduler-native renderer requires zero extra U-Net calls")
+        if float(registered_sampling.get("scheduler_churn", 0.0)) != 0.0:
+            raise RuntimeError("scheduler-native Euler mapping requires zero scheduler churn")
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
@@ -1932,6 +2551,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     latent_runtime_cache[action["id"]] = (latent_renderer, latent_provider)
             else:
                 latent_renderer, latent_provider = None, None
+            renderer_pipeline_kwargs = latent_renderer_pipeline_kwargs(
+                action, latent_renderer, latent_provider
+            )
             if cfg["stage2_enabled"] and clean_config is not None:
                 raise ValueError("clean transport is registered for Stage 1 only")
             cfg_scale = float(action.get("cfg_scale", cfg["guidance_scale"]))
@@ -1959,6 +2581,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             scheduler_isolated = bool(
                 cfg.get("scheduler_baseline_registered")
                 or cfg.get("cfg_baseline_registered")
+                or cfg.get("native_renderer_registered")
             )
             scheduler_runtime = None
             if scheduler_isolated:
@@ -1981,6 +2604,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             active_scheduler_order = int(getattr(active_scheduler, "order", 1))
             active_solver_order = active_scheduler.config.get("solver_order")
             active_init_noise_sigma = float(active_scheduler.init_noise_sigma)
+            validate_latent_renderer_scheduler(action, active_scheduler)
             schedule_provenance = {}
             if scheduler_isolated:
                 schedule_provenance = prepare_scheduler_schedule_provenance(
@@ -2019,11 +2643,10 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         attn_guidance_controller=controller,
                         attn_guidance_band_cutoffs=tuple(cfg["frequency_band_cutoffs"]),
                         semantic_transport_config=clean_config,
-                        latent_renderer=latent_renderer,
-                        latent_renderer_basis_provider=latent_provider,
                         freeu_schedule=freeu_schedule,
                         freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
                         trajectory_correction=trajectory_correction,
+                        **renderer_pipeline_kwargs,
                     )
                 if schedule_provenance:
                     observed_schedule_hash = json_sha256(
@@ -2066,16 +2689,36 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     cfg["num_inference_steps"],
                     run_label="CFG baselines",
                 )
+            if (
+                cfg.get("native_renderer_registered")
+                and action.get("type") == "latent_renderer_fixed"
+                and action.get("latent_renderer_provider", {}).get("scheduler_mapping")
+                == "euler_clean_endpoint"
+            ):
+                validate_one_unet_call_per_step(
+                    observed_unet_calls,
+                    cfg["num_inference_steps"],
+                    run_label="scheduler-native renderer matrix",
+                )
             observed_extra_unet_calls = max(
                 (value - 1 for value in observed_unet_calls), default=0
             )
             diagnostics = getattr(pipe, "_last_guidance_diagnostics", None)
-            renderer_diagnostics = getattr(
-                pipe, "_last_latent_renderer_diagnostics", None
+            renderer_sidecar = latent_renderer_sidecar_fields(
+                action,
+                pipe,
+                observed_unet_calls,
+                cfg["num_inference_steps"],
+                schedule_provenance=schedule_provenance,
             )
-            renderer_provider_diagnostics = getattr(
-                pipe, "_last_latent_renderer_provider_diagnostics", None
-            )
+            if cfg.get("native_renderer_registered"):
+                validate_native_renderer_step_diagnostics(
+                    renderer_sidecar["latent_renderer_step_diagnostics"],
+                    cfg["num_inference_steps"],
+                    max_update_ratio=float(action.get("max_update_ratio", 0.05)),
+                    schedule_provenance=schedule_provenance,
+                    provider_contract=action.get("latent_renderer_provider"),
+                )
             atomic_save_png(images[-1], png_path)
             generated_image_sha256 = image_sha256(png_path)
             scheduler_reference_provenance = scheduler_provenance_record(
@@ -2084,6 +2727,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     scheduler_reference
                     or cfg.get("scheduler_baseline_registered")
                     or cfg.get("cfg_baseline_registered")
+                    or cfg.get("native_renderer_registered")
                 ),
                 base_config_sha256_v2=base_scheduler_hash_v2,
                 active_config_sha256_v2=active_scheduler_hash_v2,
@@ -2138,13 +2782,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "unet_calls_per_step": observed_unet_calls,
                 **cfg["runtime_provenance"],
                 "device": device,
-                "latent_renderer_diagnostics": (
-                    renderer_diagnostics.to_record()
-                    if renderer_diagnostics is not None
-                    and hasattr(renderer_diagnostics, "to_record")
-                    else None
-                ),
-                "latent_renderer_provider_diagnostics": renderer_provider_diagnostics,
+                **renderer_sidecar,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
                 "freeu_preserve_moments": getattr(pipe, "_last_freeu_preserve_moments", False),
                 "trajectory_correction": getattr(
@@ -2287,25 +2925,64 @@ def run_generation_locked(
     trajectory_registered = action_schema in TRAJECTORY_SCHEMAS
     scheduler_baseline_registered = action_schema == "scheduler_baselines_v1"
     cfg_baseline_registered = action_schema == CFG_BASELINE_SCHEMA
+    # The normalized mapping is the capability contract. This keeps a future
+    # native protocol strict even before it receives a dedicated frozen schema.
+    native_renderer_registered = has_scheduler_native_renderer(actions)
+    if native_renderer_registered:
+        sampling_registration = action_config.get("sampling")
+        if not isinstance(sampling_registration, dict):
+            ap.error(
+                "scheduler-native renderer actions require a registered sampling mapping"
+            )
+        for required_key in (
+            "model",
+            "model_revision",
+            "scheduler",
+            "extra_unet_calls",
+            "scheduler_churn",
+        ):
+            if required_key not in sampling_registration:
+                ap.error(
+                    "scheduler-native sampling registration is missing "
+                    f"{required_key!r}"
+                )
     cfg["action_schema"] = action_schema
     cfg["trajectory_registered"] = trajectory_registered
     cfg["scheduler_baseline_registered"] = scheduler_baseline_registered
     cfg["cfg_baseline_registered"] = cfg_baseline_registered
+    cfg["native_renderer_registered"] = native_renderer_registered
+    # A scheduler-native run is not auditable unless its scoring provenance is
+    # registered independently.  The executable scoring config may provide the
+    # expected payload/hash; the frozen registration files intentionally do not.
+    cfg["scorer_provenance_binding_required"] = native_renderer_registered
+    for key in (
+        "registered_scorer_provenance",
+        "expected_scorer_provenance",
+        "registered_scorer_provenance_sha256",
+        "expected_scorer_provenance_sha256",
+        "scorer_provenance_sha256",
+        "scoring",
+        "scoring_contract",
+        "executable_scoring",
+    ):
+        if key in action_config:
+            cfg[key] = action_config[key]
     cfg["registered_sampling"] = (
         dict(action_config.get("sampling") or {})
         if trajectory_registered
         or scheduler_baseline_registered
         or cfg_baseline_registered
+        or native_renderer_registered
         else {}
     )
     cfg["model_revision"] = (
         cfg["registered_sampling"].get("model_revision")
-        if cfg_baseline_registered
+        if cfg_baseline_registered or native_renderer_registered
         else None
     )
     cfg["guidance_rescale"] = (
         float(cfg["registered_sampling"]["guidance_rescale"])
-        if cfg_baseline_registered
+        if cfg_baseline_registered or native_renderer_registered
         else 0.0
     )
     cfg["scheduler_runtime"] = (
@@ -2321,13 +2998,14 @@ def run_generation_locked(
         actions_sha256=cfg["actions_sha256"],
     )
     cfg["run_contract_sha256"] = json_sha256(cfg["run_contract"])
-    # Registered trajectory, scheduler, and CFG runs require strict sidecar/
-    # contract validation on resume. Existing exploratory sweeps predate this
-    # contract and keep their original PNG+JSON completion semantics.
+    # Native renderer and other registered runs require strict sidecar/contract
+    # validation on resume. Existing legacy LR-1 sweeps retain their original
+    # PNG+JSON completion semantics.
     registered_run = (
         trajectory_registered
         or scheduler_baseline_registered
         or cfg_baseline_registered
+        or native_renderer_registered
     )
     resume_contract_sha256 = cfg["run_contract_sha256"] if registered_run else None
 

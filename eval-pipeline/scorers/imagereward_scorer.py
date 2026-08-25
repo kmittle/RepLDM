@@ -13,6 +13,13 @@ import types
 import numpy as np
 from PIL import Image
 
+from scorer_provenance import (
+    checkpoint_file_record,
+    describe_preprocess,
+    git_revision,
+    hf_checkpoint_file_record,
+    loaded_python_source_records,
+)
 from .base import Scorer, register_metric
 
 IMAGEREWARD_SRC = "/mnt/miah204/bycao/ImageReward"
@@ -56,9 +63,20 @@ def _native_crops(img, size=224):
 class ImageRewardScorer(Scorer):
     OUTPUT_KEYS = (("imagereward", "higher"), ("patch_ir_mean", "higher"),
                    ("patch_ir_std", "witness"), ("patch_ir_n", "witness"))
+    PROVENANCE_PACKAGES = (
+        "fairscale",
+        "numpy",
+        "Pillow",
+        "timm",
+        "torch",
+        "torchvision",
+        "transformers",
+    )
 
     def __init__(self, device="cuda", patch_crops=5, no_patch_ir=False, **p):
-        super().__init__(device, **p)
+        super().__init__(
+            device, patch_crops=patch_crops, no_patch_ir=no_patch_ir, **p
+        )
         self.patch_crops = patch_crops
         self.no_patch_ir = no_patch_ir
         _setup_imagereward_imports()
@@ -86,6 +104,69 @@ class ImageRewardScorer(Scorer):
         if not os.path.isdir(IMAGEREWARD_SRC):
             return False, f"ImageReward source checkout is missing: {IMAGEREWARD_SRC}"
         return True, ""
+
+    def provenance_metadata(self):
+        checkpoint = checkpoint_file_record(
+            os.path.join(IR_CACHE, "ImageReward.pt"),
+            role="imagereward_checkpoint",
+            filename="ImageReward.pt",
+            repository_id="THUDM/ImageReward",
+        )
+        med_config = checkpoint_file_record(
+            os.path.join(IR_CACHE, "med_config.json"),
+            role="imagereward_med_config",
+            filename="med_config.json",
+            repository_id="THUDM/ImageReward",
+        )
+        tokenizer_assets = [
+            hf_checkpoint_file_record(
+                "bert-base-uncased", filename, role=f"bert_tokenizer_{role}"
+            )
+            for filename, role in (
+                ("vocab.txt", "vocabulary"),
+                ("tokenizer_config.json", "config"),
+            )
+        ]
+        tokenizer_revision = tokenizer_assets[0]["revision"]
+        return {
+            "models": [
+                {
+                    "identifier": "ImageReward-v1.0",
+                    "repository_id": "THUDM/ImageReward",
+                    "revision": git_revision(IMAGEREWARD_SRC),
+                },
+                {
+                    "identifier": "bert-base-uncased",
+                    "repository_id": "bert-base-uncased",
+                    "revision": tokenizer_revision,
+                },
+            ],
+            "checkpoint_files": [checkpoint, med_config, *tokenizer_assets],
+            "preprocessing": {
+                "global_image_transform": describe_preprocess(
+                    self.model.preprocess
+                ),
+                "text_tokenizer": {
+                    "identifier": "bert-base-uncased",
+                    "padding": "max_length",
+                    "truncation": True,
+                    "max_length": 35,
+                    "added_tokens": ["[DEC]", "[ENC]"],
+                },
+                "patches": {
+                    "size": 224,
+                    "locations": ["center", "top_left", "top_right", "bottom_left", "bottom_right"],
+                    "small_image_resize": "PIL.Image.Resampling.BICUBIC",
+                },
+            },
+            "parameters": {
+                "patch_crops": self.patch_crops,
+                "no_patch_ir": self.no_patch_ir,
+            },
+            "supporting_sources": loaded_python_source_records(
+                IMAGEREWARD_SRC, label="imagereward_loaded_source"
+            ),
+        }
 
     def score_image(self, image, prompt):
         rec = {"imagereward": float(self.model.score(prompt, image))}

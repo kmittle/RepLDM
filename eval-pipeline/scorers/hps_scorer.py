@@ -8,12 +8,24 @@ import os
 
 import torch
 
+from scorer_provenance import (
+    checkpoint_file_record,
+    describe_preprocess,
+    hf_checkpoint_file_record,
+)
 from .base import Scorer, register_metric
 
 
 @register_metric("hps")
 class HPSScorer(Scorer):
     OUTPUT_KEYS = (("hpsv2", "higher"),)
+    PROVENANCE_PACKAGES = (
+        "hpsv2",
+        "huggingface-hub",
+        "Pillow",
+        "torch",
+        "torchvision",
+    )
 
     def __init__(self, device="cuda", **p):
         super().__init__(device, **p)
@@ -22,8 +34,10 @@ class HPSScorer(Scorer):
         self.model, _, self.preprocess = create_model_and_transforms(
             "ViT-H-14", pretrained="laion2B-s32B-b79K", precision="amp",
             device=device, output_dict=True)
-        cp = hf_hub_download("xswu/HPSv2", "HPS_v2.1_compressed.pt")
-        sd = torch.load(cp, map_location="cpu")
+        self.checkpoint_path = hf_hub_download(
+            "xswu/HPSv2", "HPS_v2.1_compressed.pt"
+        )
+        sd = torch.load(self.checkpoint_path, map_location="cpu")
         self.model.load_state_dict(sd["state_dict"])
         self.tokenizer = get_tokenizer("ViT-H-14")
         self.model = self.model.to(device).eval()
@@ -48,6 +62,60 @@ class HPSScorer(Scorer):
             return True, ""
         except Exception as e:
             return False, f"HPS_v2.1 / ViT-H-14 not cached ({e})"
+
+    def provenance_metadata(self):
+        import hpsv2
+
+        hps_checkpoint = checkpoint_file_record(
+            self.checkpoint_path,
+            role="hpsv2_checkpoint",
+            filename="HPS_v2.1_compressed.pt",
+            repository_id="xswu/HPSv2",
+        )
+        backbone = hf_checkpoint_file_record(
+            "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+            "open_clip_pytorch_model.bin",
+            role="open_clip_backbone",
+        )
+        vocab = os.path.join(
+            os.path.dirname(hpsv2.__file__),
+            "src",
+            "open_clip",
+            "bpe_simple_vocab_16e6.txt.gz",
+        )
+        vocabulary = checkpoint_file_record(
+            vocab,
+            role="tokenizer_vocabulary",
+            filename="bpe_simple_vocab_16e6.txt.gz",
+            repository_id="hpsv2",
+        )
+        return {
+            "models": [
+                {
+                    "identifier": "HPSv2-v2.1",
+                    "repository_id": "xswu/HPSv2",
+                    "revision": hps_checkpoint["revision"],
+                },
+                {
+                    "identifier": "ViT-H-14/laion2B-s32B-b79K",
+                    "repository_id": "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+                    "revision": backbone["revision"],
+                },
+            ],
+            "checkpoint_files": [hps_checkpoint, backbone, vocabulary],
+            "preprocessing": {
+                "image_transform": describe_preprocess(self.preprocess),
+                "text_tokenizer": {"model": "ViT-H-14"},
+                "precision": "amp",
+                "output": "raw normalized-feature cosine",
+            },
+            "parameters": {
+                "architecture": "ViT-H-14",
+                "pretrained": "laion2B-s32B-b79K",
+                "hps_version": "v2.1",
+            },
+            "supporting_sources": [],
+        }
 
     @torch.no_grad()
     def score_image(self, image, prompt):

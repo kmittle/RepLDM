@@ -62,7 +62,15 @@ def _make_renderer(device: torch.device, probe: bool) -> StructuralLatentRendere
     return renderer
 
 
-def _run(pipe, provider, renderer, prompt: str, seed: int, steps: int):
+def _run(
+    pipe,
+    provider,
+    renderer,
+    prompt: str,
+    seed: int,
+    steps: int,
+    scheduler_mapping: str = "legacy_unit",
+):
     generator = torch.Generator(pipe._execution_device).manual_seed(seed)
     return pipe(
         prompt,
@@ -79,6 +87,7 @@ def _run(pipe, provider, renderer, prompt: str, seed: int, steps: int):
         attn_guidance_scale=0.0,
         latent_renderer=renderer,
         latent_renderer_basis_provider=provider,
+        latent_renderer_scheduler_mapping=scheduler_mapping,
     )[-1]
 
 
@@ -92,6 +101,12 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument(
+        "--scheduler_mapping",
+        choices=("legacy_unit", "euler_clean_endpoint"),
+        default="legacy_unit",
+        help="Renderer-to-scheduler mapping to exercise.",
+    )
     parser.add_argument(
         "--out_dir", default="outputs/latent_renderer/structural_wiring_smoke_v1"
     )
@@ -122,7 +137,15 @@ def main() -> None:
         prompt_dim=32,
         state_dim=16,
     )
-    zero = _run(pipe, zero_provider, zero_renderer, args.prompt, args.seed, args.steps)
+    zero = _run(
+        pipe,
+        zero_provider,
+        zero_renderer,
+        args.prompt,
+        args.seed,
+        args.steps,
+        args.scheduler_mapping,
+    )
     probe_renderer = _make_renderer(device, probe=True)
     probe_provider = StructuralUNetBasisProvider(
         pipe.unet,
@@ -131,7 +154,15 @@ def main() -> None:
         prompt_dim=32,
         state_dim=16,
     )
-    probe = _run(pipe, probe_provider, probe_renderer, args.prompt, args.seed, args.steps)
+    probe = _run(
+        pipe,
+        probe_provider,
+        probe_renderer,
+        args.prompt,
+        args.seed,
+        args.steps,
+        args.scheduler_mapping,
+    )
     images = {"no_renderer": baseline, "zero_renderer": zero, "probe_renderer": probe}
     hashes: Dict[str, str] = {}
     for name, image in images.items():
@@ -148,6 +179,8 @@ def main() -> None:
         "prompt": args.prompt,
         "seed": args.seed,
         "steps": args.steps,
+        "scheduler_mapping": args.scheduler_mapping,
+        "runtime_scheduler_mapping": pipe._last_latent_renderer_scheduler_mapping,
         "hashes": hashes,
         "zero_matches_no_renderer": hashes["zero_renderer"] == hashes["no_renderer"],
         "probe_differs_from_no_renderer": hashes["probe_renderer"] != hashes["no_renderer"],

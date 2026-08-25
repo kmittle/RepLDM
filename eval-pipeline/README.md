@@ -212,7 +212,14 @@ CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   --device cuda:0 --strict
 ```
 
-`--strict` is required for reported experiments: it fails if any configured scorer cannot initialize or score an image. Scoring is additive; complete existing scorer outputs are not recomputed.
+`--strict` is required for reported experiments: it fails on unavailable scorers
+or non-finite outputs and writes a hardened provenance contract into every score
+row. The contract binds scorer/runner source hashes, package and runtime versions,
+model identifiers and resolved revisions, checkpoint hashes, and preprocessing.
+Resume reuses existing values only when this complete contract still matches.
+Preregistered runs can fail closed by adding
+`scorer_provenance.required_schema: repldm_scorer_provenance_v1` to the scoring
+YAML or by passing `--require-scorer-provenance`.
 
 Configured outputs are ImageReward and native crops, pixel witnesses, CLIPScore, HPSv2, LAION aesthetic, and TOPIQ-NR. CLIP, HPSv2, and aesthetic are correlated 224px model families, not independent confirmations. Patch-IR and Laplacian variance can reward local texture or noise; use them only as diagnostics.
 

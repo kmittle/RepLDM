@@ -60,7 +60,9 @@ from AttentionGuidance import (
     GuidanceObservation,
     SemanticTransport,
     SemanticTransportConfig,
+    euler_model_output_from_clean_sample,
     inject_rendered_clean_update,
+    prepare_euler_clean_endpoint,
     FreeUSchedule,
     MomentPreservingFreeUController,
     TrajectoryCorrectionConfig,
@@ -845,6 +847,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         semantic_transport_config: Optional[Dict[str, Any]] = None,
         latent_renderer: Optional[StructuralLatentRenderer] = None,
         latent_renderer_basis_provider: Optional[RendererBasisProvider] = None,
+        latent_renderer_scheduler_mapping: str = "legacy_unit",
         freeu_schedule: Optional[FreeUSchedule] = None,
         freeu_preserve_moments: bool = False,
         trajectory_correction: Optional[TrajectoryCorrectionConfig] = None,
@@ -1005,6 +1008,10 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 Builds candidate bases and compact conditioning from the
                 scheduler transition. This hook is intentionally explicit so
                 feature extraction and parameter counts remain auditable.
+            latent_renderer_scheduler_mapping (`str`, *optional*, defaults to
+                `"legacy_unit"`): Selects the registered LR-1 post-step
+                translation or the Euler-only `"euler_clean_endpoint"`
+                pre-step model-output conversion. Other values fail closed.
             freeu_schedule (`FreeUSchedule`, *optional*):
                 A validated, Stage-1-only schedule for FreeU backbone/skip
                 reweighting. It is disabled before Stage 2 or return.
@@ -1038,8 +1045,12 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self._last_trajectory_correction_diagnostics = []
         self._last_unet_calls_total = 0
         self._last_unet_calls_per_step = []
+        # Clear renderer state on every invocation so paired non-renderer
+        # actions cannot inherit a previous action's scheduler/provenance.
+        self._last_latent_renderer_scheduler_mapping = None
         self._last_latent_renderer_diagnostics = None
         self._last_latent_renderer_provider_diagnostics = None
+        self._last_latent_renderer_step_diagnostics = []
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
@@ -1269,10 +1280,32 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                 raise ValueError("latent_renderer is registered for Stage 1 only")
             if image_lr is not None:
                 raise ValueError("latent_renderer requires text-to-image denoising")
+            if latent_renderer_scheduler_mapping not in {
+                "legacy_unit",
+                "euler_clean_endpoint",
+            }:
+                raise ValueError("unsupported latent_renderer_scheduler_mapping")
+            if (
+                latent_renderer_scheduler_mapping == "euler_clean_endpoint"
+                and type(self.scheduler).__name__ != "EulerDiscreteScheduler"
+            ):
+                raise ValueError(
+                    "euler_clean_endpoint requires EulerDiscreteScheduler"
+                )
             latent_renderer.to(device)
             latent_renderer.eval()
+            self._last_latent_renderer_scheduler_mapping = (
+                latent_renderer_scheduler_mapping
+            )
+        elif latent_renderer_scheduler_mapping != "legacy_unit":
+            raise ValueError(
+                "latent_renderer_scheduler_mapping requires a latent_renderer"
+            )
+        if latent_renderer is None:
+            self._last_latent_renderer_scheduler_mapping = None
         self._last_latent_renderer_diagnostics = None
         self._last_latent_renderer_provider_diagnostics = None
+        self._last_latent_renderer_step_diagnostics = []
         semantic_transport = None
         if semantic_transport_config is not None:
             if height * width > 1024**2:
@@ -1375,17 +1408,87 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         scheduler_step_index = getattr(self.scheduler, "_step_index", None)
                     if scheduler_step_index is None:
                         scheduler_step_index = i
+                    native_renderer_endpoint = None
+                    rendered = None
+                    step_model_output = noise_pred
+                    if (
+                        latent_renderer is not None
+                        and latent_renderer_scheduler_mapping
+                        == "euler_clean_endpoint"
+                    ):
+                        sigmas = getattr(self.scheduler, "sigmas", None)
+                        step_index = int(scheduler_step_index)
+                        if sigmas is None or step_index < 0 or step_index + 1 >= len(sigmas):
+                            raise RuntimeError(
+                                "Euler scheduler does not expose the current sigma pair"
+                            )
+                        prediction_type = str(self.scheduler.config.prediction_type)
+                        native_renderer_endpoint = prepare_euler_clean_endpoint(
+                            latents_before_step,
+                            noise_pred,
+                            sigma_from=sigmas[step_index],
+                            sigma_to=sigmas[step_index + 1],
+                            prediction_type=prediction_type,
+                        )
+                        observation = RendererObservation(
+                            latents_before_step=latents_before_step,
+                            pred_original_sample=(
+                                native_renderer_endpoint.pred_original_sample
+                            ),
+                            scheduler_update=native_renderer_endpoint.nominal_update,
+                            step_index=i,
+                            timestep=t,
+                            normalized_timestep=latents.new_tensor(
+                                i / max(num_timesteps - 1, 1)
+                            ),
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                        )
+                        condition = latent_renderer_basis_provider(observation)
+                        if not isinstance(condition, RendererCondition):
+                            raise TypeError(
+                                "latent_renderer_basis_provider must return RendererCondition"
+                            )
+                        rendered = latent_renderer(
+                            native_renderer_endpoint.pred_original_sample,
+                            condition.bases,
+                            timestep=observation.normalized_timestep,
+                            prompt_embedding=condition.prompt_embedding,
+                            state_features=condition.state_features,
+                            scheduler_update=native_renderer_endpoint.nominal_update,
+                            clean_update_gain=(
+                                native_renderer_endpoint.clean_update_gain
+                            ),
+                        )
+                        if not torch.equal(
+                            rendered.guided_x0,
+                            native_renderer_endpoint.pred_original_sample,
+                        ):
+                            step_model_output = euler_model_output_from_clean_sample(
+                                latents_before_step,
+                                rendered.guided_x0,
+                                sigma_from=native_renderer_endpoint.sigma_from,
+                                prediction_type=prediction_type,
+                                output_dtype=noise_pred.dtype,
+                            )
                     if (
                         semantic_transport is None
                         and latent_renderer is None
                         and trajectory_correction is None
                     ):
                         latents = self.scheduler.step(
-                            noise_pred, t, latents, **extra_step_kwargs, return_dict=False
+                            step_model_output,
+                            t,
+                            latents,
+                            **extra_step_kwargs,
+                            return_dict=False,
                         )[0]
                     else:
                         step_output = self.scheduler.step(
-                            noise_pred, t, latents, **trajectory_scheduler_kwargs, return_dict=True
+                            step_model_output,
+                            t,
+                            latents,
+                            **trajectory_scheduler_kwargs,
+                            return_dict=True,
                         )
                         latents = step_output.prev_sample
                     denoising_update = latents - latents_before_step
@@ -1412,39 +1515,69 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                         )
 
                     if latent_renderer is not None:
-                        observation = RendererObservation(
-                            latents_before_step=latents_before_step,
-                            pred_original_sample=step_output.pred_original_sample,
-                            scheduler_update=denoising_update,
-                            step_index=i,
-                            timestep=t,
-                            normalized_timestep=latents.new_tensor(
-                                i / max(num_timesteps - 1, 1)
-                            ),
-                            pooled_prompt_embeds=pooled_prompt_embeds,
-                        )
-                        condition = latent_renderer_basis_provider(observation)
-                        if not isinstance(condition, RendererCondition):
-                            raise TypeError(
-                                "latent_renderer_basis_provider must return RendererCondition"
+                        if native_renderer_endpoint is None:
+                            observation = RendererObservation(
+                                latents_before_step=latents_before_step,
+                                pred_original_sample=step_output.pred_original_sample,
+                                scheduler_update=denoising_update,
+                                step_index=i,
+                                timestep=t,
+                                normalized_timestep=latents.new_tensor(
+                                    i / max(num_timesteps - 1, 1)
+                                ),
+                                pooled_prompt_embeds=pooled_prompt_embeds,
                             )
-                        rendered = latent_renderer(
-                            step_output.pred_original_sample,
-                            condition.bases,
-                            timestep=observation.normalized_timestep,
-                            prompt_embedding=condition.prompt_embedding,
-                            state_features=condition.state_features,
-                            scheduler_update=denoising_update,
-                        )
-                        latents = inject_rendered_clean_update(
-                            step_output.prev_sample,
-                            step_output.pred_original_sample,
-                            rendered.guided_x0,
-                        )
+                            condition = latent_renderer_basis_provider(observation)
+                            if not isinstance(condition, RendererCondition):
+                                raise TypeError(
+                                    "latent_renderer_basis_provider must return RendererCondition"
+                                )
+                            rendered = latent_renderer(
+                                step_output.pred_original_sample,
+                                condition.bases,
+                                timestep=observation.normalized_timestep,
+                                prompt_embedding=condition.prompt_embedding,
+                                state_features=condition.state_features,
+                                scheduler_update=denoising_update,
+                            )
+                            latents = inject_rendered_clean_update(
+                                step_output.prev_sample,
+                                step_output.pred_original_sample,
+                                rendered.guided_x0,
+                            )
                         self._last_latent_renderer_diagnostics = rendered.diagnostics
-                        self._last_latent_renderer_provider_diagnostics = getattr(
+                        provider_diagnostics = getattr(
                             latent_renderer_basis_provider, "last_diagnostics", None
                         )
+                        self._last_latent_renderer_provider_diagnostics = (
+                            provider_diagnostics
+                        )
+                        if native_renderer_endpoint is not None:
+                            renderer_step_record = {
+                                "step_index": int(i),
+                                "scheduler_step_index": int(step_index),
+                                "timestep": float(
+                                    torch.as_tensor(t).detach().float().cpu().item()
+                                ),
+                                "sigma_from": float(
+                                    native_renderer_endpoint.sigma_from.detach()
+                                    .float()
+                                    .cpu()
+                                    .item()
+                                ),
+                                "sigma_to": float(
+                                    native_renderer_endpoint.sigma_to.detach()
+                                    .float()
+                                    .cpu()
+                                    .item()
+                                ),
+                                "prediction_type": prediction_type,
+                                **rendered.diagnostics.to_record(),
+                                "provider_diagnostics": provider_diagnostics,
+                            }
+                            self._last_latent_renderer_step_diagnostics.append(
+                                renderer_step_record
+                            )
 
                     # AttnFusion
                     t_index = num_timesteps - 1 - i

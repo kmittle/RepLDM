@@ -18,10 +18,10 @@ RL experiments.
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 import math
-from typing import Any, Callable, Iterator, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterator, Optional, Protocol, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -53,6 +53,7 @@ class LatentRendererConfig:
     max_update_ratio: Optional[float] = 0.05
     preserve_moments: bool = True
     normalize_bases: bool = True
+    basis_normalization: str = "legacy_l2_to_rms"
     epsilon: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -82,6 +83,10 @@ class LatentRendererConfig:
                 raise ValueError("max_update_ratio must be finite and non-negative")
         if not math.isfinite(float(self.epsilon)) or self.epsilon <= 0:
             raise ValueError("epsilon must be finite and positive")
+        if self.basis_normalization not in {"legacy_l2_to_rms", "match_rms"}:
+            raise ValueError(
+                "basis_normalization must be legacy_l2_to_rms or match_rms"
+            )
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,9 @@ class RendererDiagnostics:
     update_ratio: Optional[Tensor]
     mean_error: Tensor
     variance_error: Tensor
+    clean_update_gain: Optional[Tensor] = None
+    applied_update_norm: Optional[Tensor] = None
+    applied_update_ratio: Optional[Tensor] = None
 
     def to_record(self) -> dict:
         """Return JSON-safe per-sample diagnostics for an experiment sidecar."""
@@ -110,6 +118,9 @@ class RendererDiagnostics:
             "update_ratio": encode(self.update_ratio),
             "mean_error": encode(self.mean_error),
             "variance_error": encode(self.variance_error),
+            "clean_update_gain": encode(self.clean_update_gain),
+            "applied_update_norm": encode(self.applied_update_norm),
+            "applied_update_ratio": encode(self.applied_update_ratio),
         }
 
 
@@ -150,6 +161,99 @@ class RendererBasisProvider(Protocol):
 
     def __call__(self, observation: RendererObservation) -> RendererCondition:
         ...
+
+
+# Canonical names are part of the renderer action contract.  Keep the spectral
+# bands separate so a caller can request a genuinely minimal basis without
+# constructing semantic or decoder features.
+LAZY_LATENT_STRUCTURE_BASIS_NAMES = (
+    "semantic",
+    "spectral_low",
+    "spectral_mid",
+    "spectral_high",
+    "freeu",
+    "laplacian",
+)
+LAZY_LATENT_STRUCTURE_BASIS_ALIASES = {
+    "spectral": ("spectral_low", "spectral_mid", "spectral_high"),
+    "semantic_transport": ("semantic",),
+    "reciprocal_semantic_transport": ("semantic",),
+    "freeu_backbone_minus_skip": ("freeu",),
+    "freeu_style": ("freeu",),
+    "laplacian_edge": ("laplacian",),
+}
+LAZY_LATENT_STRUCTURE_PROVIDER_ID = "lazy_latent_structure_basis_v1"
+LATENT_STRUCTURE_PROVIDER_IMPLEMENTATION_ALIASES = {
+    "lazy": LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+    "lazy_latent_structure": LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+    "lazy_latent_structure_basis_provider": LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+    "LazyLatentStructureBasisProvider": LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+    "structural": "structural_unet_basis_v1",
+    "structural_unet": "structural_unet_basis_v1",
+    "structural_unet_basis_provider": "structural_unet_basis_v1",
+    "StructuralUNetBasisProvider": "structural_unet_basis_v1",
+}
+LATENT_RENDERER_SCHEDULER_MAPPINGS = frozenset(
+    {"legacy_unit", "euler_clean_endpoint"}
+)
+LATENT_RENDERER_BASIS_NORMALIZATIONS = frozenset(
+    {"legacy_l2_to_rms", "match_rms"}
+)
+
+
+def normalize_latent_structure_bases(
+    requested_bases: Optional[Sequence[str] | str] = None,
+) -> Tuple[str, ...]:
+    """Normalize a requested basis list while preserving its explicit order."""
+    if requested_bases is None:
+        values = list(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+    elif isinstance(requested_bases, str):
+        values = [requested_bases]
+    else:
+        if not isinstance(requested_bases, Sequence):
+            raise ValueError("requested_bases must be a sequence of basis names")
+        values = list(requested_bases)
+    expanded = []
+    for raw_name in values:
+        name = str(raw_name)
+        if not name:
+            raise ValueError("requested_bases cannot contain an empty basis name")
+        names = LAZY_LATENT_STRUCTURE_BASIS_ALIASES.get(name, (name,))
+        for canonical in names:
+            if canonical not in LAZY_LATENT_STRUCTURE_BASIS_NAMES:
+                raise ValueError(f"unsupported latent structure basis {name!r}")
+            if canonical in expanded:
+                raise ValueError(
+                    f"requested_bases contains duplicate basis {canonical!r}"
+                )
+            expanded.append(canonical)
+    return tuple(expanded)
+
+
+def normalize_latent_structure_provider_implementation(value: Optional[str]) -> str:
+    """Normalize public provider class names to a registered implementation id."""
+    raw = LAZY_LATENT_STRUCTURE_PROVIDER_ID if value is None else str(value)
+    return LATENT_STRUCTURE_PROVIDER_IMPLEMENTATION_ALIASES.get(raw, raw)
+
+
+def latent_structure_required_hook_names(
+    requested_bases: Optional[Sequence[str] | str] = None,
+    *,
+    semantic_layer: Optional[str] = (
+        "up_blocks.0.attentions.0.transformer_blocks.0.attn1"
+    ),
+    feature_block: str = "up_blocks.0",
+) -> Tuple[str, ...]:
+    """Return the hooks a lazy provider is allowed to register for a request."""
+    names = normalize_latent_structure_bases(requested_bases)
+    hooks = []
+    if "freeu" in names:
+        # This is a mechanism-level name.  The actual PyTorch pre-hook handle
+        # is intentionally private and can vary across implementations.
+        hooks.append(f"{feature_block}_backbone_skip")
+    if "semantic" in names and semantic_layer is not None:
+        hooks.append(f"{semantic_layer}_qk")
+    return tuple(hooks)
 
 
 def _require_nchw(value: Tensor, name: str) -> None:
@@ -241,9 +345,11 @@ def _basis_statistics(latent: Tensor, bases: Tensor, epsilon: float) -> Tensor:
 def _spectral_summary(value: Tensor, epsilon: float) -> Tensor:
     """Return low/mid/high energy fractions as a compact state feature."""
     height, width = value.shape[-2:]
-    spectrum = torch.fft.rfft2(value.float(), dim=(-2, -1), norm="ortho")
+    # Keep both Hermitian halves so 90-degree rotations do not change the
+    # multiplicity assigned to the horizontal and vertical frequency axes.
+    spectrum = torch.fft.fft2(value.float(), dim=(-2, -1), norm="ortho")
     fy = torch.fft.fftfreq(height, device=value.device, dtype=torch.float32)
-    fx = torch.fft.rfftfreq(width, device=value.device, dtype=torch.float32)
+    fx = torch.fft.fftfreq(width, device=value.device, dtype=torch.float32)
     radius = torch.sqrt(fy[:, None].square() + fx[None, :].square())
     low = radius <= 0.08
     mid = (radius > 0.08) & (radius <= 0.25)
@@ -337,6 +443,46 @@ def build_spectral_bases(
     return bands.to(reference.dtype)
 
 
+def build_spectral_basis(
+    reference: Tensor,
+    band: str,
+    cutoffs: Tuple[float, float] = (0.08, 0.25),
+) -> Tensor:
+    """Construct exactly one requested Fourier band.
+
+    This deliberately does not call :func:`build_spectral_bases`: a lazy
+    provider can therefore prove that an action requesting one band did not
+    materialize the other two bands.
+    """
+    _require_nchw(reference, "reference")
+    low_cutoff, mid_cutoff = map(float, cutoffs)
+    if not 0 < low_cutoff < mid_cutoff < 0.5:
+        raise ValueError("cutoffs must satisfy 0 < low < mid < 0.5")
+    band = str(band)
+    if band not in {"spectral_low", "spectral_mid", "spectral_high"}:
+        raise ValueError(f"unsupported spectral band {band!r}")
+    height, width = reference.shape[-2:]
+    work = reference.float()
+    spectrum = torch.fft.rfft2(work, dim=(-2, -1), norm="ortho")
+    fy = torch.fft.fftfreq(height, device=reference.device, dtype=torch.float32)
+    fx = torch.fft.rfftfreq(width, device=reference.device, dtype=torch.float32)
+    radius = torch.sqrt(fy[:, None].square() + fx[None, :].square())
+    low_pass = torch.exp(-0.5 * (radius / low_cutoff).pow(4))
+    mid_pass = torch.exp(-0.5 * (radius / mid_cutoff).pow(4))
+    if band == "spectral_low":
+        mask = low_pass
+    elif band == "spectral_mid":
+        mask = mid_pass - low_pass
+    else:
+        mask = 1.0 - mid_pass
+    return torch.fft.irfft2(
+        spectrum * mask[None, None],
+        s=(height, width),
+        dim=(-2, -1),
+        norm="ortho",
+    ).to(reference.dtype)
+
+
 def build_graph_transport_basis(
     reference: Tensor, graph: Tensor, grid_height: int, grid_width: int
 ) -> Tensor:
@@ -415,7 +561,13 @@ def build_feature_difference_basis(
 def inject_rendered_clean_update(
     prev_sample: Tensor, pred_original_sample: Tensor, guided_x0: Tensor
 ) -> Tensor:
-    """Inject a rendered ``x0`` while retaining the scheduler's own step."""
+    """Apply the legacy unit-gain clean-latent displacement after a step.
+
+    This operation translates the scheduler output by the full clean-latent
+    displacement. It is retained to reproduce the registered LR-1 runs. A
+    coherent Euler transition from the unchanged current sample must instead
+    use :func:`inject_euler_clean_update`, whose gain depends on both sigmas.
+    """
     _require_nchw(prev_sample, "prev_sample")
     _require_nchw(pred_original_sample, "pred_original_sample")
     _require_nchw(guided_x0, "guided_x0")
@@ -425,6 +577,181 @@ def inject_rendered_clean_update(
     ):
         raise ValueError("scheduler samples and guided_x0 must have identical shapes")
     return (prev_sample + guided_x0 - pred_original_sample).to(prev_sample.dtype)
+
+
+def euler_clean_update_gain(
+    sigma_from: Tensor | float,
+    sigma_to: Tensor | float,
+    *,
+    sigma_hat: Optional[Tensor | float] = None,
+) -> Tensor:
+    """Return Euler's exact map from a clean-endpoint shift to the next sample.
+
+    With the current noisy sample fixed, replacing ``x0`` by ``x0 + delta``
+    changes the Euler derivative by ``-delta / sigma_hat``. The resulting
+    next-sample displacement is therefore
+    ``(1 - sigma_to / sigma_hat) * delta``. ``sigma_hat`` defaults to
+    ``sigma_from``, which is exact when scheduler churn is disabled.
+    """
+
+    source = torch.as_tensor(sigma_from, dtype=torch.float64)
+    target = torch.as_tensor(sigma_to, dtype=torch.float64, device=source.device)
+    effective = (
+        source
+        if sigma_hat is None
+        else torch.as_tensor(sigma_hat, dtype=torch.float64, device=source.device)
+    )
+    try:
+        source, target, effective = torch.broadcast_tensors(source, target, effective)
+    except RuntimeError as exc:
+        raise ValueError("Euler sigmas must be broadcast-compatible") from exc
+    if not (
+        torch.isfinite(source).all()
+        and torch.isfinite(target).all()
+        and torch.isfinite(effective).all()
+    ):
+        raise ValueError("Euler sigmas must be finite")
+    if torch.any(source <= 0) or torch.any(effective <= 0):
+        raise ValueError("sigma_from and sigma_hat must be positive")
+    if torch.any(target < 0) or torch.any(target > effective):
+        raise ValueError("sigma_to must satisfy 0 <= sigma_to <= sigma_hat")
+    return (effective - target) / effective
+
+
+@dataclass(frozen=True)
+class EulerCleanEndpoint:
+    """Analytic Euler state needed by a pre-step clean-latent renderer."""
+
+    pred_original_sample: Tensor
+    nominal_update: Tensor
+    clean_update_gain: Tensor
+    sigma_from: Tensor
+    sigma_to: Tensor
+    prediction_type: str
+
+
+def prepare_euler_clean_endpoint(
+    sample: Tensor,
+    model_output: Tensor,
+    *,
+    sigma_from: Tensor | float,
+    sigma_to: Tensor | float,
+    prediction_type: str,
+) -> EulerCleanEndpoint:
+    """Recover Euler's nominal ``x0`` and transition before ``scheduler.step``.
+
+    This adapter is intentionally limited to a no-churn Euler step. It mirrors
+    diffusers' prediction conversions in float32 without importing or mutating
+    a scheduler instance.
+    """
+
+    _require_nchw(sample, "sample")
+    _require_nchw(model_output, "model_output")
+    if sample.shape != model_output.shape:
+        raise ValueError("sample and model_output must have identical shapes")
+    source = torch.as_tensor(
+        sigma_from, device=sample.device, dtype=torch.float32
+    )
+    target = torch.as_tensor(sigma_to, device=sample.device, dtype=torch.float32)
+    if source.numel() != 1 or target.numel() != 1:
+        raise ValueError("Euler endpoint preparation requires scalar sigmas")
+    gain = euler_clean_update_gain(source, target).to(
+        device=sample.device, dtype=torch.float32
+    )
+    work = sample.float()
+    predicted = model_output.float()
+    if prediction_type == "epsilon":
+        x0 = work - source * predicted
+    elif prediction_type in {"sample", "original_sample"}:
+        x0 = predicted
+    elif prediction_type == "v_prediction":
+        x0 = (
+            predicted * (-source / torch.sqrt(source.square() + 1.0))
+            + work / (source.square() + 1.0)
+        )
+    else:
+        raise ValueError(f"unsupported Euler prediction_type {prediction_type!r}")
+    nominal_update = gain * (x0 - work)
+    return EulerCleanEndpoint(
+        pred_original_sample=x0,
+        nominal_update=nominal_update,
+        clean_update_gain=gain.reshape(1),
+        sigma_from=source.reshape(1),
+        sigma_to=target.reshape(1),
+        prediction_type=prediction_type,
+    )
+
+
+def euler_model_output_from_clean_sample(
+    sample: Tensor,
+    guided_x0: Tensor,
+    *,
+    sigma_from: Tensor | float,
+    prediction_type: str,
+    output_dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    """Convert a guided clean endpoint back to Euler's native model output."""
+
+    _require_nchw(sample, "sample")
+    _require_nchw(guided_x0, "guided_x0")
+    if sample.shape != guided_x0.shape:
+        raise ValueError("sample and guided_x0 must have identical shapes")
+    sigma = torch.as_tensor(
+        sigma_from, device=sample.device, dtype=torch.float32
+    )
+    if sigma.numel() != 1 or not torch.isfinite(sigma).all() or torch.any(sigma <= 0):
+        raise ValueError("sigma_from must be one finite positive scalar")
+    work = sample.float()
+    clean = guided_x0.float()
+    if prediction_type == "epsilon":
+        converted = (work - clean) / sigma
+    elif prediction_type in {"sample", "original_sample"}:
+        converted = clean
+    elif prediction_type == "v_prediction":
+        converted = (
+            work - (1.0 + sigma.square()) * clean
+        ) / (sigma * torch.sqrt(1.0 + sigma.square()))
+    else:
+        raise ValueError(f"unsupported Euler prediction_type {prediction_type!r}")
+    return converted.to(output_dtype or sample.dtype)
+
+
+def inject_euler_clean_update(
+    prev_sample: Tensor,
+    pred_original_sample: Tensor,
+    guided_x0: Tensor,
+    *,
+    sigma_from: Tensor | float,
+    sigma_to: Tensor | float,
+    sigma_hat: Optional[Tensor | float] = None,
+) -> Tensor:
+    """Closed-form parity helper for Euler clean-endpoint tests.
+
+    Production integration should convert the guided endpoint with
+    :func:`euler_model_output_from_clean_sample` and invoke the scheduler once.
+    """
+
+    _require_nchw(prev_sample, "prev_sample")
+    _require_nchw(pred_original_sample, "pred_original_sample")
+    _require_nchw(guided_x0, "guided_x0")
+    if (
+        prev_sample.shape != pred_original_sample.shape
+        or guided_x0.shape != prev_sample.shape
+    ):
+        raise ValueError("scheduler samples and guided_x0 must have identical shapes")
+    gain = euler_clean_update_gain(
+        sigma_from,
+        sigma_to,
+        sigma_hat=sigma_hat,
+    ).to(device=prev_sample.device, dtype=torch.float32)
+    if gain.ndim == 0:
+        gain = gain.reshape(1)
+    if gain.ndim != 1 or gain.shape[0] not in (1, prev_sample.shape[0]):
+        raise ValueError("Euler gain must be scalar or have one value per batch item")
+    update = (guided_x0.float() - pred_original_sample.float()) * gain.reshape(
+        -1, 1, 1, 1
+    )
+    return (prev_sample.float() + update).to(prev_sample.dtype)
 
 
 class _D4DepthwiseConv2d(nn.Module):
@@ -549,14 +876,16 @@ class StructuralLatentRenderer(nn.Module):
         if not self.config.normalize_bases:
             return work
         basis_norm = torch.linalg.vector_norm(work.flatten(2), dim=-1)
-        latent_rms = _vector_norm(latent).reshape(-1, 1, 1, 1, 1) / math.sqrt(
-            latent[0].numel()
-        )
+        latent_norm = _vector_norm(latent).reshape(-1, 1, 1, 1, 1)
+        if self.config.basis_normalization == "legacy_l2_to_rms":
+            target_norm = latent_norm / math.sqrt(latent[0].numel())
+        else:
+            target_norm = latent_norm
         basis_scale = basis_norm.reshape(
             basis_norm.shape[0], basis_norm.shape[1], 1, 1, 1
         )
         normalized = work / basis_scale.clamp_min(self.config.epsilon)
-        normalized = normalized * latent_rms
+        normalized = normalized * target_norm
         active = basis_scale > self.config.epsilon
         return torch.where(active, normalized, torch.zeros_like(normalized))
 
@@ -585,6 +914,7 @@ class StructuralLatentRenderer(nn.Module):
         prompt_embedding: Optional[Tensor] = None,
         state_features: Optional[Tensor] = None,
         scheduler_update: Optional[Tensor] = None,
+        clean_update_gain: Optional[Tensor] = None,
     ) -> RendererOutput:
         _require_nchw(latent, "latent")
         batch = latent.shape[0]
@@ -592,6 +922,13 @@ class StructuralLatentRenderer(nn.Module):
             _require_nchw(scheduler_update, "scheduler_update")
             if scheduler_update.shape != latent.shape:
                 raise ValueError("scheduler_update must match latent shape")
+        gain = None
+        if clean_update_gain is not None:
+            gain = _coerce_batch_vector(
+                clean_update_gain, batch, "clean_update_gain"
+            ).to(device=latent.device, dtype=torch.float32)
+            if torch.any(gain <= 0) or torch.any(gain > 1):
+                raise ValueError("clean_update_gain must satisfy 0 < gain <= 1")
         prepared_bases = self._prepare_bases(latent, bases)
         basis_stats = _basis_statistics(latent, prepared_bases, self.config.epsilon)
         latent_work = latent.float()
@@ -648,9 +985,12 @@ class StructuralLatentRenderer(nn.Module):
                 raise ValueError(
                     "scheduler_update is required when max_update_ratio is configured"
                 )
+            cap_reference = scheduler_update
+            if gain is not None:
+                cap_reference = scheduler_update.float() / gain.reshape(-1, 1, 1, 1)
             update = cap_update_norm(
                 update,
-                scheduler_update,
+                cap_reference,
                 float(self.config.max_update_ratio),
                 self.config.epsilon,
             )
@@ -670,6 +1010,17 @@ class StructuralLatentRenderer(nn.Module):
             if scheduler_norm is not None
             else None
         )
+        applied_update_norm = None
+        applied_update_ratio = None
+        if gain is not None:
+            applied_update_norm = _vector_norm(
+                residual.float() * gain.reshape(-1, 1, 1, 1)
+            )
+            applied_update_ratio = (
+                applied_update_norm / scheduler_norm.clamp_min(self.config.epsilon)
+                if scheduler_norm is not None
+                else None
+            )
         mean_error = (
             guided_x0.float().mean(dim=(-2, -1)) - latent.float().mean(dim=(-2, -1))
         ).abs().amax(dim=1)
@@ -684,6 +1035,9 @@ class StructuralLatentRenderer(nn.Module):
             update_ratio=update_ratio,
             mean_error=mean_error,
             variance_error=variance_error,
+            clean_update_gain=gain,
+            applied_update_norm=applied_update_norm,
+            applied_update_ratio=applied_update_ratio,
         )
         return RendererOutput(
             guided_x0=guided_x0,
@@ -700,6 +1054,7 @@ def build_fixed_coefficient_renderer(
     coefficient_bound: float = 1.0,
     max_update_ratio: Optional[float] = 0.05,
     preserve_moments: bool = True,
+    basis_normalization: str = "legacy_l2_to_rms",
 ) -> StructuralLatentRenderer:
     """Construct a parameter-free-in-behavior renderer for basis search.
 
@@ -733,6 +1088,7 @@ def build_fixed_coefficient_renderer(
             spatial_hidden_dim=0,
             max_update_ratio=max_update_ratio,
             preserve_moments=preserve_moments,
+            basis_normalization=basis_normalization,
         )
     )
     with torch.no_grad():
@@ -912,6 +1268,13 @@ class StructuralUNetBasisProvider:
         permutation_seed: int = 1729,
         prompt_dim: int = 32,
         state_dim: int = 16,
+        requested_bases: Optional[Sequence[str] | str] = None,
+        required_hook_names: Optional[Sequence[str]] = None,
+        scheduler_mapping: str = "legacy_unit",
+        basis_normalization: str = "legacy_l2_to_rms",
+        provider_id: Optional[str] = None,
+        provider_provenance_id: Optional[str] = None,
+        provenance_id: Optional[str] = None,
     ) -> None:
         if int(latent_channels) <= 0:
             raise ValueError("latent_channels must be positive")
@@ -926,12 +1289,54 @@ class StructuralUNetBasisProvider:
             raise ValueError(f"unsupported semantic_mode {semantic_mode!r}")
         if int(prompt_dim) < 0 or int(state_dim) < 0:
             raise ValueError("prompt_dim and state_dim must be non-negative")
+        if scheduler_mapping not in LATENT_RENDERER_SCHEDULER_MAPPINGS:
+            raise ValueError("scheduler_mapping is not registered")
+        if basis_normalization not in LATENT_RENDERER_BASIS_NORMALIZATIONS:
+            raise ValueError("basis_normalization is not registered")
+        requested = normalize_latent_structure_bases(requested_bases)
+        if requested != LAZY_LATENT_STRUCTURE_BASIS_NAMES:
+            raise ValueError(
+                "StructuralUNetBasisProvider constructs all six canonical bases; "
+                "use LazyLatentStructureBasisProvider for a subset"
+            )
+        expected_hooks = latent_structure_required_hook_names(
+            requested,
+            semantic_layer=semantic_layer,
+            feature_block=feature_block,
+        )
+        if required_hook_names is None:
+            hooks = expected_hooks
+        elif isinstance(required_hook_names, str):
+            raise ValueError("required_hook_names must be a sequence of names")
+        else:
+            hooks = tuple(str(value) for value in required_hook_names)
+            if hooks != expected_hooks:
+                raise ValueError(
+                    "required_hook_names do not match the requested basis mechanisms"
+                )
+        supplied_ids = [
+            str(value)
+            for value in (provider_id, provider_provenance_id, provenance_id)
+            if value is not None
+        ]
+        if any(not value for value in supplied_ids):
+            raise ValueError("provider provenance ids must be non-empty strings")
+        if supplied_ids and any(value != supplied_ids[0] for value in supplied_ids[1:]):
+            raise ValueError("provider_id and provider_provenance_id must agree")
         self.latent_channels = int(latent_channels)
         self.semantic_mode = semantic_mode
         self.semantic_topk = int(semantic_topk)
         self.permutation_seed = int(permutation_seed)
         self.prompt_dim = int(prompt_dim)
         self.state_dim = int(state_dim)
+        self.feature_block = str(feature_block)
+        self.semantic_layer = None if semantic_layer is None else str(semantic_layer)
+        self.requested_bases = requested
+        self.required_hook_names = hooks
+        self.scheduler_mapping = scheduler_mapping
+        self.basis_normalization = basis_normalization
+        self.provider_id = supplied_ids[0] if supplied_ids else "structural_unet_basis_v1"
+        self.provider_provenance_id = self.provider_id
         self.capture = StructuralUNetFeatureCapture(
             unet,
             batch_size=batch_size,
@@ -978,6 +1383,15 @@ class StructuralUNetBasisProvider:
     @staticmethod
     def _rms(value: Tensor, epsilon: float = 1e-6) -> Tensor:
         return _vector_norm(value).div(math.sqrt(value[0].numel())).clamp_min(epsilon)
+
+    @staticmethod
+    def _basis_rms(value: Tensor, epsilon: float = 1e-6) -> Tensor:
+        """Return one RMS value per canonical basis slot (batch, basis)."""
+        if value.ndim != 5:
+            raise ValueError("basis tensor must have shape (batch, basis, channels, height, width)")
+        # Do not clamp here: zero slots are part of the lazy-provider contract
+        # and must remain auditable as exact zeroes.
+        return value.float().square().mean(dim=(2, 3, 4)).sqrt()
 
     def _prompt_features(
         self, pooled_prompt_embeds: Optional[Tensor], batch: int, reference: Tensor
@@ -1117,19 +1531,333 @@ class StructuralUNetBasisProvider:
             entropy,
         )
         self.last_diagnostics = {
+            "implementation": "structural_unet_basis_v1",
+            "provider_id": self.provider_id,
+            "provider_provenance_id": self.provider_provenance_id,
+            "requested_bases": list(self.requested_bases),
+            "constructed_bases": list(self.requested_bases),
+            "registered_hook_names": list(self.required_hook_names),
+            "required_hook_names": list(self.required_hook_names),
+            "scheduler_mapping": self.scheduler_mapping,
+            "basis_normalization": self.basis_normalization,
             "semantic_graph_mode": self.semantic_mode,
             "semantic_graph_topk": self.semantic_topk,
             "semantic_token_grid": [int(grid_height), int(grid_width)],
             "semantic_entropy": entropy.detach().float().cpu().tolist(),
             "backbone_shape": list(backbone.shape),
             "skip_shape": list(skip.shape),
-            "basis_rms": self._rms(bases.reshape(x0.shape[0], -1, *x0.shape[1:])).detach()
-            .float()
-            .cpu()
-            .tolist(),
+            "basis_rms": self._basis_rms(bases).detach().float().cpu().tolist(),
         }
         return RendererCondition(
             bases=bases,
+            prompt_embedding=prompt_features,
+            state_features=state_features,
+        )
+
+
+class LazyLatentStructureBasisProvider(StructuralUNetBasisProvider):
+    """Construct only the requested latent-structure bases.
+
+    Spectral and Laplacian bases depend only on the predicted clean latent and
+    therefore install no UNet hooks.  The semantic basis optionally captures
+    self-attention Q/K, while the FreeU-style basis optionally captures one
+    decoder backbone/skip pair.  The ordinary denoiser call remains the sole
+    UNet evaluation in every mode.
+    """
+
+    def __init__(
+        self,
+        unet: Optional[nn.Module] = None,
+        *,
+        batch_size: int,
+        do_classifier_free_guidance: bool,
+        latent_channels: int = 4,
+        requested_bases: Optional[Sequence[str] | str] = None,
+        required_hook_names: Optional[Sequence[str]] = None,
+        semantic_mode: str = "reciprocal_semantic",
+        semantic_topk: int = 16,
+        semantic_layer: Optional[str] = (
+            "up_blocks.0.attentions.0.transformer_blocks.0.attn1"
+        ),
+        feature_block: str = "up_blocks.0",
+        permutation_seed: int = 1729,
+        prompt_dim: int = 0,
+        state_dim: int = 0,
+        scheduler_mapping: str = "legacy_unit",
+        basis_normalization: str = "legacy_l2_to_rms",
+        provider_id: Optional[str] = None,
+        provider_provenance_id: Optional[str] = None,
+        provenance_id: Optional[str] = None,
+    ) -> None:
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        if int(latent_channels) <= 0:
+            raise ValueError("latent_channels must be positive")
+        if int(semantic_topk) <= 0:
+            raise ValueError("semantic_topk must be positive")
+        if semantic_mode not in {
+            "clean_tfsa",
+            "reciprocal_latent",
+            "reciprocal_semantic",
+            "reciprocal_semantic_permuted",
+        }:
+            raise ValueError(f"unsupported semantic_mode {semantic_mode!r}")
+        if int(prompt_dim) < 0 or int(state_dim) < 0:
+            raise ValueError("prompt_dim and state_dim must be non-negative")
+        if scheduler_mapping not in LATENT_RENDERER_SCHEDULER_MAPPINGS:
+            raise ValueError("scheduler_mapping is not registered")
+        if basis_normalization not in LATENT_RENDERER_BASIS_NORMALIZATIONS:
+            raise ValueError("basis_normalization is not registered")
+        supplied_ids = [
+            str(value)
+            for value in (provider_id, provider_provenance_id, provenance_id)
+            if value is not None
+        ]
+        if any(not value for value in supplied_ids):
+            raise ValueError("provider provenance ids must be non-empty strings")
+        if supplied_ids and any(value != supplied_ids[0] for value in supplied_ids[1:]):
+            raise ValueError("provider_id and provider_provenance_id must agree")
+        resolved_provider_id = supplied_ids[0] if supplied_ids else LAZY_LATENT_STRUCTURE_PROVIDER_ID
+
+        names = normalize_latent_structure_bases(requested_bases)
+        expected_hooks = latent_structure_required_hook_names(
+            names,
+            semantic_layer=semantic_layer,
+            feature_block=feature_block,
+        )
+        if required_hook_names is None:
+            hooks = expected_hooks
+        else:
+            if isinstance(required_hook_names, str):
+                raise ValueError("required_hook_names must be a sequence of names")
+            hooks = tuple(str(value) for value in required_hook_names)
+            if hooks != expected_hooks:
+                raise ValueError(
+                    "required_hook_names do not match the requested basis mechanisms"
+                )
+
+        self.latent_channels = int(latent_channels)
+        self.semantic_mode = semantic_mode
+        self.semantic_topk = int(semantic_topk)
+        self.permutation_seed = int(permutation_seed)
+        self.prompt_dim = int(prompt_dim)
+        self.state_dim = int(state_dim)
+        self.batch_size = int(batch_size)
+        self.do_classifier_free_guidance = bool(do_classifier_free_guidance)
+        self.requested_bases = names
+        self.required_hook_names = hooks
+        self.provider_id = resolved_provider_id
+        self.provider_provenance_id = resolved_provider_id
+        self.scheduler_mapping = scheduler_mapping
+        self.basis_normalization = basis_normalization
+        self.feature_block = str(feature_block)
+        self.semantic_layer = None if semantic_layer is None else str(semantic_layer)
+        self._needs_semantic = "semantic" in names
+        self._needs_freeu = "freeu" in names
+        self._feature_capture: Optional[StructuralUNetFeatureCapture] = None
+        self._semantic_capture: Optional[QKCapture] = None
+        self._semantic_module: Optional[nn.Module] = None
+
+        # Resolve only mechanisms that were requested.  In particular, this
+        # leaves spectral/laplacian-only providers independent of any UNet.
+        if self._needs_freeu:
+            if unet is None:
+                raise ValueError("freeu basis requires a UNet decoder")
+            self._feature_capture = StructuralUNetFeatureCapture(
+                unet,
+                batch_size=self.batch_size,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                feature_block=self.feature_block,
+                attention_layer=None,
+            )
+        if self._needs_semantic and self.semantic_layer is not None:
+            if unet is None:
+                raise ValueError("semantic Q/K basis requires a UNet attention layer")
+            self._semantic_module = _resolve_module_path(unet, self.semantic_layer)
+            self._semantic_capture = QKCapture(self._semantic_module)
+        # ``capture`` is retained as a compatibility/introspection alias for
+        # callers that previously inspected StructuralUNetBasisProvider.
+        self.capture = self._feature_capture
+        self.registered_hook_names: list[str] = []
+        self.last_diagnostics: Optional[dict] = None
+
+    @contextmanager
+    def capture_forward(self) -> Iterator["LazyLatentStructureBasisProvider"]:
+        """Register only the hooks implied by ``requested_bases``."""
+        active_names = list(self.required_hook_names)
+        self.registered_hook_names = active_names
+        try:
+            with ExitStack() as stack:
+                if self._feature_capture is not None:
+                    stack.enter_context(self._feature_capture.capture_forward())
+                if self._semantic_capture is not None:
+                    stack.enter_context(self._semantic_capture.forward())
+                yield self
+        finally:
+            # Keep the names from the completed ordinary forward available for
+            # the sidecar, while ensuring the actual handles are removed.
+            self.registered_hook_names = active_names
+
+    def _semantic_condition(
+        self,
+        x0: Tensor,
+        backbone: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor, Optional[Tuple[int, int]]]:
+        if self._semantic_capture is not None:
+            query, key = self._semantic_capture.get_conditional(
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                batch_size=self.batch_size,
+            )
+            grid_height, grid_width = infer_token_grid(
+                query.shape[1], x0.shape[-2], x0.shape[-1]
+            )
+            graph, entropy = affinity_from_qk(
+                query,
+                key,
+                attention_module=self._semantic_module,
+                mode=self.semantic_mode,
+                topk=self.semantic_topk,
+                permutation_seed=self.permutation_seed,
+            )
+            return (
+                build_graph_transport_basis(
+                    x0, graph, grid_height, grid_width
+                )[:, 0],
+                entropy,
+                (grid_height, grid_width),
+            )
+
+        source = x0 if backbone is None else backbone
+        grid_height = min(x0.shape[-2], max(1, round(x0.shape[-2] / 4)))
+        grid_width = min(x0.shape[-1], max(1, round(x0.shape[-1] / 4)))
+        tokens = F.interpolate(
+            source.float(), size=(grid_height, grid_width), mode="area"
+        ).flatten(2).transpose(1, 2)
+        graph, entropy = affinity_from_tokens(
+            tokens,
+            mode=self.semantic_mode,
+            topk=self.semantic_topk,
+            permutation_seed=self.permutation_seed,
+        )
+        return (
+            build_graph_transport_basis(x0, graph, grid_height, grid_width)[:, 0],
+            entropy,
+            (grid_height, grid_width),
+        )
+
+    def __call__(self, observation: RendererObservation) -> RendererCondition:
+        x0 = observation.pred_original_sample
+        _require_nchw(x0, "observation.pred_original_sample")
+        if x0.shape[0] != self.batch_size:
+            raise ValueError("observation batch does not match provider batch_size")
+        if x0.shape[1] != self.latent_channels:
+            raise ValueError(
+                f"predicted clean latent has {x0.shape[1]} channels; "
+                f"expected {self.latent_channels}"
+            )
+        if observation.scheduler_update.shape != x0.shape:
+            raise ValueError("scheduler_update must match predicted clean latent")
+
+        backbone = skip = None
+        if self._feature_capture is not None:
+            backbone, skip = self._feature_capture.conditional_features()
+
+        semantic = None
+        entropy = x0.new_zeros((x0.shape[0],), dtype=torch.float32)
+        token_grid = None
+        if self._needs_semantic:
+            semantic, entropy, token_grid = self._semantic_condition(x0, backbone)
+
+        spectral_map = {}
+        for name in ("spectral_low", "spectral_mid", "spectral_high"):
+            if name in self.requested_bases:
+                # Build only the requested band.  In particular, a low-band
+                # action must not materialize mid/high tensors as a side effect.
+                spectral_map[name] = build_spectral_basis(x0, name)[:, None]
+
+        freeu = None
+        backbone_latent = x0.new_zeros(x0.shape)
+        skip_latent = x0.new_zeros(x0.shape)
+        if self._needs_freeu:
+            if backbone is None or skip is None:
+                raise RuntimeError("freeu basis requested without captured decoder features")
+            backbone_latent = self._normalize_feature(
+                self._reduce_channels(backbone, self.latent_channels)
+            )
+            skip_latent = self._normalize_feature(
+                self._reduce_channels(skip, self.latent_channels)
+            )
+            freeu = build_feature_difference_basis(
+                backbone_latent,
+                skip_latent,
+                tuple(x0.shape[-2:]),
+            )[:, 0].to(dtype=x0.dtype)
+
+        laplacian = None
+        if "laplacian" in self.requested_bases:
+            laplacian = build_laplacian_basis(x0)[:, 0]
+
+        basis_map = {}
+        if semantic is not None:
+            basis_map["semantic"] = semantic[:, None]
+        basis_map.update(spectral_map)
+        if freeu is not None:
+            basis_map["freeu"] = freeu[:, None]
+        if laplacian is not None:
+            basis_map["laplacian"] = laplacian[:, None]
+        missing = [name for name in self.requested_bases if name not in basis_map]
+        if missing:
+            raise RuntimeError(f"lazy provider failed to construct bases: {missing}")
+        # The renderer action vector is always indexed by the six canonical
+        # names.  Lazy construction only controls which slots are populated;
+        # every omitted slot remains an explicit zero so coefficient vectors,
+        # checkpoints, and sidecars retain a stable shape.
+        zero_basis = x0.new_zeros(
+            (x0.shape[0], 1, x0.shape[1], x0.shape[2], x0.shape[3])
+        )
+        bases = torch.cat(
+            [basis_map.get(name, zero_basis) for name in LAZY_LATENT_STRUCTURE_BASIS_NAMES],
+            dim=1,
+        )
+        constructed_bases = [
+            name for name in self.requested_bases if name in basis_map
+        ]
+
+        prompt_features = self._prompt_features(
+            observation.pooled_prompt_embeds, x0.shape[0], x0
+        )
+        state_features = self._state_features(
+            observation,
+            x0,
+            backbone_latent,
+            skip_latent,
+            freeu if freeu is not None else x0.new_zeros(x0.shape),
+            laplacian if laplacian is not None else x0.new_zeros(x0.shape),
+            entropy,
+        )
+        provider_record = {
+            "implementation": LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+            "provider_id": self.provider_id,
+            "provider_provenance_id": self.provider_provenance_id,
+            "requested_bases": list(self.requested_bases),
+            "constructed_bases": constructed_bases,
+            "registered_hook_names": list(self.registered_hook_names),
+            "required_hook_names": list(self.required_hook_names),
+            "scheduler_mapping": self.scheduler_mapping,
+            "basis_normalization": self.basis_normalization,
+            "semantic_graph_mode": self.semantic_mode if self._needs_semantic else None,
+            "semantic_graph_topk": self.semantic_topk if self._needs_semantic else None,
+            "semantic_token_grid": (
+                None if token_grid is None else [int(value) for value in token_grid]
+            ),
+            "semantic_entropy": entropy.detach().float().cpu().tolist(),
+            "backbone_shape": None if backbone is None else list(backbone.shape),
+            "skip_shape": None if skip is None else list(skip.shape),
+            "basis_rms": self._basis_rms(bases).detach().float().cpu().tolist(),
+        }
+        self.last_diagnostics = provider_record
+        return RendererCondition(
+            bases=bases.to(dtype=x0.dtype),
             prompt_embedding=prompt_features,
             state_features=state_features,
         )

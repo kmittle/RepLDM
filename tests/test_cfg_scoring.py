@@ -235,13 +235,23 @@ class CFGScoringTest(unittest.TestCase):
 
             class DummyScorer:
                 OUTPUT_KEYS = output_keys
+                PROVENANCE_PACKAGES = ()
 
                 @classmethod
                 def weights_status(cls, **params):
                     return True, ""
 
                 def __init__(self, device="cpu", **params):
-                    pass
+                    self.device = device
+
+                def provenance_metadata(self):
+                    return {
+                        "models": [],
+                        "checkpoint_files": [],
+                        "preprocessing": {"fixture": "identity"},
+                        "parameters": {},
+                        "supporting_sources": [],
+                    }
 
                 def score_image(self, image, prompt, _name=metric_name, _values=metric_outputs):
                     calls[_name] += 1
@@ -272,7 +282,22 @@ class CFGScoringTest(unittest.TestCase):
             score.main()
 
     @staticmethod
-    def score_row(manifest_row, contract, values):
+    def scorer_provenance(registry):
+        active = [
+            (name, registry[name](device="cpu", **score.CFG_SCORING_PARAMS))
+            for name in score.CFG_SCORING_METRICS
+        ]
+        return score.build_scorer_provenance(
+            active,
+            params=score.CFG_SCORING_PARAMS,
+            device="cpu",
+            runner_path=EVAL_PIPELINE / "score.py",
+            base_path=EVAL_PIPELINE / "scorers" / "base.py",
+            source_root=EVAL_PIPELINE,
+        )
+
+    @staticmethod
+    def score_row(manifest_row, contract, values, scorer_provenance):
         row = {
             key: manifest_row[key]
             for key in (
@@ -292,6 +317,8 @@ class CFGScoringTest(unittest.TestCase):
             row.update(output)
         row["scoring_contract"] = contract
         row["scoring_contract_sha256"] = score.json_sha256(contract)
+        row["scorer_provenance"] = scorer_provenance[0]
+        row["scorer_provenance_sha256"] = scorer_provenance[1]
         return row
 
     def test_stale_scoring_contract_recomputes_all_metrics(self):
@@ -299,7 +326,9 @@ class CFGScoringTest(unittest.TestCase):
             run_dir, config_path, manifest_row, contract = self.make_run(tmp)
             calls = {name: 0 for name in score.CFG_SCORING_METRICS}
             registry, values = self.scorer_registry(calls)
-            existing = self.score_row(manifest_row, contract, values)
+            existing = self.score_row(
+                manifest_row, contract, values, self.scorer_provenance(registry)
+            )
             existing["scoring_contract"] = {"schema": "stale"}
             existing["scoring_contract_sha256"] = score.json_sha256(
                 existing["scoring_contract"]
@@ -334,7 +363,9 @@ class CFGScoringTest(unittest.TestCase):
             run_dir, config_path, manifest_row, contract = self.make_run(tmp)
             calls = {name: 0 for name in score.CFG_SCORING_METRICS}
             registry, values = self.scorer_registry(calls)
-            existing = self.score_row(manifest_row, contract, values)
+            existing = self.score_row(
+                manifest_row, contract, values, self.scorer_provenance(registry)
+            )
             existing["image_sha256"] = "0" * 64
             (run_dir / "scores.jsonl").write_text(json.dumps(existing) + "\n")
 
@@ -349,7 +380,9 @@ class CFGScoringTest(unittest.TestCase):
             run_dir, config_path, manifest_row, contract = self.make_run(tmp)
             calls = {name: 0 for name in score.CFG_SCORING_METRICS}
             registry, values = self.scorer_registry(calls)
-            existing = self.score_row(manifest_row, contract, values)
+            existing = self.score_row(
+                manifest_row, contract, values, self.scorer_provenance(registry)
+            )
             existing["topiq_nr"] = float("nan")
             (run_dir / "scores.jsonl").write_text(json.dumps(existing) + "\n")
 
@@ -371,6 +404,86 @@ class CFGScoringTest(unittest.TestCase):
             payload = (run_dir / "scores.jsonl").read_text()
             self.assertNotIn("NaN", payload)
             self.assertNotIn("topiq_nr", json.loads(payload))
+
+    def test_generic_strict_recomputes_nonfinite_and_provenance_drift(self):
+        for stale_kind in ("nonfinite", "plugin_source"):
+            with self.subTest(stale_kind=stale_kind), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                run_dir = root / "run"
+                image_dir = run_dir / "images"
+                image_dir.mkdir(parents=True)
+                image_path = image_dir / "generic.png"
+                Image.new("RGB", (4, 4), color=(10, 20, 30)).save(image_path)
+                manifest_row = {
+                    "id": "generic",
+                    "prompt": "a generic prompt",
+                    "image_path": "images/generic.png",
+                }
+                (run_dir / "manifest.jsonl").write_text(
+                    json.dumps(manifest_row) + "\n"
+                )
+                config_path = root / "score.yaml"
+                config_path.write_text(
+                    yaml.safe_dump(
+                        {
+                            "metrics": ["iqa"],
+                            "params": {},
+                            "scorer_provenance": {
+                                "required_schema": score.SCORER_PROVENANCE_SCHEMA
+                            },
+                        }
+                    )
+                )
+                calls = {name: 0 for name in score.CFG_SCORING_METRICS}
+                registry, values = self.scorer_registry(calls)
+                active = [("iqa", registry["iqa"](device="cpu"))]
+                contract, digest = score.build_scorer_provenance(
+                    active,
+                    params={},
+                    device="cpu",
+                    runner_path=EVAL_PIPELINE / "score.py",
+                    base_path=EVAL_PIPELINE / "scorers" / "base.py",
+                    source_root=EVAL_PIPELINE,
+                )
+                existing = {
+                    "id": "generic",
+                    "image_path": "images/generic.png",
+                    "topiq_nr": values["iqa"]["topiq_nr"],
+                    "scorer_provenance": contract,
+                    "scorer_provenance_sha256": digest,
+                }
+                if stale_kind == "nonfinite":
+                    existing["topiq_nr"] = float("nan")
+                else:
+                    contract["scorers"][0]["plugin_source"]["sha256"] = "0" * 64
+                    existing["scorer_provenance_sha256"] = score.json_sha256(contract)
+                (run_dir / "scores.jsonl").write_text(json.dumps(existing) + "\n")
+
+                argv = [
+                    "score.py",
+                    "--run_dir",
+                    str(run_dir),
+                    "--config",
+                    str(config_path),
+                    "--device",
+                    "cpu",
+                    "--strict",
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.dict(score.REGISTRY, {"iqa": registry["iqa"]}, clear=True),
+                ):
+                    score.main()
+
+                result_text = (run_dir / "scores.jsonl").read_text()
+                result = json.loads(result_text)
+                self.assertNotIn("NaN", result_text)
+                self.assertEqual(result["topiq_nr"], 0.9)
+                self.assertEqual(calls["iqa"], 1)
+                self.assertEqual(
+                    result["scorer_provenance"]["schema"],
+                    score.SCORER_PROVENANCE_SCHEMA,
+                )
 
     def test_output_lock_and_atomic_writer_protect_scores(self):
         with tempfile.TemporaryDirectory() as tmp:

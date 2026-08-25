@@ -6,12 +6,30 @@ import hashlib
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 import yaml
 from PIL import Image
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from AttentionGuidance import (  # noqa: E402
+    LAZY_LATENT_STRUCTURE_BASIS_ALIASES as _BASIS_ALIASES,
+    LAZY_LATENT_STRUCTURE_BASIS_NAMES as _BASIS_NAMES,
+    LAZY_LATENT_STRUCTURE_PROVIDER_ID as _LAZY_PROVIDER_ID,
+    LATENT_STRUCTURE_PROVIDER_IMPLEMENTATION_ALIASES,
+    normalize_latent_structure_bases as _normalize_bases,
+    normalize_latent_structure_provider_implementation,
+)
+from scorer_provenance import (
+    SCORER_PROVENANCE_SCHEMA,
+    registered_scorer_provenance_contract,
+    validate_hardened_score_rows,
+)
+from s7_provenance import validate_run_contract
 
 
 DEFAULT_SCORE_KEYS = (
@@ -35,6 +53,17 @@ SPLIT_NAMES = {
     "validation_confirmation": "validation",
     "test_final": "test",
 }
+LATENT_RENDERER_SCHEDULER_MAPPINGS = {
+    "legacy_unit",
+    "euler_clean_endpoint",
+}
+LATENT_RENDERER_BASIS_NORMALIZATIONS = {
+    "legacy_l2_to_rms",
+    "match_rms",
+}
+LAZY_LATENT_STRUCTURE_BASIS_NAMES = tuple(_BASIS_NAMES)
+LAZY_LATENT_STRUCTURE_BASIS_ALIASES = dict(_BASIS_ALIASES)
+LAZY_LATENT_STRUCTURE_PROVIDER_ID = _LAZY_PROVIDER_ID
 
 
 def sha256_file(path: str | os.PathLike[str]) -> str:
@@ -64,10 +93,515 @@ def _finite_values(record: Dict[str, Any], key: str) -> List[float]:
     values = record.get(key)
     if not isinstance(values, list) or not values:
         raise ValueError(f"renderer diagnostic {key!r} must be a non-empty list")
-    converted = [float(value) for value in values]
+    flattened = []
+
+    def visit(value):
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if isinstance(value, bool):
+            raise ValueError(f"renderer diagnostic {key!r} contains a boolean")
+        try:
+            flattened.append(float(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"renderer diagnostic {key!r} contains a non-numeric value"
+            ) from exc
+
+    visit(values)
+    converted = flattened
     if not all(math.isfinite(value) for value in converted):
         raise ValueError(f"renderer diagnostic {key!r} contains non-finite values")
     return converted
+
+
+def _registered_renderer_provider(
+    defaults: Dict[str, Any], action: Dict[str, Any], *, action_id: str
+) -> Dict[str, Any]:
+    provider = dict(defaults)
+    for mapping, label in (
+        (defaults, "defaults"),
+        (action.get("provider"), "provider"),
+        (action, "action"),
+    ):
+        if not isinstance(mapping, dict):
+            continue
+        for key in (
+            "implementation",
+            "provider_id",
+            "provider_provenance_id",
+            "provenance_id",
+            "requested_bases",
+            "required_hook_names",
+            "scheduler_mapping",
+            "basis_normalization",
+        ):
+            if key in mapping and mapping[key] is None:
+                raise ValueError(f"{action_id}: {label}.{key} cannot be null")
+    def _provider_ids(mapping: Any, label: str) -> list[str]:
+        if not isinstance(mapping, dict):
+            return []
+        values = []
+        for key in ("provider_id", "provider_provenance_id", "provenance_id"):
+            if key not in mapping:
+                continue
+            value = mapping[key]
+            if value is None or not str(value):
+                raise ValueError(
+                    f"{action_id}: {label}.{key} must be a non-empty string"
+                )
+            values.append(str(value))
+        if values and any(value != values[0] for value in values[1:]):
+            raise ValueError(
+                f"{action_id}: {label} provider provenance id fields disagree"
+            )
+        return values
+
+    action_provider_id_values = _provider_ids(action, "action")
+    if action.get("provider") is None and "provider" in action:
+        raise ValueError(f"{action_id}: registered provider cannot be null")
+    overrides = action.get("provider", {}) or {}
+    if not isinstance(overrides, dict):
+        raise ValueError(f"{action_id}: registered provider must be a mapping")
+    nested_provider_id_values = _provider_ids(overrides, "provider")
+    default_provider_id_values = _provider_ids(defaults, "defaults")
+    provider.update(overrides)
+    # Registration manifests may put the lazy mechanism contract directly on
+    # each action so heterogeneous basis subsets can share one defaults map.
+    for key in (
+        "implementation",
+        "provider_id",
+        "provider_provenance_id",
+        "provenance_id",
+        "requested_bases",
+        "required_hook_names",
+        "scheduler_mapping",
+        "basis_normalization",
+    ):
+        if key in action:
+            provider[key] = action[key]
+    explicit_contract = any(
+        key in provider
+        for key in (
+            "implementation",
+            "provider_id",
+            "provider_provenance_id",
+            "provenance_id",
+            "requested_bases",
+            "required_hook_names",
+        )
+    )
+    implementation = normalize_latent_structure_provider_implementation(
+        provider.get("implementation", LAZY_LATENT_STRUCTURE_PROVIDER_ID)
+    )
+    if implementation not in {
+        LAZY_LATENT_STRUCTURE_PROVIDER_ID,
+        "structural_unet_basis_v1",
+    }:
+        raise ValueError(f"{action_id}: registered provider implementation is invalid")
+    mapping = str(provider.get("scheduler_mapping", "legacy_unit"))
+    if mapping not in LATENT_RENDERER_SCHEDULER_MAPPINGS:
+        raise ValueError(f"{action_id}: registered scheduler_mapping is invalid")
+    normalization = str(
+        provider.get("basis_normalization", "legacy_l2_to_rms")
+    )
+    if normalization not in LATENT_RENDERER_BASIS_NORMALIZATIONS:
+        raise ValueError(f"{action_id}: registered basis_normalization is invalid")
+    requested_bases = _normalize_requested_bases(provider.get("requested_bases"))
+    feature_block = str(provider.get("feature_block", "up_blocks.0"))
+    semantic_layer = provider.get(
+        "semantic_layer",
+        "up_blocks.0.attentions.0.transformer_blocks.0.attn1",
+    )
+    semantic_layer = None if semantic_layer is None else str(semantic_layer)
+    expected_hooks = _required_hook_names(
+        requested_bases,
+        semantic_layer=semantic_layer,
+        feature_block=feature_block,
+    )
+    raw_hooks = provider.get("required_hook_names")
+    if raw_hooks is None:
+        required_hooks = expected_hooks
+    elif isinstance(raw_hooks, list):
+        required_hooks = [str(value) for value in raw_hooks]
+        if required_hooks != expected_hooks:
+            raise ValueError(f"{action_id}: registered required_hook_names drifted")
+    else:
+        raise ValueError(f"{action_id}: registered required_hook_names must be a list")
+    if (
+        implementation == "structural_unet_basis_v1"
+        and tuple(requested_bases) != tuple(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+    ):
+        raise ValueError(
+            f"{action_id}: structural_unet_basis_v1 requires all six canonical bases"
+        )
+    default_provider_id = (
+        LAZY_LATENT_STRUCTURE_PROVIDER_ID
+        if implementation == LAZY_LATENT_STRUCTURE_PROVIDER_ID
+        else "structural_unet_basis_v1"
+    )
+    provider_id_values = (
+        action_provider_id_values
+        or nested_provider_id_values
+        or default_provider_id_values
+    )
+    provider_id = provider_id_values[0] if provider_id_values else default_provider_id
+    provider["feature_block"] = feature_block
+    provider["semantic_layer"] = semantic_layer
+    provider["provider_id"] = provider_id
+    provider["provider_provenance_id"] = provider_id
+    provider.pop("provenance_id", None)
+    provider["implementation"] = implementation
+    provider["requested_bases"] = requested_bases
+    provider["required_hook_names"] = required_hooks
+    provider["scheduler_mapping"] = mapping
+    provider["basis_normalization"] = normalization
+    provider["_strict_contract"] = bool(explicit_contract)
+    return provider
+
+
+def _provider_field(provider: Dict[str, Any], key: str) -> Any:
+    """Resolve fields that were implicit in legacy LR-1 run configs."""
+    if key in provider:
+        value = provider[key]
+    elif key == "scheduler_mapping":
+        value = "legacy_unit"
+    elif key == "basis_normalization":
+        value = "legacy_l2_to_rms"
+    elif key == "implementation":
+        value = LAZY_LATENT_STRUCTURE_PROVIDER_ID
+    elif key == "requested_bases":
+        value = list(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+    elif key in {"provider_id", "provider_provenance_id"}:
+        implementation = str(
+            provider.get("implementation", LAZY_LATENT_STRUCTURE_PROVIDER_ID)
+        )
+        value = provider.get("provider_provenance_id") or provider.get("provenance_id") or (
+            "structural_unet_basis_v1"
+            if implementation in {"structural", "structural_unet", "structural_unet_basis_v1"}
+            else LAZY_LATENT_STRUCTURE_PROVIDER_ID
+        )
+    elif key == "required_hook_names":
+        requested = _normalize_requested_bases(provider.get("requested_bases"))
+        value = _required_hook_names(
+            requested,
+            semantic_layer=provider.get(
+                "semantic_layer",
+                "up_blocks.0.attentions.0.transformer_blocks.0.attn1",
+            ),
+            feature_block=provider.get("feature_block", "up_blocks.0"),
+        )
+    else:
+        value = None
+    if key == "implementation":
+        return normalize_latent_structure_provider_implementation(value)
+    if key == "requested_bases":
+        return _normalize_requested_bases(value)
+    if key == "required_hook_names" and value is not None:
+        return [str(item) for item in value]
+    if key in {"provider_id", "provider_provenance_id"}:
+        return str(value)
+    return value
+
+
+def _normalize_requested_bases(value: Any) -> list[str]:
+    """Normalize aliases using the same canonical action order as generation."""
+    try:
+        return list(_normalize_bases(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _required_hook_names(
+    requested_bases: list[str], *, semantic_layer: Any, feature_block: Any
+) -> list[str]:
+    hooks = []
+    if "freeu" in requested_bases:
+        hooks.append(f"{feature_block}_backbone_skip")
+    if "semantic" in requested_bases and semantic_layer is not None:
+        hooks.append(f"{semantic_layer}_qk")
+    return hooks
+
+
+def _audit_provider_diagnostics(
+    provider: Dict[str, Any],
+    expected_provider: Dict[str, Any] | None,
+    *,
+    expected_id: str,
+    strict: bool,
+) -> None:
+    """Check the per-step lazy-provider contract, including unused slots."""
+    if expected_provider is None or not strict:
+        return
+    expected_fields = {
+        "implementation": expected_provider["implementation"],
+        "provider_id": expected_provider["provider_id"],
+        "provider_provenance_id": expected_provider["provider_provenance_id"],
+        "requested_bases": expected_provider["requested_bases"],
+        "constructed_bases": expected_provider["requested_bases"],
+        "registered_hook_names": expected_provider["required_hook_names"],
+        "required_hook_names": expected_provider["required_hook_names"],
+        "scheduler_mapping": expected_provider["scheduler_mapping"],
+        "basis_normalization": expected_provider["basis_normalization"],
+    }
+    for key, expected in expected_fields.items():
+        if key not in provider:
+            raise ValueError(f"{expected_id}: native provider field {key!r} is missing")
+        observed = provider.get(key)
+        if observed != expected:
+            raise ValueError(f"{expected_id}: native provider field {key!r} drifted")
+
+    basis_rms = provider.get("basis_rms")
+    if (
+        not isinstance(basis_rms, list)
+        or len(basis_rms) != 1
+        or not isinstance(basis_rms[0], list)
+        or len(basis_rms[0]) != len(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+    ):
+        raise ValueError(f"{expected_id}: native basis_rms must have shape (1, 6)")
+    values = [float(value) for value in basis_rms[0]]
+    if not all(math.isfinite(value) and value >= 0 for value in values):
+        raise ValueError(f"{expected_id}: native basis_rms is invalid")
+    requested = set(expected_provider["requested_bases"])
+    for index, name in enumerate(LAZY_LATENT_STRUCTURE_BASIS_NAMES):
+        if name not in requested and values[index] != 0.0:
+            raise ValueError(f"{expected_id}: unrequested basis {name!r} is non-zero")
+
+
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_native_schedule(
+    record: Dict[str, Any],
+    ledger: list[Dict[str, Any]],
+    *,
+    expected_steps: int,
+    expected_id: str,
+    strict: bool,
+) -> bool:
+    """Validate the frozen Euler schedule and its post-run ledger bindings."""
+    schedule_keys = {
+        "scheduler_schedule_sha256",
+        "scheduler_timesteps",
+        "scheduler_sigmas",
+    }
+    present = schedule_keys & set(record)
+    if not present:
+        if strict:
+            raise ValueError(f"{expected_id}: native scheduler schedule provenance is missing")
+        return False
+    if present != schedule_keys:
+        raise ValueError(f"{expected_id}: native scheduler schedule provenance is incomplete")
+    raw_timesteps = record.get("scheduler_timesteps")
+    raw_sigmas = record.get("scheduler_sigmas")
+    if not isinstance(raw_timesteps, list) or not isinstance(raw_sigmas, list):
+        raise ValueError(f"{expected_id}: native scheduler schedule arrays are malformed")
+    try:
+        timesteps = [float(value) for value in raw_timesteps]
+        sigmas = [float(value) for value in raw_sigmas]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{expected_id}: native scheduler schedule is non-numeric") from exc
+    if len(timesteps) != expected_steps or len(sigmas) != expected_steps + 1:
+        raise ValueError(f"{expected_id}: native scheduler schedule length is invalid")
+    if not all(math.isfinite(value) for value in timesteps + sigmas):
+        raise ValueError(f"{expected_id}: native scheduler schedule is non-finite")
+    if any(sigmas[index] <= 0 for index in range(expected_steps)) or sigmas[-1] < 0:
+        raise ValueError(f"{expected_id}: native scheduler sigma schedule is invalid")
+    payload = {"timesteps": timesteps, "sigmas": sigmas}
+    if record.get("scheduler_schedule_sha256") != _json_sha256(payload):
+        raise ValueError(f"{expected_id}: native scheduler schedule hash is invalid")
+
+    for step_index, step in enumerate(ledger):
+        if not math.isclose(
+            float(step["timestep"]), timesteps[step_index], rel_tol=1e-6, abs_tol=1e-5
+        ):
+            raise ValueError(f"{expected_id}: native timestep schedule drifted")
+        if not math.isclose(
+            float(step["sigma_from"]), sigmas[step_index], rel_tol=1e-6, abs_tol=1e-6
+        ) or not math.isclose(
+            float(step["sigma_to"]), sigmas[step_index + 1], rel_tol=1e-6, abs_tol=1e-6
+        ):
+            raise ValueError(f"{expected_id}: native sigma schedule drifted")
+
+    # These fields are emitted by current registered runs.  Keep them optional
+    # for pre-contract synthetic fixtures, while validating them whenever any
+    # of the config-hash ledger is present.
+    config_hash_keys = {
+        "scheduler_config_sha256_v2",
+        "active_scheduler_config_sha256_v2",
+        "scheduler_order",
+        "scheduler_solver_order",
+        "scheduler_construction_init_noise_sigma",
+        "scheduler_effective_init_noise_sigma",
+    }
+    if strict and not config_hash_keys.issubset(record):
+        raise ValueError(f"{expected_id}: native scheduler config provenance is incomplete")
+    if config_hash_keys & set(record):
+        if not config_hash_keys.issubset(record):
+            raise ValueError(f"{expected_id}: native scheduler config provenance is incomplete")
+        for key in ("scheduler_config_sha256_v2", "active_scheduler_config_sha256_v2"):
+            value = record.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{expected_id}: native scheduler config hash is invalid")
+        if record["scheduler_config_sha256_v2"] != record["active_scheduler_config_sha256_v2"]:
+            raise ValueError(f"{expected_id}: native scheduler config hash drifted")
+        if record.get("scheduler_order") != 1 or record.get("scheduler_solver_order") is not None:
+            raise ValueError(f"{expected_id}: native scheduler order contract drifted")
+        for key in (
+            "scheduler_construction_init_noise_sigma",
+            "scheduler_effective_init_noise_sigma",
+        ):
+            value = float(record[key])
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{expected_id}: native scheduler initial sigma is invalid")
+    return True
+
+
+def _native_schedule_signature(record: Dict[str, Any], *, expected_id: str) -> str | None:
+    """Return the complete schedule identity for cross-record consistency checks."""
+    keys = (
+        "scheduler_schedule_sha256",
+        "scheduler_timesteps",
+        "scheduler_sigmas",
+        "scheduler_config_sha256_v2",
+        "active_scheduler_config_sha256_v2",
+        "scheduler_order",
+        "scheduler_solver_order",
+        "scheduler_construction_init_noise_sigma",
+        "scheduler_effective_init_noise_sigma",
+    )
+    present = [key in record for key in keys]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError(f"{expected_id}: native scheduler provenance is incomplete")
+    payload = {key: record.get(key) for key in keys}
+    try:
+        return _json_sha256(payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{expected_id}: native scheduler provenance is not canonical") from exc
+
+
+def _audit_native_step_ledger(
+    record: Dict[str, Any],
+    *,
+    expected_steps: int,
+    bound: float,
+    expected_id: str,
+    expected_provider: Dict[str, Any] | None = None,
+    strict_schedule: bool = False,
+    strict_contract: bool = False,
+) -> tuple[float, float, float]:
+    calls = record.get("unet_calls_per_step")
+    if calls != [1] * expected_steps or record.get("extra_unet_calls") != 0:
+        raise ValueError(f"{expected_id}: native renderer violates one-UNet-call NFE")
+    if record.get("scheduler_name") != "EulerDiscreteScheduler":
+        raise ValueError(f"{expected_id}: native renderer used a non-Euler scheduler")
+    ledger = record.get("latent_renderer_step_diagnostics")
+    if not isinstance(ledger, list) or len(ledger) != expected_steps:
+        raise ValueError(
+            f"{expected_id}: native renderer ledger must contain {expected_steps} steps"
+        )
+
+    _validate_native_schedule(
+        record,
+        ledger,
+        expected_steps=expected_steps,
+        expected_id=expected_id,
+        strict=strict_schedule,
+    )
+
+    max_ratio = 0.0
+    max_mean_error = 0.0
+    max_variance_error = 0.0
+    for step_index, step in enumerate(ledger):
+        if not isinstance(step, dict):
+            raise ValueError(f"{expected_id}: native step {step_index} is not a mapping")
+        if step.get("step_index") != step_index:
+            raise ValueError(f"{expected_id}: native renderer step indices drifted")
+        if step.get("scheduler_step_index") != step_index:
+            raise ValueError(f"{expected_id}: native scheduler step indices drifted")
+        try:
+            timestep = float(step["timestep"])
+            sigma_from = float(step["sigma_from"])
+            sigma_to = float(step["sigma_to"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{expected_id}: native step {step_index} lacks sigma provenance"
+            ) from exc
+        if not all(math.isfinite(value) for value in (timestep, sigma_from, sigma_to)):
+            raise ValueError(f"{expected_id}: native step provenance is non-finite")
+        if sigma_from <= 0 or sigma_to < 0 or sigma_to > sigma_from:
+            raise ValueError(f"{expected_id}: native step sigma order is invalid")
+        if step.get("prediction_type") not in {
+            "epsilon",
+            "sample",
+            "v_prediction",
+        }:
+            raise ValueError(f"{expected_id}: native prediction type is invalid")
+        gain = _finite_values(step, "clean_update_gain")
+        applied_ratio = _finite_values(step, "applied_update_ratio")
+        mean_error = _finite_values(step, "mean_error")
+        variance_error = _finite_values(step, "variance_error")
+        if any(len(values) != 1 for values in (gain, applied_ratio, mean_error, variance_error)):
+            raise ValueError(f"{expected_id}: native diagnostics must have batch size one")
+        expected_gain = 1.0 - sigma_to / sigma_from
+        if not 0 < gain[0] <= 1 or not math.isclose(
+            gain[0], expected_gain, rel_tol=1e-6, abs_tol=1e-7
+        ):
+            raise ValueError(f"{expected_id}: native clean-update gain is invalid")
+        if applied_ratio[0] < 0 or applied_ratio[0] > bound + 1e-6:
+            raise ValueError(f"{expected_id}: native applied trust bound is violated")
+        if abs(mean_error[0]) > 1e-4:
+            raise ValueError(f"{expected_id}: native mean preservation is violated")
+        if abs(variance_error[0]) > 1e-3:
+            raise ValueError(f"{expected_id}: native variance preservation is violated")
+        provider = step.get("provider_diagnostics")
+        if not isinstance(provider, dict):
+            raise ValueError(f"{expected_id}: native provider ledger is missing")
+        _finite_values(provider, "semantic_entropy")
+        if not (
+            strict_contract
+            or (expected_provider and expected_provider.get("_strict_contract"))
+        ):
+            _finite_values(provider, "basis_rms")
+        _audit_provider_diagnostics(
+            provider,
+            expected_provider,
+            expected_id=expected_id,
+            strict=bool(strict_contract or (expected_provider and expected_provider.get("_strict_contract"))),
+        )
+        max_ratio = max(max_ratio, applied_ratio[0])
+        max_mean_error = max(max_mean_error, abs(mean_error[0]))
+        max_variance_error = max(max_variance_error, abs(variance_error[0]))
+
+    last_diagnostics = record.get("latent_renderer_diagnostics")
+    for key, value in last_diagnostics.items():
+        if ledger[-1].get(key) != value:
+            raise ValueError(
+                f"{expected_id}: last renderer diagnostics differ from native ledger"
+            )
+    if ledger[-1].get("provider_diagnostics") != record.get(
+        "latent_renderer_provider_diagnostics"
+    ):
+        raise ValueError(
+            f"{expected_id}: last provider diagnostics differ from native ledger"
+        )
+    return max_ratio, max_mean_error, max_variance_error
 
 
 def audit_run(
@@ -96,6 +630,15 @@ def audit_run(
     prompts = pd.read_csv(prompts_path)
     manifest = load_jsonl(manifest_path)
     scores = load_jsonl(scores_path)
+    strict_registered_contract = bool(config.get("native_renderer_registered"))
+    run_contract_sha256 = None
+    if "run_contract" in config or "run_contract_sha256" in config:
+        try:
+            run_contract_sha256 = validate_run_contract(config)
+        except ValueError as exc:
+            raise ValueError(f"run config contract is invalid: {exc}") from exc
+    elif strict_registered_contract:
+        raise ValueError("registered native renderer run lacks a run contract")
     manifest_by_id = _unique_by_id(manifest, "manifest")
     scores_by_id = _unique_by_id(scores, "scores")
 
@@ -141,7 +684,18 @@ def audit_run(
     if configured_ids != action_ids:
         raise ValueError("run action order/set differs from source actions")
     source_by_id = {str(action["id"]): action for action in source_actions}
-    provider_defaults = dict(source.get("latent_renderer_provider", {}) or {})
+    if "latent_renderer_provider" in source:
+        raw_provider_defaults = source.get("latent_renderer_provider")
+        if raw_provider_defaults is None:
+            raise ValueError("source latent_renderer_provider cannot be null")
+    else:
+        raw_provider_defaults = source.get("required_provider", {})
+    if raw_provider_defaults is None:
+        raise ValueError("source required_provider cannot be null")
+    provider_defaults = dict(raw_provider_defaults)
+    if not isinstance(provider_defaults, dict):
+        raise ValueError("source required_provider must be a mapping")
+    renderer_providers: Dict[str, Dict[str, Any]] = {}
     for registered, configured in zip(source_actions, configured_actions):
         action_id = str(registered["id"])
         if configured.get("type") != registered.get("type"):
@@ -151,13 +705,130 @@ def audit_run(
             observed = [float(value) for value in configured.get("coefficients", [])]
             if observed != expected:
                 raise ValueError(f"{action_id}: run coefficients differ from source")
-            expected_provider = dict(provider_defaults)
-            expected_provider.update(registered.get("provider", {}) or {})
+            expected_provider = _registered_renderer_provider(
+                provider_defaults, registered, action_id=action_id
+            )
+            renderer_providers[action_id] = expected_provider
             configured_provider = configured.get("latent_renderer_provider", {}) or {}
-            for key, value in expected_provider.items():
-                if configured_provider.get(key) != value:
+            if not isinstance(configured_provider, dict):
+                raise ValueError(f"{action_id}: run provider must be a mapping")
+            for key in (
+                "implementation",
+                "provider_id",
+                "provider_provenance_id",
+                "requested_bases",
+                "required_hook_names",
+                "scheduler_mapping",
+                "basis_normalization",
+            ):
+                if _provider_field(configured_provider, key) != _provider_field(
+                    expected_provider, key
+                ):
                     raise ValueError(
                         f"{action_id}: run provider field {key!r} differs from source"
+                    )
+    native_renderer_run = any(
+        provider["scheduler_mapping"] == "euler_clean_endpoint"
+        for provider in renderer_providers.values()
+    )
+    if native_renderer_run and strict_registered_contract:
+        source_sampling = source.get("sampling")
+        registered_sampling = config.get("registered_sampling")
+        if not isinstance(source_sampling, dict) or not isinstance(
+            registered_sampling, dict
+        ):
+            raise ValueError(
+                "registered native renderer run lacks sampling provenance"
+            )
+        for key in (
+            "model",
+            "model_revision",
+            "scheduler",
+            "extra_unet_calls",
+            "scheduler_churn",
+        ):
+            if source_sampling.get(key) != registered_sampling.get(key):
+                raise ValueError(
+                    f"registered native sampling field {key!r} differs from source"
+                )
+        if source_sampling.get("scheduler") != "EulerDiscreteScheduler":
+            raise ValueError(
+                "registered native renderer run must use EulerDiscreteScheduler"
+            )
+        if int(source_sampling.get("extra_unet_calls", -1)) != 0:
+            raise ValueError(
+                "registered native renderer run requires zero extra U-Net calls"
+            )
+        if float(source_sampling.get("scheduler_churn", 0.0)) != 0.0:
+            raise ValueError(
+                "registered native renderer run requires zero scheduler churn"
+            )
+    registered_schedule_hash = None
+    registered_scheduler_config_hashes = {}
+    for registration in (source, config):
+        sampling = registration.get("sampling")
+        if not isinstance(sampling, dict):
+            sampling = registration.get("registered_sampling")
+        if not isinstance(sampling, dict):
+            continue
+        for key in ("scheduler_schedule_sha256", "schedule_sha256"):
+            candidate = sampling.get(key)
+            if candidate is None:
+                continue
+            candidate = str(candidate)
+            if registered_schedule_hash is not None and candidate != registered_schedule_hash:
+                raise ValueError("registered native scheduler schedule hashes disagree")
+            registered_schedule_hash = candidate
+        for key in ("scheduler_config_sha256_v2", "active_scheduler_config_sha256_v2"):
+            candidate = sampling.get(key)
+            if candidate is None:
+                continue
+            candidate = str(candidate)
+            prior = registered_scheduler_config_hashes.get(key)
+            if prior is not None and candidate != prior:
+                raise ValueError(f"registered native scheduler config hash {key!r} disagrees")
+            registered_scheduler_config_hashes[key] = candidate
+    scorer_provenance_sha256 = None
+    registered_scorer_contract = None
+    registered_scorer_sha256 = None
+    for registration in (source, config):
+        try:
+            candidate_contract, candidate_hash = registered_scorer_provenance_contract(
+                registration
+            )
+        except ValueError as exc:
+            raise ValueError(f"registered scorer provenance is invalid: {exc}") from exc
+        if candidate_contract is not None:
+            if (
+                registered_scorer_contract is not None
+                and candidate_contract != registered_scorer_contract
+            ):
+                raise ValueError("registered scorer provenance contracts disagree")
+            registered_scorer_contract = candidate_contract
+        if candidate_hash is not None:
+            if registered_scorer_sha256 is not None and candidate_hash != registered_scorer_sha256:
+                raise ValueError("registered scorer provenance hashes disagree")
+            registered_scorer_sha256 = candidate_hash
+    if native_renderer_run:
+        scorer_provenance_sha256 = validate_hardened_score_rows(
+            scores,
+            required_schema=SCORER_PROVENANCE_SCHEMA,
+            expected_sha256=registered_scorer_sha256
+            if registered_scorer_sha256 is not None
+            else None,
+            expected_contract=registered_scorer_contract,
+        )
+        if strict_registered_contract:
+            if registered_scorer_sha256 is None:
+                raise ValueError(
+                    "registered native renderer run lacks scorer provenance registration"
+                )
+            if not isinstance(run_contract_sha256, str):
+                raise ValueError("registered native renderer run lacks a contract hash")
+            for score in scores:
+                if score.get("run_contract_sha256") != run_contract_sha256:
+                    raise ValueError(
+                        f"{score.get('id')}: scorer row is not bound to the run contract"
                     )
     expected_cutoffs = [float(value) for value in source.get("frequency_band_cutoffs", [])]
     observed_cutoffs = [float(value) for value in config.get("frequency_band_cutoffs", [])]
@@ -195,6 +866,7 @@ def audit_run(
     image_hashes: Dict[tuple, str] = {}
     block_devices: Dict[tuple, set] = {}
     block_ranks: Dict[tuple, set] = {}
+    native_schedule_signature: str | None = None
     run_root = run_dir.resolve()
     resolution = int(config.get("resolution", 0))
     for design, record in records_by_design.items():
@@ -206,6 +878,23 @@ def audit_run(
             raise ValueError(f"prompt text drift at prompt index {prompt_index}")
         if record.get("action_type") != source_by_id[action_id].get("type"):
             raise ValueError(f"{expected_id}: record action type differs from source")
+        if strict_registered_contract and record.get("run_contract_sha256") != run_contract_sha256:
+            raise ValueError(f"{expected_id}: sidecar is not bound to the run contract")
+        if strict_registered_contract:
+            if record.get("provenance_schema") != "s7_trajectory_provenance_v1":
+                raise ValueError(f"{expected_id}: sidecar provenance schema is missing")
+            sidecar_action = record.get("action")
+            if not isinstance(sidecar_action, dict) or record.get("action_sha256") != _json_sha256(
+                sidecar_action
+            ):
+                raise ValueError(f"{expected_id}: sidecar action hash is invalid")
+            configured_action = next(
+                action
+                for action in configured_actions
+                if str(action.get("id")) == action_id
+            )
+            if sidecar_action != configured_action:
+                raise ValueError(f"{expected_id}: sidecar action differs from run config")
 
         block = (prompt_index, seed)
         block_devices.setdefault(block, set()).add(str(record.get("device", "")))
@@ -237,31 +926,118 @@ def audit_run(
             diagnostics = record.get("latent_renderer_diagnostics")
             if not isinstance(diagnostics, dict):
                 raise ValueError(f"{expected_id}: renderer diagnostics are missing")
-            update_ratio = _finite_values(diagnostics, "update_ratio")
-            mean_error = _finite_values(diagnostics, "mean_error")
-            variance_error = _finite_values(diagnostics, "variance_error")
             bound = float(record.get("action", {}).get("max_update_ratio", 0.05))
             if not math.isfinite(bound) or bound < 0:
                 raise ValueError(f"{expected_id}: renderer trust bound is invalid")
-            if min(update_ratio) < 0 or max(update_ratio) > bound + 1e-6:
-                raise ValueError(f"{expected_id}: renderer trust bound is violated")
-            if max(map(abs, mean_error)) > 1e-4:
-                raise ValueError(f"{expected_id}: renderer mean preservation is violated")
-            if max(map(abs, variance_error)) > 1e-3:
-                raise ValueError(f"{expected_id}: renderer variance preservation is violated")
-            max_update_ratio = max(max_update_ratio, max(update_ratio))
-            max_mean_error = max(max_mean_error, max(map(abs, mean_error)))
-            max_variance_error = max(
-                max_variance_error, max(map(abs, variance_error))
-            )
             provider_diagnostics = record.get("latent_renderer_provider_diagnostics")
             if not isinstance(provider_diagnostics, dict):
                 raise ValueError(f"{expected_id}: provider diagnostics are missing")
             _finite_values(provider_diagnostics, "semantic_entropy")
-            _finite_values(provider_diagnostics, "basis_rms")
+            expected_provider = renderer_providers[action_id]
+            if not (strict_registered_contract or expected_provider.get("_strict_contract")):
+                _finite_values(provider_diagnostics, "basis_rms")
+            expected_mapping = expected_provider["scheduler_mapping"]
+            observed_mapping = record.get("latent_renderer_scheduler_mapping")
+            record_provider = record.get("action", {}).get(
+                "latent_renderer_provider", {}
+            )
+            if not isinstance(record_provider, dict):
+                raise ValueError(f"{expected_id}: sidecar provider is missing")
+            for key in ("scheduler_mapping", "basis_normalization"):
+                if _provider_field(record_provider, key) != expected_provider[key]:
+                    raise ValueError(
+                        f"{expected_id}: sidecar provider field {key!r} drifted"
+                    )
+
+            _audit_provider_diagnostics(
+                provider_diagnostics,
+                expected_provider,
+                expected_id=expected_id,
+                strict=bool(
+                    strict_registered_contract
+                    or expected_provider.get("_strict_contract")
+                ),
+            )
+
+            if expected_mapping == "euler_clean_endpoint":
+                if observed_mapping != expected_mapping:
+                    raise ValueError(
+                        f"{expected_id}: native runtime scheduler mapping drifted"
+                    )
+                expected_steps = int(config.get("num_inference_steps", 0))
+                if expected_steps <= 0 or record.get("num_inference_steps") != expected_steps:
+                    raise ValueError(
+                        f"{expected_id}: native renderer inference-step contract drifted"
+                    )
+                ratio, mean_error, variance_error = _audit_native_step_ledger(
+                    record,
+                    expected_steps=expected_steps,
+                    bound=bound,
+                    expected_id=expected_id,
+                    expected_provider=expected_provider,
+                    strict_schedule=bool(config.get("native_renderer_registered")),
+                    strict_contract=strict_registered_contract,
+                )
+                schedule_signature = _native_schedule_signature(
+                    record, expected_id=expected_id
+                )
+                if registered_schedule_hash is not None and record.get(
+                    "scheduler_schedule_sha256"
+                ) != registered_schedule_hash:
+                    raise ValueError(
+                        f"{expected_id}: native scheduler schedule differs from registration"
+                    )
+                for key, expected_hash in registered_scheduler_config_hashes.items():
+                    if record.get(key) != expected_hash:
+                        raise ValueError(
+                            f"{expected_id}: native scheduler config differs from registration"
+                        )
+                if schedule_signature is not None:
+                    if (
+                        native_schedule_signature is not None
+                        and schedule_signature != native_schedule_signature
+                    ):
+                        raise ValueError(
+                            f"{expected_id}: native scheduler schedule differs across records"
+                        )
+                    native_schedule_signature = schedule_signature
+                max_update_ratio = max(max_update_ratio, ratio)
+                max_mean_error = max(max_mean_error, mean_error)
+                max_variance_error = max(max_variance_error, variance_error)
+            else:
+                if observed_mapping not in (None, "legacy_unit"):
+                    raise ValueError(
+                        f"{expected_id}: legacy runtime scheduler mapping drifted"
+                    )
+                if record.get("latent_renderer_step_diagnostics") is not None:
+                    raise ValueError(
+                        f"{expected_id}: legacy renderer has a native step ledger"
+                    )
+                update_ratio = _finite_values(diagnostics, "update_ratio")
+                mean_error = _finite_values(diagnostics, "mean_error")
+                variance_error = _finite_values(diagnostics, "variance_error")
+                if min(update_ratio) < 0 or max(update_ratio) > bound + 1e-6:
+                    raise ValueError(f"{expected_id}: renderer trust bound is violated")
+                if max(map(abs, mean_error)) > 1e-4:
+                    raise ValueError(
+                        f"{expected_id}: renderer mean preservation is violated"
+                    )
+                if max(map(abs, variance_error)) > 1e-3:
+                    raise ValueError(
+                        f"{expected_id}: renderer variance preservation is violated"
+                    )
+                max_update_ratio = max(max_update_ratio, max(update_ratio))
+                max_mean_error = max(
+                    max_mean_error, max(map(abs, mean_error))
+                )
+                max_variance_error = max(
+                    max_variance_error, max(map(abs, variance_error))
+                )
         elif (
             record.get("latent_renderer_diagnostics") is not None
             or record.get("latent_renderer_provider_diagnostics") is not None
+            or record.get("latent_renderer_scheduler_mapping") is not None
+            or record.get("latent_renderer_step_diagnostics") is not None
         ):
             raise ValueError(f"{expected_id}: non-renderer action has stale diagnostics")
 
@@ -280,6 +1056,10 @@ def audit_run(
                 raise ValueError(f"prompt/seed block {block} has identical PNG hashes")
 
     warnings = []
+    if not native_renderer_run:
+        warnings.append(
+            "legacy LR-1 score rows are not required to carry hardened scorer provenance"
+        )
     if config.get("split_role") is None:
         warnings.append("run config predates explicit split_role recording")
     return {
@@ -295,6 +1075,10 @@ def audit_run(
         "max_update_ratio": max_update_ratio,
         "max_abs_mean_error": max_mean_error,
         "max_abs_variance_error": max_variance_error,
+        "scorer_provenance_schema": (
+            SCORER_PROVENANCE_SCHEMA if native_renderer_run else None
+        ),
+        "scorer_provenance_sha256": scorer_provenance_sha256,
         "all_action_png_hashes_distinct_within_block": require_distinct_actions,
         "warnings": warnings,
         "provenance": {

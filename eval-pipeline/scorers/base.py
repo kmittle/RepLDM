@@ -22,6 +22,9 @@ class Scorer:
     NAME = None
     # OUTPUT_KEYS: tuple of (column, direction); direction in {"higher", "lower", "witness"}
     OUTPUT_KEYS: tuple = ()
+    # Strict scoring requires subclasses to name every distribution that can
+    # affect their result and to implement provenance_metadata().
+    PROVENANCE_PACKAGES: tuple[str, ...] | None = None
 
     def __init__(self, device="cuda", **params):
         self.device = device
@@ -35,4 +38,8 @@ class Scorer:
 
     def score_image(self, image, prompt):
         """Return {column: float, ...} for one PIL.Image + prompt string."""
+        raise NotImplementedError
+
+    def provenance_metadata(self):
+        """Describe models, assets, preprocessing, and effective parameters."""
         raise NotImplementedError
