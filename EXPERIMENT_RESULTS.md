@@ -282,3 +282,30 @@ split 上用 crossed prompt/seed bootstrap、prompt sign-flip、Holm correction 
 TOPIQ/HPSv2/CLIP plus clipping/saturation/contrast/colorfulness/sharpness guards
 复核。源 TSV 与已核验 commit 的 hash 记录在 metadata；若固定 correction 不通过，
 S7 关闭并报告负结果。
+
+### 注册 development 结果（失败）
+
+注册运行 `outputs/trajectory_correction/development_v3` 完成 11 prompts x 2
+seeds x 7 actions = 154 个同卡配对样本。manifest 与 scores 均为 154 行，实际
+U-Net ledger 为每步一次调用；manifest SHA-256 为
+`9388528f64b813f68f509686b1a21dc503c4f0a3af52d63be1d9ab9561d3fbdf`，
+scores SHA-256 为
+`c62095b464260f02a33bf0d3b15dbbd886493df9367ea2af6876988922b77a4f`。
+首次 queue 仅因评分 CLI 把 `7` 而非 `cuda:7` 传给 Torch 而停止；修复后的
+queue 复用了逐项 hash 校验通过的生成结果，没有重生成或改变 action。
+
+| action | Δ TOPIQ-NR [95% CI] | Holm p | Δ HPSv2 | Δ saturation |
+|---|---:|---:|---:|---:|
+| native Euler-Ancestral reference | `+0.010171 [-0.014416,+0.041049]` | n/a | `+0.002447` | `+0.040791` |
+| drift `.25` | `-0.281956 [-0.359272,-0.207228]` | `0.005999` | `-0.099942` | `-0.042550` |
+| drift `.50` | `-0.349739 [-0.402061,-0.295787]` | `0.005999` | `-0.167738` | `-0.040463` |
+| ancestral `.25` | `+0.007299 [-0.010891,+0.024723]` | `0.802120` | `-0.001931` | `+0.023584` |
+| ancestral `.50` | `+0.009080 [-0.013590,+0.031788]` | `0.802120` | `-0.001703` | `+0.031279` |
+| ancestral `.75` | `+0.006077 [-0.017856,+0.035169]` | `0.802120` | `+0.002120` | `+0.036013` |
+
+Selector 严格返回 `no_correction`。drift-only correction 是显著的大幅退化；三
+个 stochastic mixes 虽有正均值，但 CI 全部跨零、Holm 显著性失败，并伴随更高
+saturation。它们与原生 Euler-Ancestral 的不确定正均值一致，更像普通 sampler
+随机性而非可归因的 correction 收益。因此 validation seeds `[11,29,101]` 未使用，
+S7 不授权 renderer、蒸馏或 RL。后续 matched-NFE DPM++/UniPC 矩阵仅用于确认
+sampler 归因，全部 action 都禁止参与方法选择。
