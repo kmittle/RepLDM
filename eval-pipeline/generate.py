@@ -27,6 +27,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager, nullcontext
 import fcntl
 import glob
@@ -101,6 +102,22 @@ TRAJECTORY_SCHEMAS = {
     "trajectory_correction_validation_v1",
 }
 CFG_BASELINE_SCHEMA = "cfg_baselines_v1"
+NATIVE_RENDERER_SCHEMA = "scheduler_native_fixed_headroom_actions_v1"
+NATIVE_RENDERER_AUTH_SOURCE_TEMPLATE = (
+    "eval-pipeline/configs/scheduler_native_fixed_headroom_development.yaml"
+)
+NATIVE_RENDERER_AUTH_SCOPE = "development_only_fixed_headroom"
+NATIVE_RENDERER_AUTH_FIELDS = {
+    "reviewer",
+    "reviewed_commit",
+    "source_template",
+    "source_template_sha256",
+    "scope",
+    "gpu_generation",
+    "scoring",
+    "method_selection",
+}
+NATIVE_RENDERER_SCORER_SCHEMA = "repldm_scorer_provenance_v1"
 LATENT_RENDERER_SCHEDULER_MAPPINGS = {
     "legacy_unit",
     "euler_clean_endpoint",
@@ -348,6 +365,16 @@ def has_scheduler_native_renderer(actions) -> bool:
         and action.get("latent_renderer_provider", {}).get("scheduler_mapping")
         == "euler_clean_endpoint"
         for action in actions
+    )
+
+
+def native_renderer_step_diagnostics_required(cfg: dict, action: dict) -> bool:
+    """Return whether an action must carry the scheduler-native step ledger."""
+    return bool(
+        cfg.get("native_renderer_registered")
+        and action.get("type") == "latent_renderer_fixed"
+        and action.get("latent_renderer_provider", {}).get("scheduler_mapping")
+        == "euler_clean_endpoint"
     )
 
 
@@ -1169,6 +1196,184 @@ def validate_cfg_baseline_authorization(
         )
 
 
+def validate_native_renderer_authorization(
+    path: str, *, repository_root: str | None = None
+) -> None:
+    """Bind an executable native-renderer copy to its frozen registration.
+
+    The registration YAML is deliberately not executable.  This check makes a
+    separate reviewed copy explicit: the design body (prompts, actions,
+    sampling and gates) must remain byte-equivalent after removing only the
+    registration status/authorization metadata and the scorer contract.
+    """
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != NATIVE_RENDERER_SCHEMA:
+        return
+    if config.get("status") != "authorized_development":
+        raise ValueError(
+            f"{NATIVE_RENDERER_SCHEMA} is not authorized; reviewer must freeze "
+            "status: authorized_development"
+        )
+    authorization = config.get("authorization")
+    if not isinstance(authorization, dict):
+        raise ValueError(
+            "authorized native-renderer config requires an authorization mapping"
+        )
+    if set(authorization) != NATIVE_RENDERER_AUTH_FIELDS:
+        raise ValueError(
+            "native-renderer authorization fields differ from the frozen schema"
+        )
+    if not str(authorization.get("reviewer", "")).strip():
+        raise ValueError("native-renderer authorization requires reviewer")
+    if authorization.get("scope") != NATIVE_RENDERER_AUTH_SCOPE:
+        raise ValueError(
+            "native-renderer authorization scope must be "
+            f"{NATIVE_RENDERER_AUTH_SCOPE}"
+        )
+    if authorization.get("source_template") != NATIVE_RENDERER_AUTH_SOURCE_TEMPLATE:
+        raise ValueError(
+            "native-renderer authorization source_template must be "
+            f"{NATIVE_RENDERER_AUTH_SOURCE_TEMPLATE}"
+        )
+    template_hash = str(authorization.get("source_template_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", template_hash):
+        raise ValueError(
+            "native-renderer source_template_sha256 must be 64 lowercase hex"
+        )
+    registration_source = config.get("registration_source")
+    if not isinstance(registration_source, dict) or set(registration_source) != {
+        "path",
+        "sha256",
+    }:
+        raise ValueError(
+            "authorized native-renderer config requires a frozen registration_source"
+        )
+    if registration_source["path"] != NATIVE_RENDERER_AUTH_SOURCE_TEMPLATE:
+        raise ValueError(
+            "native-renderer registration_source.path differs from source_template"
+        )
+    if not isinstance(registration_source["sha256"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", registration_source["sha256"]
+    ):
+        raise ValueError("native-renderer registration_source.sha256 is invalid")
+    if registration_source["sha256"] != template_hash:
+        raise ValueError(
+            "native-renderer registration_source hash differs from authorization"
+        )
+    if authorization.get("gpu_generation") is not True:
+        raise ValueError("native-renderer development generation is not authorized")
+    if authorization.get("scoring") is not True:
+        raise ValueError("native-renderer development scoring is not authorized")
+    if authorization.get("method_selection") is not False:
+        raise ValueError(
+            "native-renderer development authorization cannot authorize method selection"
+        )
+    reviewed_commit = str(authorization.get("reviewed_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewed_commit):
+        raise ValueError(
+            "native-renderer reviewed_commit must be a full 40-hex Git commit"
+        )
+    scoring = config.get("scoring")
+    if not isinstance(scoring, dict):
+        raise ValueError("authorized native-renderer config requires scoring metadata")
+    scorer_hash = scoring.get("registered_scorer_provenance_sha256")
+    if not isinstance(scorer_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", scorer_hash):
+        raise ValueError(
+            "native-renderer scoring must register a scorer provenance SHA-256"
+        )
+    if scoring.get("required_schema") != NATIVE_RENDERER_SCORER_SCHEMA:
+        raise ValueError(
+            "native-renderer scoring must require the hardened scorer provenance schema"
+        )
+
+    repo = os.path.abspath(repository_root or ROOT)
+    try:
+        head_commit = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"],
+            stderr=subprocess.PIPE,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            f"cannot resolve repository HEAD for native-renderer authorization: {exc}"
+        ) from exc
+    ancestry = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", reviewed_commit, head_commit],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if ancestry.returncode == 1:
+        raise ValueError(
+            "native-renderer reviewed_commit is not an ancestor of HEAD"
+        )
+    if ancestry.returncode != 0:
+        detail = ancestry.stderr.strip() or "git merge-base failed"
+        raise ValueError(f"cannot verify native-renderer authorization ancestry: {detail}")
+
+    template_path = os.path.join(repo, NATIVE_RENDERER_AUTH_SOURCE_TEMPLATE)
+    try:
+        with open(template_path, "rb") as handle:
+            template_bytes = handle.read()
+        reviewed_bytes = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                repo,
+                "show",
+                f"{reviewed_commit}:{NATIVE_RENDERER_AUTH_SOURCE_TEMPLATE}",
+            ],
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            "cannot read the reviewed native-renderer source template"
+        ) from exc
+    if hashlib.sha256(template_bytes).hexdigest() != template_hash:
+        raise ValueError(
+            "native-renderer source_template_sha256 differs from current Git bytes"
+        )
+    if hashlib.sha256(reviewed_bytes).hexdigest() != template_hash:
+        raise ValueError(
+            "native-renderer source_template_sha256 differs from reviewed Git bytes"
+        )
+    try:
+        reviewed_template = yaml.safe_load(reviewed_bytes) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("reviewed native-renderer source template is invalid YAML") from exc
+    if not isinstance(reviewed_template, dict):
+        raise ValueError("reviewed native-renderer source template must be a mapping")
+
+    def design_body(value: dict) -> dict:
+        body = copy.deepcopy(value)
+        for key in (
+            "schema",
+            "status",
+            "authorization",
+            "blocking_conditions",
+            "registration_source",
+            "scoring",
+            "registered_scorer_provenance",
+            "registered_scorer_provenance_sha256",
+        ):
+            body.pop(key, None)
+        provider = body.get("required_provider")
+        if isinstance(provider, dict):
+            provider.pop("implementation_status", None)
+        return body
+
+    if design_body(config) != design_body(reviewed_template):
+        raise ValueError(
+            "authorized native-renderer config differs from the frozen source template"
+        )
+    provider = config.get("required_provider")
+    if not isinstance(provider, dict) or provider.get("implementation_status") != "implemented":
+        raise ValueError(
+            "authorized native-renderer config must record the implemented lazy provider"
+        )
+
+
 def validate_cfg_baseline_design(
     path: str,
     *,
@@ -1640,8 +1845,6 @@ def generation_contract(
         "git_commit": cfg.get("git_commit"),
         "runtime_provenance": cfg.get("runtime_provenance", {}),
     }
-
-
 def sha256_file(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -2689,12 +2892,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     cfg["num_inference_steps"],
                     run_label="CFG baselines",
                 )
-            if (
-                cfg.get("native_renderer_registered")
-                and action.get("type") == "latent_renderer_fixed"
-                and action.get("latent_renderer_provider", {}).get("scheduler_mapping")
-                == "euler_clean_endpoint"
-            ):
+            if native_renderer_step_diagnostics_required(cfg, action):
                 validate_one_unet_call_per_step(
                     observed_unet_calls,
                     cfg["num_inference_steps"],
@@ -2711,7 +2909,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 cfg["num_inference_steps"],
                 schedule_provenance=schedule_provenance,
             )
-            if cfg.get("native_renderer_registered"):
+            if native_renderer_step_diagnostics_required(cfg, action):
                 validate_native_renderer_step_diagnostics(
                     renderer_sidecar["latent_renderer_step_diagnostics"],
                     cfg["num_inference_steps"],
@@ -2929,6 +3127,11 @@ def run_generation_locked(
     # native protocol strict even before it receives a dedicated frozen schema.
     native_renderer_registered = has_scheduler_native_renderer(actions)
     if native_renderer_registered:
+        if action_schema != NATIVE_RENDERER_SCHEMA:
+            ap.error(
+                "scheduler-native renderer actions require the independently reviewed "
+                f"{NATIVE_RENDERER_SCHEMA} executable schema"
+            )
         sampling_registration = action_config.get("sampling")
         if not isinstance(sampling_registration, dict):
             ap.error(
@@ -2946,6 +3149,19 @@ def run_generation_locked(
                     "scheduler-native sampling registration is missing "
                     f"{required_key!r}"
                 )
+        authorization = action_config.get("authorization")
+        if not isinstance(authorization, dict):
+            ap.error("scheduler-native executable authorization metadata is missing")
+        cfg["native_renderer_authorization"] = copy.deepcopy(authorization)
+        cfg["native_renderer_registration_schema"] = NATIVE_RENDERER_SCHEMA
+        cfg["native_renderer_source_template"] = authorization.get("source_template")
+        cfg["native_renderer_source_template_sha256"] = authorization.get(
+            "source_template_sha256"
+        )
+        # ``actions_sha256`` remains the executable-copy hash.  Record it under
+        # a distinct name so an audit can retain both the executable and frozen
+        # template identities without overloading the S7 contract field.
+        cfg["native_renderer_executable_actions_sha256"] = observed_actions_sha256
     cfg["action_schema"] = action_schema
     cfg["trajectory_registered"] = trajectory_registered
     cfg["scheduler_baseline_registered"] = scheduler_baseline_registered
@@ -3028,6 +3244,25 @@ def run_generation_locked(
                 "existing registered run config differs from the requested "
                 "model/scheduler/action/sampling contract; use a new output directory"
             )
+        if native_renderer_registered:
+            # Keep the legacy run-contract schema stable, but bind native
+            # authorization metadata separately on resume.
+            native_metadata_keys = (
+                "native_renderer_registered",
+                "native_renderer_registration_schema",
+                "native_renderer_authorization",
+                "native_renderer_source_template",
+                "native_renderer_source_template_sha256",
+                "native_renderer_executable_actions_sha256",
+                "scorer_provenance_binding_required",
+                "scoring",
+            )
+            for key in native_metadata_keys:
+                if previous_config.get(key) != cfg.get(key):
+                    ap.error(
+                        "existing native renderer authorization metadata differs "
+                        f"for {key!r}; use a new output directory"
+                    )
     elif (
         registered_run
         and not os.path.exists(config_path)
@@ -3139,6 +3374,7 @@ def prepare_generation_locked(ap, args, stage_settings: dict, seeds: list[int]) 
                 action_config = yaml.safe_load(action_handle) or {}
             validate_scheduler_baseline_authorization(args.actions)
             validate_cfg_baseline_authorization(args.actions)
+            validate_native_renderer_authorization(args.actions)
             validate_split_seed_role(args.actions, args.split_role, seeds)
             validate_cfg_baseline_design(
                 args.actions,

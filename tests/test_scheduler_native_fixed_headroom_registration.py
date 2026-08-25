@@ -5,6 +5,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import yaml
@@ -214,6 +215,23 @@ class SchedulerNativeFixedHeadroomRegistrationTest(unittest.TestCase):
             development["required_provider"]["implementation_status"],
             "missing_blocker",
         )
+
+    def test_reviewed_executable_copy_is_bound_to_frozen_registration(self):
+        executable = CONFIG_DIR / "scheduler_native_fixed_headroom_actions_v1.yaml"
+        generate.validate_native_renderer_authorization(str(executable))
+        actions, _ = generate.load_actions(str(executable), 50)
+        self.assertEqual(len(actions), 8)
+        self.assertTrue(generate.has_scheduler_native_renderer(actions))
+
+        with tempfile.TemporaryDirectory() as directory:
+            tampered = pathlib.Path(directory) / executable.name
+            text = executable.read_text(encoding="utf-8")
+            tampered.write_text(
+                text.replace("gpu_generation: true", "gpu_generation: false"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "generation is not authorized"):
+                generate.validate_native_renderer_authorization(str(tampered))
 
 
 if __name__ == "__main__":

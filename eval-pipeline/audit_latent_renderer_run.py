@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -49,6 +52,7 @@ DEFAULT_SCORE_KEYS = (
     "topiq_nr",
 )
 SPLIT_NAMES = {
+    "development": "development",
     "train_search": "train",
     "validation_confirmation": "validation",
     "test_final": "test",
@@ -65,6 +69,26 @@ LAZY_LATENT_STRUCTURE_BASIS_NAMES = tuple(_BASIS_NAMES)
 LAZY_LATENT_STRUCTURE_BASIS_ALIASES = dict(_BASIS_ALIASES)
 LAZY_LATENT_STRUCTURE_PROVIDER_ID = _LAZY_PROVIDER_ID
 
+# A scheduler-native run must be an independently reviewed executable copy of
+# the registration template.  Keep these literals local to this dependency-
+# light auditor so it can validate a run without importing the GPU generator.
+NATIVE_RENDERER_SCHEMA = "scheduler_native_fixed_headroom_actions_v1"
+NATIVE_RENDERER_SOURCE_TEMPLATE = (
+    "eval-pipeline/configs/scheduler_native_fixed_headroom_development.yaml"
+)
+NATIVE_RENDERER_AUTH_SCOPE = "development_only_fixed_headroom"
+NATIVE_RENDERER_AUTH_FIELDS = {
+    "reviewer",
+    "reviewed_commit",
+    "source_template",
+    "source_template_sha256",
+    "scope",
+    "gpu_generation",
+    "scoring",
+    "method_selection",
+}
+NATIVE_RENDERER_SCORER_SCHEMA = "repldm_scorer_provenance_v1"
+
 
 def sha256_file(path: str | os.PathLike[str]) -> str:
     digest = hashlib.sha256()
@@ -72,6 +96,182 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _native_design_body(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove review/status metadata before comparing two native designs."""
+    body = copy.deepcopy(value)
+    for key in (
+        "schema",
+        "status",
+        "authorization",
+        "blocking_conditions",
+        "registration_source",
+        "scoring",
+        "registered_scorer_provenance",
+        "registered_scorer_provenance_sha256",
+    ):
+        body.pop(key, None)
+    provider = body.get("required_provider")
+    if isinstance(provider, dict):
+        # The implementation status is the one field expected to change when
+        # a registration-only template becomes an executable copy.
+        provider.pop("implementation_status", None)
+    return body
+
+
+def _load_yaml_mapping(path: str | os.PathLike[str], *, label: str) -> Dict[str, Any]:
+    try:
+        with open(path) as handle:
+            value = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"{label} is not readable YAML") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a YAML mapping")
+    return value
+
+
+def _validate_native_registration(
+    source_actions_path: str | os.PathLike[str],
+    source: Dict[str, Any],
+    config: Dict[str, Any],
+    *,
+    registration_actions_path: str | os.PathLike[str] | None = None,
+) -> Dict[str, str]:
+    """Validate the reviewed executable copy and its two action hashes.
+
+    ``actions_sha256`` always identifies the executable YAML supplied to the
+    generator.  The separate ``native_renderer_source_template_sha256`` binds
+    that copy to the frozen registration template.  Keeping both identities is
+    important: passing the frozen registration file as the audit source would
+    otherwise make a valid executable run look like action-hash drift.
+    """
+    if source.get("schema") != NATIVE_RENDERER_SCHEMA:
+        raise ValueError(
+            "registered native renderer must use the reviewed executable schema"
+        )
+    if source.get("status") != "authorized_development":
+        raise ValueError("registered native renderer executable is not authorized")
+    authorization = source.get("authorization")
+    if not isinstance(authorization, dict):
+        raise ValueError("registered native renderer executable lacks authorization")
+    if set(authorization) != NATIVE_RENDERER_AUTH_FIELDS:
+        raise ValueError("native renderer authorization fields differ from frozen v1")
+    if not str(authorization.get("reviewer", "")).strip():
+        raise ValueError("native renderer authorization reviewer is missing")
+    if authorization.get("scope") != NATIVE_RENDERER_AUTH_SCOPE:
+        raise ValueError("native renderer authorization scope differs from frozen v1")
+    if authorization.get("source_template") != NATIVE_RENDERER_SOURCE_TEMPLATE:
+        raise ValueError("native renderer authorization source_template differs from frozen v1")
+    if authorization.get("gpu_generation") is not True:
+        raise ValueError("native renderer executable is not authorized for generation")
+    if authorization.get("scoring") is not True:
+        raise ValueError("native renderer executable is not authorized for scoring")
+    if authorization.get("method_selection") is not False:
+        raise ValueError("native renderer executable cannot authorize method selection")
+
+    reviewed_commit = str(authorization.get("reviewed_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewed_commit):
+        raise ValueError("native renderer reviewed_commit must be full lowercase 40-hex")
+    template_hash = str(authorization.get("source_template_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", template_hash):
+        raise ValueError("native renderer source_template_sha256 must be lowercase 64-hex")
+
+    scoring = source.get("scoring")
+    if not isinstance(scoring, dict):
+        raise ValueError("registered native renderer executable lacks scoring provenance")
+    scorer_hash = scoring.get("registered_scorer_provenance_sha256")
+    if not isinstance(scorer_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", scorer_hash):
+        raise ValueError("native renderer scorer provenance hash is invalid")
+    if scoring.get("required_schema") != NATIVE_RENDERER_SCORER_SCHEMA:
+        raise ValueError("native renderer scorer provenance schema differs from frozen v1")
+
+    repo_root = ROOT.resolve()
+    template_path = (repo_root / NATIVE_RENDERER_SOURCE_TEMPLATE).resolve()
+    try:
+        if os.path.commonpath((str(repo_root), str(template_path))) != str(repo_root):
+            raise ValueError("native renderer source template escapes the repository")
+    except ValueError:
+        raise ValueError("native renderer source template escapes the repository")
+    if not template_path.is_file():
+        raise ValueError(f"native renderer source template is missing: {template_path}")
+    if sha256_file(template_path) != template_hash:
+        raise ValueError("native renderer source template hash differs from current bytes")
+
+    # Verify that the reviewed commit really contained the bytes being used.
+    try:
+        head_commit = subprocess.check_output(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        ancestry = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge-base",
+                "--is-ancestor",
+                reviewed_commit,
+                head_commit,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if ancestry.returncode != 0:
+            raise ValueError("native renderer reviewed_commit is not an ancestor of HEAD")
+        reviewed_bytes = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "show",
+                f"{reviewed_commit}:{NATIVE_RENDERER_SOURCE_TEMPLATE}",
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("cannot verify native renderer reviewed template") from exc
+    if hashlib.sha256(reviewed_bytes).hexdigest() != template_hash:
+        raise ValueError("native renderer source template hash differs from reviewed Git bytes")
+    try:
+        reviewed_template = yaml.safe_load(reviewed_bytes) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("native renderer reviewed template is invalid YAML") from exc
+    if not isinstance(reviewed_template, dict):
+        raise ValueError("native renderer reviewed template must be a mapping")
+    if _native_design_body(source) != _native_design_body(reviewed_template):
+        raise ValueError("native renderer executable differs from the frozen design")
+
+    executable_hash = sha256_file(source_actions_path)
+    if config.get("actions_sha256") != executable_hash:
+        raise ValueError("run config executable actions hash differs from audited YAML")
+    if config.get("native_renderer_executable_actions_sha256") != executable_hash:
+        raise ValueError("run config native executable actions hash is missing or stale")
+    if config.get("native_renderer_source_template") != NATIVE_RENDERER_SOURCE_TEMPLATE:
+        raise ValueError("run config native source template path is missing or stale")
+    if config.get("native_renderer_source_template_sha256") != template_hash:
+        raise ValueError("run config native source template hash is missing or stale")
+    if config.get("native_renderer_authorization") != authorization:
+        raise ValueError("run config native authorization differs from executable YAML")
+
+    registration_hash = template_hash
+    if registration_actions_path is not None:
+        registration_path = Path(registration_actions_path).resolve()
+        if not registration_path.is_file():
+            raise ValueError(f"registered source template is missing: {registration_path}")
+        registration_hash = sha256_file(registration_path)
+        if registration_hash != template_hash:
+            raise ValueError("registered source template hash differs from authorization")
+        registered_copy = _load_yaml_mapping(
+            registration_path, label="registered source template"
+        )
+        if _native_design_body(registered_copy) != _native_design_body(reviewed_template):
+            raise ValueError("registered source template differs from reviewed Git bytes")
+    return {
+        "executable_actions_sha256": executable_hash,
+        "source_template_sha256": registration_hash,
+    }
 
 
 def load_jsonl(path: str | os.PathLike[str]) -> List[Dict[str, Any]]:
@@ -369,6 +569,98 @@ def _audit_provider_diagnostics(
             raise ValueError(f"{expected_id}: unrequested basis {name!r} is non-zero")
 
 
+def _validate_native_action_contract(
+    source: Dict[str, Any], source_actions: List[Dict[str, Any]]
+) -> tuple[str, str]:
+    """Validate the role-level primary and zero-identity rules."""
+    if source.get("schema") != NATIVE_RENDERER_SCHEMA:
+        raise ValueError("native renderer source uses an executable schema different from v1")
+    by_id = {str(action.get("id")): action for action in source_actions}
+    analysis = source.get("analysis")
+    if not isinstance(analysis, dict):
+        raise ValueError("native renderer source lacks analysis metadata")
+    baseline_id = str(analysis.get("baseline_action", ""))
+    identity_id = str(analysis.get("identity_control", ""))
+    if not baseline_id or not identity_id or baseline_id == identity_id:
+        raise ValueError(
+            "native renderer source must register distinct baseline and identity actions"
+        )
+    if baseline_id not in by_id or identity_id not in by_id:
+        raise ValueError("native renderer baseline/identity action is not registered")
+    if by_id[baseline_id].get("type") != "none":
+        raise ValueError("native renderer baseline action must be a scheduler no-op")
+    identity = by_id[identity_id]
+    if identity.get("type") != "latent_renderer_fixed":
+        raise ValueError("native renderer identity control must be latent_renderer_fixed")
+    coefficients = identity.get("coefficients")
+    if (
+        not isinstance(coefficients, list)
+        or len(coefficients) != len(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+        or any(float(value) != 0.0 for value in coefficients)
+    ):
+        raise ValueError("native renderer identity control must have all-zero coefficients")
+    if identity.get("requested_bases") not in ([], None):
+        raise ValueError("native renderer identity control must request no bases")
+    if identity.get("required_hook_names") not in ([], None):
+        raise ValueError("native renderer identity control must register no hooks")
+
+    primary_ids = [
+        str(action.get("id"))
+        for action in source_actions
+        if action.get("role") == "non_attention_primary"
+    ]
+    family = analysis.get("primary_holm_family")
+    registered_primary = family.get("actions") if isinstance(family, dict) else None
+    if (
+        not isinstance(registered_primary, list)
+        or len(primary_ids) != 4
+        or set(registered_primary) != set(primary_ids)
+    ):
+        raise ValueError("native renderer primary Holm family differs from action roles")
+
+    allowed = {"spectral_low", "spectral_mid", "spectral_high", "laplacian"}
+    canonical_index = {
+        name: index for index, name in enumerate(LAZY_LATENT_STRUCTURE_BASIS_NAMES)
+    }
+    for action in source_actions:
+        if action.get("role") != "non_attention_primary":
+            continue
+        action_id = str(action.get("id"))
+        requested = action.get("requested_bases")
+        if isinstance(requested, str):
+            requested = [requested]
+        if not isinstance(requested, list) or len(requested) != 1:
+            raise ValueError(
+                f"{action_id}: non-attention primary must request exactly one basis"
+            )
+        try:
+            normalized = list(_normalize_bases(requested))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{action_id}: invalid primary requested basis") from exc
+        if len(normalized) != 1 or normalized[0] not in allowed:
+            raise ValueError(
+                f"{action_id}: non-attention primary must be one spectral/Laplacian basis"
+            )
+        if action.get("required_hook_names") != []:
+            raise ValueError(f"{action_id}: non-attention primary must register no hooks")
+        coefficients = action.get("coefficients")
+        if not isinstance(coefficients, list) or len(coefficients) != len(
+            LAZY_LATENT_STRUCTURE_BASIS_NAMES
+        ):
+            raise ValueError(f"{action_id}: primary coefficient vector is malformed")
+        nonzero = [
+            index for index, value in enumerate(coefficients) if float(value) != 0.0
+        ]
+        expected_index = canonical_index[normalized[0]]
+        if nonzero != [expected_index]:
+            raise ValueError(
+                f"{action_id}: primary coefficient must select only its requested basis"
+            )
+        if action.get("selection_eligible") is not True:
+            raise ValueError(f"{action_id}: primary action must be selection-eligible")
+    return baseline_id, identity_id
+
+
 def _json_sha256(value: Any) -> str:
     payload = json.dumps(
         value,
@@ -613,6 +905,7 @@ def audit_run(
     required_score_keys: Iterable[str] = DEFAULT_SCORE_KEYS,
     verify_images: bool = True,
     require_distinct_actions: bool = True,
+    registration_actions_path: str | os.PathLike[str] | None = None,
 ) -> Dict[str, Any]:
     """Reject incomplete, unpaired, malformed, or numerically unsafe runs."""
     run_dir = Path(run_dir)
@@ -625,8 +918,7 @@ def audit_run(
 
     with config_path.open() as handle:
         config = json.load(handle)
-    with open(source_actions_path) as handle:
-        source = yaml.safe_load(handle) or {}
+    source = _load_yaml_mapping(source_actions_path, label="source actions")
     prompts = pd.read_csv(prompts_path)
     manifest = load_jsonl(manifest_path)
     scores = load_jsonl(scores_path)
@@ -658,7 +950,7 @@ def audit_run(
         recorded_action_hash is not None
         and recorded_action_hash != sha256_file(source_actions_path)
     ):
-        raise ValueError("run config action hash differs from the audited source YAML")
+        raise ValueError("run config executable action hash differs from the audited source YAML")
 
     expected_split = SPLIT_NAMES.get(split_role)
     if not {"index", "TEXT"}.issubset(prompts.columns):
@@ -731,7 +1023,47 @@ def audit_run(
         provider["scheduler_mapping"] == "euler_clean_endpoint"
         for provider in renderer_providers.values()
     )
-    if native_renderer_run and strict_registered_contract:
+    native_v1_contract = (
+        source.get("schema") == NATIVE_RENDERER_SCHEMA
+        or config.get("action_schema") == NATIVE_RENDERER_SCHEMA
+    )
+    if native_v1_contract and (
+        not native_renderer_run
+        or not strict_registered_contract
+        or config.get("action_schema") != NATIVE_RENDERER_SCHEMA
+    ):
+        raise ValueError(
+            "scheduler-native renderer actions require the strict v1 registered contract"
+        )
+    identity_pair: tuple[str, str] | None = None
+    native_registration_provenance: Dict[str, str] | None = None
+    if native_renderer_run and native_v1_contract and strict_registered_contract:
+        native_registration_provenance = _validate_native_registration(
+            source_actions_path,
+            source,
+            config,
+            registration_actions_path=registration_actions_path,
+        )
+        identity_pair = _validate_native_action_contract(source, source_actions)
+    if native_renderer_run and native_v1_contract and strict_registered_contract:
+        registration_source = source.get("registration_source")
+        if not isinstance(registration_source, dict) or set(registration_source) != {
+            "path",
+            "sha256",
+        }:
+            raise ValueError(
+                "registered native renderer source lacks registration_source metadata"
+            )
+        registration_path = (ROOT / str(registration_source["path"])).resolve()
+        if os.path.commonpath((str(ROOT.resolve()), str(registration_path))) != str(
+            ROOT.resolve()
+        ) or not registration_path.is_file():
+            raise ValueError("registered native renderer registration_source path is invalid")
+        if sha256_file(registration_path) != registration_source["sha256"]:
+            raise ValueError(
+                "registered native renderer frozen registration hash differs"
+            )
+    if native_renderer_run and native_v1_contract and strict_registered_contract:
         source_sampling = source.get("sampling")
         registered_sampling = config.get("registered_sampling")
         if not isinstance(source_sampling, dict) or not isinstance(
@@ -1042,18 +1374,74 @@ def audit_run(
             raise ValueError(f"{expected_id}: non-renderer action has stale diagnostics")
 
     expected_ranks = set(range(len(action_ids)))
+    identity_pairs = set()
+    baseline_ids = {
+        str(action.get("id"))
+        for action in source_actions
+        if action.get("role") == "nominal_scheduler_baseline"
+        or action.get("type") == "none"
+    }
+    for action in source_actions:
+        if action.get("role") != "implementation_identity_control":
+            continue
+        identity_id = str(action.get("id"))
+        if len(baseline_ids) != 1:
+            raise ValueError(
+                "an implementation identity control requires exactly one nominal baseline"
+            )
+        coefficients = action.get("coefficients")
+        if coefficients is not None and any(float(value) != 0.0 for value in coefficients):
+            raise ValueError(
+                f"{identity_id}: implementation identity control must have zero coefficients"
+            )
+        identity_pairs.add(frozenset((identity_id, next(iter(baseline_ids)))))
+    if identity_pair is not None:
+        # The strict native contract names exactly one pair.  Do not let a
+        # stale or extra implementation-identity role silently widen it.
+        identity_pairs = {frozenset(identity_pair)}
+    observed_identity_pairs = set()
     for block, devices in block_devices.items():
         if len(devices) != 1 or "" in devices:
             raise ValueError(f"prompt/seed block {block} spans or lacks devices")
         if block_ranks[block] != expected_ranks:
             raise ValueError(f"prompt/seed block {block} has invalid execution ranks")
-        if require_distinct_actions:
-            hashes = {
-                image_hashes[(block[0], block[1], action_id)]
-                for action_id in action_ids
-            }
-            if len(hashes) != len(action_ids):
-                raise ValueError(f"prompt/seed block {block} has identical PNG hashes")
+        hashes_by_id = {
+            action_id: image_hashes[(block[0], block[1], action_id)]
+            for action_id in action_ids
+        }
+        if identity_pair is not None:
+            baseline_id, identity_id = identity_pair
+            if hashes_by_id[baseline_id] != hashes_by_id[identity_id]:
+                raise ValueError(
+                    f"prompt/seed block {block} violates zero-identity PNG parity"
+                )
+            # Exactly this pair may collide.  Any duplicate involving a
+            # non-identity action remains a hard failure.
+            non_identity_ids = [
+                action_id for action_id in action_ids if action_id != identity_id
+            ]
+            if len({hashes_by_id[action_id] for action_id in non_identity_ids}) != len(
+                non_identity_ids
+            ):
+                raise ValueError(
+                    f"prompt/seed block {block} has duplicate non-identity PNG hashes"
+                )
+            observed_identity_pairs.add(tuple(sorted(identity_pair)))
+        elif require_distinct_actions:
+            by_hash = {}
+            for action_id, image_hash in hashes_by_id.items():
+                by_hash.setdefault(image_hash, set()).add(action_id)
+            for duplicate_ids in by_hash.values():
+                if len(duplicate_ids) == 1:
+                    continue
+                pair = frozenset(duplicate_ids)
+                if pair in identity_pairs and len(duplicate_ids) == 2:
+                    observed_identity_pairs.add(tuple(sorted(duplicate_ids)))
+                    continue
+                raise ValueError(
+                    f"prompt/seed block {block} has unexpected identical PNG hashes "
+                    f"for actions {sorted(duplicate_ids)}"
+                )
 
     warnings = []
     if not native_renderer_run:
@@ -1079,7 +1467,23 @@ def audit_run(
             SCORER_PROVENANCE_SCHEMA if native_renderer_run else None
         ),
         "scorer_provenance_sha256": scorer_provenance_sha256,
-        "all_action_png_hashes_distinct_within_block": require_distinct_actions,
+        "all_action_png_hashes_distinct_within_block": (
+            False if identity_pair is not None else require_distinct_actions
+        ),
+        "allowed_identity_pairs": [
+            sorted(pair)
+            for pair in sorted(
+                identity_pairs, key=lambda value: tuple(sorted(value))
+            )
+        ],
+        "observed_identity_pairs": [
+            sorted(pair)
+            for pair in sorted(
+                observed_identity_pairs, key=lambda value: tuple(sorted(value))
+            )
+        ],
+        "registered_identity_pair": list(identity_pair) if identity_pair else None,
+        "identity_pair_png_hashes_equal": identity_pair is not None,
         "warnings": warnings,
         "provenance": {
             "config_sha256": sha256_file(config_path),
@@ -1087,6 +1491,11 @@ def audit_run(
             "scores_sha256": sha256_file(scores_path),
             "prompts_sha256": sha256_file(prompts_path),
             "source_actions_sha256": sha256_file(source_actions_path),
+            "source_template_sha256": (
+                native_registration_provenance["source_template_sha256"]
+                if native_registration_provenance is not None
+                else None
+            ),
         },
     }
 
@@ -1096,6 +1505,11 @@ def main() -> None:
     parser.add_argument("--run_dir", required=True)
     parser.add_argument("--prompts", required=True)
     parser.add_argument("--source_actions", required=True)
+    parser.add_argument(
+        "--registration_actions",
+        default="",
+        help="optional frozen registration YAML to verify against an executable copy",
+    )
     parser.add_argument("--split_role", required=True, choices=tuple(SPLIT_NAMES))
     parser.add_argument("--output", default="")
     parser.add_argument("--skip_image_verify", action="store_true")
@@ -1109,6 +1523,7 @@ def main() -> None:
         split_role=args.split_role,
         verify_images=not args.skip_image_verify,
         require_distinct_actions=not args.allow_duplicate_action_hashes,
+        registration_actions_path=args.registration_actions or None,
     )
     output = Path(args.output) if args.output else Path(args.run_dir) / "run_audit.json"
     output.parent.mkdir(parents=True, exist_ok=True)

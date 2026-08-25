@@ -1273,6 +1273,27 @@ class EvalPipelineTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly EulerDiscreteScheduler"):
             generate.validate_latent_renderer_scheduler(action, object())
 
+    def test_native_renderer_no_op_skips_step_diagnostics(self):
+        registered = {"native_renderer_registered": True}
+        self.assertFalse(
+            generate.native_renderer_step_diagnostics_required(
+                registered,
+                {"id": "no_op", "type": "none"},
+            )
+        )
+        self.assertTrue(
+            generate.native_renderer_step_diagnostics_required(
+                registered,
+                {
+                    "id": "lazy_zero_identity",
+                    "type": "latent_renderer_fixed",
+                    "latent_renderer_provider": {
+                        "scheduler_mapping": "euler_clean_endpoint"
+                    },
+                },
+            )
+        )
+
     def test_native_provider_action_level_aliases_override_shared_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = pathlib.Path(temp_dir) / "native_alias.yaml"
