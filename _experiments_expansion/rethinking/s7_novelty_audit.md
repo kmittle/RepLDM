@@ -1,86 +1,84 @@
-# S7 Novelty Audit: Scheduler and Spectral Claims
+# S7 新颖性审计：调度器与频谱主张
 
-**Cutoff:** 2026-08-25. This is a literature/protocol note, not an experiment
-result. The underlying arXiv API audit was retrieved on 2026-08-24 and is
-recorded in `SCHEDULER_SPECTRAL_NOVELTY_AUDIT_2026.md`. No GPU run is
-authorized by this file.
+**截止日期：** 2026-08-25。本文是文献与实验协议说明，不是实验结果。底层
+arXiv API 审计于 2026-08-24 获取，并记录在
+`SCHEDULER_SPECTRAL_NOVELTY_AUDIT_2026.md`。本文不授权任何 GPU 实验。
 
-## Motivation
+## 动机
 
-S7 tests a bounded correction around a frozen diffusion sampler. The tempting
-claim is "scheduler-consistent ancestral correction" or "spectral trajectory
-improvement." That wording is too broad. Recent work already treats the
-sampler, stochasticity, trajectory geometry, and latent spectrum as design
-objects. The only credible claim is a narrow causal result under the exact
-frozen SDXL/U-Net, scheduler, and compute budget used here.
+S7 检验冻结 diffusion sampler 周围的有界校正。容易想到的主张是
+“scheduler-consistent ancestral correction”或“spectral trajectory
+improvement”，但这些说法范围过大。近期工作已经把 sampler、随机性、轨迹几何
+和 latent spectrum 当作可设计对象。因此，本项目最多只能在这里检验一个窄的
+因果问题：在固定的 SDXL/U-Net、scheduler 和计算预算下，所注册的校正是否产生
+独立于现有控制的改进。文献中的机制不等于本项目已经验证的机制。
 
-## Nearby Threats
+## 最接近的工作与新颖性边界
 
-- **CPS (2509.05952), Precise (2605.23522), and LC-GRPO (2608.05600):** finite-
-  step ODE/SDE mismatch, coefficient-preserving noise, and ODE Euler plus
-  Langevin correction are already covered. Ancestral noise or a stochastic
-  interpolation is not a new RL sampler.
-- **SlerpFlow (2607.21326) and SGPS (2512.23232):** spherical velocity repair,
-  caching, and low-NFE trajectory-gradient correction are already reported.
-  A trust cap or one clean-latent step is not sufficient novelty.
-- **SPA (2607.22091), SpectralDiT (2606.18765), Frequency-Forcing
-  (2604.20902), SEGA (2605.22668), and SPAE (2608.01306):** FFT priors,
-  timestep-conditioned low/high residuals, wavelet coarse-to-fine forcing,
-  frequency-aware attention, and spectral latent adaptation are covered.
-  A spectral band or schedule cannot be the contribution.
-- **CFG distortion analysis (2602.00716):** variance shrinkage and negative-
-  guidance windows are known controls; changing CFG/energy needs a diversity
-  and variance witness.
+- **CPS (2509.05952)、Precise (2605.23522) 和 LC-GRPO
+  (2608.05600)：** 已讨论 finite-step ODE/SDE mismatch、
+  coefficient-preserving noise，以及 ODE Euler 加 Langevin correction。
+  Ancestral noise 或随机插值不能称为新的 RL sampler。
+- **SlerpFlow (2607.21326) 和 SGPS (2512.23232)：** 已报告 spherical
+  velocity repair、缓存和 low-NFE trajectory-gradient correction。仅增加 trust
+  cap 或一步 clean-latent update，不足以构成新颖性。
+- **SPA (2607.22091)、SpectralDiT (2606.18765)、Frequency-Forcing
+  (2604.20902)、SEGA (2605.22668) 和 SPAE (2608.01306)：** 已覆盖 FFT
+  prior、timestep-conditioned low/high residual、wavelet coarse-to-fine
+  forcing、frequency-aware attention 和 spectral latent adaptation。某个
+  spectral band 或 schedule 本身不能成为贡献。
+- **CFG distortion analysis (2602.00716)：** variance shrinkage 和
+  negative-guidance window 已是已知控制；任何 CFG 或 energy 改动都必须同时
+  提供 diversity 和 variance 证据。
 
-## S7 Design Constraints
+## S7 设计约束
 
-1. Run and report four separate conditions: native
-   `EulerAncestralDiscreteScheduler`; deterministic Euler with `sigma_up=0`;
-   the registered `mix` interpolation; and an RL rollout sampler (CPS,
-   Precise, or LC-GRPO-style). `mix=1,sqrt` is the only registered exact
-   ancestral endpoint; intermediate mixes are ablations unless an SDE
-   derivation is supplied.
-2. Freeze the installed `diffusers` version, scheduler config hash, timestep
-   list, `sigma_up/down`, prediction type, CFG, initial-noise seed, and actual
-   U-Net call count. Record the current provenance mismatch: environments use
-   `diffusers==0.32.1`, while the package declarations request `~=0.21.4`.
-   Report noise norms, latent moments, wall time, peak memory, and reward
-   variance. Equal nominal steps are not equal compute.
-3. A scheduler claim must beat both native ancestral and deterministic Euler on
-   held-out prompts, and must not lose to matched-NFE DPM-Solver++ or UniPC.
-   Otherwise label the result a sampler choice and do not call it a new
-   correction.
+1. 必须分别运行并报告四种条件：原生
+   `EulerAncestralDiscreteScheduler`；令 `sigma_up=0` 的 deterministic
+   Euler；注册的 `mix` 插值；以及一种 RL rollout sampler（CPS、Precise 或
+   LC-GRPO-style）。只有 `mix=1,sqrt` 是注册的精确 ancestral endpoint。
+   如果没有 SDE 推导，中间 `mix` 只能作为 ablation。
+2. 必须冻结并记录 installed `diffusers` version、scheduler config hash、
+   timestep list、`sigma_up/down`、prediction type、CFG、initial-noise seed 和
+   实际 U-Net call count。当前 provenance mismatch 也必须记录：运行环境使用
+   `diffusers==0.32.1`，而 package declaration 要求 `~=0.21.4`。同时报告
+   noise norm、latent moment、wall time、peak memory 和 reward variance。
+   nominal step 数量相同不代表计算量相同。
+3. 如果要提出 scheduler 相关主张，方法必须在 held-out prompt 上同时击败原生
+   ancestral 和 deterministic Euler，而且不能输给 matched-NFE 的
+   DPM-Solver++ 或 UniPC。否则只能把结果称为 sampler choice，不能称为新的
+   correction。
 
-## FRLA Constraints
+## FRLA 约束
 
-SARA, iREPA, sREPA, SGA, and SSVAE already cover autocorrelation, cosine
-self-similarity, Gram structure, and local correlation. FRLA may therefore
-claim only the **interaction** between one fixed rank-compatible descriptor and
-one scheduler-coordinate clean-latent injection. The development matrix must
-include no-op, pointwise and full-Gram descriptors, shuffled tokens,
-L2-matched random directions, Euclidean injection, MOG/DiffRGD geometry, SPA
-or fixed DCT/wavelet controls, and an equal-NFE extra-U-Net upper bound.
+SARA、iREPA、sREPA、SGA 和 SSVAE 已覆盖 autocorrelation、cosine
+self-similarity、Gram structure 和 local correlation。因此，FRLA 最多只能
+检验一个固定、rank-compatible descriptor 与 scheduler-coordinate
+clean-latent injection 的**交互作用**。development matrix 必须包含 no-op、
+pointwise descriptor、full-Gram descriptor、shuffled token、每步 RMS 与 trust
+cap 匹配的 random direction、Euclidean injection、MOG/DiffRGD geometry、SPA
+或固定 DCT/wavelet control，以及 matched-compute extra-U-Net reference。
 
-Use a preregistered difference-in-differences interaction, not a point gain:
+使用预注册的 difference-in-differences interaction，而不是单个分数增益：
 
 ```text
 I = (FRLA - descriptor-only)
     - (scheduler-injection-only - no-op)
 ```
 
-Charge feature hooks, backward/FFT work, reward calls, wall time, and memory.
-Spectral, VIV, or latent-moment improvements without independent
-TOPIQ/HPS/CLIP, OCR/count/layout/detail, diversity, and pixel-safety witnesses
-do not establish a mechanism.
+计算开销必须包括 feature hook、backward/FFT、reward call、wall time 和 memory。
+只有 spectral、VIV 或 latent-moment 指标变好，不能证明机制成立；还必须有独立的
+TOPIQ/HPS/CLIP、OCR/count/layout/detail、diversity 和 pixel-safety 证据。
 
-## Stop Rule
+## 停止规则
 
-S7 must first clear the registered fixed-action gate: TOPIQ-NR delta `>=
-+0.005`, crossed prompt/seed 95% interval above zero, Holm-adjusted prompt
-sign-flip significance, HPSv2/CLIP non-inferiority, finite outputs, moment and
-trust-cap bounds, and clipping/saturation guards. If it only beats deterministic
-Euler, classify it as an ancestral/sampler effect. If FRLA has no positive
-interaction or any independent witness fails, report the simplest surviving
-baseline and stop S8. Do not add a frequency band, scheduler blend, negative
-guidance window, reward weight, distillation stage, or RL controller after
-held-out scores are visible.
+S7 必须先通过注册的 fixed-action gate：TOPIQ-NR delta `>= +0.005`、crossed
+prompt/seed 95% interval 的下界高于零、经过 Holm correction 的 prompt
+sign-flip significance、HPSv2/CLIP non-inferiority、有限数值输出、moment 和
+trust-cap bounds，以及 clipping/saturation guards。
+
+如果方法只击败 deterministic Euler，就把它归类为 ancestral/sampler effect。
+如果 FRLA 没有正的 interaction，或任一独立证据未通过，就报告仍然成立的最简单
+baseline，并停止 S8。在看到 held-out scores 后，不得再添加 frequency band、
+scheduler blend、negative-guidance window、reward weight、distillation stage 或
+RL controller。
