@@ -27,7 +27,8 @@ Example:
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import fcntl
 import glob
 import hashlib
 import json
@@ -38,6 +39,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -91,6 +93,60 @@ TRAJECTORY_SCHEMAS = {
     "trajectory_correction_actions_v1",
     "trajectory_correction_validation_v1",
 }
+CFG_BASELINE_SCHEMA = "cfg_baselines_v1"
+CFG_BASELINE_ACTION_SCALES = {
+    "cfg_2p5": 2.5,
+    "cfg_5p0": 5.0,
+    "cfg_7p5": 7.5,
+    "cfg_10p0": 10.0,
+    "cfg_15p0": 15.0,
+}
+CFG_BASELINE_SAMPLING_KEYS = {
+    "model",
+    "model_revision",
+    "base_scheduler",
+    "resolution",
+    "num_inference_steps",
+    "default_cfg_scale",
+    "negative_prompt",
+    "power_calibrate",
+    "stage2",
+    "extra_unet_calls",
+    "initialization",
+    "cfg_source",
+    "cfg_pipeline_argument",
+    "guidance_rescale",
+}
+CFG_BASELINE_EXECUTION_ORDER = {
+    "version": "action-order-v1",
+    "grouping": ["prompt_index", "seed"],
+    "digest": "sha256",
+    "input": "action-order-v1:{prompt_index}:{seed}:{action_id}",
+    "sort": "ascending_raw_digest",
+    "single_device_per_group": True,
+}
+CFG_BASELINE_PROMPTS = "eval-pipeline/prompts/s5_development.csv"
+CFG_BASELINE_PROMPTS_SHA256 = (
+    "cf9ae37f2c066e5a35712e2aaf6ea637d85281dc7cd2b104fbc07fe1d8e5201e"
+)
+CFG_BASELINE_SPLIT_SEEDS = {"development": [0, 42, 123]}
+CFG_BASELINE_AUTH_SOURCE_TEMPLATE = "eval-pipeline/configs/cfg_baselines_v1.yaml"
+CFG_BASELINE_AUTH_SCOPE = "development_only_cfg_selection"
+CFG_BASELINE_AUTH_FIELDS = {
+    "reviewer",
+    "reviewed_commit",
+    "source_template",
+    "source_template_sha256",
+    "scope",
+}
+CFG_BASELINE_MODEL_REVISION = "462165984030d82259a11f4367a4eed129e94a7b"
+CFG_BASELINE_SCHEDULER_RUNTIME = {
+    "config_sha256_v2": "6bf0509f22d8d3a06d6493c2291af8655f6f74846b2d2eae3cf71b5cda000102",
+    "num_inference_steps": 50,
+    "schedule_sha256": "302d2452f411bf3eea64f8dd3530e232b95c23aed7b818ed6697982a4428c144",
+    "construction_init_noise_sigma": 14.648818969726562,
+    "effective_init_noise_sigma": 13.158469200134277,
+}
 
 # Keep this map explicit: scheduler names come from experiment YAML and must
 # never be resolved through eval/importlib. The kwargs are part of the action
@@ -137,6 +193,90 @@ SCHEDULER_BASELINE_ALLOWED_KWARGS = {
 def _require_int(value, *, action_id: str, field: str, expected: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value != expected:
         raise ValueError(f"{action_id}: {field} must be integer {expected}")
+
+
+@contextmanager
+def generation_output_lock(out_dir: str):
+    """Hold a non-blocking process lock for one generation output directory."""
+    output_dir = os.path.abspath(out_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    lock_path = os.path.join(output_dir, ".generate.lock")
+    lock_handle = open(lock_path, "a+")
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"generation output directory is already locked: {output_dir}"
+            ) from exc
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+
+
+@contextmanager
+def atomic_text_writer(path: str):
+    """Write one text artifact through a unique same-directory temp file."""
+    destination = os.path.abspath(path)
+    directory = os.path.dirname(destination)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    handle = None
+    try:
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        with handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        if handle is None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_write_json(path: str, value, *, indent: int | None = None) -> None:
+    with atomic_text_writer(path) as handle:
+        json.dump(value, handle, indent=indent)
+
+
+def atomic_save_png(image, path: str) -> None:
+    """Save and publish a PNG without exposing a partially encoded image."""
+    destination = os.path.abspath(path)
+    directory = os.path.dirname(destination)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    os.close(fd)
+    try:
+        image.save(temporary, format="PNG")
+        with open(temporary, "r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def generation_artifacts_exist(img_dir: str) -> bool:
+    return any(
+        name.endswith((".png", ".json")) for name in os.listdir(img_dir)
+    )
 
 
 def task_id(prompt_index: int, seed: int, action: dict, legacy_scale_id: bool = False) -> str:
@@ -214,13 +354,32 @@ def task_is_complete(
             expected_task=task,
             expected_contract_sha256=run_contract_sha256,
         )
+        if "execution_rank" in task and record.get("execution_rank") != task[
+            "execution_rank"
+        ]:
+            raise ValueError("sidecar execution_rank differs from the frozen order")
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
     return True
 
 
-def recorded_group_device(task_group: list, img_dir: str):
-    """Return a block's recorded device and reject already-invalid pairing."""
+def worker_resume_contract_sha256(cfg: dict) -> str | None:
+    """Return the strict contract for registered workers and None for legacy runs."""
+    registered = bool(
+        cfg.get("trajectory_registered")
+        or cfg.get("scheduler_baseline_registered")
+        or cfg.get("cfg_baseline_registered")
+    )
+    return cfg["run_contract_sha256"] if registered else None
+
+
+def recorded_group_device(
+    task_group: list,
+    img_dir: str,
+    *,
+    run_contract_sha256: str | None = None,
+):
+    """Return a valid block device; ignore crash debris for registered runs."""
     devices = set()
     for task in task_group:
         json_path = os.path.join(img_dir, task["id"] + ".json")
@@ -230,7 +389,19 @@ def recorded_group_device(task_group: list, img_dir: str):
             with open(json_path) as handle:
                 record = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
+            if run_contract_sha256 is not None:
+                continue
             raise ValueError(f"cannot read existing sidecar {json_path}: {exc}") from exc
+        if run_contract_sha256 is not None:
+            try:
+                validate_sidecar(
+                    record,
+                    os.path.dirname(img_dir),
+                    expected_task=task,
+                    expected_contract_sha256=run_contract_sha256,
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
         if record.get("device"):
             devices.add(str(record["device"]))
 
@@ -257,7 +428,11 @@ def assign_tasks_to_devices(
     """
     assignments = {device: [] for device in devices}
     for group_index, task_group in enumerate(group_tasks_by_pair(tasks)):
-        recorded_device = recorded_group_device(task_group, img_dir)
+        recorded_device = recorded_group_device(
+            task_group,
+            img_dir,
+            run_contract_sha256=run_contract_sha256,
+        )
         ordered_group = sorted(
             task_group,
             key=lambda task: hashlib.sha256(
@@ -292,6 +467,7 @@ def assign_tasks_to_devices(
 def load_actions(path: str, num_inference_steps: int):
     with open(path) as handle:
         config = yaml.safe_load(handle) or {}
+    action_schema = config.get("schema")
     if config.get("schema") == "latent_renderer_registration_v1":
         raise ValueError(
             "latent-renderer registration manifests are not generation action configs; "
@@ -335,6 +511,8 @@ def load_actions(path: str, num_inference_steps: int):
         raise ValueError("latent_renderer_provider must be a mapping")
     normalized = []
     for raw in actions:
+        if not isinstance(raw, dict):
+            raise ValueError("each action must be a mapping")
         action = dict(raw)
         action_id = str(action.get("id", ""))
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", action_id):
@@ -343,6 +521,25 @@ def load_actions(path: str, num_inference_steps: int):
             raise ValueError(f"duplicate action id {action_id!r}")
         seen.add(action_id)
         action_type = action.get("type")
+        if action_schema == CFG_BASELINE_SCHEMA:
+            unknown_fields = set(action) - {
+                "id",
+                "type",
+                "cfg_scale",
+            }
+            if unknown_fields:
+                raise ValueError(
+                    f"{action_id}: cfg_baselines_v1 action has unsupported fields "
+                    f"{sorted(unknown_fields)}"
+                )
+            if action_type != "none":
+                raise ValueError(
+                    f"{action_id}: cfg_baselines_v1 actions must use type 'none'"
+                )
+            if "cfg_scale" not in action:
+                raise ValueError(
+                    f"{action_id}: cfg_baselines_v1 requires an explicit cfg_scale"
+                )
         if action_type not in {
             "none",
             "scalar",
@@ -662,6 +859,305 @@ def validate_scheduler_baseline_authorization(path: str) -> None:
         )
 
 
+def validate_cfg_baseline_authorization(
+    path: str, *, repository_root: str | None = None
+) -> None:
+    """Bind CFG authorization to an immutable, reviewed Git template."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != CFG_BASELINE_SCHEMA:
+        return
+    if config.get("status") != "authorized":
+        raise ValueError(
+            "cfg_baselines_v1 is not authorized; a reviewer must freeze "
+            "status: authorized before generation"
+        )
+    authorization = config.get("authorization")
+    if not isinstance(authorization, dict):
+        raise ValueError(
+            "authorized CFG baseline config requires an authorization mapping"
+        )
+    if set(authorization) != CFG_BASELINE_AUTH_FIELDS:
+        raise ValueError(
+            "CFG authorization fields differ from the frozen authorization schema"
+        )
+    if not str(authorization.get("reviewer", "")).strip():
+        raise ValueError(
+            "authorized CFG baseline config requires authorization.reviewer"
+        )
+    if authorization.get("source_template") != CFG_BASELINE_AUTH_SOURCE_TEMPLATE:
+        raise ValueError(
+            "CFG authorization source_template must be "
+            f"{CFG_BASELINE_AUTH_SOURCE_TEMPLATE}"
+        )
+    if authorization.get("scope") != CFG_BASELINE_AUTH_SCOPE:
+        raise ValueError(
+            f"CFG authorization scope must be {CFG_BASELINE_AUTH_SCOPE}"
+        )
+    reviewed_commit = str(authorization.get("reviewed_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewed_commit):
+        raise ValueError(
+            "CFG authorization reviewed_commit must be a full 40-hex Git commit"
+        )
+    template_hash = str(authorization.get("source_template_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", template_hash):
+        raise ValueError(
+            "CFG authorization source_template_sha256 must be 64 lowercase hex"
+        )
+
+    repo = os.path.abspath(repository_root or ROOT)
+    try:
+        head_commit = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"],
+            stderr=subprocess.PIPE,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"cannot resolve repository HEAD for CFG authorization: {exc}") from exc
+    ancestry = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", reviewed_commit, head_commit],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if ancestry.returncode == 1:
+        raise ValueError("CFG authorization reviewed_commit is not an ancestor of HEAD")
+    if ancestry.returncode != 0:
+        detail = ancestry.stderr.strip() or "git merge-base failed"
+        raise ValueError(f"cannot verify CFG authorization ancestry: {detail}")
+    try:
+        template_bytes = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                repo,
+                "show",
+                f"{reviewed_commit}:{CFG_BASELINE_AUTH_SOURCE_TEMPLATE}",
+            ],
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            "cannot read the reviewed CFG source template from Git"
+        ) from exc
+    if hashlib.sha256(template_bytes).hexdigest() != template_hash:
+        raise ValueError(
+            "CFG authorization source_template_sha256 differs from reviewed Git bytes"
+        )
+    try:
+        reviewed_template = yaml.safe_load(template_bytes) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("reviewed CFG source template is not valid YAML") from exc
+    if not isinstance(reviewed_template, dict):
+        raise ValueError("reviewed CFG source template must be a mapping")
+
+    def unsigned_body(value: dict) -> dict:
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in {"status", "authorization"}
+        }
+
+    if unsigned_body(config) != unsigned_body(reviewed_template):
+        raise ValueError(
+            "authorized CFG config differs from the reviewed source template"
+        )
+
+
+def validate_cfg_baseline_design(
+    path: str,
+    *,
+    prompts_path: str,
+    actions: list,
+    seeds: list,
+    model_name: str,
+    resolution: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    negative_prompt: str,
+    power_calibrate: int,
+    stage2_enabled: bool,
+) -> None:
+    """Reject drift from an authorized ordinary-CFG reference matrix."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != CFG_BASELINE_SCHEMA:
+        return
+
+    sampling = config.get("sampling")
+    if not isinstance(sampling, dict):
+        raise ValueError("cfg_baselines_v1 requires a sampling mapping")
+    if set(sampling) != CFG_BASELINE_SAMPLING_KEYS:
+        missing = sorted(CFG_BASELINE_SAMPLING_KEYS - set(sampling))
+        extra = sorted(set(sampling) - CFG_BASELINE_SAMPLING_KEYS)
+        raise ValueError(
+            "cfg_baselines_v1 sampling fields differ from the frozen schema: "
+            f"missing={missing}, extra={extra}"
+        )
+    if float(guidance_scale) != 7.5:
+        raise ValueError("cfg_baselines_v1 requires --guidance_scale 7.5")
+    if negative_prompt != DEFAULT_NEG:
+        raise ValueError("cfg_baselines_v1 requires the repository default negative prompt")
+    if (
+        isinstance(power_calibrate, bool)
+        or not isinstance(power_calibrate, int)
+        or power_calibrate != 0
+    ):
+        raise ValueError("cfg_baselines_v1 requires --power_calibrate 0")
+    expected_sampling = {
+        "model": str(model_name),
+        "model_revision": CFG_BASELINE_MODEL_REVISION,
+        "base_scheduler": "EulerDiscreteScheduler",
+        "resolution": int(resolution),
+        "num_inference_steps": int(num_inference_steps),
+        "default_cfg_scale": 7.5,
+        "negative_prompt": DEFAULT_NEG,
+        "power_calibrate": 0,
+        "stage2": bool(stage2_enabled),
+        "extra_unet_calls": 0,
+        "initialization": "scheduler_native_init_sigma",
+        "cfg_source": "action.cfg_scale",
+        "cfg_pipeline_argument": "guidance_scale",
+        "guidance_rescale": 0.0,
+    }
+    for key, observed in expected_sampling.items():
+        registered = sampling.get(key)
+        if isinstance(observed, bool):
+            same = isinstance(registered, bool) and registered is observed
+        elif isinstance(observed, float):
+            same = (
+                not isinstance(registered, bool)
+                and isinstance(registered, (int, float))
+                and float(registered) == observed
+            )
+        elif isinstance(observed, int):
+            same = (
+                not isinstance(registered, bool)
+                and isinstance(registered, int)
+                and registered == observed
+            )
+        else:
+            same = registered == observed
+        if not same:
+            raise ValueError(
+                f"CFG baseline sampling.{key} differs: "
+                f"registered {registered!r}, observed {observed!r}"
+            )
+    if config.get("scheduler_runtime") != CFG_BASELINE_SCHEDULER_RUNTIME:
+        raise ValueError(
+            "cfg_baselines_v1 scheduler_runtime differs from the frozen Euler contract"
+        )
+
+    source = config.get("source_manifest")
+    if not isinstance(source, dict):
+        raise ValueError("cfg_baselines_v1 requires a source_manifest mapping")
+    registered_prompts = source.get("prompts")
+    if not isinstance(registered_prompts, str) or not registered_prompts:
+        raise ValueError("CFG baseline source_manifest.prompts is required")
+    if registered_prompts != CFG_BASELINE_PROMPTS:
+        raise ValueError(
+            "CFG baseline prompt registration must use "
+            f"{CFG_BASELINE_PROMPTS}"
+        )
+    registered_abs = os.path.abspath(os.path.join(ROOT, registered_prompts))
+    actual_abs = os.path.abspath(prompts_path)
+    if registered_abs != actual_abs:
+        raise ValueError(
+            "CFG baseline prompt path differs: "
+            f"registered {registered_abs!r}, observed {actual_abs!r}"
+        )
+    if source.get("prompts_sha256") != CFG_BASELINE_PROMPTS_SHA256:
+        raise ValueError("CFG baseline registered prompt SHA-256 is not frozen v1")
+    if sha256_file(prompts_path) != CFG_BASELINE_PROMPTS_SHA256:
+        raise ValueError("CFG baseline prompt SHA-256 differs from registration")
+
+    split_seeds = config.get("split_seeds")
+    if split_seeds != CFG_BASELINE_SPLIT_SEEDS:
+        raise ValueError(
+            "cfg_baselines_v1 split_seeds must be exactly development: [0, 42, 123]"
+        )
+    if list(seeds) != CFG_BASELINE_SPLIT_SEEDS["development"]:
+        raise ValueError(
+            f"CFG baseline seeds {list(seeds)} differ from frozen development seeds"
+        )
+
+    design = config.get("design")
+    if not isinstance(design, dict):
+        raise ValueError("cfg_baselines_v1 requires a design mapping")
+    if config.get("execution_order") != CFG_BASELINE_EXECUTION_ORDER:
+        raise ValueError("cfg_baselines_v1 execution_order differs from the contract")
+    prompts = pd.read_csv(prompts_path)
+    observed_counts = {
+        "prompt_count": len(prompts),
+        "action_count": len(actions),
+        "seed_count": len(seeds),
+        "task_count": len(prompts) * len(actions) * len(seeds),
+        "block_count": len(prompts) * len(seeds),
+    }
+    count_fields = {
+        "prompt_count": "expected_prompt_count",
+        "action_count": "expected_action_count",
+        "seed_count": "expected_seed_count",
+        "task_count": "expected_task_count",
+        "block_count": "expected_block_count",
+    }
+    for observed_name, registered_name in count_fields.items():
+        registered = design.get(registered_name)
+        if isinstance(registered, bool) or not isinstance(registered, int):
+            raise ValueError(
+                f"CFG baseline design.{registered_name} must be an integer"
+            )
+        if registered != observed_counts[observed_name]:
+            raise ValueError(
+                f"CFG baseline design {observed_name} differs: "
+                f"registered {registered}, observed {observed_counts[observed_name]}"
+            )
+
+    expected_action_ids = list(CFG_BASELINE_ACTION_SCALES)
+    registered_scales = design.get("cfg_scales")
+    if not isinstance(registered_scales, list) or any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in registered_scales
+    ):
+        raise ValueError("CFG baseline design.cfg_scales must be a numeric list")
+    if [float(value) for value in registered_scales] != list(
+        CFG_BASELINE_ACTION_SCALES.values()
+    ):
+        raise ValueError("CFG baseline design.cfg_scales differs from the frozen grid")
+    if design.get("baseline_action_id") != "cfg_7p5":
+        raise ValueError("CFG baseline design.baseline_action_id must be cfg_7p5")
+    if design.get("action_ids") != expected_action_ids:
+        raise ValueError(
+            "CFG baseline registered action IDs differ from the frozen five-arm matrix"
+        )
+    observed_action_ids = [str(action.get("id")) for action in actions]
+    if observed_action_ids != expected_action_ids:
+        raise ValueError(
+            "CFG baseline action IDs differ: "
+            f"expected {expected_action_ids!r}, observed {observed_action_ids!r}"
+        )
+    for action in actions:
+        action_id = str(action.get("id"))
+        if action.get("type") != "none":
+            raise ValueError(f"CFG baseline action {action_id!r} must use type none")
+        if float(action.get("cfg_scale", float("nan"))) != CFG_BASELINE_ACTION_SCALES[
+            action_id
+        ]:
+            raise ValueError(f"CFG baseline action {action_id!r} has wrong cfg_scale")
+
+    expected_hashes = design.get("action_sha256")
+    if not isinstance(expected_hashes, dict) or set(expected_hashes) != set(
+        expected_action_ids
+    ):
+        raise ValueError(
+            "CFG baseline design.action_sha256 must exactly cover the five actions"
+        )
+    for action in actions:
+        action_id = str(action["id"])
+        if expected_hashes[action_id] != action_sha256(action):
+            raise ValueError(f"CFG baseline action hash differs for {action_id!r}")
+
+
 def validate_scheduler_baseline_design(
     path: str,
     *,
@@ -961,11 +1457,17 @@ def scheduler_config_sha256(scheduler) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def scheduler_config_sha256_v2(scheduler) -> str:
-    """Hash effective scheduler config with stable default bookkeeping."""
+def scheduler_config_payload(scheduler) -> dict:
+    """Return the complete JSON-safe scheduler config with stable metadata."""
     config = dict(getattr(scheduler, "config", {}))
     if isinstance(config.get("_use_default_values"), list):
         config["_use_default_values"] = sorted(config["_use_default_values"])
+    return json.loads(json.dumps(config, sort_keys=True, default=str))
+
+
+def scheduler_config_sha256_v2(scheduler) -> str:
+    """Hash effective scheduler config with stable default bookkeeping."""
+    config = scheduler_config_payload(scheduler)
     payload = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -1037,6 +1539,42 @@ def prepare_scheduler_schedule_provenance(
     }
 
 
+def validate_cfg_scheduler_runtime(
+    registered_runtime: dict,
+    *,
+    config_sha256_v2: str,
+    schedule_provenance: dict | None = None,
+) -> None:
+    """Reject any Euler implementation or schedule drift before CFG sampling."""
+    if registered_runtime != CFG_BASELINE_SCHEDULER_RUNTIME:
+        raise RuntimeError("CFG-baseline scheduler runtime contract drifted")
+    if config_sha256_v2 != registered_runtime["config_sha256_v2"]:
+        raise RuntimeError("CFG-baseline Euler config differs from the frozen runtime")
+    if schedule_provenance is None:
+        return
+    observed = {
+        "num_inference_steps": len(schedule_provenance["scheduler_timesteps"]),
+        "schedule_sha256": schedule_provenance["scheduler_schedule_sha256"],
+        "construction_init_noise_sigma": schedule_provenance[
+            "scheduler_construction_init_noise_sigma"
+        ],
+        "effective_init_noise_sigma": schedule_provenance[
+            "scheduler_effective_init_noise_sigma"
+        ],
+    }
+    expected = {
+        key: registered_runtime[key]
+        for key in (
+            "num_inference_steps",
+            "schedule_sha256",
+            "construction_init_noise_sigma",
+            "effective_init_noise_sigma",
+        )
+    }
+    if observed != expected:
+        raise RuntimeError("CFG-baseline Euler schedule differs from the frozen runtime")
+
+
 def scheduler_provenance_record(
     action: dict,
     *,
@@ -1062,6 +1600,19 @@ def scheduler_provenance_record(
     if schedule_provenance:
         record.update(schedule_provenance)
     return record
+
+
+def validate_one_unet_call_per_step(
+    observed_calls: list[int], num_inference_steps: int, *, run_label: str
+) -> None:
+    """Enforce the matched-NFE contract for a registered generation run."""
+    expected_steps = int(num_inference_steps)
+    if len(observed_calls) != expected_steps or any(
+        isinstance(value, bool) or int(value) != 1 for value in observed_calls
+    ):
+        raise RuntimeError(
+            f"{run_label} requires exactly one U-Net call per denoising step"
+        )
 
 
 def validate_final_test_authorization(
@@ -1090,7 +1641,7 @@ def validate_final_test_authorization(
 def git_commit() -> str:
     try:
         return subprocess.check_output(
-            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "--short", "HEAD"],
+            ["git", "-C", ROOT, "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL,
         ).decode().strip()
     except Exception:
@@ -1264,16 +1815,30 @@ def latent_renderer_runtime(action: dict, pipe, device: str, guidance_scale: flo
 
 def worker_process(cfg: dict, device: str, task_queue, error_queue):
     torch.cuda.set_device(device)
+    registered_sampling = cfg.get("registered_sampling") or {}
+    load_kwargs = {
+        "torch_dtype": torch.float16,
+        "variant": "fp16",
+        "cache_dir": cfg["cache_dir"],
+        "local_files_only": True,
+    }
+    if cfg.get("cfg_baseline_registered"):
+        model_revision = str(registered_sampling.get("model_revision", ""))
+        if model_revision != CFG_BASELINE_MODEL_REVISION:
+            raise RuntimeError("CFG-baseline model revision differs from registration")
+        if cfg.get("model_revision") != model_revision:
+            raise RuntimeError("CFG-baseline run config has model revision drift")
+        load_kwargs["revision"] = model_revision
     pipe = RepLDMSDXLPipeline.from_pretrained(
-        cfg["model_name"], torch_dtype=torch.float16, variant="fp16",
-        cache_dir=cfg["cache_dir"], local_files_only=True,
+        cfg["model_name"],
+        **load_kwargs,
     ).to(device)
     pipe.set_progress_bar_config(disable=True)
     base_scheduler = pipe.scheduler
     base_scheduler_name = type(base_scheduler).__name__
     base_scheduler_hash = scheduler_config_sha256(base_scheduler)
     base_scheduler_hash_v2 = scheduler_config_sha256_v2(base_scheduler)
-    registered_sampling = cfg.get("registered_sampling") or {}
+    base_scheduler_config = scheduler_config_payload(base_scheduler)
     if cfg.get("trajectory_registered"):
         expected_scheduler = str(registered_sampling.get("scheduler", ""))
         if base_scheduler_name != expected_scheduler:
@@ -1296,9 +1861,35 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             raise RuntimeError("scheduler-baseline model differs from registration")
         if int(registered_sampling.get("extra_unet_calls", -1)) != 0:
             raise RuntimeError("scheduler-baseline requires zero extra U-Net calls")
+    if cfg.get("cfg_baseline_registered"):
+        expected_scheduler = str(registered_sampling.get("base_scheduler", ""))
+        if base_scheduler_name != expected_scheduler:
+            raise RuntimeError(
+                "CFG-baseline run loaded the wrong base scheduler: "
+                f"registered {expected_scheduler!r}, got {base_scheduler_name!r}"
+            )
+        if str(cfg.get("model_name")) != str(registered_sampling.get("model")):
+            raise RuntimeError("CFG-baseline model differs from registration")
+        if int(registered_sampling.get("extra_unet_calls", -1)) != 0:
+            raise RuntimeError("CFG-baseline requires zero extra U-Net calls")
+        if str(registered_sampling.get("cfg_source")) != "action.cfg_scale":
+            raise RuntimeError("CFG-baseline requires action.cfg_scale as its CFG source")
+        if str(registered_sampling.get("cfg_pipeline_argument")) != "guidance_scale":
+            raise RuntimeError(
+                "CFG-baseline must pass each action scale through guidance_scale"
+            )
+        if cfg.get("guidance_rescale") != 0.0 or registered_sampling.get(
+            "guidance_rescale"
+        ) != 0.0:
+            raise RuntimeError("CFG-baseline guidance_rescale must be exactly 0.0")
+        validate_cfg_scheduler_runtime(
+            cfg.get("scheduler_runtime"),
+            config_sha256_v2=base_scheduler_hash_v2,
+        )
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
+    worker_contract_sha256 = worker_resume_contract_sha256(cfg)
     latent_runtime_cache = {}
     n_done = 0
     while True:
@@ -1310,7 +1901,11 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             break
         png_path = os.path.join(img_dir, task["id"] + ".png")
         json_path = os.path.join(img_dir, task["id"] + ".json")
-        if os.path.exists(png_path) and os.path.exists(json_path):
+        if task_is_complete(
+            task,
+            img_dir,
+            run_contract_sha256=worker_contract_sha256,
+        ):
             continue
         try:
             generator = torch.Generator(device).manual_seed(task["seed"])
@@ -1340,6 +1935,13 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             if cfg["stage2_enabled"] and clean_config is not None:
                 raise ValueError("clean transport is registered for Stage 1 only")
             cfg_scale = float(action.get("cfg_scale", cfg["guidance_scale"]))
+            guidance_rescale = float(cfg.get("guidance_rescale", 0.0))
+            if cfg.get("cfg_baseline_registered"):
+                expected_cfg_scale = CFG_BASELINE_ACTION_SCALES.get(action["id"])
+                if expected_cfg_scale is None or cfg_scale != expected_cfg_scale:
+                    raise RuntimeError(
+                        f"CFG-baseline action {action['id']!r} has runtime scale drift"
+                    )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
@@ -1354,7 +1956,10 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             # scheduler state left by the previous pipeline call.  In
             # particular, Euler's ``init_noise_sigma`` property changes after
             # ``set_timesteps`` for the legacy SDXL scheduler config.
-            scheduler_isolated = bool(cfg.get("scheduler_baseline_registered"))
+            scheduler_isolated = bool(
+                cfg.get("scheduler_baseline_registered")
+                or cfg.get("cfg_baseline_registered")
+            )
             scheduler_runtime = None
             if scheduler_isolated:
                 scheduler_runtime = (
@@ -1372,6 +1977,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             scheduler_name = type(active_scheduler).__name__
             active_scheduler_hash = scheduler_config_sha256(active_scheduler)
             active_scheduler_hash_v2 = scheduler_config_sha256_v2(active_scheduler)
+            active_scheduler_config = scheduler_config_payload(active_scheduler)
             active_scheduler_order = int(getattr(active_scheduler, "order", 1))
             active_solver_order = active_scheduler.config.get("solver_order")
             active_init_noise_sigma = float(active_scheduler.init_noise_sigma)
@@ -1382,6 +1988,12 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     cfg["num_inference_steps"],
                     device,
                 )
+                if cfg.get("cfg_baseline_registered"):
+                    validate_cfg_scheduler_runtime(
+                        cfg["scheduler_runtime"],
+                        config_sha256_v2=active_scheduler_hash_v2,
+                        schedule_provenance=schedule_provenance,
+                    )
             try:
                 with baseline_context:
                     images = pipe(
@@ -1391,6 +2003,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         height=cfg["resolution"], width=cfg["resolution"],
                         num_inference_steps=cfg["num_inference_steps"],
                         guidance_scale=cfg_scale,
+                        guidance_rescale=guidance_rescale,
                         show_image=False,
                         multi_decoder=cfg["multi_decoder"],
                         multi_encoder=cfg["multi_encoder"],
@@ -1436,19 +2049,23 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 for value in getattr(pipe, "_last_unet_calls_per_step", [])
             ]
             if trajectory_correction is not None:
-                if len(observed_unet_calls) != cfg["num_inference_steps"] or any(
-                    value != 1 for value in observed_unet_calls
-                ):
-                    raise RuntimeError(
-                        "trajectory correction requires exactly one U-Net call per Stage-1 step"
-                    )
+                validate_one_unet_call_per_step(
+                    observed_unet_calls,
+                    cfg["num_inference_steps"],
+                    run_label="trajectory correction",
+                )
             if cfg.get("scheduler_baseline_registered"):
-                if len(observed_unet_calls) != cfg["num_inference_steps"] or any(
-                    value != 1 for value in observed_unet_calls
-                ):
-                    raise RuntimeError(
-                        "scheduler baselines require exactly one U-Net call per step"
-                    )
+                validate_one_unet_call_per_step(
+                    observed_unet_calls,
+                    cfg["num_inference_steps"],
+                    run_label="scheduler baselines",
+                )
+            if cfg.get("cfg_baseline_registered"):
+                validate_one_unet_call_per_step(
+                    observed_unet_calls,
+                    cfg["num_inference_steps"],
+                    run_label="CFG baselines",
+                )
             observed_extra_unet_calls = max(
                 (value - 1 for value in observed_unet_calls), default=0
             )
@@ -1459,12 +2076,14 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             renderer_provider_diagnostics = getattr(
                 pipe, "_last_latent_renderer_provider_diagnostics", None
             )
-            images[-1].save(png_path)  # lossless PNG
+            atomic_save_png(images[-1], png_path)
             generated_image_sha256 = image_sha256(png_path)
             scheduler_reference_provenance = scheduler_provenance_record(
                 action,
                 include=bool(
-                    scheduler_reference or cfg.get("scheduler_baseline_registered")
+                    scheduler_reference
+                    or cfg.get("scheduler_baseline_registered")
+                    or cfg.get("cfg_baseline_registered")
                 ),
                 base_config_sha256_v2=base_scheduler_hash_v2,
                 active_config_sha256_v2=active_scheduler_hash_v2,
@@ -1473,6 +2092,13 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 init_noise_sigma=active_init_noise_sigma,
                 schedule_provenance=schedule_provenance,
             )
+            if cfg.get("cfg_baseline_registered"):
+                scheduler_reference_provenance.update(
+                    {
+                        "scheduler_config": base_scheduler_config,
+                        "active_scheduler_config": active_scheduler_config,
+                    }
+                )
             record = {
                 **task,
                 "provenance_schema": PROVENANCE_SCHEMA,
@@ -1483,6 +2109,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "height": cfg["resolution"], "width": cfg["resolution"],
                 "num_inference_steps": cfg["num_inference_steps"],
                 "guidance_scale": cfg_scale,
+                "guidance_rescale": guidance_rescale,
                 "inference_seconds": elapsed,
                 "peak_gpu_memory_bytes": peak_memory,
                 "power_calibrate": cfg["power_calibrate"],
@@ -1498,6 +2125,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "init_rates": cfg["init_rates"],
                 "stage2_noise_source": cfg["stage2_noise_source"],
                 "model_name": cfg["model_name"],
+                "model_revision": cfg.get("model_revision"),
                 "scheduler_name": scheduler_name,
                 "base_scheduler_name": base_scheduler_name,
                 "scheduler_config_sha256": base_scheduler_hash,
@@ -1505,6 +2133,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "scheduler_reference": scheduler_reference,
                 "git_commit": commit,
                 "registered_sampling": registered_sampling or None,
+                "scheduler_runtime": cfg.get("scheduler_runtime"),
                 "extra_unet_calls": observed_extra_unet_calls,
                 "unet_calls_per_step": observed_unet_calls,
                 **cfg["runtime_provenance"],
@@ -1543,8 +2172,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         "mean_scheduler_update_norm": None,
                     }
                 )
-            with open(json_path, "w") as f:
-                json.dump(record, f)
+            atomic_write_json(json_path, record)
             del images
             n_done += 1
         except Exception:
@@ -1599,10 +2227,323 @@ def consolidate_manifest(
             expected_action_ids=sorted({task["action_id"] for task in expected_tasks}),
             expected_seeds=sorted({int(task["seed"]) for task in expected_tasks}),
         )
-    with open(os.path.join(out_dir, "manifest.jsonl"), "w") as f:
+    with atomic_text_writer(os.path.join(out_dir, "manifest.jsonl")) as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     return len(rows)
+
+
+def run_generation_locked(
+    ap,
+    args,
+    *,
+    stage_settings: dict,
+    seeds: list[int],
+    actions: list,
+    band_cutoffs: list[float],
+    legacy_scale_ids: bool,
+    action_config: dict,
+    devices: list[str],
+    expected_prompts_sha256: str,
+    expected_actions_sha256: str | None,
+) -> None:
+    """Execute all output reads and writes while the caller holds its lock."""
+    prompts = pd.read_csv(args.prompts)
+    observed_prompts_sha256 = sha256_file(args.prompts)
+    if observed_prompts_sha256 != expected_prompts_sha256:
+        ap.error("prompts file changed after locked validation")
+    observed_actions_sha256 = sha256_file(args.actions) if args.actions else None
+    if observed_actions_sha256 != expected_actions_sha256:
+        ap.error("actions file changed after locked validation")
+    assert "index" in prompts.columns and "TEXT" in prompts.columns, (
+        "prompts CSV needs index,TEXT[,bucket]"
+    )
+    if prompts["index"].duplicated().any():
+        ap.error("prompt indices must be unique")
+    validate_model_cache(args.model_name, args.cache_dir)
+    os.makedirs(os.path.join(args.out_dir, "images"), exist_ok=True)
+
+    cfg = {
+        "out_dir": args.out_dir,
+        "resolution": args.resolution,
+        "num_inference_steps": args.num_inference_steps,
+        "guidance_scale": args.guidance_scale,
+        "power_calibrate": args.power_calibrate,
+        "negative_prompt": args.negative_prompt,
+        "cache_dir": args.cache_dir,
+        "model_name": args.model_name,
+        "low_vram": args.low_vram,
+        "frequency_band_cutoffs": band_cutoffs,
+        "git_commit": git_commit(),
+        "split_role": args.split_role,
+        "prompts_csv": os.path.abspath(args.prompts),
+        "prompts_sha256": observed_prompts_sha256,
+        "actions_yaml": os.path.abspath(args.actions) if args.actions else None,
+        "actions_sha256": observed_actions_sha256,
+        "runtime_provenance": runtime_provenance(),
+        **stage_settings,
+    }
+    action_schema = action_config.get("schema") if args.actions else None
+    trajectory_registered = action_schema in TRAJECTORY_SCHEMAS
+    scheduler_baseline_registered = action_schema == "scheduler_baselines_v1"
+    cfg_baseline_registered = action_schema == CFG_BASELINE_SCHEMA
+    cfg["action_schema"] = action_schema
+    cfg["trajectory_registered"] = trajectory_registered
+    cfg["scheduler_baseline_registered"] = scheduler_baseline_registered
+    cfg["cfg_baseline_registered"] = cfg_baseline_registered
+    cfg["registered_sampling"] = (
+        dict(action_config.get("sampling") or {})
+        if trajectory_registered
+        or scheduler_baseline_registered
+        or cfg_baseline_registered
+        else {}
+    )
+    cfg["model_revision"] = (
+        cfg["registered_sampling"].get("model_revision")
+        if cfg_baseline_registered
+        else None
+    )
+    cfg["guidance_rescale"] = (
+        float(cfg["registered_sampling"]["guidance_rescale"])
+        if cfg_baseline_registered
+        else 0.0
+    )
+    cfg["scheduler_runtime"] = (
+        dict(action_config.get("scheduler_runtime") or {})
+        if cfg_baseline_registered
+        else None
+    )
+    cfg["run_contract"] = generation_contract(
+        cfg,
+        actions=actions,
+        seeds=seeds,
+        prompts_sha256=cfg["prompts_sha256"],
+        actions_sha256=cfg["actions_sha256"],
+    )
+    cfg["run_contract_sha256"] = json_sha256(cfg["run_contract"])
+    # Registered trajectory, scheduler, and CFG runs require strict sidecar/
+    # contract validation on resume. Existing exploratory sweeps predate this
+    # contract and keep their original PNG+JSON completion semantics.
+    registered_run = (
+        trajectory_registered
+        or scheduler_baseline_registered
+        or cfg_baseline_registered
+    )
+    resume_contract_sha256 = cfg["run_contract_sha256"] if registered_run else None
+
+    tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)
+    expected_ids = {task["id"] for task in tasks}
+    img_dir = os.path.join(args.out_dir, "images")
+    config_path = os.path.join(args.out_dir, "config.json")
+    if registered_run and os.path.exists(config_path):
+        try:
+            with open(config_path) as handle:
+                previous_config = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            ap.error(f"cannot read existing run config: {exc}")
+        try:
+            validate_run_contract(previous_config)
+        except ValueError as exc:
+            ap.error(f"existing registered run config is invalid: {exc}")
+        if previous_config.get("run_contract_sha256") != cfg["run_contract_sha256"]:
+            ap.error(
+                "existing registered run config differs from the requested "
+                "model/scheduler/action/sampling contract; use a new output directory"
+            )
+    elif (
+        registered_run
+        and not os.path.exists(config_path)
+        and generation_artifacts_exist(img_dir)
+    ):
+        ap.error(
+            "registered artifacts exist without config.json; use a new output directory"
+        )
+    device_tasks = assign_tasks_to_devices(
+        tasks,
+        devices,
+        img_dir,
+        run_contract_sha256=resume_contract_sha256,
+    )
+    # Assignment freezes each action's deterministic execution rank. Compute
+    # completion only after that field exists so registered resumes reject a
+    # sidecar whose order provenance drifted.
+    todo = [
+        task
+        for task in tasks
+        if not task_is_complete(
+            task, img_dir, run_contract_sha256=resume_contract_sha256
+        )
+    ]
+    worker_count = len(device_tasks)
+    print(
+        f"{len(prompts)} prompts x {len(seeds)} seeds x {len(actions)} actions = "
+        f"{len(tasks)} tasks; {len(tasks) - len(todo)} already done, "
+        f"{len(todo)} to generate on {worker_count} GPU(s).",
+        flush=True,
+    )
+
+    if todo:
+        atomic_write_json(
+            os.path.join(args.out_dir, "config.json"),
+            {**cfg, "seeds": seeds, "actions": actions, "devices": devices},
+            indent=2,
+        )
+        tmp.set_start_method("spawn", force=True)
+        manager = tmp.Manager()
+        error_queue = manager.Queue()
+        active_devices = list(device_tasks)
+        task_queues = [manager.Queue() for _ in active_devices]
+        for device, task_queue in zip(active_devices, task_queues):
+            for task in device_tasks[device]:
+                task_queue.put(task)
+        procs = []
+        for device, task_queue in zip(active_devices, task_queues):
+            process = tmp.Process(
+                target=worker_process,
+                args=(cfg, device, task_queue, error_queue),
+            )
+            process.start()
+            procs.append((device, process))
+        for _, process in procs:
+            process.join()
+
+        worker_failures = [
+            (device, process.exitcode)
+            for device, process in procs
+            if process.exitcode != 0
+        ]
+        task_failures = []
+        while True:
+            try:
+                task_failures.append(error_queue.get_nowait())
+            except Exception:
+                break
+        if worker_failures or task_failures:
+            completed = consolidate_manifest(
+                args.out_dir,
+                expected_ids,
+                expected_tasks=tasks,
+                run_contract_sha256=resume_contract_sha256,
+                strict=registered_run,
+            )
+            examples = ", ".join(task_id for task_id, _ in task_failures[:5])
+            raise RuntimeError(
+                f"generation failed: workers={worker_failures}, "
+                f"task_failures={len(task_failures)} ({examples}); "
+                f"preserved {completed} completed records for resume"
+            )
+
+    completed = consolidate_manifest(
+        args.out_dir,
+        expected_ids,
+        expected_tasks=tasks,
+        run_contract_sha256=resume_contract_sha256,
+        strict=registered_run,
+    )
+    print(
+        f"manifest.jsonl written with {completed} records -> "
+        f"{os.path.join(args.out_dir, 'manifest.jsonl')}",
+        flush=True,
+    )
+
+
+def prepare_generation_locked(ap, args, stage_settings: dict, seeds: list[int]) -> None:
+    """Load and validate every file-backed input while holding the output lock."""
+    if args.actions and args.scales:
+        ap.error("--actions and --scales are mutually exclusive")
+    expected_prompts_sha256 = sha256_file(args.prompts)
+    expected_actions_sha256 = sha256_file(args.actions) if args.actions else None
+    action_config = {}
+    if args.actions:
+        actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
+        try:
+            with open(args.actions) as action_handle:
+                action_config = yaml.safe_load(action_handle) or {}
+            validate_scheduler_baseline_authorization(args.actions)
+            validate_cfg_baseline_authorization(args.actions)
+            validate_split_seed_role(args.actions, args.split_role, seeds)
+            validate_cfg_baseline_design(
+                args.actions,
+                prompts_path=args.prompts,
+                actions=actions,
+                seeds=seeds,
+                model_name=args.model_name,
+                resolution=args.resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                negative_prompt=args.negative_prompt,
+                power_calibrate=args.power_calibrate,
+                stage2_enabled=args.stage2,
+            )
+            validate_scheduler_baseline_design(
+                args.actions,
+                prompts_path=args.prompts,
+                actions=actions,
+                seeds=seeds,
+                model_name=args.model_name,
+                resolution=args.resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                stage2_enabled=args.stage2,
+            )
+            validate_registered_trajectory_design(
+                args.actions,
+                prompts_path=args.prompts,
+                resolution=args.resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                stage2_enabled=args.stage2,
+                model_name=args.model_name,
+            )
+            if (
+                args.split_role == "test_final"
+                and action_config.get("schema") == "latent_renderer_actions_v1"
+            ):
+                if not args.authorization:
+                    raise ValueError(
+                        "latent-renderer test_final requires --authorization from the validation gate"
+                    )
+                validate_final_test_authorization(
+                    args.authorization, args.actions, seeds
+                )
+        except ValueError as exc:
+            ap.error(str(exc))
+        legacy_scale_ids = False
+    else:
+        if args.split_role is not None:
+            ap.error("--split_role requires --actions")
+        scale_values = args.scales or "0,0.001,0.002,0.003,0.005"
+        scales = [float(s) for s in scale_values.split(",") if s != ""]
+        actions = scale_actions(scales)
+        band_cutoffs = [0.08, 0.25]
+        legacy_scale_ids = True
+    devices = [
+        f"cuda:{value.strip()}"
+        for value in args.devices.split(",")
+        if value.strip()
+    ]
+    if not devices:
+        ap.error("no devices")
+    if len(devices) != len(set(devices)):
+        ap.error("--devices must not contain duplicates")
+    if sha256_file(args.prompts) != expected_prompts_sha256:
+        ap.error("prompts file changed during locked validation")
+    if args.actions and sha256_file(args.actions) != expected_actions_sha256:
+        ap.error("actions file changed during locked validation")
+
+    run_generation_locked(
+        ap,
+        args,
+        stage_settings=stage_settings,
+        seeds=seeds,
+        actions=actions,
+        band_cutoffs=band_cutoffs,
+        legacy_scale_ids=legacy_scale_ids,
+        action_config=action_config,
+        devices=devices,
+        expected_prompts_sha256=expected_prompts_sha256,
+        expected_actions_sha256=expected_actions_sha256,
+    )
 
 
 def main():
@@ -1650,198 +2591,9 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",") if s != ""]
     if len(seeds) != len(set(seeds)):
         ap.error("--seeds must not contain duplicates")
-    if args.actions and args.scales:
-        ap.error("--actions and --scales are mutually exclusive")
-    action_config = {}
-    if args.actions:
-        actions, band_cutoffs = load_actions(args.actions, args.num_inference_steps)
-        try:
-            with open(args.actions) as action_handle:
-                action_config = yaml.safe_load(action_handle) or {}
-            validate_scheduler_baseline_authorization(args.actions)
-            validate_split_seed_role(args.actions, args.split_role, seeds)
-            validate_scheduler_baseline_design(
-                args.actions,
-                prompts_path=args.prompts,
-                actions=actions,
-                seeds=seeds,
-                model_name=args.model_name,
-                resolution=args.resolution,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                stage2_enabled=args.stage2,
-            )
-            validate_registered_trajectory_design(
-                args.actions,
-                prompts_path=args.prompts,
-                resolution=args.resolution,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.guidance_scale,
-                stage2_enabled=args.stage2,
-                model_name=args.model_name,
-            )
-            if (
-                args.split_role == "test_final"
-                and action_config.get("schema") == "latent_renderer_actions_v1"
-            ):
-                if not args.authorization:
-                    raise ValueError(
-                        "latent-renderer test_final requires --authorization from the validation gate"
-                    )
-                validate_final_test_authorization(args.authorization, args.actions, seeds)
-        except ValueError as exc:
-            ap.error(str(exc))
-        legacy_scale_ids = False
-    else:
-        if args.split_role is not None:
-            ap.error("--split_role requires --actions")
-        scale_values = args.scales or "0,0.001,0.002,0.003,0.005"
-        scales = [float(s) for s in scale_values.split(",") if s != ""]
-        actions = scale_actions(scales)
-        band_cutoffs = [0.08, 0.25]
-        legacy_scale_ids = True
-    devices = [f"cuda:{d.strip()}" for d in args.devices.split(",") if d.strip() != ""]
-    assert devices, "no devices"
-    if len(devices) != len(set(devices)):
-        ap.error("--devices must not contain duplicates")
 
-    prompts = pd.read_csv(args.prompts)
-    assert "index" in prompts.columns and "TEXT" in prompts.columns, "prompts CSV needs index,TEXT[,bucket]"
-    if prompts["index"].duplicated().any():
-        ap.error("prompt indices must be unique")
-    validate_model_cache(args.model_name, args.cache_dir)
-    os.makedirs(os.path.join(args.out_dir, "images"), exist_ok=True)
-
-    cfg = {
-        "out_dir": args.out_dir, "resolution": args.resolution,
-        "num_inference_steps": args.num_inference_steps, "guidance_scale": args.guidance_scale,
-        "power_calibrate": args.power_calibrate, "negative_prompt": args.negative_prompt,
-        "cache_dir": args.cache_dir, "model_name": args.model_name, "low_vram": args.low_vram,
-        "frequency_band_cutoffs": band_cutoffs,
-        "git_commit": git_commit(),
-        "split_role": args.split_role,
-        "prompts_csv": os.path.abspath(args.prompts),
-        "prompts_sha256": sha256_file(args.prompts),
-        "actions_yaml": os.path.abspath(args.actions) if args.actions else None,
-        "actions_sha256": sha256_file(args.actions) if args.actions else None,
-        "runtime_provenance": runtime_provenance(),
-        **stage_settings,
-    }
-    action_schema = action_config.get("schema") if args.actions else None
-    trajectory_registered = action_schema in TRAJECTORY_SCHEMAS
-    scheduler_baseline_registered = action_schema == "scheduler_baselines_v1"
-    cfg["action_schema"] = action_schema
-    cfg["trajectory_registered"] = trajectory_registered
-    cfg["scheduler_baseline_registered"] = scheduler_baseline_registered
-    cfg["registered_sampling"] = (
-        dict(action_config.get("sampling") or {})
-        if trajectory_registered or scheduler_baseline_registered
-        else {}
-    )
-    cfg["run_contract"] = generation_contract(
-        cfg,
-        actions=actions,
-        seeds=seeds,
-        prompts_sha256=cfg["prompts_sha256"],
-        actions_sha256=cfg["actions_sha256"],
-    )
-    cfg["run_contract_sha256"] = json_sha256(cfg["run_contract"])
-    # Registered S7 and scheduler-reference runs require strict sidecar/
-    # contract validation on resume. Existing exploratory sweeps predate this
-    # contract and must keep their original PNG+JSON completion semantics.
-    registered_run = trajectory_registered or scheduler_baseline_registered
-    resume_contract_sha256 = cfg["run_contract_sha256"] if registered_run else None
-
-    tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)
-    expected_ids = {task["id"] for task in tasks}
-    img_dir = os.path.join(args.out_dir, "images")
-    config_path = os.path.join(args.out_dir, "config.json")
-    if registered_run and os.path.exists(config_path):
-        try:
-            with open(config_path) as handle:
-                previous_config = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            ap.error(f"cannot read existing run config: {exc}")
-        try:
-            validate_run_contract(previous_config)
-        except ValueError as exc:
-            ap.error(f"existing registered run config is invalid: {exc}")
-        if previous_config.get("run_contract_sha256") != cfg["run_contract_sha256"]:
-            ap.error(
-                "existing trajectory-correction run config differs from the requested "
-                "model/scheduler/action/sampling contract; use a new output directory"
-            )
-    elif registered_run and not os.path.exists(config_path) and os.listdir(img_dir):
-        ap.error(
-            "registered artifacts exist without config.json; use a new output directory"
-        )
-    todo = [
-        task
-        for task in tasks
-        if not task_is_complete(
-            task, img_dir, run_contract_sha256=resume_contract_sha256
-        )
-    ]
-    device_tasks = assign_tasks_to_devices(
-        tasks,
-        devices,
-        img_dir,
-        run_contract_sha256=resume_contract_sha256,
-    )
-    worker_count = len(device_tasks)
-    print(f"{len(prompts)} prompts x {len(seeds)} seeds x {len(actions)} actions = {len(tasks)} tasks; "
-          f"{len(tasks) - len(todo)} already done, {len(todo)} to generate on {worker_count} GPU(s).", flush=True)
-
-    if todo:
-        with open(os.path.join(args.out_dir, "config.json"), "w") as f:
-            json.dump({**cfg, "seeds": seeds, "actions": actions,
-                       "devices": devices}, f, indent=2)
-        tmp.set_start_method("spawn", force=True)
-        manager = tmp.Manager()
-        error_queue = manager.Queue()
-        active_devices = list(device_tasks)
-        task_queues = [manager.Queue() for _ in active_devices]
-        for device, queue in zip(active_devices, task_queues):
-            for task in device_tasks[device]:
-                queue.put(task)
-        procs = []
-        for device, task_queue in zip(active_devices, task_queues):
-            p = tmp.Process(target=worker_process, args=(cfg, device, task_queue, error_queue))
-            p.start()
-            procs.append((device, p))
-        for _, p in procs:
-            p.join()
-
-        worker_failures = [(device, p.exitcode) for device, p in procs if p.exitcode != 0]
-        task_failures = []
-        while True:
-            try:
-                task_failures.append(error_queue.get_nowait())
-            except Exception:
-                break
-        if worker_failures or task_failures:
-            n = consolidate_manifest(
-                args.out_dir,
-                expected_ids,
-                expected_tasks=tasks,
-                run_contract_sha256=resume_contract_sha256,
-                strict=trajectory_registered,
-            )
-            examples = ", ".join(task_id for task_id, _ in task_failures[:5])
-            raise RuntimeError(
-                f"generation failed: workers={worker_failures}, "
-                f"task_failures={len(task_failures)} ({examples}); "
-                f"preserved {n} completed records for resume"
-            )
-
-    n = consolidate_manifest(
-        args.out_dir,
-        expected_ids,
-        expected_tasks=tasks,
-        run_contract_sha256=resume_contract_sha256,
-        strict=trajectory_registered,
-    )
-    print(f"manifest.jsonl written with {n} records -> {os.path.join(args.out_dir, 'manifest.jsonl')}", flush=True)
+    with generation_output_lock(args.out_dir):
+        prepare_generation_locked(ap, args, stage_settings, seeds)
 
 
 if __name__ == "__main__":
