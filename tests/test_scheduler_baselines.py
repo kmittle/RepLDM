@@ -233,6 +233,41 @@ class SchedulerBaselineTest(unittest.TestCase):
         self.assertEqual(float(fresh.init_noise_sigma), float(base.init_noise_sigma))
         self.assertIsNot(fresh, base)
 
+    def test_schedule_ledger_separates_construction_and_effective_sigma(self):
+        scheduler = EulerDiscreteScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            prediction_type="epsilon",
+            timestep_spacing="leading",
+            steps_offset=1,
+        )
+        record = generate.prepare_scheduler_schedule_provenance(
+            scheduler, 50, "cpu"
+        )
+        self.assertNotEqual(
+            record["scheduler_construction_init_noise_sigma"],
+            record["scheduler_effective_init_noise_sigma"],
+        )
+        self.assertEqual(
+            record["scheduler_init_noise_sigma"],
+            record["scheduler_construction_init_noise_sigma"],
+        )
+        self.assertEqual(len(record["scheduler_timesteps"]), 50)
+        self.assertEqual(len(record["scheduler_sigmas"]), 51)
+        payload = {
+            "timesteps": record["scheduler_timesteps"],
+            "sigmas": record["scheduler_sigmas"],
+        }
+        self.assertEqual(
+            record["scheduler_schedule_sha256"], generate.json_sha256(payload)
+        )
+        self.assertEqual(
+            generate.json_sha256(generate.scheduler_schedule_payload(scheduler)),
+            record["scheduler_schedule_sha256"],
+        )
+
     def test_registered_euler_baseline_records_native_scheduler_provenance(self):
         record = generate.scheduler_provenance_record(
             {"id": "no_correction", "type": "none"},

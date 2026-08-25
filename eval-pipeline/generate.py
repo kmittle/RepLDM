@@ -999,6 +999,44 @@ def native_scheduler_runtime(base_scheduler):
     return type(base_scheduler).from_config(base_scheduler.config)
 
 
+def scheduler_schedule_payload(scheduler) -> dict:
+    """Serialize the active timestep/sigma schedule without scheduler state."""
+    timesteps = getattr(scheduler, "timesteps", None)
+    sigmas = getattr(scheduler, "sigmas", None)
+
+    def values(tensor):
+        if tensor is None:
+            return None
+        if torch.is_tensor(tensor):
+            tensor = tensor.detach().cpu().reshape(-1).tolist()
+        return [float(value) for value in tensor]
+
+    return {"timesteps": values(timesteps), "sigmas": values(sigmas)}
+
+
+def prepare_scheduler_schedule_provenance(
+    scheduler, num_inference_steps: int, device: str
+) -> dict:
+    """Freeze the exact schedule and both meanings of initial noise scale."""
+    construction_sigma = float(scheduler.init_noise_sigma)
+    scheduler.set_timesteps(int(num_inference_steps), device=device)
+    effective_sigma = float(scheduler.init_noise_sigma)
+    payload = scheduler_schedule_payload(scheduler)
+    timesteps = payload["timesteps"] or []
+    sigmas = payload["sigmas"] or []
+    if len(timesteps) != int(num_inference_steps):
+        raise ValueError("scheduler produced an unexpected timestep count")
+    return {
+        # Retain the old field as a construction-state alias for compatibility.
+        "scheduler_init_noise_sigma": construction_sigma,
+        "scheduler_construction_init_noise_sigma": construction_sigma,
+        "scheduler_effective_init_noise_sigma": effective_sigma,
+        "scheduler_timesteps": timesteps,
+        "scheduler_sigmas": sigmas or None,
+        "scheduler_schedule_sha256": json_sha256(payload),
+    }
+
+
 def scheduler_provenance_record(
     action: dict,
     *,
@@ -1008,11 +1046,12 @@ def scheduler_provenance_record(
     order: int,
     solver_order,
     init_noise_sigma: float,
+    schedule_provenance: dict | None = None,
 ) -> dict:
     """Return the versioned scheduler ledger for registered reference runs."""
     if not include:
         return {}
-    return {
+    record = {
         "scheduler_config_sha256_v2": base_config_sha256_v2,
         "active_scheduler_config_sha256_v2": active_config_sha256_v2,
         "scheduler_kwargs": dict(action.get("scheduler_kwargs", {})),
@@ -1020,6 +1059,9 @@ def scheduler_provenance_record(
         "scheduler_solver_order": solver_order,
         "scheduler_init_noise_sigma": float(init_noise_sigma),
     }
+    if schedule_provenance:
+        record.update(schedule_provenance)
+    return record
 
 
 def validate_final_test_authorization(
@@ -1333,6 +1375,13 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             active_scheduler_order = int(getattr(active_scheduler, "order", 1))
             active_solver_order = active_scheduler.config.get("solver_order")
             active_init_noise_sigma = float(active_scheduler.init_noise_sigma)
+            schedule_provenance = {}
+            if scheduler_isolated:
+                schedule_provenance = prepare_scheduler_schedule_provenance(
+                    active_scheduler,
+                    cfg["num_inference_steps"],
+                    device,
+                )
             try:
                 with baseline_context:
                     images = pipe(
@@ -1363,6 +1412,16 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         freeu_preserve_moments=bool(action.get("freeu_preserve_moments", False)),
                         trajectory_correction=trajectory_correction,
                     )
+                if schedule_provenance:
+                    observed_schedule_hash = json_sha256(
+                        scheduler_schedule_payload(active_scheduler)
+                    )
+                    if observed_schedule_hash != schedule_provenance[
+                        "scheduler_schedule_sha256"
+                    ]:
+                        raise RuntimeError(
+                            "pipeline scheduler schedule differs from the registered ledger"
+                        )
             finally:
                 if scheduler_runtime is not None:
                     pipe.scheduler = base_scheduler
@@ -1412,6 +1471,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 order=active_scheduler_order,
                 solver_order=active_solver_order,
                 init_noise_sigma=active_init_noise_sigma,
+                schedule_provenance=schedule_provenance,
             )
             record = {
                 **task,
