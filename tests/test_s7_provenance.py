@@ -60,6 +60,8 @@ class S7ProvenanceTest(unittest.TestCase):
             "action_sha256": provenance.action_sha256(action),
             "image_path": "images/p0_seed7_atest.png",
             "image_sha256": provenance.image_sha256(image_path),
+            "width": 4,
+            "height": 4,
             "run_contract_sha256": "a" * 64,
         }
         return image_path, record
@@ -83,6 +85,44 @@ class S7ProvenanceTest(unittest.TestCase):
             Image.new("RGB", (4, 4), color=(20, 40, 60)).save(image_path)
             record["action"]["mix"] = 0.75
             with self.assertRaisesRegex(ValueError, "action hash"):
+                provenance.validate_sidecar(
+                    record, root, expected_contract_sha256="a" * 64
+                )
+
+    def test_s7_sidecar_rejects_tampered_contract_path_and_dimensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            image_path, record = self._valid_sidecar(root)
+            provenance.validate_sidecar(
+                record, root, expected_contract_sha256="a" * 64
+            )
+
+            record["run_contract_sha256"] = "b" * 64
+            with self.assertRaisesRegex(ValueError, "run contract"):
+                provenance.validate_sidecar(
+                    record, root, expected_contract_sha256="a" * 64
+                )
+
+            record["run_contract_sha256"] = "a" * 64
+            record["image_path"] = "images/other.png"
+            with self.assertRaisesRegex(ValueError, "image_path"):
+                provenance.validate_sidecar(
+                    record, root, expected_contract_sha256="a" * 64
+                )
+
+            record["image_path"] = "images/p0_seed7_atest.png"
+            record["width"] = 5
+            with self.assertRaisesRegex(ValueError, "dimensions"):
+                provenance.validate_sidecar(
+                    record, root, expected_contract_sha256="a" * 64
+                )
+
+            # A correctly hashed JPEG must still be rejected as a non-PNG.
+            jpeg_path = root / "images" / "p0_seed7_atest.png"
+            Image.new("RGB", (4, 4), color=(20, 40, 60)).save(jpeg_path, format="JPEG")
+            record["width"] = 4
+            record["image_sha256"] = provenance.image_sha256(jpeg_path)
+            with self.assertRaisesRegex(ValueError, "PNG"):
                 provenance.validate_sidecar(
                     record, root, expected_contract_sha256="a" * 64
                 )
@@ -162,6 +202,89 @@ class S7ProvenanceTest(unittest.TestCase):
         scores[0]["run_contract_sha256"] = "3" * 64
         with self.assertRaisesRegex(ValueError, "run contract"):
             provenance.validate_scores_against_manifest(manifest, scores)
+
+    @staticmethod
+    def _contract_config():
+        config = {
+            "action_schema": "trajectory_correction_actions_v1",
+            "actions_sha256": "a" * 64,
+            "actions": [
+                {"id": "no_correction", "type": "none"},
+                {
+                    "id": "mix",
+                    "type": "trajectory_correction",
+                    "mix": 0.5,
+                    "noise_mode": "sqrt",
+                },
+            ],
+            "prompts_sha256": "b" * 64,
+            "seeds": [0, 42],
+            "model_name": "stabilityai/stable-diffusion-xl-base-1.0",
+            "resolution": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 7.5,
+            "negative_prompt": "bad",
+            "power_calibrate": 0,
+            "stage_name": "stage1_1024",
+            "stage2_enabled": False,
+            "models_to_cpu": False,
+            "multi_encoder": False,
+            "multi_decoder": False,
+            "num_resample_timesteps": 50,
+            "init_rates": [0.8],
+            "frequency_band_cutoffs": [0.08, 0.25],
+            "split_role": "development",
+            "git_commit": "fixture",
+            "runtime_provenance": {"python_version": "3.11"},
+        }
+        config["run_contract"] = {
+            "schema": provenance.PROVENANCE_SCHEMA,
+            "action_schema": config["action_schema"],
+            "actions_sha256": config["actions_sha256"],
+            "actions": config["actions"],
+            "prompts_sha256": config["prompts_sha256"],
+            "seeds": config["seeds"],
+            "model_name": config["model_name"],
+            "resolution": config["resolution"],
+            "num_inference_steps": config["num_inference_steps"],
+            "guidance_scale": config["guidance_scale"],
+            "negative_prompt": config["negative_prompt"],
+            "power_calibrate": config["power_calibrate"],
+            "stage_name": config["stage_name"],
+            "stage2_enabled": config["stage2_enabled"],
+            "models_to_cpu": config["models_to_cpu"],
+            "multi_encoder": config["multi_encoder"],
+            "multi_decoder": config["multi_decoder"],
+            "num_resample_timesteps": config["num_resample_timesteps"],
+            "init_rates": config["init_rates"],
+            "frequency_band_cutoffs": config["frequency_band_cutoffs"],
+            "split_role": config["split_role"],
+            "git_commit": config["git_commit"],
+            "runtime_provenance": config["runtime_provenance"],
+        }
+        config["run_contract_sha256"] = provenance.json_sha256(config["run_contract"])
+        return config
+
+    def test_run_contract_hash_and_top_level_fields_are_bound(self):
+        config = self._contract_config()
+        self.assertEqual(
+            provenance.validate_run_contract(config), config["run_contract_sha256"]
+        )
+
+        config["run_contract"]["resolution"] = 2048
+        config["run_contract_sha256"] = provenance.json_sha256(config["run_contract"])
+        with self.assertRaisesRegex(ValueError, "resolution"):
+            provenance.validate_run_contract(config)
+
+        config = self._contract_config()
+        config["guidance_scale"] = 8.0
+        with self.assertRaisesRegex(ValueError, "guidance_scale"):
+            provenance.validate_run_contract(config)
+
+        config = self._contract_config()
+        config["run_contract_sha256"] = "c" * 64
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            provenance.validate_run_contract(config)
 
     def test_registered_model_and_scheduler_mismatches_are_rejected(self):
         actions = ROOT / "eval-pipeline/configs/trajectory_correction_development.yaml"

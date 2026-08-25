@@ -25,6 +25,7 @@ from s7_provenance import (
     action_sha256,
     sha256_file as provenance_sha256_file,
     validate_design_rows,
+    validate_run_contract,
     validate_scores_against_manifest,
     validate_sidecar,
 )
@@ -406,6 +407,7 @@ def main() -> None:
     actions_hash = provenance_sha256_file(args.actions)
     if run_config.get("actions_sha256") != actions_hash:
         raise ValueError("run config action hash does not match selector registration")
+    validate_run_contract(run_config)
     contract_hash = run_config.get("run_contract_sha256")
     if not isinstance(contract_hash, str) or len(contract_hash) != 64:
         raise ValueError("run config lacks a valid run_contract_sha256")
@@ -420,6 +422,10 @@ def main() -> None:
     if provenance_sha256_file(prompts_path) != run_config.get("prompts_sha256"):
         raise ValueError("run prompt CSV hash differs from run config")
     prompts = pd.read_csv(prompts_path)
+    if "index" not in prompts.columns or "TEXT" not in prompts.columns:
+        raise ValueError("registered prompt CSV requires index and TEXT columns")
+    if prompts["index"].duplicated().any():
+        raise ValueError("registered prompt CSV contains duplicate indices")
     prompt_by_index = {int(row["index"]): row for _, row in prompts.iterrows()}
     validate_design_rows(
         manifest_rows,

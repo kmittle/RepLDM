@@ -4,12 +4,43 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import struct
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 
 PROVENANCE_SCHEMA = "s7_trajectory_provenance_v1"
+
+# Keep this list synchronized with generate.generation_contract().  The
+# contract intentionally excludes operational paths and device placement while
+# binding every field that can change generated pixels or the crossed design.
+RUN_CONTRACT_KEYS = (
+    "schema",
+    "action_schema",
+    "actions_sha256",
+    "actions",
+    "prompts_sha256",
+    "seeds",
+    "model_name",
+    "resolution",
+    "num_inference_steps",
+    "guidance_scale",
+    "negative_prompt",
+    "power_calibrate",
+    "stage_name",
+    "stage2_enabled",
+    "models_to_cpu",
+    "multi_encoder",
+    "multi_decoder",
+    "num_resample_timesteps",
+    "init_rates",
+    "frequency_band_cutoffs",
+    "split_role",
+    "git_commit",
+    "runtime_provenance",
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -48,12 +79,109 @@ def action_sha256(action: Mapping[str, Any]) -> str:
     return json_sha256(dict(action))
 
 
+def _contract_fields(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Build the expected immutable contract fields from a run config."""
+    try:
+        return {
+            "schema": PROVENANCE_SCHEMA,
+            "action_schema": config["action_schema"],
+            "actions_sha256": config["actions_sha256"],
+            "actions": config["actions"],
+            "prompts_sha256": config["prompts_sha256"],
+            "seeds": config["seeds"],
+            "model_name": config["model_name"],
+            "resolution": config["resolution"],
+            "num_inference_steps": config["num_inference_steps"],
+            "guidance_scale": config["guidance_scale"],
+            "negative_prompt": config["negative_prompt"],
+            "power_calibrate": config["power_calibrate"],
+            "stage_name": config["stage_name"],
+            "stage2_enabled": config["stage2_enabled"],
+            "models_to_cpu": config["models_to_cpu"],
+            "multi_encoder": config["multi_encoder"],
+            "multi_decoder": config["multi_decoder"],
+            "num_resample_timesteps": config["num_resample_timesteps"],
+            "init_rates": list(config["init_rates"]),
+            "frequency_band_cutoffs": list(config["frequency_band_cutoffs"]),
+            "split_role": config.get("split_role"),
+            "git_commit": config.get("git_commit"),
+            "runtime_provenance": config.get("runtime_provenance", {}),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"run config lacks valid contract fields: {exc}") from exc
+
+
+def validate_run_contract(config: Mapping[str, Any]) -> str:
+    """Recompute and field-bind a registered run's immutable contract.
+
+    The hash alone is insufficient when both the payload and digest are
+    edited.  Binding the payload to the duplicated top-level config fields
+    catches that class of drift while keeping the helper independent of
+    generation/scoring dependencies.
+    """
+    contract = config.get("run_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("run config lacks a run_contract object")
+    for key in ("stage2_enabled", "models_to_cpu", "multi_encoder", "multi_decoder"):
+        if not isinstance(config.get(key), bool):
+            raise ValueError(f"run config field {key!r} must be boolean")
+    for key in ("resolution", "num_inference_steps", "power_calibrate", "num_resample_timesteps"):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"run config field {key!r} must be an integer")
+    seeds = config.get("seeds")
+    if not isinstance(seeds, list) or any(
+        isinstance(value, bool) or not isinstance(value, int) for value in seeds
+    ):
+        raise ValueError("run config field 'seeds' must be a list of integers")
+    guidance_scale = config.get("guidance_scale")
+    if (
+        isinstance(guidance_scale, bool)
+        or not isinstance(guidance_scale, (int, float))
+        or not math.isfinite(float(guidance_scale))
+    ):
+        raise ValueError("run config field 'guidance_scale' must be finite numeric")
+    expected = _contract_fields(config)
+    if set(contract) != set(RUN_CONTRACT_KEYS):
+        raise ValueError("run contract fields differ from the registered schema")
+    for key in RUN_CONTRACT_KEYS:
+        if contract.get(key) != expected[key]:
+            raise ValueError(f"run contract field {key!r} differs from run config")
+    observed_hash = config.get("run_contract_sha256")
+    recomputed_hash = json_sha256(contract)
+    if observed_hash != recomputed_hash:
+        raise ValueError("run_contract_sha256 does not match the run_contract payload")
+    return recomputed_hash
+
+
 def safe_child_path(root: str | os.PathLike[str], relative: str) -> Path:
     root_path = Path(root).resolve()
     path = (root_path / relative).resolve()
     if os.path.commonpath((str(root_path), str(path))) != str(root_path):
         raise ValueError(f"path escapes run directory: {relative!r}")
     return path
+
+
+def _png_dimensions(path: Path) -> tuple[int, int]:
+    """Read and validate the PNG signature/IHDR without decoding the image."""
+    with path.open("rb") as handle:
+        header = handle.read(33)
+    signature = b"\x89PNG\r\n\x1a\n"
+    if len(header) < 33 or header[:8] != signature:
+        raise ValueError(f"image is not a valid PNG: {path}")
+    chunk_length = struct.unpack(">I", header[8:12])[0]
+    if header[12:16] != b"IHDR" or chunk_length != 13:
+        raise ValueError(f"PNG lacks a valid IHDR: {path}")
+    width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
+        ">IIBBBBB", header[16:29]
+    )
+    if width <= 0 or height <= 0:
+        raise ValueError(f"PNG has invalid dimensions: {path}")
+    if bit_depth not in {1, 2, 4, 8, 16} or color_type not in {0, 2, 3, 4, 6}:
+        raise ValueError(f"PNG has an invalid pixel format: {path}")
+    if compression != 0 or filtering != 0 or interlace not in {0, 1}:
+        raise ValueError(f"PNG has an invalid IHDR format: {path}")
+    return width, height
 
 
 def validate_design_rows(
@@ -138,9 +266,24 @@ def validate_sidecar(
     image_path_value = record.get("image_path")
     if not isinstance(image_path_value, str) or not image_path_value:
         raise ValueError(f"{row_id}: image_path is missing")
+    strict_s7 = expected_contract_sha256 is not None
+    if strict_s7 and image_path_value != f"images/{row_id}.png":
+        raise ValueError(f"{row_id}: image_path must be images/<id>.png")
     image_path = safe_child_path(run_dir, image_path_value)
     if not image_path.is_file():
         raise ValueError(f"{row_id}: image is missing: {image_path}")
+    if strict_s7:
+        width, height = _png_dimensions(image_path)
+        has_width = "width" in record
+        has_height = "height" in record
+        if has_width != has_height:
+            raise ValueError(f"{row_id}: PNG width/height metadata must be paired")
+        if has_width:
+            for key, observed in (("width", record["width"]), ("height", record["height"])):
+                if isinstance(observed, bool) or not isinstance(observed, int) or observed <= 0:
+                    raise ValueError(f"{row_id}: {key} metadata is invalid")
+            if (record["width"], record["height"]) != (width, height):
+                raise ValueError(f"{row_id}: PNG dimensions differ from sidecar")
     observed_hash = record.get("image_sha256")
     if not isinstance(observed_hash, str) or len(observed_hash) != 64:
         raise ValueError(f"{row_id}: image_sha256 is missing")
@@ -195,6 +338,7 @@ def validate_scores_against_manifest(
 
 __all__ = [
     "PROVENANCE_SCHEMA",
+    "RUN_CONTRACT_KEYS",
     "action_sha256",
     "canonical_json",
     "image_sha256",
@@ -203,6 +347,7 @@ __all__ = [
     "sha256_bytes",
     "sha256_file",
     "validate_design_rows",
+    "validate_run_contract",
     "validate_scores_against_manifest",
     "validate_sidecar",
 ]
