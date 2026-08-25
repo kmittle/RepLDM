@@ -1,0 +1,40 @@
+schema: scheduler_native_fixed_headroom_evaluation_authorization_v1
+status: authorized_quantitative_screen
+scope: development_only_quantitative_screen
+
+authorization:
+  reviewers: [plan_progress_audit, literature_survey]
+  result_access_before_freeze: false
+  method_selection: false
+  validation: false
+  distillation: false
+  rl: false
+
+bindings:
+  evaluator_path: eval-pipeline/evaluate_scheduler_native_fixed_headroom_development.py
+  evaluator_sha256: 9539e6e170730da81f086cf14216018e4cc72e3d1fb8466a87750f063e5292ef
+  auditor_path: eval-pipeline/audit_latent_renderer_run.py
+  auditor_sha256: 3af0e25a82fa1306d6da0a68ef9afaa7c62fcdbce8cbe3aa5e4e015dde4edef1
+  actions_path: eval-pipeline/configs/scheduler_native_fixed_headroom_actions_v1.yaml
+  actions_sha256: 9b64c5773b6b4494507036b677193d1e596665ce92393434802a9e01c01f3393
+  source_template_sha256: aa42ab90e9dfc7993d0d8e5e0dcbcdfd80e3426cb3400c33dd3d2db1122fdb61
+  prompts_sha256: 065a86b95200eb89dc367ffe0f9f8c2d0a64fdab827e4004a1b629b169a6173f
+  prompt_manifest_sha256: 5373acf08f0e28d586732909f38787f8180a5d12c1ed58c2e1881134c10b6d5f
+  scorer_provenance_sha256: 3e6bf93643dc2c063a841176d14546a42617a4ef70873d89fe9e9568fea0c4dc
+  evaluation_schema: scheduler_native_fixed_headroom_development_evaluation_v1
+
+runtime:
+  python: "3.11.10"
+  numpy: "2.0.1"
+  pandas: "2.2.3"
+  pyyaml: "6.0.2"
+
+interpretation:
+  estimand: registered_33_prompt_3_seed_grid_screen
+  practical_threshold_inference: false
+  topiq_multiplicity_scope: four_action_zero_null_only
+  guard_familywise_control_across_actions: false
+  challenge_inference: descriptive_only
+  pass_decision: independent_review_required
+  null_scope: registered_positive_0p02_primary_action_family_only
+  method_selection: false

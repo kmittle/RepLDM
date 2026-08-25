@@ -1,4 +1,5 @@
 import csv
+import copy
 import hashlib
 import importlib.util
 import json
@@ -33,6 +34,10 @@ builder = load_module(
 generate = load_module(
     "scheduler_native_fixed_headroom_generate_test",
     EVAL_PIPELINE / "generate.py",
+)
+audit = load_module(
+    "scheduler_native_fixed_headroom_audit_test",
+    EVAL_PIPELINE / "audit_latent_renderer_run.py",
 )
 
 
@@ -232,6 +237,48 @@ class SchedulerNativeFixedHeadroomRegistrationTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "generation is not authorized"):
                 generate.validate_native_renderer_authorization(str(tampered))
+
+    def test_auditor_binds_executable_and_native_action_roles(self):
+        executable = CONFIG_DIR / "scheduler_native_fixed_headroom_actions_v1.yaml"
+        frozen = CONFIG_DIR / "scheduler_native_fixed_headroom_development.yaml"
+        source = yaml.safe_load(executable.read_text(encoding="utf-8"))
+        executable_hash = sha256_file(executable)
+        config = {
+            "actions_sha256": executable_hash,
+            "native_renderer_executable_actions_sha256": executable_hash,
+            "native_renderer_source_template": source["authorization"][
+                "source_template"
+            ],
+            "native_renderer_source_template_sha256": source["authorization"][
+                "source_template_sha256"
+            ],
+            "native_renderer_authorization": source["authorization"],
+        }
+        provenance = audit._validate_native_registration(
+            executable,
+            source,
+            config,
+            registration_actions_path=frozen,
+        )
+        self.assertEqual(provenance["executable_actions_sha256"], executable_hash)
+        self.assertEqual(
+            provenance["source_template_sha256"], sha256_file(frozen)
+        )
+        self.assertEqual(
+            audit._validate_native_action_contract(source, source["actions"]),
+            ("no_op", "lazy_zero_identity"),
+        )
+        self.assertEqual(audit.SPLIT_NAMES["development"], "development")
+
+        tampered = copy.deepcopy(source)
+        primary = next(
+            action
+            for action in tampered["actions"]
+            if action.get("role") == "non_attention_primary"
+        )
+        primary["required_hook_names"] = ["unexpected.attention_hook"]
+        with self.assertRaisesRegex(ValueError, "must register no hooks"):
+            audit._validate_native_action_contract(tampered, tampered["actions"])
 
 
 if __name__ == "__main__":
