@@ -214,6 +214,25 @@ class SchedulerBaselineTest(unittest.TestCase):
             scheduler = generate.scheduler_baseline_runtime(action, base)
             self.assertEqual(scheduler.config.get("solver_order"), 2, name)
 
+    def test_native_runtime_is_fresh_after_base_scheduler_was_used(self):
+        base = EulerDiscreteScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            prediction_type="epsilon",
+            timestep_spacing="leading",
+            steps_offset=1,
+        )
+        initial_sigma = float(base.init_noise_sigma)
+        base.set_timesteps(50, device="cpu")
+        self.assertNotEqual(float(base.init_noise_sigma), initial_sigma)
+        fresh = generate.native_scheduler_runtime(base)
+        self.assertEqual(float(fresh.init_noise_sigma), initial_sigma)
+        fresh.set_timesteps(50, device="cpu")
+        self.assertEqual(float(fresh.init_noise_sigma), float(base.init_noise_sigma))
+        self.assertIsNot(fresh, base)
+
     def test_registered_euler_baseline_records_native_scheduler_provenance(self):
         record = generate.scheduler_provenance_record(
             {"id": "no_correction", "type": "none"},
