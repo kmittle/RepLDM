@@ -427,3 +427,26 @@ U-Net/一次 scheduler call，逐步记录 gain、applied update ratio 和 momen
 源码、依赖版本、模型 revision、checkpoint hash 和预处理版本。该 provenance 缺口
 必须在任何新的质量 run 前修复；已完成 CFG null 因其专用 selector 强制完整配对，
 不受通用比较脚本可能静默 `dropna` 的问题影响。
+
+## Scheduler-native fixed-headroom screen（完成，null route）
+
+修正 scheduler 坐标后，冻结运行
+`outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2` 完成
+33 prompts x 3 seeds x 8 actions = `792/792` 个生成与 strict score。zero identity
+逐位复现 no-op；结果盲审计无 warning 通过，一次性 evaluator 返回
+`decision=null_route`。config、manifest、scores、audit、evaluation JSON/CSV 的
+SHA-256 依次为 `4566993c...bf1de`、`badab464...af319`、
+`f6ab5f08...c7acb`、`c8d2dedf...462a4`、`890f7906...fe9e` 和
+`dadcf5b5...1c90`。
+
+| action | Delta TOPIQ-NR [95% CI] | 冻结门槛结论 |
+|---|---:|---|
+| spectral-low | `-0.001154 [-0.003224,+0.000910]` | 失败 |
+| spectral-mid | `+0.004027 [+0.002120,+0.005830]` | 低于 `+0.005` 且 clipped-fraction guard 失败 |
+| spectral-high | `-0.004024 [-0.007645,-0.000357]` | 失败 |
+| Laplacian | `-0.002463 [-0.006129,+0.001185]` | 失败 |
+
+spectral-mid 的 zero-null 检验在 Holm 校正后显著，但它没有通过预注册的效应量
+screen 和像素 guard，因此只能作为描述性信号；禁止围绕它事后调符号、幅度、频带
+或 schedule。该结果关闭这四个固定 `+0.02` action 的直接蒸馏/RL 路线，不授权
+validation、method selection、learned renderer 或 RL。

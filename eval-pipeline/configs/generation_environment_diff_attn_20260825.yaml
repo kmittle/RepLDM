@@ -1,0 +1,57 @@
+schema: repldm_generation_environment_lock_v1
+lock_id: diff_attn_20260825
+scope: scheduler_native_generation_and_structural_controls
+platform: linux-x86_64
+
+runtime:
+  python: 3.11.10
+  cuda: "12.1"
+  cudnn: 90100
+
+packages:
+  accelerate: 1.12.0
+  diffusers: 0.32.1
+  einops: 0.8.0
+  entmax: "1.3"
+  huggingface-hub: 0.26.3
+  numpy: 2.0.1
+  pandas: 2.2.3
+  pillow: 11.0.0
+  pyyaml: 6.0.2
+  safetensors: 0.4.5
+  scipy: 1.14.1
+  tokenizers: 0.21.0
+  torch: 2.5.1
+  torchvision: 0.20.1
+  tqdm: 4.67.1
+  transformers: 4.47.1
+
+reference_hardware:
+  gpu: NVIDIA GeForce RTX 3090
+  driver: 580.126.09
+  compute_capability: "8.6"
+
+determinism:
+  deterministic_algorithms: false
+  cudnn_benchmark: false
+  cudnn_deterministic: false
+  cuda_matmul_allow_tf32: false
+  cudnn_allow_tf32: true
+
+upstream_method_bindings:
+  freeu:
+    repository: ChenyangSi/FreeU
+    commit: 3676d3652a44101f9cca030c33f82756dab249d7
+    license: MIT
+  pladis:
+    repository: cubeyoung/PLADIS
+    commit: 248b9d15701c08094c47dc90b4ae24afbf5cf7a9
+    license: Apache-2.0
+    upstream_diffusers: 0.33.1
+    local_operator_port_diffusers: 0.32.1
+  gag:
+    paper: 2603.02531v2
+    official_code_available: false
+    implementation_origin: independent_reimplementation
+    paper_license: CC-BY-4.0
+    software_license: Apache-2.0

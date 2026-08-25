@@ -55,6 +55,10 @@ conda activate repldm
 pip install -e .
 ```
 
+The editable install supports development. Formal 1024px experiments use the
+exact runtime in `eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml`;
+validate it with `eval-pipeline/generation_environment.py` before generation.
+
 
 ## 🚀 Quik Start
 

@@ -27,8 +27,8 @@ from InferencePipelines import RepLDMSDXLPipeline  # noqa: E402
 
 SETTINGS: Dict[str, Optional[Tuple[float, float, float, float]]] = {
     "no_freeu": None,
-    # Values reported for SDXL in the official FreeU implementation and
-    # commonly used as a starting point for a backbone/skip control.
+    # Historical diffusers constant-gain preset. This is neither the adaptive
+    # paper operator nor the FreeU README's SDXL parameter set.
     "freeu_sdxl": (0.6, 0.4, 1.1, 1.2),
     "freeu_balanced": (0.8, 0.8, 1.1, 1.1),
 }

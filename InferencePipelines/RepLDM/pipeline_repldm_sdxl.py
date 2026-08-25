@@ -235,7 +235,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.default_sample_size = self.unet.config.sample_size
         self._last_guidance_diagnostics = None
+        self._last_attention_guidance_runtime = []
         self._last_freeu_schedule = None
+        self._last_freeu_runtime = []
         self._last_freeu_preserve_moments = False
         self._last_trajectory_correction = None
         self._last_trajectory_correction_diagnostics = None
@@ -1039,7 +1041,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         # them before input validation so a failed or early-returned task cannot
         # leak the previous action's records into the next sidecar.
         self._last_guidance_diagnostics = None
+        self._last_attention_guidance_runtime = []
         self._last_freeu_schedule = None
+        self._last_freeu_runtime = []
         self._last_freeu_preserve_moments = False
         self._last_trajectory_correction = None
         self._last_trajectory_correction_diagnostics = []
@@ -1361,9 +1365,22 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     # Apply any scheduled backbone/skip reweighting immediately
                     # before the ordinary frozen-UNet evaluation.
                     if moment_controller is not None:
-                        moment_controller.apply(freeu_schedule, i, num_timesteps)
+                        freeu_parameters = moment_controller.apply(
+                            freeu_schedule, i, num_timesteps
+                        )
                     elif freeu_schedule is not None:
-                        freeu_schedule.apply(self.unet, i, num_timesteps)
+                        freeu_parameters = freeu_schedule.apply(
+                            self.unet, i, num_timesteps
+                        )
+                    else:
+                        freeu_parameters = None
+                    if freeu_parameters is not None:
+                        self._last_freeu_runtime.append(
+                            {
+                                "step_index": int(i),
+                                "parameters": list(freeu_parameters.as_tuple()),
+                            }
+                        )
 
                     # predict the noise residual
                     added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
@@ -1607,7 +1624,28 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                                 residual_mode=action.residual_mode,
                             )
                     elif attn_guidance_scale > 0:
-                        latents = attn_guidance(num_timesteps - 1 - i, latents, alphas_cumprod_sample[i])
+                        active = t_index in attn_guidance.guidance_step_index
+                        applied_scale = 0.0
+                        if active:
+                            rank = attn_guidance._guidance_rank_by_t_index[t_index]
+                            applied_scale = float(
+                                attn_guidance.guidance_step_scale[rank]
+                                .detach()
+                                .float()
+                                .cpu()
+                                .item()
+                            )
+                        self._last_attention_guidance_runtime.append(
+                            {
+                                "step_index": int(i),
+                                "t_index": int(t_index),
+                                "active": bool(active),
+                                "applied_scale": applied_scale,
+                            }
+                        )
+                        latents = attn_guidance(
+                            t_index, latents, alphas_cumprod_sample[i]
+                        )
     
                     # call the callback, if provided
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

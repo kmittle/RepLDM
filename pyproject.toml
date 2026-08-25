@@ -8,12 +8,12 @@ version = "0.1.0"
 description = "The naive implementation of Attention Guidance"
 requires-python = ">=3.9"
 dependencies = [
-    "diffusers~=0.21.4",
-    "torch~=2.1.0",
-    "scipy~=1.11.3",
+    "diffusers>=0.32.1,<0.33",
+    "torch>=2.5.1,<2.6",
+    "scipy>=1.14.1,<1.15",
     "omegaconf~=2.3.0",
-    "accelerate~=0.23.0",
-    "transformers~=4.34.0",
+    "accelerate>=1.2,<2",
+    "transformers>=4.47.1,<4.48",
     "tqdm",
     "einops",
     "entmax",

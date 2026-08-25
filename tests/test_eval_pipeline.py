@@ -6,6 +6,7 @@ import math
 import pathlib
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -76,40 +77,117 @@ freeze_trajectory_correction = load_module(
 
 
 class EvalPipelineTest(unittest.TestCase):
-    def test_frequency_cutoff_resolver_matches_generator_and_auditor(self):
-        cases = (
-            ({}, [0.08, 0.25]),
-            ({"frequency_band_cutoffs": [0.1, 0.2]}, [0.1, 0.2]),
-        )
-        for fields, expected in cases:
-            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as temp_dir:
-                action_path = pathlib.Path(temp_dir) / "actions.yaml"
-                payload = {
-                    "schema": "fixture",
-                    "actions": [{"id": "none", "type": "none"}],
-                    **fields,
-                }
-                action_path.write_text(yaml.safe_dump(payload, sort_keys=False))
-                _, generated = generate.load_actions(action_path, 3)
-                audited = audit_renderer_run.resolve_frequency_band_cutoffs(payload)
-                self.assertEqual(generated, expected)
-                self.assertEqual(audited, expected)
+    def test_structural_engineering_smoke_rejects_scoring_before_scorer_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            scoring_config = root / "score.yaml"
+            scoring_config.write_text("metrics: []\nparams: {}\n", encoding="utf-8")
+            (run_dir / "manifest.jsonl").write_text(
+                json.dumps({"id": "smoke-cell"}) + "\n", encoding="utf-8"
+            )
+            (run_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "split_role": "engineering_smoke",
+                        "engineering_only": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                config=str(scoring_config),
+                run_dir=str(run_dir),
+                device="cpu",
+                metrics=None,
+                strict=True,
+                require_scorer_provenance=False,
+            )
+            with self.assertRaisesRegex(RuntimeError, "forbids quality scoring"):
+                score._score_run(args, mock.Mock())
 
-    def test_frequency_cutoff_resolver_rejects_invalid_explicit_values(self):
-        invalid_values = (
-            [],
-            [0.1],
-            [0.2, 0.1],
-            [0.0, 0.2],
-            [0.1, 0.5],
-            [0.1, float("nan")],
-            "0.1,0.2",
+    def test_structural_worker_startup_failure_signals_shared_abort(self):
+        error_queue = generate.queue.Queue()
+        abort_event = mock.Mock()
+        with mock.patch.object(
+            generate, "worker_process", side_effect=RuntimeError("startup failure")
+        ), self.assertRaisesRegex(RuntimeError, "startup failure"):
+            generate.worker_process_entry(
+                {"structural_control_registered": True},
+                "cuda:7",
+                generate.queue.Queue(),
+                error_queue,
+                abort_event,
+            )
+        abort_event.set.assert_called_once_with()
+        task_id, traceback_text = error_queue.get_nowait()
+        self.assertEqual(task_id, "worker:cuda:7")
+        self.assertIn("startup failure", traceback_text)
+
+    def test_generation_environment_lock_is_exact_and_hash_bound(self):
+        registration = {
+            "environment_lock": {
+                "path": "eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml",
+                "sha256": "8f7b38ccb770880537f5080b1d3b4eb426a294458ea644ec8a4ef6b61f771da4",
+            }
+        }
+        record = generate.validate_registered_environment_lock(registration)
+        self.assertEqual(record["lock_id"], "diff_attn_20260825")
+        self.assertEqual(record["observed"]["packages"]["diffusers"], "0.32.1")
+        self.assertEqual(
+            record["observed"]["hardware"],
+            {
+                "gpu": "NVIDIA GeForce RTX 3090",
+                "driver": "580.126.09",
+                "compute_capability": "8.6",
+            },
         )
-        for invalid in invalid_values:
-            with self.subTest(invalid=invalid):
-                payload = {"frequency_band_cutoffs": invalid}
-                with self.assertRaises(ValueError):
-                    audit_renderer_run.resolve_frequency_band_cutoffs(payload)
+        self.assertFalse(record["observed"]["determinism"]["cudnn_benchmark"])
+
+        registration["environment_lock"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+            generate.validate_registered_environment_lock(registration)
+
+        lock_path = ROOT / "eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml"
+        lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "lock.yaml"
+            hardware_drift = copy.deepcopy(lock)
+            hardware_drift["reference_hardware"]["compute_capability"] = "9.0"
+            path.write_text(yaml.safe_dump(hardware_drift), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reference_hardware"):
+                generate.validate_environment_lock(str(path))
+
+            determinism_drift = copy.deepcopy(lock)
+            determinism_drift["determinism"]["cudnn_benchmark"] = True
+            path.write_text(yaml.safe_dump(determinism_drift), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "determinism.cudnn_benchmark"):
+                generate.validate_environment_lock(str(path))
+
+    def test_structural_control_registration_is_not_executable(self):
+        path = (
+            ROOT
+            / "eval-pipeline/configs/"
+            "scheduler_native_structural_controls_development_registration_v1.yaml"
+        )
+        with self.assertRaisesRegex(ValueError, "registration manifests"):
+            generate.load_actions(str(path), 50)
+
+    def test_historical_baseline_configs_remain_byte_stable(self):
+        expected = {
+            "eval-pipeline/configs/freeu_structural_pilot.yaml": (
+                "e930e918d0ab1a56b3853bd1433b4f073c65d816ee4466f5b93a1761acc8f25b"
+            ),
+            "eval-pipeline/configs/s5_smoke.yaml": (
+                "c64f9f94cfa772427cf671dd09e1782bb058df576e32685aed0d039b4345a3f3"
+            ),
+            "eval-pipeline/configs/s5_development.yaml": (
+                "76cd773a030b4180f79d328faec183baae0e201ca061d1444c98de9d39e4d718"
+            ),
+        }
+        for relative_path, digest in expected.items():
+            self.assertEqual(generate.sha256_file(str(ROOT / relative_path)), digest)
 
     def test_score_device_normalizes_numeric_gpu_indices(self):
         self.assertEqual(score.resolve_device("7", cuda_available=True), "cuda:7")
@@ -176,6 +254,7 @@ class EvalPipelineTest(unittest.TestCase):
                 "torch_version",
                 "diffusers_version",
                 "cuda_runtime_version",
+                "cudnn_version",
             },
         )
         json.dumps(provenance)
@@ -208,6 +287,112 @@ class EvalPipelineTest(unittest.TestCase):
             self.assertTrue(actions[0]["freeu_preserve_moments"])
             schedule = generate.freeu_runtime(actions[0])
             self.assertEqual(schedule.at(1.0).as_tuple(), (0.6, 0.4, 1.1, 1.2))
+
+    def test_paper_freeu_action_binds_implementation_and_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "paper_freeu.yaml"
+            source = {
+                "actions": [
+                    {
+                        "id": "paper_freeu_sdxl",
+                        "type": "freeu",
+                        "implementation": generate.PAPER_FREEU_IMPLEMENTATION,
+                        "source_commit": generate.PAPER_FREEU_SOURCE_COMMIT,
+                        "implementation_diffusers_version": (
+                            generate.PAPER_FREEU_PORT_DIFFUSERS_VERSION
+                        ),
+                        "parameters": [0.9, 0.2, 1.3, 1.4],
+                    }
+                ]
+            }
+            path.write_text(yaml.safe_dump(source))
+            actions, _ = generate.load_actions(str(path), 50)
+            self.assertEqual(
+                generate.freeu_implementation_runtime(actions[0]),
+                generate.PAPER_FREEU_IMPLEMENTATION,
+            )
+            schedule = generate.freeu_runtime(actions[0])
+            self.assertEqual(schedule.at(0.5).as_tuple(), (0.9, 0.2, 1.3, 1.4))
+
+            source["actions"][0]["source_commit"] = "0" * 40
+            path.write_text(yaml.safe_dump(source))
+            with self.assertRaisesRegex(ValueError, "source_commit"):
+                generate.load_actions(str(path), 50)
+
+    def test_pladis_action_records_pinned_layer_and_precision_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pladis.yaml"
+            source = {
+                "actions": [
+                    {
+                        "id": "pladis_pinned",
+                        "type": "attention_baseline",
+                        "attention_baseline": "pladis",
+                        "implementation": generate.PLADIS_OPERATOR_PORT_IMPLEMENTATION,
+                        "source_commit": generate.PLADIS_SOURCE_COMMIT,
+                        "alpha": 1.5,
+                        "baseline_scale": 2.0,
+                        "applied_layers": ["up", "down"],
+                        "probability_dtype": "query",
+                        "expected_processor_group_counts": {"up": 36, "down": 24},
+                        "expected_processor_count": 60,
+                        "expected_processor_names_sha256": (
+                            "2d66ed06dfc07e6d0b0d7ce1a8d39bd262c5e5e86b5d1947e1e412f5b6fe8c8f"
+                        ),
+                        "attention_mask_policy": "none",
+                    }
+                ]
+            }
+            path.write_text(yaml.safe_dump(source))
+            actions, _ = generate.load_actions(str(path), 50)
+            runtime = generate.attention_baseline_runtime(actions[0])
+            self.assertEqual(runtime["applied_layers"], ["up", "down"])
+            self.assertEqual(runtime["probability_dtype"], "query")
+
+            source["actions"][0]["applied_layers"] = ["down", "up"]
+            path.write_text(yaml.safe_dump(source))
+            with self.assertRaisesRegex(ValueError, "applied_layers"):
+                generate.load_actions(str(path), 50)
+
+    def test_gag_action_requires_paper_derived_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "gag.yaml"
+            action = {
+                "id": "gag_eq13",
+                "type": "attention_baseline",
+                "attention_baseline": "gag",
+                "implementation": generate.GAG_EQ13_IMPLEMENTATION,
+                "paper_id": generate.GAG_PAPER_ID,
+                "official_code_available": False,
+                "implementation_origin": "independent_reimplementation",
+                "equations": [12, 13],
+                "alpha_source": "inferred_from_pladis",
+                "layer_policy_source": "inherited_from_pladis",
+                "paper_license": "CC-BY-4.0",
+                "software_license": "Apache-2.0",
+                "alpha": 1.5,
+                "baseline_scale": 10.0,
+                "eta": 15.0,
+                "zeta": 0.0,
+                "applied_layers": ["up", "down"],
+                "probability_dtype": "query",
+                "expected_processor_group_counts": {"up": 36, "down": 24},
+                "expected_processor_count": 60,
+                "expected_processor_names_sha256": (
+                    "2d66ed06dfc07e6d0b0d7ce1a8d39bd262c5e5e86b5d1947e1e412f5b6fe8c8f"
+                ),
+                "attention_mask_policy": "none",
+            }
+            path.write_text(yaml.safe_dump({"actions": [action]}))
+            actions, _ = generate.load_actions(str(path), 50)
+            self.assertEqual(
+                actions[0]["implementation"], generate.GAG_EQ13_IMPLEMENTATION
+            )
+
+            action["official_code_available"] = True
+            path.write_text(yaml.safe_dump({"actions": [action]}))
+            with self.assertRaisesRegex(ValueError, "official_code_available"):
+                generate.load_actions(str(path), 50)
 
     def test_trajectory_correction_action_is_normalized(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1127,6 +1312,27 @@ class EvalPipelineTest(unittest.TestCase):
                         split_role="train_search",
                     )
 
+    def test_frequency_cutoff_resolver_matches_generator_and_fails_closed(self):
+        cases = (
+            ({}, [0.08, 0.25]),
+            ({"frequency_band_cutoffs": [0.1, 0.2]}, [0.1, 0.2]),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as temp_dir:
+                action_path = pathlib.Path(temp_dir) / "actions.yaml"
+                payload = {"schema": "fixture", "actions": [{"id": "none", "type": "none"}], **fields}
+                action_path.write_text(yaml.safe_dump(payload, sort_keys=False))
+                _, generated = generate.load_actions(action_path, 3)
+                audited = audit_renderer_run.resolve_frequency_band_cutoffs(payload)
+                self.assertEqual(generated, expected)
+                self.assertEqual(audited, expected)
+
+        for invalid in ([], [0.1], [0.2, 0.1], [0.0, 0.2], [0.1, 0.5], "0.1,0.2"):
+            with self.subTest(invalid=invalid):
+                payload = {"frequency_band_cutoffs": invalid}
+                with self.assertRaises(ValueError):
+                    audit_renderer_run.resolve_frequency_band_cutoffs(payload)
+
     def test_latent_renderer_audit_honors_explicit_frequency_cutoffs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(
@@ -1147,7 +1353,6 @@ class EvalPipelineTest(unittest.TestCase):
                     split_role="train_search",
                 )["passed"]
             )
-
             config["frequency_band_cutoffs"] = [0.1, 0.25]
             config_path.write_text(json.dumps(config))
             with self.assertRaisesRegex(ValueError, "cutoffs differ"):
@@ -1158,6 +1363,56 @@ class EvalPipelineTest(unittest.TestCase):
                     split_role="train_search",
                 )
 
+    def test_registered_failure_can_consolidate_a_valid_partial_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = pathlib.Path(temp_dir)
+            image_dir = out_dir / "images"
+            image_dir.mkdir()
+            action = {"id": "baseline", "type": "none"}
+            tasks = [
+                {
+                    "id": f"p{prompt_index}_seed7_abaseline",
+                    "prompt_index": prompt_index,
+                    "prompt": f"prompt {prompt_index}",
+                    "seed": 7,
+                    "action_id": "baseline",
+                    "action_type": "none",
+                    "action": action,
+                }
+                for prompt_index in (0, 1)
+            ]
+            completed = tasks[0]
+            image_path = image_dir / f"{completed['id']}.png"
+            Image.new("RGB", (8, 8), color=(1, 2, 3)).save(image_path)
+            record = {
+                **completed,
+                "image_path": f"images/{completed['id']}.png",
+                "image_sha256": generate.image_sha256(image_path),
+                "run_contract_sha256": "c" * 64,
+                "action_sha256": generate.action_sha256(action),
+                "width": 8,
+                "height": 8,
+            }
+            (image_dir / f"{completed['id']}.json").write_text(json.dumps(record))
+
+            count = generate.consolidate_manifest(
+                str(out_dir),
+                {task["id"] for task in tasks},
+                expected_tasks=tasks,
+                run_contract_sha256="c" * 64,
+                strict=True,
+                allow_partial=True,
+            )
+            self.assertEqual(count, 1)
+            self.assertIn(completed["id"], (out_dir / "manifest.jsonl").read_text())
+            with self.assertRaisesRegex(ValueError, "incomplete manifest"):
+                generate.consolidate_manifest(
+                    str(out_dir),
+                    {task["id"] for task in tasks},
+                    expected_tasks=tasks,
+                    run_contract_sha256="c" * 64,
+                    strict=True,
+                )
     def test_latent_renderer_run_audit_rejects_duplicate_action_images(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir, prompts_path, source_path = self._write_renderer_audit_fixture(

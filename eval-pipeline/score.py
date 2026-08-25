@@ -279,6 +279,13 @@ def _score_run(args, ap):
     if os.path.isfile(run_config_path):
         with open(run_config_path) as handle:
             run_config = json.load(handle)
+    if (
+        run_config.get("split_role") == "engineering_smoke"
+        or run_config.get("engineering_only") is True
+    ):
+        raise RuntimeError(
+            "structural engineering smoke forbids quality scoring"
+        )
     required_provenance_schema = required_scorer_provenance_schema(
         cfg,
         run_config,

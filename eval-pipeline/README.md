@@ -150,7 +150,7 @@ SHA256("repldm-s5-v1:development:" + challenge + ":" + row_index + ":" + Prompt)
 
 and retain the two smallest digests from each of `Complex`, `Fine-grained Detail`, `Properties & Positioning`, `Quantity`, `Writing & Symbols`, and `Perspective`. Exclude those 12 rows, then rank the remaining rows in those challenges by `SHA256("repldm-s5-v1:smoke:" + row_index + ":" + Prompt)` and retain the two smallest. The recorded source rows are `359,367,636,424,997,979,1045,1042,1621,1549,909,929` for development and `450,996` for smoke. Do not replace a prompt after seeing an image or score.
 
-`configs/s5_smoke.yaml` is a correctness and catastrophic-range check, not a tuning set. It fixes the self-attention layer `up_blocks.0.attentions.0.transformer_blocks.0.attn1`, mutual top-k `16`, and semantic angle candidates `0.005, 0.01, 0.02, 0.04`. It also freezes raw noisy-latent TFSA, clean latent controls, a jointly permuted semantic graph, CFG-only 5.0, official PLADIS, and official GAG. Run it as:
+`configs/s5_smoke.yaml` is a correctness and catastrophic-range check, not a tuning set. It fixes the self-attention layer `up_blocks.0.attentions.0.transformer_blocks.0.attn1`, mutual top-k `16`, and semantic angle candidates `0.005, 0.01, 0.02, 0.04`. It also freezes raw noisy-latent TFSA, clean latent controls, a jointly permuted semantic graph, CFG-only 5.0, and historical PLADIS/GAG reproductions. The action IDs containing `official` are preserved only for artifact provenance and must not be cited as official implementations; see `../BASELINE_PROVENANCE.md`. Run it as:
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -188,6 +188,118 @@ comparison with:
 No semantic action reached the `+0.005` TOPIQ gate or showed a stable
 structural gain in the fixed montage. S5 is therefore a registered null and
 must not be followed by an angle/top-k/layer/reward sweep or RL training.
+
+## Pin the Generation Runtime
+
+Formal generation uses the repository lock rather than the older broad package
+declarations. Validate the active interpreter before launching a registered
+control:
+
+```bash
+/home/bycao/miniforge3/envs/diff_attn/bin/python \
+  eval-pipeline/generation_environment.py \
+  --lock eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml \
+  --expected_sha256 8f7b38ccb770880537f5080b1d3b4eb426a294458ea644ec8a4ef6b61f771da4
+```
+
+The lock pins the pixel-affecting generation packages, platform, CUDA/cuDNN/GPU
+stack, and PyTorch determinism/TF32 flags. Each newly registered YAML must bind
+its lock SHA-256. Registered structural-control workers also verify the selected
+GPU model and compute capability; generated sidecars record the actual device.
+
+## Register Structural Controls
+
+`configs/scheduler_native_structural_controls_development_registration_v1.yaml`
+is a result-blind design record, not an action file. `generate.py` rejects its
+`structural_control_registration_v1` schema. Do not make it executable by merely
+renaming the schema.
+
+An independently reviewed executable must use
+`scheduler_native_structural_controls_actions_v1`, preserve the registration's
+prompt, seed, action, sampling, execution-order, scoring, and analysis bodies,
+and bind both the template hash and a reviewed implementation commit. Its source
+manifest covers the generation pipeline and every local Attention Guidance,
+FreeU, PLADIS, and GAG implementation file. Generation fails when those bytes
+drift or the Git worktree is dirty. Every arm is scheduler-isolated and must
+record exactly 50 one-call denoising steps. These development controls calibrate
+baselines only; they cannot select a renderer or authorize RL.
+
+After an independent reviewer issues and commits
+`configs/scheduler_native_structural_controls_development_authorized_v1.yaml`,
+run the engineering profile first. It reuses the exact eight actions and
+sampling contract from that YAML at 1024px and 50 steps; it does not permit
+quality scoring:
+
+```bash
+ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 7 \
+  --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_smoke.csv \
+  --out_dir outputs/structural_controls/engineering_smoke_v1 \
+  --actions "$ACTIONS" --split_role engineering_smoke \
+  --seeds 1798464083 --resolution 1024 --num_inference_steps 50
+
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/audit_structural_control_run.py --engineering_smoke \
+  --run_dir outputs/structural_controls/engineering_smoke_v1 \
+  --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_smoke.csv \
+  --actions "$ACTIONS"
+```
+
+The smoke must report `88/88`, complete runtime ledgers, and eight distinct
+PNGs in every prompt block. A shared abort signal stops sibling workers after
+the first task failure. Its config and every sidecar bind
+`engineering_only=true`, `formal_matrix_evidence=false`,
+`quality_claim_allowed=false`, and `method_selection_allowed=false`; the scorer
+rejects this scope before loading metric models. The audit also recomputes each
+action's deterministic execution rank and requires the disk sidecar to equal its
+manifest row. Only a passing smoke permits the formal development generation
+and strict scoring:
+
+```bash
+ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
+/home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
+  --devices 7 \
+  --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv \
+  --out_dir outputs/structural_controls/development_v1 \
+  --actions "$ACTIONS" --split_role development \
+  --seeds 1932556753,1065503757,201635682 \
+  --resolution 1024 --num_inference_steps 50
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/score.py \
+  --run_dir outputs/structural_controls/development_v1 \
+  --device cuda:7 --strict --require-scorer-provenance
+```
+
+Then run the dedicated result-blind audit before any metric comparison:
+
+```bash
+ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/audit_structural_control_run.py \
+  --run_dir outputs/structural_controls/development_v1 \
+  --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv \
+  --actions "$ACTIONS" \
+  --registration eval-pipeline/configs/scheduler_native_structural_controls_development_registration_v1.yaml \
+  --output outputs/structural_controls/development_v1/run_audit.json
+```
+
+Only a warning-free audit may enter the one-shot evaluator:
+
+```bash
+ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/evaluate_structural_control_run.py \
+  --run-dir outputs/structural_controls/development_v1 \
+  --actions "$ACTIONS" \
+  --audit outputs/structural_controls/development_v1/run_audit.json
+```
+
+The evaluator reports every registered action and guard, reruns the dedicated
+audit, and never emits a selected action. Isolated duplicate PNGs are reported
+without deleting samples; an action pair that is identical across all 99 formal
+blocks fails as an intervention-activation error.
 
 ## Prepare Scorers
 

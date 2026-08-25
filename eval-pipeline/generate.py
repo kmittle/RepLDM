@@ -63,6 +63,8 @@ if ROOT not in sys.path:
 
 from AttentionGuidance import (
     ConstantGuidanceController,
+    DIFFUSERS_FREEU_IMPLEMENTATION,
+    FREEU_IMPLEMENTATIONS,
     LAZY_LATENT_STRUCTURE_BASIS_NAMES,
     LAZY_LATENT_STRUCTURE_PROVIDER_ID,
     MOMENT_TANGENT_MODES,
@@ -73,13 +75,35 @@ from AttentionGuidance import (
     StructuralUNetBasisProvider,
     build_fixed_coefficient_renderer,
     FreeUSchedule,
+    PAPER_FREEU_IMPLEMENTATION,
+    PAPER_FREEU_PORT_DIFFUSERS_VERSION,
+    PAPER_FREEU_SOURCE_COMMIT,
     TrajectoryCorrectionConfig,
+    installed_freeu_implementation,
     latent_structure_required_hook_names,
     normalize_latent_structure_bases,
     normalize_latent_structure_provider_implementation,
 )
-from AttentionGuidance.attention_baselines import installed_attention_baseline
+from AttentionGuidance.attention_baselines import (
+    ATTENTION_BASELINE_LAYER_GROUPS,
+    ATTENTION_PROBABILITY_DTYPES,
+    GAG_EQ13_IMPLEMENTATION,
+    GAG_INHERITED_LAYER_POLICY,
+    GAG_INHERITED_PROBABILITY_DTYPE,
+    GAG_PAPER_EQUATIONS,
+    GAG_PAPER_ID,
+    PLADIS_OPERATOR_PORT_IMPLEMENTATION,
+    PLADIS_PINNED_PROBABILITY_DTYPE,
+    PLADIS_PINNED_SDXL_GROUP_COUNTS,
+    PLADIS_PINNED_SDXL_LAYERS,
+    PLADIS_PINNED_SDXL_PROCESSOR_COUNT,
+    PLADIS_PINNED_SDXL_PROCESSOR_NAMES_SHA256,
+    PLADIS_PORT_DIFFUSERS_VERSION,
+    PLADIS_SOURCE_COMMIT,
+    installed_attention_baseline,
+)
 from InferencePipelines import RepLDMSDXLPipeline
+from generation_environment import validate_environment_lock
 from s7_provenance import (
     PROVENANCE_SCHEMA,
     action_sha256,
@@ -183,6 +207,155 @@ CFG_BASELINE_SCHEDULER_RUNTIME = {
     "schedule_sha256": "302d2452f411bf3eea64f8dd3530e232b95c23aed7b818ed6697982a4428c144",
     "construction_init_noise_sigma": 14.648818969726562,
     "effective_init_noise_sigma": 13.158469200134277,
+}
+STRUCTURAL_CONTROL_SCHEMA = "scheduler_native_structural_controls_actions_v1"
+STRUCTURAL_CONTROL_REGISTRATION_SCHEMA = "scheduler_native_structural_controls_v1"
+STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE = (
+    "eval-pipeline/configs/"
+    "scheduler_native_structural_controls_development_registration_v1.yaml"
+)
+STRUCTURAL_CONTROL_AUTH_SCOPE = "development_only_baseline_calibration"
+STRUCTURAL_CONTROL_AUTH_FIELDS = {
+    "reviewer",
+    "reviewed_commit",
+    "source_template",
+    "source_template_sha256",
+    "scope",
+    "gpu_generation",
+    "scoring",
+    "method_selection",
+    "result_access_before_freeze",
+}
+STRUCTURAL_CONTROL_IMPLEMENTATION_PATHS = (
+    "AttentionGuidance/__init__.py",
+    "AttentionGuidance/ancestral_correction.py",
+    "AttentionGuidance/attention_baselines.py",
+    "AttentionGuidance/attention_guidance.py",
+    "AttentionGuidance/controller.py",
+    "AttentionGuidance/freeu.py",
+    "AttentionGuidance/latent_renderer.py",
+    "AttentionGuidance/semantic_transport.py",
+    "AttentionGuidance/types.py",
+    "InferencePipelines/FreeScale/pipeline_freescale_sdxl.py",
+    "InferencePipelines/FreeScale/scale_attention.py",
+    "InferencePipelines/__init__.py",
+    "InferencePipelines/cfg_batch.py",
+    "InferencePipelines/RepLDM/pipeline_repldm_sdxl.py",
+    "InferencePipelines/RepLDM/pipeline_repldm_sdxl_controlnet.py",
+    "eval-pipeline/generate.py",
+    "eval-pipeline/generation_environment.py",
+    "eval-pipeline/s7_provenance.py",
+)
+STRUCTURAL_CONTROL_ANALYSIS_SCHEMA = "structural_control_analysis_implementation_v1"
+STRUCTURAL_CONTROL_ANALYSIS_PATHS = (
+    "AttentionGuidance/__init__.py",
+    "eval-pipeline/audit_latent_renderer_run.py",
+    "eval-pipeline/audit_structural_control_run.py",
+    "eval-pipeline/compare_actions.py",
+    "eval-pipeline/evaluate_structural_control_run.py",
+    "eval-pipeline/generate.py",
+    "eval-pipeline/generation_environment.py",
+    "eval-pipeline/s7_provenance.py",
+    "eval-pipeline/scorer_provenance.py",
+)
+STRUCTURAL_CONTROL_SAMPLING_KEYS = {
+    "model",
+    "model_revision",
+    "pipeline",
+    "resolution",
+    "num_inference_steps",
+    "default_cfg_scale",
+    "cfg_source",
+    "cfg_pipeline_argument",
+    "negative_prompt",
+    "power_calibrate",
+    "guidance_rescale",
+    "scheduler",
+    "prediction_type",
+    "scheduler_churn",
+    "initialization",
+    "stage2",
+    "extra_unet_calls",
+    "torch_dtype",
+    "variant",
+    "local_files_only",
+    "low_vram",
+    "batch_size",
+    "num_images_per_prompt",
+    "attention_mask_policy",
+}
+STRUCTURAL_CONTROL_ACTION_IDS = (
+    "no_op_cfg7p5",
+    "cfg_only_5",
+    "conference_tfsa",
+    "freeu_diffusers_historical",
+    "freeu_diffusers_paper_parameters",
+    "freeu_paper_adaptive",
+    "pladis_operator_port",
+    "gag_eq13_reimplementation",
+)
+STRUCTURAL_CONTROL_PROMPTS = (
+    "eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv"
+)
+STRUCTURAL_CONTROL_PROMPTS_SHA256 = (
+    "065a86b95200eb89dc367ffe0f9f8c2d0a64fdab827e4004a1b629b169a6173f"
+)
+STRUCTURAL_CONTROL_SMOKE_PROMPTS = (
+    "eval-pipeline/prompts/scheduler_native_fixed_headroom_smoke.csv"
+)
+STRUCTURAL_CONTROL_SMOKE_PROMPTS_SHA256 = (
+    "60a3bf278689165bcb7a4bdf1f18c7ab91d8bf7a77eb287369a60fe40b6ef4e1"
+)
+STRUCTURAL_CONTROL_SPLIT_SEEDS = {
+    "engineering_smoke": [1798464083],
+    "development": [1932556753, 1065503757, 201635682]
+}
+STRUCTURAL_CONTROL_ENGINEERING_SMOKE = {
+    "role": "engineering_only",
+    "engineering_only": True,
+    "prompts": STRUCTURAL_CONTROL_SMOKE_PROMPTS,
+    "prompts_sha256": STRUCTURAL_CONTROL_SMOKE_PROMPTS_SHA256,
+    "expected_prompt_count": 11,
+    "expected_challenges": 11,
+    "seeds": STRUCTURAL_CONTROL_SPLIT_SEEDS["engineering_smoke"],
+    "action_count": 8,
+    "expected_task_count": 88,
+    "require_all_actions_distinct_within_block": True,
+    "quality_scoring": False,
+    "formal_matrix_evidence": False,
+    "quality_claim_allowed": False,
+    "method_selection_allowed": False,
+}
+STRUCTURAL_CONTROL_SMOKE_EVIDENCE_SCOPE = {
+    key: STRUCTURAL_CONTROL_ENGINEERING_SMOKE[key]
+    for key in (
+        "engineering_only",
+        "formal_matrix_evidence",
+        "quality_claim_allowed",
+        "method_selection_allowed",
+    )
+}
+STRUCTURAL_CONTROL_EVIDENCE_SCOPE_KEYS = tuple(
+    STRUCTURAL_CONTROL_SMOKE_EVIDENCE_SCOPE
+)
+STRUCTURAL_CONTROL_FREEU_RESOLUTION_COUNTS = [3, 3, 3]
+STRUCTURAL_CONTROL_FREEU_CHANNEL_COUNTS = {"1280": 4, "640": 3, "320": 2}
+STRUCTURAL_CONTROL_FREEU_JOINT_COUNTS = {
+    "0:1280": 3,
+    "1:1280": 1,
+    "1:640": 2,
+    "2:640": 1,
+    "2:320": 2,
+}
+STRUCTURAL_CONTROL_FREEU_CONSTANT_EFFECT_COUNTS = {
+    "b1_s1": 3,
+    "b2_s2": 3,
+    "no_op": 3,
+}
+STRUCTURAL_CONTROL_FREEU_PAPER_EFFECT_COUNTS = {
+    "b1_s1": 4,
+    "b2_s2": 3,
+    "no_op": 2,
 }
 
 # Keep this map explicit: scheduler names come from experiment YAML and must
@@ -379,6 +552,379 @@ def native_renderer_step_diagnostics_required(cfg: dict, action: dict) -> bool:
     )
 
 
+def strict_registered_run(cfg: dict) -> bool:
+    """Return whether resume/consolidation must use the strict S7 contract."""
+    return bool(
+        cfg.get("trajectory_registered")
+        or cfg.get("scheduler_baseline_registered")
+        or cfg.get("cfg_baseline_registered")
+        or cfg.get("native_renderer_registered")
+        or cfg.get("structural_control_registered")
+    )
+
+
+def structural_control_evidence_scope(split_role: str | None) -> dict:
+    """Return the explicit non-evidentiary scope attached to smoke artifacts."""
+    if split_role == "engineering_smoke":
+        return dict(STRUCTURAL_CONTROL_SMOKE_EVIDENCE_SCOPE)
+    return {}
+
+
+def validate_structural_intervention_runtime(
+    record: dict, action: dict, *, num_inference_steps: int
+) -> None:
+    """Validate actual activation ledgers for one structural-control action."""
+    steps = int(num_inference_steps)
+    action_type = action.get("type")
+    if action_type == "legacy":
+        delay_steps = int(action.get("delay_steps", 0))
+        expected_density = [1] * (steps - delay_steps) + [0] * delay_steps
+        expected_decay = list(action.get("decay") or []) or None
+        if (
+            record.get("attn_guidance_scale") != float(action.get("scale", 0.0))
+            or record.get("attn_guidance_density") != expected_density
+            or record.get("attn_guidance_decay") != expected_decay
+        ):
+            raise ValueError("structural-control TFSA runtime arguments differ")
+        ledger = record.get("attention_guidance_runtime")
+        active_steps = steps - delay_steps
+        if not isinstance(ledger, list) or len(ledger) != steps:
+            raise ValueError("structural-control TFSA runtime ledger is incomplete")
+        for step_index, item in enumerate(ledger):
+            t_index = steps - 1 - step_index
+            active = step_index >= delay_steps
+            if not isinstance(item, dict) or item.get("step_index") != step_index:
+                raise ValueError("structural-control TFSA step index differs")
+            if item.get("t_index") != t_index or item.get("active") is not active:
+                raise ValueError("structural-control TFSA activation schedule differs")
+            observed_scale = item.get("applied_scale")
+            if isinstance(observed_scale, bool) or not isinstance(
+                observed_scale, (int, float)
+            ) or not math.isfinite(float(observed_scale)):
+                raise ValueError("structural-control TFSA scale ledger is invalid")
+            expected_scale = 0.0
+            if active:
+                rank = step_index - delay_steps
+                phase = 0.0 if active_steps == 1 else rank / (active_steps - 1)
+                expected_scale = float(action["scale"]) * (
+                    (math.cos(math.pi * phase) + 1.0) / 2.0
+                ) ** float(action["decay"][2])
+                expected_scale = max(expected_scale, float(action["decay"][1]))
+            if not math.isclose(
+                float(observed_scale), expected_scale, rel_tol=5e-3, abs_tol=5e-6
+            ):
+                raise ValueError("structural-control TFSA applied scale differs")
+    else:
+        if (
+            record.get("attn_guidance_scale") != 0.0
+            or record.get("attn_guidance_density") != "all"
+            or record.get("attn_guidance_decay") is not None
+            or record.get("attention_guidance_runtime") != []
+        ):
+            raise ValueError("non-TFSA action has stale TFSA runtime provenance")
+
+    if action_type == "freeu":
+        schedule = freeu_runtime(action)
+        expected_runtime = [
+            {
+                "step_index": step_index,
+                "parameters": list(
+                    schedule.at(step_index / max(steps - 1, 1)).as_tuple()
+                ),
+            }
+            for step_index in range(steps)
+        ]
+        if record.get("freeu_runtime") != expected_runtime:
+            raise ValueError("structural-control FreeU activation ledger differs")
+        expected_calls_per_step = action.get("expected_operator_calls_per_step")
+        expected_resolution_counts = action.get(
+            "expected_resolution_idx_call_counts_per_step"
+        )
+        expected_channel_counts = action.get(
+            "expected_hidden_channel_call_counts_per_step"
+        )
+        expected_joint_counts = action.get(
+            "expected_resolution_channel_call_counts_per_step"
+        )
+        expected_effect_counts = action.get(
+            "expected_operator_effect_call_counts_per_step"
+        )
+        if not isinstance(expected_calls_per_step, int) or not isinstance(
+            expected_resolution_counts, list
+        ):
+            raise ValueError("structural-control FreeU call topology is missing")
+        expected_operator_runtime = {
+            "implementation": action.get("implementation"),
+            "operator_calls_total": expected_calls_per_step * steps,
+            "resolution_idx_call_counts": {
+                str(index): int(count) * steps
+                for index, count in enumerate(expected_resolution_counts)
+            },
+            "hidden_channel_call_counts": {
+                str(channel): int(count) * steps
+                for channel, count in expected_channel_counts.items()
+            },
+            "resolution_channel_call_counts": {
+                str(key): int(count) * steps
+                for key, count in expected_joint_counts.items()
+            },
+            "operator_effect_call_counts": {
+                str(effect): int(count) * steps
+                for effect, count in expected_effect_counts.items()
+            },
+        }
+        if record.get("freeu_operator_runtime") != expected_operator_runtime:
+            raise ValueError("structural-control FreeU operator calls differ")
+    elif record.get("freeu_runtime") != [] or record.get(
+        "freeu_operator_runtime"
+    ) is not None:
+        raise ValueError("non-FreeU action has stale FreeU runtime provenance")
+
+
+def validate_structural_control_sidecar(
+    record: dict, cfg: dict, *, expected_task: dict | None = None
+) -> None:
+    """Reject a structural-control sidecar that cannot be safely resumed."""
+    if not cfg.get("structural_control_registered"):
+        return
+    expected_evidence_scope = structural_control_evidence_scope(cfg.get("split_role"))
+    config_evidence_scope = {
+        key: cfg[key] for key in STRUCTURAL_CONTROL_EVIDENCE_SCOPE_KEYS if key in cfg
+    }
+    record_evidence_scope = {
+        key: record[key]
+        for key in STRUCTURAL_CONTROL_EVIDENCE_SCOPE_KEYS
+        if key in record
+    }
+    if config_evidence_scope != expected_evidence_scope:
+        raise ValueError("structural-control run evidence scope differs")
+    if record_evidence_scope != expected_evidence_scope:
+        raise ValueError("structural-control sidecar evidence scope differs")
+    sampling = cfg.get("registered_sampling")
+    scheduler_runtime = cfg.get("scheduler_runtime")
+    runtime = cfg.get("runtime_provenance")
+    if not all(isinstance(value, dict) for value in (sampling, scheduler_runtime, runtime)):
+        raise ValueError("structural-control resume contract is incomplete")
+    if record.get("registered_sampling") != sampling or record.get(
+        "scheduler_runtime"
+    ) != scheduler_runtime:
+        raise ValueError("structural-control sidecar sampling contract differs")
+    if record.get("num_inference_steps") != 50 or record.get(
+        "unet_calls_per_step"
+    ) != [1] * 50 or record.get("extra_unet_calls") != 0:
+        raise ValueError("structural-control sidecar violates matched 50x1 U-Net calls")
+
+    if record.get("scheduler_name") != "EulerDiscreteScheduler" or record.get(
+        "base_scheduler_name"
+    ) != "EulerDiscreteScheduler":
+        raise ValueError("structural-control sidecar scheduler class differs")
+    expected_config_hash = scheduler_runtime.get("config_sha256_v2")
+    if any(
+        record.get(key) != expected_config_hash
+        for key in (
+            "scheduler_config_sha256_v2",
+            "active_scheduler_config_sha256_v2",
+        )
+    ):
+        raise ValueError("structural-control sidecar Euler config differs")
+    for payload_key, digest_key in (
+        ("scheduler_config", "scheduler_config_sha256_v2"),
+        ("active_scheduler_config", "active_scheduler_config_sha256_v2"),
+    ):
+        payload = record.get(payload_key)
+        try:
+            observed_hash = scheduler_config_payload_sha256(payload)
+        except ValueError as exc:
+            raise ValueError(
+                "structural-control sidecar scheduler config payload differs"
+            ) from exc
+        if observed_hash != record.get(digest_key):
+            raise ValueError("structural-control sidecar scheduler config hash differs")
+    timesteps = record.get("scheduler_timesteps")
+    sigmas = record.get("scheduler_sigmas")
+    if (
+        not isinstance(timesteps, list)
+        or len(timesteps) != 50
+        or not isinstance(sigmas, list)
+        or len(sigmas) != 51
+        or record.get("scheduler_schedule_sha256")
+        != scheduler_runtime.get("schedule_sha256")
+        or json_sha256({"timesteps": timesteps, "sigmas": sigmas})
+        != scheduler_runtime.get("schedule_sha256")
+    ):
+        raise ValueError("structural-control sidecar Euler schedule differs")
+    scheduler_values = {
+        "scheduler_construction_init_noise_sigma": scheduler_runtime.get(
+            "construction_init_noise_sigma"
+        ),
+        "scheduler_effective_init_noise_sigma": scheduler_runtime.get(
+            "effective_init_noise_sigma"
+        ),
+        "scheduler_init_noise_sigma": scheduler_runtime.get(
+            "construction_init_noise_sigma"
+        ),
+        "scheduler_order": 1,
+        "scheduler_kwargs": {},
+    }
+    if any(record.get(key) != value for key, value in scheduler_values.items()):
+        raise ValueError("structural-control sidecar Euler ledger differs")
+
+    device = str(record.get("device", ""))
+    devices = cfg.get("devices")
+    worker_device = record.get("worker_device_provenance")
+    required_device_fields = {
+        "gpu",
+        "compute_capability",
+        "total_memory_bytes",
+        "requested_device",
+        "logical_device_index",
+        "physical_device_index",
+        "gpu_uuid",
+        "pci_bus_id",
+        "cuda_visible_devices",
+    }
+    if (
+        not re.fullmatch(r"cuda:\d+", device)
+        or not isinstance(devices, list)
+        or device not in devices
+        or not isinstance(worker_device, dict)
+        or set(worker_device) != required_device_fields
+        or worker_device.get("requested_device") != device
+        or worker_device.get("logical_device_index") != int(device.split(":", 1)[1])
+        or isinstance(worker_device.get("physical_device_index"), bool)
+        or not isinstance(worker_device.get("physical_device_index"), int)
+        or worker_device["physical_device_index"] < 0
+        or not re.fullmatch(
+            r"GPU-[0-9a-fA-F-]{36}", str(worker_device.get("gpu_uuid", ""))
+        )
+        or not str(worker_device.get("pci_bus_id", "")).strip()
+        or isinstance(worker_device.get("total_memory_bytes"), bool)
+        or not isinstance(worker_device.get("total_memory_bytes"), int)
+        or worker_device["total_memory_bytes"] <= 0
+    ):
+        raise ValueError("structural-control sidecar worker device identity differs")
+    expected_hardware = runtime.get("generation_environment_hardware")
+    if not isinstance(expected_hardware, dict) or any(
+        worker_device.get(key) != expected_hardware.get(key)
+        for key in ("gpu", "compute_capability")
+    ):
+        raise ValueError("structural-control sidecar worker hardware differs")
+    expected_determinism = runtime.get("generation_environment_determinism")
+    if not isinstance(expected_determinism, dict) or record.get(
+        "worker_determinism_provenance"
+    ) != expected_determinism:
+        raise ValueError("structural-control sidecar worker determinism differs")
+    model_load = record.get("model_load_provenance")
+    expected_model_load = {
+        "torch_dtype": sampling.get("torch_dtype"),
+        "variant": sampling.get("variant"),
+        "local_files_only": sampling.get("local_files_only"),
+        "revision": sampling.get("model_revision"),
+    }
+    if model_load != expected_model_load:
+        raise ValueError("structural-control sidecar model-load provenance differs")
+    for key, expected in runtime.items():
+        if record.get(key) != expected:
+            raise ValueError(
+                f"structural-control sidecar runtime provenance differs for {key!r}"
+            )
+    expected_run_fields = {
+        "height": int(sampling["resolution"]),
+        "width": int(sampling["resolution"]),
+        "power_calibrate": int(sampling["power_calibrate"]),
+        "frequency_band_cutoffs": cfg.get("frequency_band_cutoffs"),
+        "stage": cfg.get("stage_name"),
+        "stage2_enabled": bool(sampling["stage2"]),
+        "models_to_cpu": cfg.get("models_to_cpu"),
+        "multi_encoder": cfg.get("multi_encoder"),
+        "multi_decoder": cfg.get("multi_decoder"),
+        "num_resample_timesteps": cfg.get("num_resample_timesteps"),
+        "init_rates": cfg.get("init_rates"),
+        "stage2_noise_source": cfg.get("stage2_noise_source"),
+        "model_name": sampling["model"],
+        "model_revision": sampling["model_revision"],
+    }
+    if any(record.get(key) != expected for key, expected in expected_run_fields.items()):
+        raise ValueError("structural-control sidecar run settings differ")
+
+    action = record.get("action")
+    if expected_task is not None:
+        action = expected_task.get("action")
+    if not isinstance(action, dict):
+        raise ValueError("structural-control sidecar action is missing")
+    expected_cfg = float(action.get("cfg_scale", float("nan")))
+    if record.get("guidance_scale") != expected_cfg or record.get(
+        "guidance_rescale"
+    ) != 0.0:
+        raise ValueError("structural-control sidecar CFG provenance differs")
+    action_type = action.get("type")
+    validate_structural_intervention_runtime(
+        record, action, num_inference_steps=int(sampling["num_inference_steps"])
+    )
+    if action_type == "freeu":
+        expected_freeu = {
+            "freeu_schedule": action.get("freeu_schedule"),
+            "freeu_implementation": action.get("implementation"),
+            "freeu_source_commit": action.get("source_commit"),
+            "freeu_implementation_diffusers_version": action.get(
+                "implementation_diffusers_version"
+            ),
+            "freeu_preserve_moments": False,
+        }
+        if any(record.get(key) != value for key, value in expected_freeu.items()):
+            raise ValueError("structural-control sidecar FreeU provenance differs")
+    elif any(
+        record.get(key) is not None
+        for key in (
+            "freeu_schedule",
+            "freeu_implementation",
+            "freeu_source_commit",
+            "freeu_implementation_diffusers_version",
+        )
+    ) or record.get("freeu_preserve_moments") is not False:
+        raise ValueError("structural-control sidecar has stale FreeU provenance")
+    if action_type == "attention_baseline":
+        expected_attention = {
+            "attention_baseline_implementation": action.get("implementation"),
+            "attention_baseline_source_commit": action.get("source_commit"),
+            "attention_baseline_paper_id": action.get("paper_id"),
+            "attention_baseline_topology": {
+                "group_counts": action.get("expected_processor_group_counts"),
+                "processor_count": action.get("expected_processor_count"),
+                "processor_names_sha256": action.get(
+                    "expected_processor_names_sha256"
+                ),
+                "processors_called": action.get("expected_processor_count"),
+                "processor_calls_total": action.get("expected_processor_count")
+                * int(sampling["num_inference_steps"]),
+                "processor_call_count_min": int(sampling["num_inference_steps"]),
+                "processor_call_count_max": int(sampling["num_inference_steps"]),
+            },
+        }
+        if any(record.get(key) != value for key, value in expected_attention.items()):
+            raise ValueError("structural-control sidecar attention provenance differs")
+    elif any(
+        record.get(key) is not None
+        for key in (
+            "attention_baseline_implementation",
+            "attention_baseline_source_commit",
+            "attention_baseline_paper_id",
+            "attention_baseline_topology",
+        )
+    ):
+        raise ValueError("structural-control sidecar has stale attention provenance")
+
+
+def scheduler_isolation_required(cfg: dict) -> bool:
+    """Return whether each action requires a fresh scheduler instance."""
+    return bool(
+        cfg.get("scheduler_baseline_registered")
+        or cfg.get("cfg_baseline_registered")
+        or cfg.get("native_renderer_registered")
+        or cfg.get("structural_control_registered")
+    )
+
+
 def group_tasks_by_pair(tasks):
     """Keep every action for a (prompt, seed) pair on one worker/device."""
     groups = {}
@@ -393,6 +939,7 @@ def task_is_complete(
     img_dir: str,
     *,
     run_contract_sha256: str | None = None,
+    structural_config: dict | None = None,
 ) -> bool:
     stem = os.path.join(img_dir, task["id"])
     if not (os.path.exists(stem + ".png") and os.path.exists(stem + ".json")):
@@ -411,6 +958,10 @@ def task_is_complete(
             expected_task=task,
             expected_contract_sha256=run_contract_sha256,
         )
+        if structural_config is not None:
+            validate_structural_control_sidecar(
+                record, structural_config, expected_task=task
+            )
         if "execution_rank" in task and record.get("execution_rank") != task[
             "execution_rank"
         ]:
@@ -422,13 +973,7 @@ def task_is_complete(
 
 def worker_resume_contract_sha256(cfg: dict) -> str | None:
     """Return the strict contract for registered workers and None for legacy runs."""
-    registered = bool(
-        cfg.get("trajectory_registered")
-        or cfg.get("scheduler_baseline_registered")
-        or cfg.get("cfg_baseline_registered")
-        or cfg.get("native_renderer_registered")
-    )
-    return cfg["run_contract_sha256"] if registered else None
+    return cfg["run_contract_sha256"] if strict_registered_run(cfg) else None
 
 
 def recorded_group_device(
@@ -436,6 +981,7 @@ def recorded_group_device(
     img_dir: str,
     *,
     run_contract_sha256: str | None = None,
+    structural_config: dict | None = None,
 ):
     """Return a valid block device; ignore crash debris for registered runs."""
     devices = set()
@@ -458,6 +1004,10 @@ def recorded_group_device(
                     expected_task=task,
                     expected_contract_sha256=run_contract_sha256,
                 )
+                if structural_config is not None:
+                    validate_structural_control_sidecar(
+                        record, structural_config, expected_task=task
+                    )
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
         if record.get("device"):
@@ -478,6 +1028,7 @@ def assign_tasks_to_devices(
     img_dir: str,
     *,
     run_contract_sha256: str | None = None,
+    structural_config: dict | None = None,
 ) -> dict:
     """Assign pending tasks without changing block placement on resume.
 
@@ -490,6 +1041,7 @@ def assign_tasks_to_devices(
             task_group,
             img_dir,
             run_contract_sha256=run_contract_sha256,
+            structural_config=structural_config,
         )
         ordered_group = sorted(
             task_group,
@@ -506,7 +1058,10 @@ def assign_tasks_to_devices(
             task
             for task in ordered_group
             if not task_is_complete(
-                task, img_dir, run_contract_sha256=run_contract_sha256
+                task,
+                img_dir,
+                run_contract_sha256=run_contract_sha256,
+                structural_config=structural_config,
             )
         ]
         if not pending:
@@ -526,10 +1081,13 @@ def load_actions(path: str, num_inference_steps: int):
     with open(path) as handle:
         config = yaml.safe_load(handle) or {}
     action_schema = config.get("schema")
-    if config.get("schema") == "latent_renderer_registration_v1":
+    if config.get("schema") in {
+        "latent_renderer_registration_v1",
+        "structural_control_registration_v1",
+    }:
         raise ValueError(
-            "latent-renderer registration manifests are not generation action configs; "
-            "run eval-pipeline/audit_latent_renderer.py first"
+            "registration manifests are not generation action configs; "
+            "an independently reviewed executable YAML is required"
         )
     actions = config.get("actions")
     if not isinstance(actions, list) or not actions:
@@ -666,6 +1224,141 @@ def load_actions(path: str, num_inference_steps: int):
                 action["eta"] <= 0 or not 0 <= action["zeta"] <= 1
             ):
                 raise ValueError(f"{action_id}: invalid GAG eta/zeta")
+            if "applied_layers" in action:
+                raw_layers = action["applied_layers"]
+                if isinstance(raw_layers, (str, bytes)) or not isinstance(
+                    raw_layers, list
+                ):
+                    raise ValueError(
+                        f"{action_id}: applied_layers must be a list of layer groups"
+                    )
+                layers = [str(value) for value in raw_layers]
+                if not layers or len(layers) != len(set(layers)):
+                    raise ValueError(
+                        f"{action_id}: applied_layers must be non-empty and unique"
+                    )
+                unknown_layers = set(layers) - ATTENTION_BASELINE_LAYER_GROUPS
+                if unknown_layers:
+                    raise ValueError(
+                        f"{action_id}: unsupported attention layer groups "
+                        f"{sorted(unknown_layers)}"
+                    )
+                action["applied_layers"] = layers
+            if "probability_dtype" in action:
+                probability_dtype = str(action["probability_dtype"])
+                if probability_dtype not in ATTENTION_PROBABILITY_DTYPES:
+                    raise ValueError(
+                        f"{action_id}: probability_dtype must be one of "
+                        f"{sorted(ATTENTION_PROBABILITY_DTYPES)}"
+                    )
+                action["probability_dtype"] = probability_dtype
+            if "implementation" in action:
+                implementation = str(action["implementation"])
+                expected_group_counts = action.get("expected_processor_group_counts")
+                if expected_group_counts != PLADIS_PINNED_SDXL_GROUP_COUNTS:
+                    raise ValueError(
+                        f"{action_id}: expected_processor_group_counts must be "
+                        f"{PLADIS_PINNED_SDXL_GROUP_COUNTS}"
+                    )
+                expected_processor_count = action.get("expected_processor_count")
+                if (
+                    isinstance(expected_processor_count, bool)
+                    or expected_processor_count != PLADIS_PINNED_SDXL_PROCESSOR_COUNT
+                ):
+                    raise ValueError(
+                        f"{action_id}: expected_processor_count must be "
+                        f"{PLADIS_PINNED_SDXL_PROCESSOR_COUNT}"
+                    )
+                if (
+                    action.get("expected_processor_names_sha256")
+                    != PLADIS_PINNED_SDXL_PROCESSOR_NAMES_SHA256
+                ):
+                    raise ValueError(
+                        f"{action_id}: expected_processor_names_sha256 differs from "
+                        "the pinned SDXL topology"
+                    )
+                action["expected_processor_group_counts"] = dict(
+                    expected_group_counts
+                )
+                action["expected_processor_count"] = expected_processor_count
+                action["expected_processor_names_sha256"] = (
+                    PLADIS_PINNED_SDXL_PROCESSOR_NAMES_SHA256
+                )
+                if action.get("attention_mask_policy") != "none":
+                    raise ValueError(
+                        f"{action_id}: pinned attention baseline requires "
+                        "attention_mask_policy 'none'"
+                    )
+                if baseline == "pladis":
+                    if implementation != PLADIS_OPERATOR_PORT_IMPLEMENTATION:
+                        raise ValueError(
+                            f"{action_id}: unsupported PLADIS implementation "
+                            f"{implementation!r}"
+                        )
+                    if action.get("source_commit") != PLADIS_SOURCE_COMMIT:
+                        raise ValueError(
+                            f"{action_id}: pinned PLADIS must bind source_commit "
+                            f"{PLADIS_SOURCE_COMMIT}"
+                        )
+                    if tuple(action.get("applied_layers", ())) != PLADIS_PINNED_SDXL_LAYERS:
+                        raise ValueError(
+                            f"{action_id}: pinned PLADIS applied_layers must be "
+                            f"{list(PLADIS_PINNED_SDXL_LAYERS)}"
+                        )
+                    if action.get("probability_dtype") != PLADIS_PINNED_PROBABILITY_DTYPE:
+                        raise ValueError(
+                            f"{action_id}: pinned PLADIS probability_dtype must be "
+                            f"{PLADIS_PINNED_PROBABILITY_DTYPE!r}"
+                        )
+                    runtime_diffusers = str(getattr(diffusers, "__version__", "unknown"))
+                    if runtime_diffusers != PLADIS_PORT_DIFFUSERS_VERSION:
+                        raise ValueError(
+                            f"{action_id}: PLADIS operator port requires diffusers "
+                            f"{PLADIS_PORT_DIFFUSERS_VERSION}, got {runtime_diffusers}; "
+                            "the upstream PLADIS repository itself binds 0.33.1"
+                        )
+                else:
+                    if implementation != GAG_EQ13_IMPLEMENTATION:
+                        raise ValueError(
+                            f"{action_id}: unsupported GAG implementation "
+                            f"{implementation!r}"
+                        )
+                    required_provenance = {
+                        "paper_id": GAG_PAPER_ID,
+                        "official_code_available": False,
+                        "implementation_origin": "independent_reimplementation",
+                        "equations": list(GAG_PAPER_EQUATIONS),
+                        "alpha_source": "inferred_from_pladis",
+                        "layer_policy_source": "inherited_from_pladis",
+                        "paper_license": "CC-BY-4.0",
+                        "software_license": "Apache-2.0",
+                    }
+                    for field, expected in required_provenance.items():
+                        if action.get(field) != expected:
+                            raise ValueError(
+                                f"{action_id}: GAG provenance field {field} must be "
+                                f"{expected!r}"
+                            )
+                    if tuple(action.get("applied_layers", ())) != GAG_INHERITED_LAYER_POLICY:
+                        raise ValueError(
+                            f"{action_id}: GAG inherited applied_layers must be "
+                            f"{list(GAG_INHERITED_LAYER_POLICY)}"
+                        )
+                    if action.get("probability_dtype") != GAG_INHERITED_PROBABILITY_DTYPE:
+                        raise ValueError(
+                            f"{action_id}: GAG inherited probability_dtype must be "
+                            f"{GAG_INHERITED_PROBABILITY_DTYPE!r}"
+                        )
+                    if (
+                        action["baseline_scale"] != 10.0
+                        or action["eta"] != 15.0
+                        or action["zeta"] != 0.0
+                    ):
+                        raise ValueError(
+                            f"{action_id}: GAG Eq. 13 reproduction requires "
+                            "lambda=10, eta=15, zeta=0"
+                        )
+                action["implementation"] = implementation
             action["scale"] = 0.0
         elif action_type == "latent_renderer_fixed":
             coefficients = [float(value) for value in action.get("coefficients", [])]
@@ -917,6 +1610,98 @@ def load_actions(path: str, num_inference_steps: int):
             preserve_moments = action.get("preserve_moments", False)
             if not isinstance(preserve_moments, bool):
                 raise ValueError(f"{action_id}: preserve_moments must be a boolean")
+            implementation = str(
+                action.get("implementation", DIFFUSERS_FREEU_IMPLEMENTATION)
+            )
+            if implementation not in FREEU_IMPLEMENTATIONS:
+                raise ValueError(
+                    f"{action_id}: unsupported FreeU implementation {implementation!r}"
+                )
+            if implementation == PAPER_FREEU_IMPLEMENTATION:
+                if preserve_moments:
+                    raise ValueError(
+                        f"{action_id}: paper FreeU cannot be combined with moment preservation"
+                    )
+                if action.get("source_commit") != PAPER_FREEU_SOURCE_COMMIT:
+                    raise ValueError(
+                        f"{action_id}: paper FreeU must bind source_commit "
+                        f"{PAPER_FREEU_SOURCE_COMMIT}"
+                    )
+                if (
+                    action.get("implementation_diffusers_version")
+                    != PAPER_FREEU_PORT_DIFFUSERS_VERSION
+                ):
+                    raise ValueError(
+                        f"{action_id}: paper FreeU must bind diffusers "
+                        f"{PAPER_FREEU_PORT_DIFFUSERS_VERSION}"
+                    )
+            if "implementation" in action:
+                action["implementation"] = implementation
+            expected_calls = action.get("expected_operator_calls_per_step")
+            expected_resolution_counts = action.get(
+                "expected_resolution_idx_call_counts_per_step"
+            )
+            expected_channel_counts = action.get(
+                "expected_hidden_channel_call_counts_per_step"
+            )
+            expected_joint_counts = action.get(
+                "expected_resolution_channel_call_counts_per_step"
+            )
+            expected_effect_counts = action.get(
+                "expected_operator_effect_call_counts_per_step"
+            )
+            topology_values = (
+                expected_calls,
+                expected_resolution_counts,
+                expected_channel_counts,
+                expected_joint_counts,
+                expected_effect_counts,
+            )
+            if any(value is None for value in topology_values) and any(
+                value is not None for value in topology_values
+            ):
+                raise ValueError(
+                    f"{action_id}: FreeU call topology fields must be provided together"
+                )
+            if expected_calls is not None:
+                if (
+                    isinstance(expected_calls, bool)
+                    or not isinstance(expected_calls, int)
+                    or expected_calls <= 0
+                    or not isinstance(expected_resolution_counts, list)
+                    or not expected_resolution_counts
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                        for value in expected_resolution_counts
+                    )
+                    or sum(expected_resolution_counts) != expected_calls
+                    or not isinstance(expected_channel_counts, dict)
+                    or not isinstance(expected_joint_counts, dict)
+                    or not isinstance(expected_effect_counts, dict)
+                    or any(
+                        not isinstance(key, str)
+                        or isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                        for mapping in (
+                            expected_channel_counts,
+                            expected_joint_counts,
+                            expected_effect_counts,
+                        )
+                        for key, value in mapping.items()
+                    )
+                    or any(
+                        sum(mapping.values()) != expected_calls
+                        for mapping in (
+                            expected_channel_counts,
+                            expected_joint_counts,
+                            expected_effect_counts,
+                        )
+                    )
+                ):
+                    raise ValueError(f"{action_id}: invalid FreeU call topology")
             action["freeu_schedule"] = schedule.to_record()
             action["freeu_preserve_moments"] = preserve_moments
             action.pop("parameters", None)
@@ -1373,6 +2158,534 @@ def validate_native_renderer_authorization(
         )
 
 
+def validate_structural_control_authorization(
+    path: str,
+    *,
+    repository_root: str | None = None,
+    require_clean: bool = True,
+    verify_current_source: bool = True,
+) -> None:
+    """Bind an executable structural-control matrix to reviewed source bytes."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != STRUCTURAL_CONTROL_SCHEMA:
+        return
+    if config.get("registration_schema") != STRUCTURAL_CONTROL_REGISTRATION_SCHEMA:
+        raise ValueError("structural-control registration_schema differs")
+    if config.get("status") != "authorized_development":
+        raise ValueError("structural-control executable is not authorized_development")
+
+    authorization = config.get("authorization")
+    if not isinstance(authorization, dict) or set(
+        authorization
+    ) != STRUCTURAL_CONTROL_AUTH_FIELDS:
+        raise ValueError(
+            "structural-control authorization fields differ from the frozen schema"
+        )
+    if not str(authorization.get("reviewer", "")).strip():
+        raise ValueError("structural-control authorization requires reviewer")
+    if authorization.get("scope") != STRUCTURAL_CONTROL_AUTH_SCOPE:
+        raise ValueError("structural-control authorization scope differs")
+    if authorization.get("source_template") != STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE:
+        raise ValueError("structural-control authorization source_template differs")
+    if authorization.get("gpu_generation") is not True:
+        raise ValueError("structural-control generation is not authorized")
+    if authorization.get("scoring") is not True:
+        raise ValueError("structural-control scoring is not authorized")
+    if authorization.get("method_selection") is not False:
+        raise ValueError("structural controls cannot authorize method selection")
+    if authorization.get("result_access_before_freeze") is not False:
+        raise ValueError("structural controls must remain result-blind before freeze")
+    reviewed_commit = str(authorization.get("reviewed_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", reviewed_commit):
+        raise ValueError("structural-control reviewed_commit must be full 40-hex")
+    template_hash = str(authorization.get("source_template_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", template_hash):
+        raise ValueError("structural-control source_template_sha256 is invalid")
+
+    registration_source = config.get("registration_source")
+    if not isinstance(registration_source, dict) or set(registration_source) != {
+        "path",
+        "sha256",
+    }:
+        raise ValueError("structural-control registration_source is invalid")
+    if registration_source != {
+        "path": STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+        "sha256": template_hash,
+    }:
+        raise ValueError("structural-control registration_source differs from authorization")
+
+    scoring = config.get("scoring")
+    if not isinstance(scoring, dict) or set(scoring) != {
+        "required_schema",
+        "registered_scorer_provenance_sha256",
+    }:
+        raise ValueError("structural-control scoring contract is invalid")
+    if scoring.get("required_schema") != NATIVE_RENDERER_SCORER_SCHEMA or not re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(scoring.get("registered_scorer_provenance_sha256", "")),
+    ):
+        raise ValueError("structural-control scorer provenance binding is invalid")
+
+    implementation_source = config.get("implementation_source")
+    if not isinstance(implementation_source, dict) or set(implementation_source) != {
+        "reviewed_commit",
+        "files",
+    }:
+        raise ValueError("structural-control implementation_source is invalid")
+    if implementation_source.get("reviewed_commit") != reviewed_commit:
+        raise ValueError("implementation_source reviewed_commit differs from authorization")
+    source_files = implementation_source.get("files")
+    if not isinstance(source_files, dict) or set(source_files) != set(
+        STRUCTURAL_CONTROL_IMPLEMENTATION_PATHS
+    ):
+        raise ValueError("structural-control implementation source paths differ")
+    if any(
+        not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in source_files.values()
+    ):
+        raise ValueError("structural-control implementation source hash is invalid")
+
+    analysis_implementation = config.get("analysis_implementation")
+    if not isinstance(analysis_implementation, dict) or set(
+        analysis_implementation
+    ) != {"schema", "files"}:
+        raise ValueError("structural-control analysis_implementation is invalid")
+    if analysis_implementation.get("schema") != STRUCTURAL_CONTROL_ANALYSIS_SCHEMA:
+        raise ValueError("structural-control analysis implementation schema differs")
+    analysis_files = analysis_implementation.get("files")
+    if not isinstance(analysis_files, dict) or set(analysis_files) != set(
+        STRUCTURAL_CONTROL_ANALYSIS_PATHS
+    ):
+        raise ValueError("structural-control analysis implementation paths differ")
+    if any(
+        not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in analysis_files.values()
+    ):
+        raise ValueError("structural-control analysis implementation hash is invalid")
+
+    repo = os.path.realpath(repository_root or ROOT)
+    executable_path = os.path.realpath(path)
+    try:
+        if os.path.commonpath((repo, executable_path)) != repo:
+            raise ValueError(
+                "structural-control executable must be inside the reviewed repository"
+            )
+    except ValueError as exc:
+        raise ValueError(
+            "structural-control executable must be inside the reviewed repository"
+        ) from exc
+    executable_relative_path = os.path.relpath(executable_path, repo)
+    try:
+        head_commit = subprocess.check_output(
+            ["git", "-C", repo, "rev-parse", "HEAD"],
+            stderr=subprocess.PIPE,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"cannot resolve repository HEAD: {exc}") from exc
+    ancestry = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", reviewed_commit, head_commit],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if ancestry.returncode == 1:
+        raise ValueError("structural-control reviewed_commit is not an ancestor of HEAD")
+    if ancestry.returncode != 0:
+        raise ValueError(
+            "cannot verify structural-control reviewed commit: "
+            f"{ancestry.stderr.strip() or 'git merge-base failed'}"
+        )
+    try:
+        subprocess.check_output(
+            [
+                "git",
+                "-C",
+                repo,
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                executable_relative_path,
+            ],
+            stderr=subprocess.PIPE,
+        )
+        committed_executable_bytes = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                repo,
+                "show",
+                f"{head_commit}:{executable_relative_path}",
+            ],
+            stderr=subprocess.PIPE,
+        )
+        with open(executable_path, "rb") as handle:
+            current_executable_bytes = handle.read()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(
+            "structural-control executable must be tracked at repository HEAD"
+        ) from exc
+    if current_executable_bytes != committed_executable_bytes:
+        raise ValueError(
+            "structural-control executable bytes differ from repository HEAD"
+        )
+    if require_clean and not verify_current_source:
+        raise ValueError("clean-tree validation requires current-source verification")
+    if require_clean:
+        try:
+            dirty = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    repo,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                stderr=subprocess.PIPE,
+                text=True,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(f"cannot verify clean source tree: {exc}") from exc
+        if dirty:
+            raise ValueError(
+                "structural-control generation requires a clean repository worktree"
+            )
+
+    try:
+        reviewed_template_bytes = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                repo,
+                "show",
+                f"{reviewed_commit}:{STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE}",
+            ],
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("cannot read reviewed structural-control template") from exc
+    if verify_current_source:
+        template_path = os.path.join(repo, STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE)
+        try:
+            with open(template_path, "rb") as handle:
+                current_template_bytes = handle.read()
+        except OSError as exc:
+            raise ValueError("cannot read current structural-control template") from exc
+        if hashlib.sha256(current_template_bytes).hexdigest() != template_hash:
+            raise ValueError("current structural-control template hash differs")
+    if hashlib.sha256(reviewed_template_bytes).hexdigest() != template_hash:
+        raise ValueError("reviewed structural-control template hash differs")
+    try:
+        reviewed_template = yaml.safe_load(reviewed_template_bytes) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("reviewed structural-control template is invalid YAML") from exc
+
+    def design_body(value: dict) -> dict:
+        body = copy.deepcopy(value)
+        for key in (
+            "schema",
+            "status",
+            "authorization",
+            "blocking_conditions",
+            "registration_source",
+            "implementation_source",
+        ):
+            body.pop(key, None)
+        return body
+
+    if design_body(config) != design_body(reviewed_template):
+        raise ValueError(
+            "authorized structural-control config differs from the frozen template"
+        )
+    for relative_path in STRUCTURAL_CONTROL_IMPLEMENTATION_PATHS:
+        expected_hash = source_files[relative_path]
+        current_path = os.path.join(repo, relative_path)
+        try:
+            reviewed_bytes = subprocess.check_output(
+                ["git", "-C", repo, "show", f"{reviewed_commit}:{relative_path}"],
+                stderr=subprocess.PIPE,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(
+                f"cannot read reviewed implementation source {relative_path}"
+            ) from exc
+        if verify_current_source:
+            try:
+                with open(current_path, "rb") as handle:
+                    current_bytes = handle.read()
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot read current implementation source {relative_path}"
+                ) from exc
+            if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
+                raise ValueError(
+                    f"current implementation source hash differs for {relative_path}"
+                )
+        if hashlib.sha256(reviewed_bytes).hexdigest() != expected_hash:
+            raise ValueError(
+                f"reviewed implementation source hash differs for {relative_path}"
+            )
+    for relative_path in STRUCTURAL_CONTROL_ANALYSIS_PATHS:
+        expected_hash = analysis_files[relative_path]
+        current_path = os.path.join(repo, relative_path)
+        try:
+            reviewed_bytes = subprocess.check_output(
+                ["git", "-C", repo, "show", f"{reviewed_commit}:{relative_path}"],
+                stderr=subprocess.PIPE,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(
+                f"cannot read reviewed analysis source {relative_path}"
+            ) from exc
+        if verify_current_source:
+            try:
+                with open(current_path, "rb") as handle:
+                    current_bytes = handle.read()
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot read current analysis source {relative_path}"
+                ) from exc
+            if hashlib.sha256(current_bytes).hexdigest() != expected_hash:
+                raise ValueError(
+                    f"current analysis source hash differs for {relative_path}"
+                )
+        if hashlib.sha256(reviewed_bytes).hexdigest() != expected_hash:
+            raise ValueError(
+                f"reviewed analysis source hash differs for {relative_path}"
+            )
+
+
+def validate_structural_control_design(
+    path: str,
+    *,
+    prompts_path: str,
+    actions: list,
+    seeds: list,
+    model_name: str,
+    resolution: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    negative_prompt: str,
+    power_calibrate: int,
+    stage2_enabled: bool,
+    split_role: str | None,
+    low_vram: bool = False,
+) -> None:
+    """Reject any execution drift from the frozen structural-control matrix."""
+    with open(path) as handle:
+        config = yaml.safe_load(handle) or {}
+    if config.get("schema") != STRUCTURAL_CONTROL_SCHEMA:
+        return
+    sampling = config.get("sampling")
+    if not isinstance(sampling, dict) or set(sampling) != STRUCTURAL_CONTROL_SAMPLING_KEYS:
+        raise ValueError("structural-control sampling fields differ from the schema")
+    analysis_implementation = config.get("analysis_implementation")
+    if not isinstance(analysis_implementation, dict) or set(
+        analysis_implementation
+    ) != {"schema", "files"}:
+        raise ValueError("structural-control analysis_implementation is invalid")
+    if analysis_implementation.get("schema") != STRUCTURAL_CONTROL_ANALYSIS_SCHEMA:
+        raise ValueError("structural-control analysis implementation schema differs")
+    analysis_files = analysis_implementation.get("files")
+    if not isinstance(analysis_files, dict) or set(analysis_files) != set(
+        STRUCTURAL_CONTROL_ANALYSIS_PATHS
+    ) or any(
+        not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in analysis_files.values()
+    ):
+        raise ValueError("structural-control analysis implementation files differ")
+    expected_sampling = {
+        "model": str(model_name),
+        "model_revision": CFG_BASELINE_MODEL_REVISION,
+        "pipeline": "RepLDMSDXLPipeline",
+        "resolution": int(resolution),
+        "num_inference_steps": int(num_inference_steps),
+        "default_cfg_scale": 7.5,
+        "cfg_source": "action.cfg_scale",
+        "cfg_pipeline_argument": "guidance_scale",
+        "negative_prompt": DEFAULT_NEG,
+        "power_calibrate": 0,
+        "guidance_rescale": 0.0,
+        "scheduler": "EulerDiscreteScheduler",
+        "prediction_type": "epsilon",
+        "scheduler_churn": 0.0,
+        "initialization": "scheduler_native_init_sigma",
+        "stage2": bool(stage2_enabled),
+        "extra_unet_calls": 0,
+        "torch_dtype": "float16",
+        "variant": "fp16",
+        "local_files_only": True,
+        "low_vram": False,
+        "batch_size": 1,
+        "num_images_per_prompt": 1,
+        "attention_mask_policy": "none",
+    }
+    for key, expected in expected_sampling.items():
+        observed = sampling.get(key)
+        if isinstance(expected, bool):
+            same = isinstance(observed, bool) and observed is expected
+        elif isinstance(expected, int):
+            same = not isinstance(observed, bool) and isinstance(observed, int) and observed == expected
+        elif isinstance(expected, float):
+            same = (
+                not isinstance(observed, bool)
+                and isinstance(observed, (int, float))
+                and float(observed) == expected
+            )
+        else:
+            same = observed == expected
+        if not same:
+            raise ValueError(
+                f"structural-control sampling.{key} differs: expected "
+                f"{expected!r}, got {observed!r}"
+            )
+    if float(guidance_scale) != 7.5:
+        raise ValueError("structural controls require --guidance_scale 7.5")
+    if negative_prompt != DEFAULT_NEG:
+        raise ValueError("structural controls require the registered negative prompt")
+    if isinstance(power_calibrate, bool) or int(power_calibrate) != 0:
+        raise ValueError("structural controls require --power_calibrate 0")
+    if bool(low_vram):
+        raise ValueError("structural controls require low_vram=False")
+    if config.get("scheduler_runtime") != CFG_BASELINE_SCHEDULER_RUNTIME:
+        raise ValueError("structural-control Euler runtime contract differs")
+    if config.get("frequency_band_cutoffs") != [0.08, 0.25]:
+        raise ValueError("structural-control frequency-band cutoffs differ")
+    if config.get("execution_order") != CFG_BASELINE_EXECUTION_ORDER:
+        raise ValueError("structural-control execution_order differs")
+    if config.get("split_role") != "development":
+        raise ValueError("structural controls must retain the development result role")
+    if config.get("split_seeds") != STRUCTURAL_CONTROL_SPLIT_SEEDS:
+        raise ValueError("structural-control split seeds differ")
+    if config.get("engineering_smoke") != STRUCTURAL_CONTROL_ENGINEERING_SMOKE:
+        raise ValueError("structural-control engineering smoke profile differs")
+    if split_role not in STRUCTURAL_CONTROL_SPLIT_SEEDS:
+        raise ValueError("structural controls require engineering_smoke or development")
+    if list(seeds) != STRUCTURAL_CONTROL_SPLIT_SEEDS[split_role]:
+        raise ValueError("structural-control CLI seeds differ")
+    if config.get("failure_policy") != "shared_abort_after_first_task_error":
+        raise ValueError("structural-control failure policy differs")
+
+    source = config.get("source_manifest")
+    expected_source = {
+        "path": "eval-pipeline/prompts/scheduler_native_fixed_headroom_manifest.json",
+        "sha256": "5373acf08f0e28d586732909f38787f8180a5d12c1ed58c2e1881134c10b6d5f",
+        "prompts": STRUCTURAL_CONTROL_PROMPTS,
+        "prompts_sha256": STRUCTURAL_CONTROL_PROMPTS_SHA256,
+        "expected_prompt_count": 33,
+        "expected_challenges": 11,
+    }
+    if source != expected_source:
+        raise ValueError("structural-control source manifest registration differs")
+    prompt_profile = (
+        STRUCTURAL_CONTROL_ENGINEERING_SMOKE
+        if split_role == "engineering_smoke"
+        else expected_source
+    )
+    expected_prompts_path = os.path.abspath(
+        os.path.join(ROOT, str(prompt_profile["prompts"]))
+    )
+    if os.path.abspath(prompts_path) != expected_prompts_path:
+        raise ValueError("structural-control prompts path differs")
+    if sha256_file(prompts_path) != prompt_profile["prompts_sha256"]:
+        raise ValueError("structural-control prompts hash differs")
+    manifest_path = os.path.abspath(os.path.join(ROOT, expected_source["path"]))
+    if sha256_file(manifest_path) != expected_source["sha256"]:
+        raise ValueError("structural-control source manifest hash differs")
+    prompts = pd.read_csv(prompts_path)
+    if (
+        len(prompts) != int(prompt_profile["expected_prompt_count"])
+        or prompts["source_challenge"].nunique()
+        != int(prompt_profile["expected_challenges"])
+    ):
+        raise ValueError("structural-control prompt/challenge counts differ")
+
+    expected_design = {
+        "role": "development_only_baseline_calibration",
+        "prompt_count": 33,
+        "seed_count": 3,
+        "action_count": 8,
+        "expected_task_count": 792,
+        "paired_block_policy": "one_prompt_seed_block_per_gpu",
+        "method_selection": False,
+        "confirmation": False,
+        "reuse_scope": "same_development_split_as_headroom_screen",
+    }
+    if config.get("design") != expected_design:
+        raise ValueError("structural-control design metadata differs")
+    if [str(action.get("id")) for action in actions] != list(
+        STRUCTURAL_CONTROL_ACTION_IDS
+    ):
+        raise ValueError("structural-control action IDs/order differ")
+    expected_types = {
+        "no_op_cfg7p5": "none",
+        "cfg_only_5": "none",
+        "conference_tfsa": "legacy",
+        "freeu_diffusers_historical": "freeu",
+        "freeu_diffusers_paper_parameters": "freeu",
+        "freeu_paper_adaptive": "freeu",
+        "pladis_operator_port": "attention_baseline",
+        "gag_eq13_reimplementation": "attention_baseline",
+    }
+    expected_cfg = {action_id: 7.5 for action_id in STRUCTURAL_CONTROL_ACTION_IDS}
+    expected_cfg.update(
+        {
+            "cfg_only_5": 5.0,
+            "pladis_operator_port": 5.0,
+            "gag_eq13_reimplementation": 5.0,
+        }
+    )
+    for action in actions:
+        action_id = str(action["id"])
+        if action.get("type") != expected_types[action_id]:
+            raise ValueError(f"{action_id}: structural-control action type differs")
+        if float(action.get("cfg_scale", float("nan"))) != expected_cfg[action_id]:
+            raise ValueError(f"{action_id}: structural-control cfg_scale differs")
+    freeu_actions = [action for action in actions if action["type"] == "freeu"]
+    if any(
+        action.get("implementation_diffusers_version")
+        != PAPER_FREEU_PORT_DIFFUSERS_VERSION
+        for action in freeu_actions
+    ):
+        raise ValueError("structural-control FreeU diffusers binding differs")
+    for action in freeu_actions:
+        expected_effect_counts = (
+            STRUCTURAL_CONTROL_FREEU_PAPER_EFFECT_COUNTS
+            if action.get("implementation") == PAPER_FREEU_IMPLEMENTATION
+            else STRUCTURAL_CONTROL_FREEU_CONSTANT_EFFECT_COUNTS
+        )
+        if (
+            action.get("expected_operator_calls_per_step") != 9
+            or action.get("expected_resolution_idx_call_counts_per_step")
+            != STRUCTURAL_CONTROL_FREEU_RESOLUTION_COUNTS
+            or action.get("expected_hidden_channel_call_counts_per_step")
+            != STRUCTURAL_CONTROL_FREEU_CHANNEL_COUNTS
+            or action.get("expected_resolution_channel_call_counts_per_step")
+            != STRUCTURAL_CONTROL_FREEU_JOINT_COUNTS
+            or action.get("expected_operator_effect_call_counts_per_step")
+            != expected_effect_counts
+        ):
+            raise ValueError("structural-control FreeU call topology differs")
+
+    analysis = config.get("analysis")
+    if not isinstance(analysis, dict) or analysis.get("primary_metric") != "topiq_nr":
+        raise ValueError("structural-control primary analysis differs")
+    families = analysis.get("multiplicity_families")
+    if not isinstance(families, dict) or set(families) != {
+        "freeu_vs_no_op",
+        "freeu_mechanism_contrasts",
+        "attention_vs_cfg5",
+    }:
+        raise ValueError("structural-control multiplicity families differ")
+    for family in families.values():
+        if family.get("holm_alpha") != 0.05 or family.get(
+            "point_estimate_screen_delta"
+        ) != 0.005:
+            raise ValueError("structural-control family threshold differs")
+
+
 def validate_cfg_baseline_design(
     path: str,
     *,
@@ -1819,7 +3132,7 @@ def generation_contract(
     actions_sha256: str | None,
 ) -> dict:
     """Return the immutable fields that define a resumable generation run."""
-    return {
+    contract = {
         "schema": PROVENANCE_SCHEMA,
         "action_schema": cfg.get("action_schema"),
         "actions_sha256": actions_sha256,
@@ -1844,6 +3157,9 @@ def generation_contract(
         "git_commit": cfg.get("git_commit"),
         "runtime_provenance": cfg.get("runtime_provenance", {}),
     }
+    return contract
+
+
 def sha256_file(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -1872,11 +3188,18 @@ def scheduler_config_payload(scheduler) -> dict:
     return json.loads(json.dumps(config, sort_keys=True, default=str))
 
 
+def scheduler_config_payload_sha256(payload: dict) -> str:
+    """Hash one recorded scheduler-config payload using the v2 byte contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("scheduler config payload must be a mapping")
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def scheduler_config_sha256_v2(scheduler) -> str:
     """Hash effective scheduler config with stable default bookkeeping."""
     config = scheduler_config_payload(scheduler)
-    payload = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return scheduler_config_payload_sha256(config)
 
 
 def scheduler_baseline_runtime(action: dict, base_scheduler):
@@ -1982,6 +3305,42 @@ def validate_cfg_scheduler_runtime(
         raise RuntimeError("CFG-baseline Euler schedule differs from the frozen runtime")
 
 
+def validate_structural_control_scheduler_runtime(
+    registered_runtime: dict,
+    *,
+    config_sha256_v2: str,
+    schedule_provenance: dict | None = None,
+) -> None:
+    """Reject Euler config/schedule drift for every structural-control arm."""
+    if registered_runtime != CFG_BASELINE_SCHEDULER_RUNTIME:
+        raise RuntimeError("structural-control scheduler runtime contract drifted")
+    if config_sha256_v2 != registered_runtime["config_sha256_v2"]:
+        raise RuntimeError("structural-control Euler config differs")
+    if schedule_provenance is None:
+        return
+    observed = {
+        "num_inference_steps": len(schedule_provenance["scheduler_timesteps"]),
+        "schedule_sha256": schedule_provenance["scheduler_schedule_sha256"],
+        "construction_init_noise_sigma": schedule_provenance[
+            "scheduler_construction_init_noise_sigma"
+        ],
+        "effective_init_noise_sigma": schedule_provenance[
+            "scheduler_effective_init_noise_sigma"
+        ],
+    }
+    expected = {
+        key: registered_runtime[key]
+        for key in (
+            "num_inference_steps",
+            "schedule_sha256",
+            "construction_init_noise_sigma",
+            "effective_init_noise_sigma",
+        )
+    }
+    if observed != expected:
+        raise RuntimeError("structural-control Euler schedule differs")
+
+
 def scheduler_provenance_record(
     action: dict,
     *,
@@ -2022,6 +3381,21 @@ def validate_one_unet_call_per_step(
         )
 
 
+def validate_structural_control_worker_result(
+    cfg: dict, images, observed_calls: list[int]
+) -> None:
+    """Enforce one image and matched NFE for every structural-control action."""
+    if not cfg.get("structural_control_registered"):
+        return
+    if not isinstance(images, (list, tuple)) or len(images) != 1:
+        raise RuntimeError("structural controls require exactly one image per prompt")
+    validate_one_unet_call_per_step(
+        observed_calls,
+        cfg["num_inference_steps"],
+        run_label="structural controls",
+    )
+
+
 def validate_final_test_authorization(
     authorization_path: str, actions_path: str, seeds
 ) -> None:
@@ -2055,13 +3429,113 @@ def git_commit() -> str:
         return "unknown"
 
 
-def runtime_provenance() -> dict:
+def validate_registered_environment_lock(config: dict) -> dict | None:
+    """Validate an optional repository-relative environment-lock registration."""
+
+    registration = config.get("environment_lock")
+    if registration is None:
+        return None
+    if not isinstance(registration, dict) or set(registration) != {"path", "sha256"}:
+        raise ValueError("environment_lock must exactly define path and sha256")
+    relative_path = registration["path"]
+    expected_sha256 = registration["sha256"]
+    if not isinstance(relative_path, str) or not relative_path:
+        raise ValueError("environment_lock.path must be a non-empty repository path")
+    if not isinstance(expected_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_sha256
+    ):
+        raise ValueError("environment_lock.sha256 must be a lowercase SHA-256 digest")
+    absolute_path = os.path.abspath(os.path.join(ROOT, relative_path))
+    if os.path.commonpath((ROOT, absolute_path)) != ROOT:
+        raise ValueError("environment_lock.path must stay inside the repository")
+    record = validate_environment_lock(
+        absolute_path, expected_sha256=expected_sha256
+    )
+    record["path"] = os.path.relpath(absolute_path, ROOT)
+    return record
+
+
+def runtime_provenance(environment_lock: dict | None = None) -> dict:
     """Return package/runtime versions that can affect generated pixels."""
-    return {
+    record = {
         "python_version": platform.python_version(),
         "torch_version": str(torch.__version__),
         "diffusers_version": str(getattr(diffusers, "__version__", "unknown")),
         "cuda_runtime_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+    }
+    if environment_lock is not None:
+        record.update(
+            {
+                "generation_environment_lock_id": environment_lock["lock_id"],
+                "generation_environment_lock_path": environment_lock["path"],
+                "generation_environment_lock_sha256": environment_lock["sha256"],
+                "generation_environment_packages": environment_lock["observed"][
+                    "packages"
+                ],
+                "generation_environment_platform": environment_lock["observed"][
+                    "platform"
+                ],
+                "generation_environment_hardware": environment_lock["observed"][
+                    "hardware"
+                ],
+                "generation_environment_determinism": environment_lock["observed"][
+                    "determinism"
+                ],
+            }
+        )
+    return record
+
+
+def worker_determinism_provenance() -> dict:
+    """Sample determinism controls inside the spawned generation worker."""
+    return {
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+    }
+
+
+def cuda_device_identity(device_index: int, device_properties) -> dict:
+    """Resolve a CUDA logical device to its physical NVIDIA identity."""
+    torch_uuid = str(getattr(device_properties, "uuid", "")).lower()
+    normalized_torch_uuid = torch_uuid.removeprefix("gpu-")
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,pci.bus_id",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("cannot resolve the selected CUDA device identity") from exc
+    matches = []
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 3:
+            continue
+        physical_index, gpu_uuid, pci_bus_id = fields
+        if gpu_uuid.lower().removeprefix("gpu-") == normalized_torch_uuid:
+            matches.append((physical_index, gpu_uuid, pci_bus_id))
+    if len(matches) != 1:
+        raise RuntimeError("selected CUDA device UUID is absent or ambiguous in nvidia-smi")
+    physical_index, gpu_uuid, pci_bus_id = matches[0]
+    try:
+        physical_index_value = int(physical_index)
+    except ValueError as exc:
+        raise RuntimeError("selected CUDA physical index is invalid") from exc
+    return {
+        "requested_device": f"cuda:{int(device_index)}",
+        "logical_device_index": int(device_index),
+        "physical_device_index": physical_index_value,
+        "gpu_uuid": gpu_uuid,
+        "pci_bus_id": pci_bus_id,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
 
 
@@ -2163,6 +3637,13 @@ def attention_baseline_runtime(action: dict):
         "alpha": action["alpha"],
         "eta": action["eta"],
         "zeta": action["zeta"],
+        "applied_layers": action.get("applied_layers"),
+        "probability_dtype": action.get("probability_dtype", "float32"),
+        "expected_group_counts": action.get("expected_processor_group_counts"),
+        "expected_processor_names_sha256": action.get(
+            "expected_processor_names_sha256"
+        ),
+        "attention_mask_policy": action.get("attention_mask_policy", "supported"),
     }
 
 
@@ -2176,6 +3657,13 @@ def freeu_runtime(action: dict):
     return FreeUSchedule(
         (item["position"], item["parameters"]) for item in record["knots"]
     )
+
+
+def freeu_implementation_runtime(action: dict) -> str:
+    """Return the explicitly named FreeU tensor operator for one action."""
+    if action["type"] != "freeu":
+        return DIFFUSERS_FREEU_IMPLEMENTATION
+    return str(action.get("implementation", DIFFUSERS_FREEU_IMPLEMENTATION))
 
 
 def trajectory_correction_runtime(action: dict):
@@ -2616,8 +4104,23 @@ def latent_renderer_sidecar_fields(
     }
 
 
-def worker_process(cfg: dict, device: str, task_queue, error_queue):
+def worker_process(cfg: dict, device: str, task_queue, error_queue, abort_event=None):
     torch.cuda.set_device(device)
+    device_index = torch.device(device).index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device_index)
+    worker_device_provenance = {
+        "gpu": str(device_properties.name),
+        "compute_capability": (
+            f"{int(device_properties.major)}.{int(device_properties.minor)}"
+        ),
+        "total_memory_bytes": int(device_properties.total_memory),
+        **cuda_device_identity(device_index, device_properties),
+    }
+    if worker_device_provenance["requested_device"] != str(device):
+        raise RuntimeError("selected CUDA logical device differs from worker assignment")
+    worker_determinism = worker_determinism_provenance()
     registered_sampling = cfg.get("registered_sampling") or {}
     load_kwargs = {
         "torch_dtype": torch.float16,
@@ -2625,12 +4128,20 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
         "cache_dir": cfg["cache_dir"],
         "local_files_only": True,
     }
-    if cfg.get("cfg_baseline_registered") or cfg.get("native_renderer_registered"):
+    if (
+        cfg.get("cfg_baseline_registered")
+        or cfg.get("native_renderer_registered")
+        or cfg.get("structural_control_registered")
+    ):
         model_revision = str(registered_sampling.get("model_revision", ""))
         if cfg.get("cfg_baseline_registered") and model_revision != CFG_BASELINE_MODEL_REVISION:
             raise RuntimeError("CFG-baseline model revision differs from registration")
         if cfg.get("native_renderer_registered") and not model_revision:
             raise RuntimeError("scheduler-native run lacks a registered model revision")
+        if cfg.get("structural_control_registered") and (
+            model_revision != CFG_BASELINE_MODEL_REVISION
+        ):
+            raise RuntimeError("structural-control model revision differs")
         if cfg.get("model_revision") != model_revision:
             raise RuntimeError("registered run config has model revision drift")
         load_kwargs["revision"] = model_revision
@@ -2644,6 +4155,48 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
     base_scheduler_hash = scheduler_config_sha256(base_scheduler)
     base_scheduler_hash_v2 = scheduler_config_sha256_v2(base_scheduler)
     base_scheduler_config = scheduler_config_payload(base_scheduler)
+    model_load_provenance = None
+    if cfg.get("structural_control_registered"):
+        expected_hardware = cfg.get("runtime_provenance", {}).get(
+            "generation_environment_hardware"
+        )
+        if not isinstance(expected_hardware, dict):
+            raise RuntimeError("structural-control hardware provenance is missing")
+        observed_hardware = {
+            key: worker_device_provenance[key]
+            for key in ("gpu", "compute_capability")
+        }
+        registered_hardware = {
+            key: expected_hardware.get(key)
+            for key in ("gpu", "compute_capability")
+        }
+        if observed_hardware != registered_hardware:
+            raise RuntimeError(
+                "selected structural-control worker GPU differs from environment lock"
+            )
+        expected_determinism = cfg.get("runtime_provenance", {}).get(
+            "generation_environment_determinism"
+        )
+        if worker_determinism != expected_determinism:
+            raise RuntimeError(
+                "structural-control worker determinism differs from environment lock"
+            )
+        if type(pipe).__name__ != "RepLDMSDXLPipeline":
+            raise RuntimeError("structural-control pipeline class differs")
+        try:
+            observed_model_dtype = str(next(pipe.unet.parameters()).dtype).removeprefix(
+                "torch."
+            )
+        except (AttributeError, StopIteration) as exc:
+            raise RuntimeError("cannot determine structural-control U-Net dtype") from exc
+        if observed_model_dtype != registered_sampling.get("torch_dtype"):
+            raise RuntimeError("structural-control U-Net dtype differs")
+        model_load_provenance = {
+            "torch_dtype": observed_model_dtype,
+            "variant": load_kwargs.get("variant"),
+            "local_files_only": load_kwargs.get("local_files_only"),
+            "revision": load_kwargs.get("revision"),
+        }
     if cfg.get("trajectory_registered"):
         expected_scheduler = str(registered_sampling.get("scheduler", ""))
         if base_scheduler_name != expected_scheduler:
@@ -2707,6 +4260,40 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             raise RuntimeError("scheduler-native renderer requires zero extra U-Net calls")
         if float(registered_sampling.get("scheduler_churn", 0.0)) != 0.0:
             raise RuntimeError("scheduler-native Euler mapping requires zero scheduler churn")
+    if cfg.get("structural_control_registered"):
+        if base_scheduler_name != registered_sampling.get("scheduler"):
+            raise RuntimeError("structural-control scheduler class differs")
+        if str(cfg.get("model_name")) != str(registered_sampling.get("model")):
+            raise RuntimeError("structural-control model differs")
+        if base_scheduler.config.get("prediction_type") != registered_sampling.get(
+            "prediction_type"
+        ):
+            raise RuntimeError("structural-control prediction_type differs")
+        if registered_sampling.get("cfg_source") != "action.cfg_scale" or (
+            registered_sampling.get("cfg_pipeline_argument") != "guidance_scale"
+        ):
+            raise RuntimeError("structural-control CFG routing differs")
+        if cfg.get("guidance_rescale") != 0.0 or registered_sampling.get(
+            "guidance_rescale"
+        ) != 0.0:
+            raise RuntimeError("structural-control guidance_rescale differs")
+        if registered_sampling.get("attention_mask_policy") != "none":
+            raise RuntimeError("structural-control attention-mask policy differs")
+        if (
+            registered_sampling.get("variant") != "fp16"
+            or registered_sampling.get("local_files_only") is not True
+            or registered_sampling.get("batch_size") != 1
+            or registered_sampling.get("num_images_per_prompt") != 1
+            or int(registered_sampling.get("extra_unet_calls", -1)) != 0
+            or float(registered_sampling.get("scheduler_churn", float("nan"))) != 0.0
+            or registered_sampling.get("initialization")
+            != "scheduler_native_init_sigma"
+        ):
+            raise RuntimeError("structural-control runtime policy differs")
+        validate_structural_control_scheduler_runtime(
+            cfg.get("scheduler_runtime"),
+            config_sha256_v2=base_scheduler_hash_v2,
+        )
 
     img_dir = os.path.join(cfg["out_dir"], "images")
     commit = cfg["git_commit"]
@@ -2714,6 +4301,8 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
     latent_runtime_cache = {}
     n_done = 0
     while True:
+        if abort_event is not None and abort_event.is_set():
+            break
         try:
             task = task_queue.get_nowait()
         except queue.Empty:
@@ -2726,6 +4315,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             task,
             img_dir,
             run_contract_sha256=worker_contract_sha256,
+            structural_config=cfg if cfg.get("structural_control_registered") else None,
         ):
             continue
         try:
@@ -2737,6 +4327,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             clean_config = clean_transport_runtime(action)
             baseline_config = attention_baseline_runtime(action)
             freeu_schedule = freeu_runtime(action)
+            freeu_implementation = freeu_implementation_runtime(action)
             trajectory_correction = trajectory_correction_runtime(action)
             # The diffusers FreeU implementation stores mutable attributes on
             # every up block.  Clear them before every action to preserve exact
@@ -2766,6 +4357,21 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     raise RuntimeError(
                         f"CFG-baseline action {action['id']!r} has runtime scale drift"
                     )
+            if cfg.get("structural_control_registered"):
+                expected_cfg_scale = (
+                    5.0
+                    if action["id"]
+                    in {
+                        "cfg_only_5",
+                        "pladis_operator_port",
+                        "gag_eq13_reimplementation",
+                    }
+                    else 7.5
+                )
+                if cfg_scale != expected_cfg_scale:
+                    raise RuntimeError(
+                        f"structural-control action {action['id']!r} has CFG drift"
+                    )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
                 torch.cuda.reset_peak_memory_stats(device)
@@ -2775,16 +4381,17 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 if baseline_config is not None
                 else nullcontext()
             )
+            freeu_context = (
+                installed_freeu_implementation(freeu_implementation)
+                if freeu_schedule is not None
+                else nullcontext()
+            )
             scheduler_reference = action["type"] == "scheduler_baseline"
             # A registered matrix isolates every action from the mutable
             # scheduler state left by the previous pipeline call.  In
             # particular, Euler's ``init_noise_sigma`` property changes after
             # ``set_timesteps`` for the legacy SDXL scheduler config.
-            scheduler_isolated = bool(
-                cfg.get("scheduler_baseline_registered")
-                or cfg.get("cfg_baseline_registered")
-                or cfg.get("native_renderer_registered")
-            )
+            scheduler_isolated = scheduler_isolation_required(cfg)
             scheduler_runtime = None
             if scheduler_isolated:
                 scheduler_runtime = (
@@ -2820,8 +4427,14 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                         config_sha256_v2=active_scheduler_hash_v2,
                         schedule_provenance=schedule_provenance,
                     )
+                if cfg.get("structural_control_registered"):
+                    validate_structural_control_scheduler_runtime(
+                        cfg["scheduler_runtime"],
+                        config_sha256_v2=active_scheduler_hash_v2,
+                        schedule_provenance=schedule_provenance,
+                    )
             try:
-                with baseline_context:
+                with baseline_context as attention_baseline_topology, freeu_context as freeu_operator_runtime:
                     images = pipe(
                         task["prompt"],
                         negative_prompt=cfg["negative_prompt"],
@@ -2891,6 +4504,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     cfg["num_inference_steps"],
                     run_label="CFG baselines",
                 )
+            validate_structural_control_worker_result(
+                cfg, images, observed_unet_calls
+            )
             if native_renderer_step_diagnostics_required(cfg, action):
                 validate_one_unet_call_per_step(
                     observed_unet_calls,
@@ -2925,6 +4541,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                     or cfg.get("scheduler_baseline_registered")
                     or cfg.get("cfg_baseline_registered")
                     or cfg.get("native_renderer_registered")
+                    or cfg.get("structural_control_registered")
                 ),
                 base_config_sha256_v2=base_scheduler_hash_v2,
                 active_config_sha256_v2=active_scheduler_hash_v2,
@@ -2933,7 +4550,9 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 init_noise_sigma=active_init_noise_sigma,
                 schedule_provenance=schedule_provenance,
             )
-            if cfg.get("cfg_baseline_registered"):
+            if cfg.get("cfg_baseline_registered") or cfg.get(
+                "structural_control_registered"
+            ):
                 scheduler_reference_provenance.update(
                     {
                         "scheduler_config": base_scheduler_config,
@@ -2954,8 +4573,12 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "inference_seconds": elapsed,
                 "peak_gpu_memory_bytes": peak_memory,
                 "power_calibrate": cfg["power_calibrate"],
+                "attn_guidance_scale": attn_scale,
                 "attn_guidance_density": attn_density,
                 "attn_guidance_decay": attn_decay,
+                "attention_guidance_runtime": getattr(
+                    pipe, "_last_attention_guidance_runtime", []
+                ),
                 "frequency_band_cutoffs": cfg["frequency_band_cutoffs"],
                 "stage": cfg["stage_name"],
                 "stage2_enabled": cfg["stage2_enabled"],
@@ -2967,6 +4590,7 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "stage2_noise_source": cfg["stage2_noise_source"],
                 "model_name": cfg["model_name"],
                 "model_revision": cfg.get("model_revision"),
+                "model_load_provenance": model_load_provenance,
                 "scheduler_name": scheduler_name,
                 "base_scheduler_name": base_scheduler_name,
                 "scheduler_config_sha256": base_scheduler_hash,
@@ -2979,9 +4603,45 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
                 "unet_calls_per_step": observed_unet_calls,
                 **cfg["runtime_provenance"],
                 "device": device,
+                "worker_device_provenance": worker_device_provenance,
+                "worker_determinism_provenance": worker_determinism,
+                **structural_control_evidence_scope(
+                    cfg.get("split_role")
+                    if cfg.get("structural_control_registered")
+                    else None
+                ),
                 **renderer_sidecar,
                 "freeu_schedule": getattr(pipe, "_last_freeu_schedule", None),
+                "freeu_runtime": getattr(pipe, "_last_freeu_runtime", []),
+                "freeu_operator_runtime": freeu_operator_runtime,
                 "freeu_preserve_moments": getattr(pipe, "_last_freeu_preserve_moments", False),
+                "freeu_implementation": (
+                    freeu_implementation if freeu_schedule is not None else None
+                ),
+                "freeu_source_commit": (
+                    action.get("source_commit") if freeu_schedule is not None else None
+                ),
+                "freeu_implementation_diffusers_version": (
+                    action.get("implementation_diffusers_version")
+                    if freeu_schedule is not None
+                    else None
+                ),
+                "attention_baseline_implementation": (
+                    action.get("implementation")
+                    if action["type"] == "attention_baseline"
+                    else None
+                ),
+                "attention_baseline_source_commit": (
+                    action.get("source_commit")
+                    if action["type"] == "attention_baseline"
+                    else None
+                ),
+                "attention_baseline_paper_id": (
+                    action.get("paper_id")
+                    if action["type"] == "attention_baseline"
+                    else None
+                ),
+                "attention_baseline_topology": attention_baseline_topology,
                 "trajectory_correction": getattr(
                     pipe, "_last_trajectory_correction", None
                 ),
@@ -3014,7 +4674,22 @@ def worker_process(cfg: dict, device: str, task_queue, error_queue):
             error = traceback.format_exc()
             error_queue.put((task["id"], error))
             print(f"[{device}] FAILED task {task['id']}:\n{error}", flush=True)
+            if cfg.get("structural_control_registered"):
+                if abort_event is not None:
+                    abort_event.set()
+                break
     print(f"[{device}] done, generated {n_done} images", flush=True)
+
+
+def worker_process_entry(cfg, device, task_queue, error_queue, abort_event=None):
+    """Propagate worker-startup failures to sibling structural workers."""
+    try:
+        worker_process(cfg, device, task_queue, error_queue, abort_event)
+    except BaseException:
+        if abort_event is not None:
+            abort_event.set()
+        error_queue.put((f"worker:{device}", traceback.format_exc()))
+        raise
 
 
 def consolidate_manifest(
@@ -3024,6 +4699,8 @@ def consolidate_manifest(
     expected_tasks=None,
     run_contract_sha256: str | None = None,
     strict: bool = False,
+    allow_partial: bool = False,
+    structural_config: dict | None = None,
 ):
     img_dir = os.path.join(out_dir, "images")
     rows = []
@@ -3032,7 +4709,18 @@ def consolidate_manifest(
     }
     expected_set = set(expected_ids or expected_task_map)
     observed_set = set()
-    for fn in sorted(os.listdir(img_dir)):
+    artifact_names = sorted(os.listdir(img_dir))
+    if strict:
+        unexpected_pngs = [
+            fn
+            for fn in artifact_names
+            if fn.endswith(".png") and expected_set and fn[:-4] not in expected_set
+        ]
+        if unexpected_pngs:
+            raise ValueError(
+                f"unexpected PNG for unregistered task: {unexpected_pngs[0]}"
+            )
+    for fn in artifact_names:
         if fn.endswith(".json"):
             stem = fn[:-5]
             if expected_set and stem not in expected_set:
@@ -3050,13 +4738,19 @@ def consolidate_manifest(
                     expected_task=expected_task_map.get(stem),
                     expected_contract_sha256=run_contract_sha256,
                 )
+                if structural_config is not None:
+                    validate_structural_control_sidecar(
+                        record,
+                        structural_config,
+                        expected_task=expected_task_map.get(stem),
+                    )
             rows.append(record)
             observed_set.add(stem)
-    if strict and expected_set and observed_set != expected_set:
+    if strict and not allow_partial and expected_set and observed_set != expected_set:
         raise ValueError(
             f"incomplete manifest: {len(expected_set - observed_set)} missing sidecars"
         )
-    if expected_tasks and run_contract_sha256 is not None:
+    if strict and not allow_partial and expected_tasks and run_contract_sha256 is not None:
         validate_design_rows(
             rows,
             expected_action_ids=sorted({task["action_id"] for task in expected_tasks}),
@@ -3115,13 +4809,16 @@ def run_generation_locked(
         "prompts_sha256": observed_prompts_sha256,
         "actions_yaml": os.path.abspath(args.actions) if args.actions else None,
         "actions_sha256": observed_actions_sha256,
-        "runtime_provenance": runtime_provenance(),
+        "runtime_provenance": runtime_provenance(
+            action_config.get("_validated_environment_lock")
+        ),
         **stage_settings,
     }
     action_schema = action_config.get("schema") if args.actions else None
     trajectory_registered = action_schema in TRAJECTORY_SCHEMAS
     scheduler_baseline_registered = action_schema == "scheduler_baselines_v1"
     cfg_baseline_registered = action_schema == CFG_BASELINE_SCHEMA
+    structural_control_registered = action_schema == STRUCTURAL_CONTROL_SCHEMA
     # The normalized mapping is the capability contract. This keeps a future
     # native protocol strict even before it receives a dedicated frozen schema.
     native_renderer_registered = has_scheduler_native_renderer(actions)
@@ -3161,15 +4858,49 @@ def run_generation_locked(
         # a distinct name so an audit can retain both the executable and frozen
         # template identities without overloading the S7 contract field.
         cfg["native_renderer_executable_actions_sha256"] = observed_actions_sha256
+    if structural_control_registered:
+        authorization = action_config.get("authorization")
+        implementation_source = action_config.get("implementation_source")
+        analysis_implementation = action_config.get("analysis_implementation")
+        if not isinstance(authorization, dict) or not isinstance(
+            implementation_source, dict
+        ) or not isinstance(analysis_implementation, dict):
+            ap.error("structural-control authorization/source metadata is missing")
+        cfg["structural_control_authorization"] = copy.deepcopy(authorization)
+        cfg["structural_control_registration_schema"] = (
+            STRUCTURAL_CONTROL_REGISTRATION_SCHEMA
+        )
+        cfg["structural_control_source_template"] = authorization.get(
+            "source_template"
+        )
+        cfg["structural_control_source_template_sha256"] = authorization.get(
+            "source_template_sha256"
+        )
+        cfg["structural_control_implementation_source"] = copy.deepcopy(
+            implementation_source
+        )
+        cfg["structural_control_analysis_implementation"] = copy.deepcopy(
+            analysis_implementation
+        )
+        cfg["structural_control_executable_actions_sha256"] = (
+            observed_actions_sha256
+        )
+        cfg["structural_control_failure_policy"] = action_config.get(
+            "failure_policy"
+        )
+        cfg.update(structural_control_evidence_scope(args.split_role))
     cfg["action_schema"] = action_schema
     cfg["trajectory_registered"] = trajectory_registered
     cfg["scheduler_baseline_registered"] = scheduler_baseline_registered
     cfg["cfg_baseline_registered"] = cfg_baseline_registered
     cfg["native_renderer_registered"] = native_renderer_registered
+    cfg["structural_control_registered"] = structural_control_registered
     # A scheduler-native run is not auditable unless its scoring provenance is
     # registered independently.  The executable scoring config may provide the
     # expected payload/hash; the frozen registration files intentionally do not.
-    cfg["scorer_provenance_binding_required"] = native_renderer_registered
+    cfg["scorer_provenance_binding_required"] = bool(
+        native_renderer_registered or structural_control_registered
+    )
     for key in (
         "registered_scorer_provenance",
         "expected_scorer_provenance",
@@ -3188,21 +4919,26 @@ def run_generation_locked(
         or scheduler_baseline_registered
         or cfg_baseline_registered
         or native_renderer_registered
+        or structural_control_registered
         else {}
     )
     cfg["model_revision"] = (
         cfg["registered_sampling"].get("model_revision")
-        if cfg_baseline_registered or native_renderer_registered
+        if cfg_baseline_registered
+        or native_renderer_registered
+        or structural_control_registered
         else None
     )
     cfg["guidance_rescale"] = (
         float(cfg["registered_sampling"]["guidance_rescale"])
-        if cfg_baseline_registered or native_renderer_registered
+        if cfg_baseline_registered
+        or native_renderer_registered
+        or structural_control_registered
         else 0.0
     )
     cfg["scheduler_runtime"] = (
         dict(action_config.get("scheduler_runtime") or {})
-        if cfg_baseline_registered
+        if cfg_baseline_registered or structural_control_registered
         else None
     )
     cfg["run_contract"] = generation_contract(
@@ -3216,12 +4952,7 @@ def run_generation_locked(
     # Native renderer and other registered runs require strict sidecar/contract
     # validation on resume. Existing legacy LR-1 sweeps retain their original
     # PNG+JSON completion semantics.
-    registered_run = (
-        trajectory_registered
-        or scheduler_baseline_registered
-        or cfg_baseline_registered
-        or native_renderer_registered
-    )
+    registered_run = strict_registered_run(cfg)
     resume_contract_sha256 = cfg["run_contract_sha256"] if registered_run else None
 
     tasks = build_tasks(prompts, seeds, actions, legacy_scale_ids)
@@ -3262,6 +4993,26 @@ def run_generation_locked(
                         "existing native renderer authorization metadata differs "
                         f"for {key!r}; use a new output directory"
                     )
+        if structural_control_registered:
+            structural_metadata_keys = (
+                "structural_control_registered",
+                "structural_control_registration_schema",
+                "structural_control_authorization",
+                "structural_control_source_template",
+                "structural_control_source_template_sha256",
+                "structural_control_implementation_source",
+                "structural_control_analysis_implementation",
+                "structural_control_executable_actions_sha256",
+                "structural_control_failure_policy",
+                "scorer_provenance_binding_required",
+                "scoring",
+            )
+            for key in structural_metadata_keys:
+                if previous_config.get(key) != cfg.get(key):
+                    ap.error(
+                        "existing structural-control authorization metadata differs "
+                        f"for {key!r}; use a new output directory"
+                    )
     elif (
         registered_run
         and not os.path.exists(config_path)
@@ -3270,11 +5021,14 @@ def run_generation_locked(
         ap.error(
             "registered artifacts exist without config.json; use a new output directory"
         )
+    cfg["devices"] = list(devices)
+    structural_config = cfg if structural_control_registered else None
     device_tasks = assign_tasks_to_devices(
         tasks,
         devices,
         img_dir,
         run_contract_sha256=resume_contract_sha256,
+        structural_config=structural_config,
     )
     # Assignment freezes each action's deterministic execution rank. Compute
     # completion only after that field exists so registered resumes reject a
@@ -3283,7 +5037,10 @@ def run_generation_locked(
         task
         for task in tasks
         if not task_is_complete(
-            task, img_dir, run_contract_sha256=resume_contract_sha256
+            task,
+            img_dir,
+            run_contract_sha256=resume_contract_sha256,
+            structural_config=structural_config,
         )
     ]
     worker_count = len(device_tasks)
@@ -3303,6 +5060,7 @@ def run_generation_locked(
         tmp.set_start_method("spawn", force=True)
         manager = tmp.Manager()
         error_queue = manager.Queue()
+        abort_event = manager.Event() if structural_control_registered else None
         active_devices = list(device_tasks)
         task_queues = [manager.Queue() for _ in active_devices]
         for device, task_queue in zip(active_devices, task_queues):
@@ -3311,8 +5069,8 @@ def run_generation_locked(
         procs = []
         for device, task_queue in zip(active_devices, task_queues):
             process = tmp.Process(
-                target=worker_process,
-                args=(cfg, device, task_queue, error_queue),
+                target=worker_process_entry,
+                args=(cfg, device, task_queue, error_queue, abort_event),
             )
             process.start()
             procs.append((device, process))
@@ -3337,6 +5095,8 @@ def run_generation_locked(
                 expected_tasks=tasks,
                 run_contract_sha256=resume_contract_sha256,
                 strict=registered_run,
+                allow_partial=True,
+                structural_config=structural_config,
             )
             examples = ", ".join(task_id for task_id, _ in task_failures[:5])
             raise RuntimeError(
@@ -3351,6 +5111,7 @@ def run_generation_locked(
         expected_tasks=tasks,
         run_contract_sha256=resume_contract_sha256,
         strict=registered_run,
+        structural_config=structural_config,
     )
     print(
         f"manifest.jsonl written with {completed} records -> "
@@ -3371,10 +5132,29 @@ def prepare_generation_locked(ap, args, stage_settings: dict, seeds: list[int]) 
         try:
             with open(args.actions) as action_handle:
                 action_config = yaml.safe_load(action_handle) or {}
+            action_config["_validated_environment_lock"] = (
+                validate_registered_environment_lock(action_config)
+            )
             validate_scheduler_baseline_authorization(args.actions)
             validate_cfg_baseline_authorization(args.actions)
             validate_native_renderer_authorization(args.actions)
+            validate_structural_control_authorization(args.actions)
             validate_split_seed_role(args.actions, args.split_role, seeds)
+            validate_structural_control_design(
+                args.actions,
+                prompts_path=args.prompts,
+                actions=actions,
+                seeds=seeds,
+                model_name=args.model_name,
+                resolution=args.resolution,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                negative_prompt=args.negative_prompt,
+                power_calibrate=args.power_calibrate,
+                stage2_enabled=args.stage2,
+                split_role=args.split_role,
+                low_vram=args.low_vram,
+            )
             validate_cfg_baseline_design(
                 args.actions,
                 prompts_path=args.prompts,

@@ -8,11 +8,22 @@ mutating UNet state between rollouts.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
-from typing import Iterable, Protocol, Sequence, Tuple, Union
+from typing import Iterable, Iterator, Protocol, Sequence, Tuple, Union
 
 import torch
+
+
+DIFFUSERS_FREEU_IMPLEMENTATION = "diffusers_constant_v1"
+PAPER_FREEU_IMPLEMENTATION = "paper_adaptive_3676d36"
+FREEU_IMPLEMENTATIONS = frozenset(
+    {DIFFUSERS_FREEU_IMPLEMENTATION, PAPER_FREEU_IMPLEMENTATION}
+)
+PAPER_FREEU_SOURCE_COMMIT = "3676d3652a44101f9cca030c33f82756dab249d7"
+PAPER_FREEU_SDXL_PARAMETERS = (0.9, 0.2, 1.3, 1.4)
+PAPER_FREEU_PORT_DIFFUSERS_VERSION = "0.32.1"
 
 
 class _FreeUModel(Protocol):
@@ -144,6 +155,153 @@ class FreeUSchedule:
                 for knot in self._knots
             ]
         }
+
+
+def apply_paper_freeu(
+    resolution_idx: int,
+    hidden_states: torch.Tensor,
+    res_hidden_states: torch.Tensor,
+    **freeu_kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply the spatially adaptive FreeU transform from the paper code.
+
+    The author's README normalizes the channel-mean backbone activation over
+    space before scaling the first half of the channels. Diffusers and the
+    author's runnable demo instead use a constant multiplier. The zero-range
+    branch below is the only numerical safeguard added to the published
+    formula; it leaves a spatially constant backbone unchanged.
+    """
+
+    if hidden_states.ndim != 4 or res_hidden_states.ndim != 4:
+        raise ValueError("paper FreeU requires NCHW backbone and skip tensors")
+    if hidden_states.shape[0] != res_hidden_states.shape[0]:
+        raise ValueError("paper FreeU backbone and skip batch sizes must match")
+    hidden_channels = int(hidden_states.shape[1])
+    if hidden_channels == 1280:
+        suffix = "1"
+    elif hidden_channels == 640:
+        suffix = "2"
+    else:
+        return hidden_states, res_hidden_states
+    backbone_scale = float(freeu_kwargs[f"b{suffix}"])
+    skip_scale = float(freeu_kwargs[f"s{suffix}"])
+    if not math.isfinite(backbone_scale) or not math.isfinite(skip_scale):
+        raise ValueError("paper FreeU scales must be finite")
+
+    spatial_mean = hidden_states.mean(dim=1, keepdim=True)
+    flat_mean = spatial_mean.flatten(1)
+    spatial_min = flat_mean.amin(dim=1).reshape(-1, 1, 1, 1)
+    spatial_max = flat_mean.amax(dim=1).reshape(-1, 1, 1, 1)
+    spatial_range = spatial_max - spatial_min
+    safe_range = torch.where(
+        spatial_range > 0,
+        spatial_range,
+        torch.ones_like(spatial_range),
+    )
+    normalized = (spatial_mean - spatial_min) / safe_range
+    modulation = 1.0 + (backbone_scale - 1.0) * normalized
+    half_channels = int(hidden_states.shape[1]) // 2
+    if half_channels:
+        hidden_states = torch.cat(
+            (
+                hidden_states[:, :half_channels] * modulation,
+                hidden_states[:, half_channels:],
+            ),
+            dim=1,
+        )
+
+    try:
+        from diffusers.utils.torch_utils import fourier_filter
+    except ImportError as exc:  # pragma: no cover - diffusers is a runtime dependency
+        raise RuntimeError("paper FreeU requires diffusers' Fourier filter") from exc
+    res_hidden_states = fourier_filter(
+        res_hidden_states, threshold=1, scale=skip_scale
+    )
+    return hidden_states, res_hidden_states
+
+
+@contextmanager
+def installed_freeu_implementation(implementation: str) -> Iterator[dict]:
+    """Install and count one process-local FreeU tensor operator."""
+
+    implementation = str(implementation)
+    if implementation not in FREEU_IMPLEMENTATIONS:
+        raise ValueError(
+            f"unsupported FreeU implementation {implementation!r}; "
+            f"choose one of {sorted(FREEU_IMPLEMENTATIONS)}"
+        )
+    try:
+        import diffusers
+        from diffusers.models.unets import unet_2d_blocks
+    except ImportError as exc:  # pragma: no cover - diffusers is a runtime dependency
+        raise RuntimeError("FreeU requires diffusers' 2D U-Net blocks") from exc
+    runtime_version = str(getattr(diffusers, "__version__", "unknown"))
+    if (
+        implementation == PAPER_FREEU_IMPLEMENTATION
+        and runtime_version != PAPER_FREEU_PORT_DIFFUSERS_VERSION
+    ):
+        raise RuntimeError(
+            "paper FreeU operator port requires diffusers "
+            f"{PAPER_FREEU_PORT_DIFFUSERS_VERSION}, got {runtime_version}"
+        )
+    original = unet_2d_blocks.apply_freeu
+    target = (
+        apply_paper_freeu
+        if implementation == PAPER_FREEU_IMPLEMENTATION
+        else original
+    )
+    runtime = {
+        "implementation": implementation,
+        "operator_calls_total": 0,
+        "resolution_idx_call_counts": {},
+        "hidden_channel_call_counts": {},
+        "resolution_channel_call_counts": {},
+        "operator_effect_call_counts": {},
+    }
+
+    def counted_apply_freeu(
+        resolution_idx: int,
+        hidden_states: torch.Tensor,
+        res_hidden_states: torch.Tensor,
+        **freeu_kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = str(int(resolution_idx))
+        runtime["operator_calls_total"] += 1
+        counts = runtime["resolution_idx_call_counts"]
+        counts[key] = counts.get(key, 0) + 1
+        hidden_channels = int(hidden_states.shape[1])
+        channel_key = str(hidden_channels)
+        channel_counts = runtime["hidden_channel_call_counts"]
+        channel_counts[channel_key] = channel_counts.get(channel_key, 0) + 1
+        joint_key = f"{key}:{hidden_channels}"
+        joint_counts = runtime["resolution_channel_call_counts"]
+        joint_counts[joint_key] = joint_counts.get(joint_key, 0) + 1
+        if implementation == PAPER_FREEU_IMPLEMENTATION:
+            effect = (
+                "b1_s1"
+                if hidden_channels == 1280
+                else "b2_s2"
+                if hidden_channels == 640
+                else "no_op"
+            )
+        else:
+            effect = "b1_s1" if int(resolution_idx) == 0 else (
+                "b2_s2" if int(resolution_idx) == 1 else "no_op"
+            )
+        effect_counts = runtime["operator_effect_call_counts"]
+        effect_counts[effect] = effect_counts.get(effect, 0) + 1
+        return target(
+            resolution_idx,
+            hidden_states,
+            res_hidden_states,
+            **freeu_kwargs,
+        )
+
+    unet_2d_blocks.apply_freeu = counted_apply_freeu
+    try:
+        yield runtime
+    finally:
+        unet_2d_blocks.apply_freeu = original
 
 
 def match_channel_moments(candidate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:

@@ -270,7 +270,11 @@ step 前重建原生 prediction，不能用上面的单位增益公式表达 cle
 
 必须包含这些对照：no-AG、论文版 expert、raw noisy-latent TFSA、plain predicted-clean TFSA、predicted-clean reciprocal latent affinity、reciprocal semantic affinity，以及把同一个 semantic graph 的行列一起打乱后再应用的版本。这个 permutation 保留 graph 的数值和计算量，但破坏它与空间位置的对应关系。
 
-还要加入 CFG-only 5.0、官方 PLADIS（`alpha=1.5`、scale `2.0`）和官方 GAG（`lambda=10`、`eta=15`、`zeta=0`）。按论文登记方式，PLADIS/GAG 使用 CFG 5.0；所有 RepLDM 对照保持 CFG 7.5。必须报告 NFE、wall time 和 GPU 峰值显存。
+当时还登记了 CFG-only 5.0，以及被命名为 `pladis_official` 和
+`gag_official` 的独立实现。按论文参数登记，二者使用 CFG 5.0；所有 RepLDM
+对照保持 CFG 7.5。后续 provenance 审计证明这两个 ID 不能支持“官方代码复现”
+表述，精确边界见 `BASELINE_PROVENANCE.md`。必须报告 NFE、wall time 和 GPU
+峰值显存。
 
 ## S5：冒烟测试和工程门槛
 
@@ -321,6 +325,12 @@ shows no stable
 counting, position, text, or detail correction. The semantic and permuted
 graphs are statistically indistinguishable at the required scale, so the
 development run does not establish a causal spatial-graph benefit.
+
+后验的 baseline provenance 审计不改变 S5 主方法相对 no-AG 的零结果，但缩小
+了可引用范围：历史 PLADIS action 修改了所有 `attn2` 并在 FP32 计算概率，而上游
+SDXL 默认只用 `[up, down]` 且沿用 query dtype；历史 GAG action 是 Eq.12/13 的
+独立 paper-derived 实现，作者没有可核实的公开代码。它们的分数只能保留为已固定
+实现的对照，不能再写成官方 baseline 的端到端结果。
 
 Per the preregistration, S5 is closed as an Attention Guidance extension: do
 not search another angle, top-k, layer, schedule, reward, or controller, and do
@@ -429,7 +439,8 @@ headroom; this null result is retained as the complete negative control.
 ## S6：FreeU 结构干预与 feature-moment 对照（失败）
 
 S5 与 LR-1 都没有提供可用的固定更新方向，因此本轮换用 U-Net 的天然
-backbone/skip 结构。FreeU 是已有方法，这里只把它作为强结构 baseline，并检验
+backbone/skip 结构。这里实际运行的是 diffusers constant-gain FreeU surrogate，
+而不是作者 README 的 spatially adaptive 公式；它只作为结构 baseline，并检验
 它是否能在不改变 RepLDM 冻结轨迹原则的前提下提供期刊扩展的软连接。动机还来自
 2502.14831 对 latent 高频成分的分析和 2502.09509 对 latent 变换一致性的讨论；
 两篇工作训练 autoencoder，不等于可以直接在 SDXL 推理时低通 latent。
@@ -451,7 +462,9 @@ clipping `-0.000042`，saturation `-0.000032`。因此去掉全局增强捷径�
 headroom。一个更激进的“每步 latent 投影回上一步矩统计”在 smoke 中生成全黑/无效
 图像，已淘汰，未进入评分。
 
-S6 关闭 FreeU scale/window 搜索、蒸馏和 RL。下一轮若继续，必须更换更新来源，先
+S6 关闭这个 diffusers FreeU surrogate 的 scale/window 搜索、蒸馏和 RL。它不
+等价于否定作者 README 的 adaptive operator；后者必须作为新固定对照独立运行，
+不能借用 S6 分数。下一轮若继续，必须更换更新来源，先
 用固定动作验证 scheduler-consistent 的 equivariance 或低频一致性残差；不能把
 FreeU 的代理指标提升包装成方法结果。
 
@@ -536,3 +549,24 @@ seeds 的约束已失效；新方法必须冻结一组全新、未参与任何 s
 只调用一次 `scheduler.step`，记录全部 50 步的 gain/applied ratio/moment diagnostics，
 并对 DPM multistep fail closed。零 renderer 必须逐位复现 baseline。完成这些门槛、
 冻结 fresh prompts/seeds 与 scorer/checkpoint provenance 之前，不允许质量搜索或 RL。
+
+## Scheduler-native fixed headroom：开发集失败，RL 继续关闭
+
+冻结运行 `outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2`
+完成 `792/792` 个生成和评分，结果盲审计与一次性 evaluator 均通过。四个 primary
+action 相对 no-op 的 TOPIQ-NR 均值为 low `-0.001154`、mid `+0.004027`、high
+`-0.004024`、Laplacian `-0.002463`。mid 的 95% CI 为
+`[+0.002120,+0.005830]`，其 zero-null 检验经 Holm 校正显著，但点估计未达到冻结的
+`+0.005` screen，且 clipped-fraction interval guard 失败。最终决策为
+`null_route`，不得围绕 mid band 进行事后幅度、符号或 schedule 搜索。
+
+该结果只关闭已测试的四个固定正向 `+0.02` action 及其直接蒸馏/RL 路线，不否定
+未测试的表示学习。下一步先做同开发 split 上的结果盲结构 baseline calibration：
+no-op、CFG 5、会议 TFSA、三种 matched FreeU、PLADIS operator port 和 GAG Eq.12/13
+重实现。其 registration 不能执行；只有独立审稿人审核源码、环境锁、调用 topology
+和分析契约后，才可签发 executable YAML。该 calibration 不论结果如何都不能选择
+期刊方法或授权 RL。最终 executable 同时冻结一个 engineering-only profile：11
+个既有 smoke prompts x seed `1798464083` x 同一 8 actions = `88` 个 1024²/50-step
+任务，不评分；只有 runtime ledger 完整且每个 block 的 8 张 PNG 全异，才可启动
+正式 `792` 个任务。worker 首错会通过共享信号停止其他 worker，保留 partial manifest
+供修复后续跑。

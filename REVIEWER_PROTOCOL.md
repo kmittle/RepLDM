@@ -68,14 +68,18 @@ This matrix is a rejection-risk screen, not a related-work conclusion. It must b
 
 ## FreeU Structural Baseline Amendment
 
-FreeU is registered only as an established structural baseline. A development
+The completed S6 arm used diffusers' constant-gain FreeU surrogate, not the
+spatially adaptive formula in the author's README. It is registered only as an
+established structural baseline. A development
 signal is invalid if it is accompanied by the registered clipping (`+0.001`) or
 saturation (`+0.005`) guard violations. A feature-moment variant may be used to
 separate structural redistribution from amplitude changes, but it cannot be
 selected from the same scores for a confirmation claim. The completed S6 runs
 showed ordinary FreeU TOPIQ `+0.008447` with clipping `+0.006656` and saturation
 `+0.018090`; the moment-preserving version showed TOPIQ `+0.000609` with both
-guards near zero. This closes the FreeU action family and does not authorize RL.
+guards near zero. This closes the tested surrogate action family and does not
+authorize RL; it does not constitute evidence against the untested adaptive
+paper operator.
 
 ## Baseline Ladder
 

@@ -79,7 +79,7 @@ The frozen files and hashes are:
 - `eval-pipeline/configs/scheduler_native_fixed_headroom_actions_v1.yaml`:
   `9b64c5773b6b4494507036b677193d1e596665ce92393434802a9e01c01f3393`
 - `eval-pipeline/configs/scheduler_native_fixed_headroom_evaluation_v1.yaml`:
-  `307d4ccbd28f2fdbeb8f8b10318ca225c6dc9fb12ea6059da98a08e62e4ea6c3`
+  `5a1cb85e7ea30deef89bd0ae353bba2ac380dc12ad78b8138a22299e5ad55f80`
 
 The immutable registration remains fail-closed. The distinct executable copy,
 `scheduler_native_fixed_headroom_actions_v1.yaml`, was independently reviewed
@@ -120,3 +120,23 @@ large or diverse enough for a TPAMI-level broad efficacy claim. Such a claim
 still requires larger external prompt suites, multiple training seeds and model
 settings, strong same-NFE baselines, randomized blinded human evaluation, and
 complete runtime, VRAM, failure, and compute reporting.
+
+## Completed Development Result
+
+The authorized run
+`outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2`
+completed `792/792` generations and strict score rows. The result-blind audit
+passed without warnings, and the one-shot evaluator returned `decision=null_route`.
+Relative to no-op, primary TOPIQ-NR deltas were `-0.001154` for spectral-low,
+`+0.004027` for spectral-mid, `-0.004024` for spectral-high, and `-0.002463`
+for Laplacian. Spectral-mid had a positive interval and passed its Holm-adjusted
+zero-null test, but missed the preregistered `+0.005` point screen and failed the
+clipped-fraction interval guard. It is descriptive evidence, not a winner, and
+must not be tuned post hoc.
+
+The sealed config, manifest, scores, audit, evaluation JSON, and evaluation CSV
+SHA-256 values are respectively
+`4566993c...bf1de`, `badab464...af319`, `f6ab5f08...c7acb`,
+`c8d2dedf...462a4`, `890f7906...fe9e`, and `dadcf5b5...1c90`.
+No validation, distillation, method selection, learned renderer, or RL run is
+authorized by this result.
