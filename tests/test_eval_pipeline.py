@@ -1188,6 +1188,117 @@ class EvalPipelineTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_actions.validate_pairing(frame)
 
+    @staticmethod
+    def _complete_comparison_frame():
+        return pd.DataFrame(
+            [
+                {
+                    "id": f"p{prompt}_s{seed}_a{action}",
+                    "prompt_index": prompt,
+                    "seed": seed,
+                    "action_id": action,
+                    "device": "cuda:0",
+                    "quality": float(prompt + seed + (action == "candidate")),
+                }
+                for prompt in (0, 1)
+                for seed in (7, 9)
+                for action in ("baseline", "candidate")
+            ]
+        )
+
+    def test_compare_requires_complete_registered_grid(self):
+        result = compare_actions.compare(
+            self._complete_comparison_frame(),
+            "baseline",
+            ["quality"],
+            n_boot=20,
+            n_random=20,
+            expected_prompt_indices=[0, 1],
+            expected_seeds=[7, 9],
+            expected_actions=["baseline", "candidate"],
+        )
+        self.assertEqual(result.loc[0, "n_prompts"], 2)
+        self.assertEqual(result.loc[0, "n_seeds"], 2)
+        self.assertEqual(result.loc[0, "n_pairs"], 4)
+        self.assertEqual(result.loc[0, "mean_delta"], 1.0)
+
+    def test_compare_rejects_duplicate_missing_extra_and_nonfinite_cells(self):
+        complete = self._complete_comparison_frame()
+        cases = {
+            "duplicate": pd.concat([complete, complete.iloc[[0]]], ignore_index=True),
+            "missing": complete[complete["prompt_index"] != 1],
+            "extra": pd.concat(
+                [
+                    complete,
+                    pd.DataFrame(
+                        [
+                            {
+                                "id": "extra",
+                                "prompt_index": 2,
+                                "seed": 7,
+                                "action_id": "baseline",
+                                "device": "cuda:0",
+                                "quality": 0.0,
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            ),
+            "nonfinite": complete.assign(
+                quality=lambda frame: frame["quality"].mask(frame.index == 0, np.nan)
+            ),
+        }
+        for label, frame in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                compare_actions.compare(
+                    frame,
+                    "baseline",
+                    ["quality"],
+                    n_boot=20,
+                    n_random=20,
+                    expected_prompt_indices=[0, 1],
+                    expected_seeds=[7, 9],
+                    expected_actions=["baseline", "candidate"],
+                )
+
+    def test_score_ids_must_exactly_match_manifest_before_merge(self):
+        manifest = pd.DataFrame(
+            [{"id": "a", "prompt_index": 0}, {"id": "b", "prompt_index": 1}]
+        )
+        complete = pd.DataFrame([{"id": "a", "score": 1.0}, {"id": "b", "score": 2.0}])
+        merged = compare_actions.merge_manifest_scores(manifest, complete)
+        self.assertEqual(list(merged["id"]), ["a", "b"])
+
+        invalid = {
+            "missing": complete.iloc[[0]],
+            "extra": pd.concat(
+                [complete, pd.DataFrame([{"id": "c", "score": 3.0}])],
+                ignore_index=True,
+            ),
+            "duplicate": pd.concat([complete, complete.iloc[[0]]], ignore_index=True),
+        }
+        for label, scores in invalid.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                compare_actions.merge_manifest_scores(manifest, scores)
+
+    def test_expected_grid_is_loaded_from_run_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prompts = root / "prompts.csv"
+            prompts.write_text("index,TEXT\n0,first\n1,second\n")
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "prompts_csv": str(prompts),
+                        "seeds": [7, 9],
+                        "actions": [{"id": "baseline"}, {"id": "candidate"}],
+                    }
+                )
+            )
+            grid = compare_actions.load_expected_grid(str(root))
+        self.assertEqual(grid, ([0, 1], [7, 9], ["baseline", "candidate"]))
+
     def test_action_execution_order_is_deterministic(self):
         prompts = pd.DataFrame([{"index": 3, "TEXT": "test"}])
         actions = generate.scale_actions([0.0, 0.001, 0.002, 0.004])
