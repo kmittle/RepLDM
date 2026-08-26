@@ -40,7 +40,8 @@ grid define three D4-complete offset orbits:
 \]
 
 Only in-bounds neighbours are present; indexing never wraps. Let
-`epsilon_h=epsilon_a=1e-6`. A pooled feature-vector norm at or below
+`epsilon_h=1e-6`, `epsilon_z=1e-6`, and `epsilon_a=1e-6` be independently
+registered constants. A pooled feature-vector norm at or below
 `epsilon_h` is undefined and fails the record; it is never silently treated as
 cosine zero. For node `i` and valid neighbour `j` in orbit `o`, define
 
@@ -96,7 +97,7 @@ post-intervention trajectory with common initial noise.
 The primary logical bank is `{P0, +/-a1, +/-d1, +/-a2}`. Its seven members are
 no-op and the six signed geodesics above. The seven-member random bank is
 `{R0, +/-r_a1, +/-r_d1, +/-r_a2}`. `R0` is the same generated record as `P0`,
-so the complete matrix has 13 unique executions, not two knowingly identical
+so the primary matrix has 13 unique executions, not two knowingly identical
 no-ops. Each `r_o` uses the same orbit, 16x16 grid, pooling, bilinear
 upsampling, tangent projection, and geodesic as `P`, but replaces feature
 cosine by a counter-keyed symmetric random edge affinity fixed before outcomes.
@@ -127,6 +128,32 @@ same graph. No process RNG or floating-point hash conversion is permitted.
 Repeated `k` or `U` values are valid; uniqueness is required only for counter
 tuples and the registered prompt/seed namespaces.
 
+Two nested controls test whether any gain is specific to the hooked feature
+relations. They are not independently searched action banks. The **uniform**
+control sets every in-bounds affinity in the selected orbit to
+\(a^{u,o}_{ij}=1\). The **predicted-clean** control uses
+\(z=D_{16}(\hat x_{0,t})\), fails when any token norm is at or below
+`epsilon_z`, and sets
+
+\[
+a^{x,o}_{ij}=\epsilon_a+
+\frac{1+\operatorname{clip}(\cos(z_i,z_j),-1,1)}{2}.
+\]
+
+For each held OOF block, the structural selector chooses `P0` or one signed
+orbit without using that block's outcomes. A masked freezer writes this choice
+and the operator/config `P/U/X` hashes to the decision ledger before either new
+control is generated. Those hashes exclude PNG, sidecar, and score artifacts.
+For an active choice, `U` and `X` rerun separate complete trajectories with the
+identical orbit, sign, initial noise, geodesic, ratio, and guards; each
+recomputes its own graph and scheduler state at every step. For `P0`, all three
+reuse the one no-op record but the audit emits logical `U/X` rows with
+`P-U=P-X=0`. Every block remains in the intention-to-treat estimand; active-only
+analysis is forbidden. For `N` blocks and `N_active` active choices, search
+therefore executes exactly `13N + 2N_active` trajectories, not 25 full banks.
+The predicted-clean control uses the model's current \(\hat x_0\), not a ground-
+truth VAE latent, future state, decoded image, or SPARE reproduction.
+
 The causal 2x2 crosses **descriptor source** with **injection basis**:
 
 | | Relational injection | Norm-matched random injection |
@@ -138,7 +165,8 @@ These are four active selectors, not a descriptor-only no-op. A fixed
 context-free selector, described below, is an additional control. The primary
 interaction is
 \(I=[S_{rel}-P_{rel}]-[S_{rnd}-P_{rnd}]\); it must be positive with a
-simultaneous interval above zero.
+frozen selection bound at search and a confirmatory simultaneous interval above
+zero at replay.
 
 ## Fresh Data and Outcome Isolation
 
@@ -163,13 +191,15 @@ sealed until a distilled checkpoint and its analysis are frozen.
 
 ## Oracle, Selector, and Controls
 
-The search split renders the complete paired 13-action matrix. Feasibility has
+The search split first renders the complete paired 13-action primary matrix.
+Feasibility has
 three non-interchangeable levels. A **record** is valid only when its image,
 hook, scheduler, moment, cap, and call ledgers pass. Within each training fold,
 an **action** is eligible only when aggregate HPSv2, CLIP, pixel, and diversity
-guards computed from that fold pass. A **selector** is acceptable only when its
-OOF or replay outputs pass the full simultaneous inference guards. Collection-
-level guards are never used as per-record ridge labels. For valid records, the
+guards computed from that fold pass. A **selector** advances from search only
+when its frozen OOF selection guards pass and is confirmatory only when replay
+passes the simultaneous inference guards. Collection-level guards are never
+used as per-record ridge labels. For valid records, the
 frozen utility is the minimum of the two margin-standardized co-primary deltas;
 no-op has utility zero. Scales, missing-record behavior, and tie order are
 frozen in the power artifact.
@@ -194,15 +224,30 @@ coefficients, tie-breaking, and action choice are selected or fitted only in
 `T_{k,s}` before evaluation on the held fold. This applies to best global,
 intercept-only/context-free ridge, prompt-only ridge, fixed within-challenge
 shuffled structural descriptors, and equal-outcome-query-budget random search
-with a preregistered counter RNG. OOF must first beat the cross-fitted global
-action on both co-primary endpoints and pass its selector-level guards. Only
-then may each complete procedure refit on all search data; the chosen
-preprocessing, penalty, tie rule, eligible-action rule, and one deterministic
-ridge per action are serialized and hash-frozen for replay. Query counts,
-failed queries, candidate exposure, and failure accounting must match. Training
-has a common preregistered compute ceiling rather than artificial numerical
-equality; actual fit time, FLOPs, and peak memory are reported. No control may
-query replay outcomes.
+with a preregistered counter RNG.
+
+After primary scoring, the independent masked freezer receives, for each
+`(k,s)`, only `T_{k,s}` scores, held pre-outcome descriptors, and reviewed
+operator/config hashes. It cannot read held PNGs, sidecars, or scores. It seals
+all OOF choices and logical `P0` rows before the preliminary evaluator runs.
+Only then may that evaluator read held primary outcomes; it emits only an
+authorization or terminal bit bound to the existing ledger hash and releases
+no metric. The generator can read only that bit, the ledger, and generation
+inputs, never any score file. If authorized, it generates the frozen nested
+`U/X` trajectories above.
+
+Search OOF is a development selection and futility gate, not confirmatory
+inference. Its primary, interaction, `P-U`, and `P-X` intervals are selection
+statistics with no advertised coverage or paper efficacy claim. A full search
+pass permits refitting for replay, but every preprocessing statistic, penalty,
+eligibility decision, coefficient, tie rule, and action choice in that refit
+may read only the original 13-action primary matrix. `U/X` scores are isolated
+inputs to the independent gate evaluator and never train or alter a procedure.
+The refitted procedures are serialized and hash-frozen for replay. Query
+counts, failed queries, candidate exposure, and failure accounting must match.
+Training has a common preregistered compute ceiling rather than artificial
+numerical equality; actual fit time, FLOPs, and peak memory are reported. No
+control may query replay outcomes.
 
 ## Endpoints, Guards, and Inference
 
@@ -212,9 +257,11 @@ evaluator. For the full structural-relational selector, co-primary endpoints
 are (1) TOPIQ-NR delta versus no-op, requiring at least `+0.005`, and (2) an
 equal-category macro of OCR exact/normalized accuracy, exact counting accuracy,
 and spatial-relation accuracy. The frozen power artifact also sets nonzero
-adaptivity margins versus best global for both endpoints. Their simultaneous
-95% lower bounds, and the 2x2 interaction bounds, must exceed the registered
-margins rather than merely zero.
+adaptivity margins versus best global for both endpoints. At confirmatory
+replay, their simultaneous 95% lower bounds, the 2x2 interaction bounds, and
+the intention-to-treat `P-U` and `P-X` bounds on both endpoints must exceed
+their power-registered nonzero margins rather than merely zero. Identically
+computed search bounds are selection diagnostics only.
 
 Against both no-op and best global, HPSv2 and CLIP lower bounds must be at least
 `-0.005`. Pixel guards retain clipped-fraction `+0.001`, saturation `+0.005`,
@@ -232,23 +279,30 @@ preference metrics cannot substitute for the structural macro.
 The statistical unit is the prompt after averaging its registered seeds.
 Crossed prompt/seed bootstrap intervals use 10,000 fixed-seed resamples; prompt-
 level paired sign flips use 100,000 draws (or exact enumeration when smaller).
-Max-T gives simultaneous intervals across action/selector contrasts, and Holm
-controls the preregistered endpoint families at FWER 0.05. Challenge results are
-sensitivity analyses, not independent samples.
+For confirmatory replay, Max-T gives simultaneous intervals across all
+action/selector and `P-U/P-X` contrasts, and Holm controls the preregistered
+endpoint families at FWER 0.05. Search uses the same estimators only as a frozen
+selection rule. Challenge results are sensitivity analyses, not independent
+samples.
 
 Sample counts are not guessed here. A CPU simulator starts from candidate-blind
 historical no-op variance, then spans a preregistered conservative grid of
 treatment/no-op variance ratios, paired correlations, action heterogeneity,
-selector error, and all covariance terms needed for the difference-in-
-differences. It chooses the worst-case sample count by directly simulating the
-final max-T/Holm rejection rule. If these inputs cannot bound paired or
-interaction variance, an independently held, blinded `ao-variance-pilot-v1`
+selector error, selector no-op rates, and all covariance terms needed for the
+difference-in-differences and nested controls. For search it simulates the
+entire masked-freezer, preliminary authorization, conditional `U/X` generation,
+ITT-zero-row, and final futility rule to report selection operating
+characteristics without a Type-I or coverage claim. For replay it chooses the
+worst-case sample count by directly simulating the final max-T/Holm rejection
+rule. If these inputs cannot bound paired, interaction, or nested-control
+variance, an independently held, blinded `ao-variance-pilot-v1`
 may release only covariance and sample-size artifacts, never rankings; its
 prompts/seeds are retired and cannot train or select the method. For TOPIQ
 `0.005`, the reliability-calibrated structural effect, and registered
-adaptivity margins, search, replay, and test are powered separately for at
-least 90% joint efficacy power and 80% guard power. Inputs, sensitivity grid,
-simulation code, pilot firewall if used, chosen counts, and hashes form
+adaptivity margins, search selection and replay/test confirmation are powered
+separately for at least 90% joint pass probability and 80% guard power under
+their respective rules. Inputs, sensitivity grid, simulation code, pilot
+firewall if used, chosen counts, and hashes form
 `power_analysis.json`; infeasible power leaves the study blocked.
 
 ## One-Shot Artifacts and Sequential Gates
@@ -261,29 +315,40 @@ their SHA-256 values and the reviewed commit. Every run binds config, prompt,
 action, code, environment, model, scheduler, decision-ledger, PNG, sidecar, and
 strict-scorer hashes.
 
-1. **CPU gate:** synthetic affine-cosine constants, zero-feature fail-closed,
-   orbit/D4/no-wrap/row-sum, both-input-detach, antithetic norm parity,
+1. **CPU gate:** synthetic affine-cosine constants, zero-feature and zero-`z`
+   fail-closed, uniform/predicted-clean/random row sums, orbit/D4/no-wrap,
+   both-input-detach, antithetic norm parity,
    tangent/geodesic moments, bitwise no-op, native Euler round trip,
    trajectory-isolation, counter-tuple and namespace collision audit (not
    uniqueness of truncated random values), and power analysis must produce one
    warning-free `cpu_audit.json`.
 2. **Engineering gate:** only after independent authorization, run the 11 fresh
-   challenge smoke prompts x one retired-on-use seed x 13 unique actions at
-   1024, Euler, 50 steps. Scoring is forbidden. Require 143 PNG/sidecar pairs,
-   distinct active outputs, complete ledgers, bounds, and a warning-free
-   one-shot `engineering_audit.json`.
-3. **Formal search gate:** run the powered full matrix, strict offline scoring,
-   result-blind `search_run_audit.json`, then one-shot `search_evaluation.json`.
-   Incomplete cells, provenance/mechanism warnings, an absent seed-CV oracle
-   gap, OOF failure versus global, or a failed OOF interaction close this
-   family. An individual action's aggregate guard failure makes that action
-   ineligible under the frozen fold rule and is fully reported; it is not
-   silently converted into a family-wide failure or omitted after outcomes.
+   challenge smoke prompts x one retired-on-use seed x 13 primary actions plus
+   one pre-outcome, counter-cycled active `U/X` pair per prompt at 1024, Euler,
+   50 steps. The cycle covers all signed orbits. Scoring is forbidden. Require
+   165 PNG/sidecar pairs, distinct active outputs, complete ledgers, bounds, and
+   a warning-free one-shot `engineering_audit.json`.
+3. **Formal search gate:** run the powered 13-action primary matrix, strict
+   offline scoring, and result-blind `search_primary_audit.json`. The masked
+   freezer first seals every OOF choice from fold-permitted inputs. Only then
+   may an independent preliminary evaluator close the family or emit a ledger-
+   bound authorization bit; it releases no outcomes. Generate and strictly
+   score the selected controls, audit the complete ITT search, then run one
+   `search_selection.json` futility evaluator. Incomplete cells,
+   provenance/mechanism warnings, an absent seed-CV oracle gap, selection-rule
+   failure versus global, a failed interaction, or either failed `P-U/P-X`
+   selection contrast closes this family. None is confirmatory evidence. An
+   individual action's aggregate guard failure makes that action ineligible
+   under the frozen fold rule and is fully reported; it is not silently
+   converted into a family-wide failure or omitted after outcomes.
 4. **Outer replay gate:** freeze `selector_freeze.json` and its decision-ledger
    schema first; run only the frozen selectors and controls on powered replay
-   data. Audit before the independent one-shot evaluator. Both co-primaries,
-   the relational interaction, and all guards must pass versus best-global,
-   context-free, prompt-only, shuffled, random-bank, and equal-budget controls.
+   data, including separately generated `U/X` trajectories under the same
+   chosen signed orbit; `P0` contributes audited ITT zero rows. Audit before the
+   independent one-shot confirmatory evaluator. Both co-primaries, the
+   relational interaction, `P-U`, `P-X`, and all guards must pass versus best-
+   global, context-free, prompt-only, shuffled, random-bank, and equal-budget
+   controls under the registered simultaneous inference.
 5. **Authorization boundary:** a replay pass may emit only
    `search_then_distill_authorization.json` for supervised distillation of the
    frozen search teacher and one frozen test evaluation. It does not authorize
@@ -301,8 +366,11 @@ hypothesis starts a new namespace and registration.
 ## Missing Implementation Checklist
 
 - Exact conditional `up_blocks.0` hook, 16x16 reducer, orbit/transport operator,
-  random bank, moment geodesic, and native-Euler integration with diagnostics.
-- Trajectory-isolated 13-action generation and hash-chained pre-outcome choices.
+  uniform/predicted-clean/random controls, moment geodesic, and native-Euler
+  integration with diagnostics.
+- Trajectory-isolated 13-action generation, result-blind selected-control
+  freezer, and hash-chained choices blind to held outcomes and sealed before
+  `U/X` generation.
 - Fresh prompt/seed builder, historical collision scanner, and power simulator.
 - OOF ridge/oracle/equal-budget controls and the genuine 2x2 interaction.
 - Provenance-locked OCR, counting, spatial, spectral, equivariance, diversity,
