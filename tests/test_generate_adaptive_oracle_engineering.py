@@ -1,5 +1,6 @@
 import csv
 from contextlib import redirect_stderr
+import errno
 import hashlib
 import importlib.util
 import io
@@ -766,6 +767,400 @@ class PipelineStagingTest(unittest.TestCase):
                     self.assertIn("to:cuda:1", events)
 
 
+class DescriptorBoundPublicationTest(unittest.TestCase):
+    def test_fd_headroom_rejects_low_limit_before_publication(self):
+        with (
+            mock.patch.object(
+                generation.resource,
+                "getrlimit",
+                return_value=(256, 256),
+            ),
+            mock.patch.object(
+                generation,
+                "_open_descriptor_count",
+                return_value=10,
+            ),
+            self.assertRaisesRegex(RuntimeError, "free file descriptors"),
+        ):
+            generation._require_fd_headroom(300, "fixture workflow")
+
+    def test_exception_notes_have_a_python_39_compatible_fallback(self):
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        error = LegacyError("primary")
+        generation._add_exception_note(error, "secondary")
+        self.assertEqual(error.__notes__, ["secondary"])
+
+    def test_link_error_is_reconciled_when_held_inode_was_committed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            payload = b"committed-before-rpc-error\n"
+            real_link = generation._link_descriptor
+
+            def link_then_report_error(descriptor, directory_descriptor, name):
+                real_link(descriptor, directory_descriptor, name)
+                raise OSError(errno.EIO, "simulated NFS reply loss")
+
+            with mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=link_then_report_error,
+            ):
+                identity = generation.atomic_create_bytes(target, payload)
+
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(identity, generation._object_identity(target.stat()))
+
+    def test_temporary_name_replacement_before_link_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            payload = b"descriptor-bound-payload\n"
+            real_link = generation._link_descriptor
+
+            def replace_temporary_then_link(
+                descriptor, directory_descriptor, name
+            ):
+                temporary_names = [
+                    entry
+                    for entry in os.listdir(directory_descriptor)
+                    if entry.endswith(".tmp")
+                ]
+                self.assertEqual(len(temporary_names), 1)
+                temporary_name = temporary_names[0]
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+                replacement = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    os.write(replacement, b"forged-path-bytes")
+                finally:
+                    os.close(replacement)
+                real_link(descriptor, directory_descriptor, name)
+
+            with mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=replace_temporary_then_link,
+            ):
+                with self.assertRaises((OSError, RuntimeError)):
+                    generation.atomic_create_bytes(target, payload)
+
+            self.assertFalse(target.exists())
+
+    def test_temporary_name_replacement_after_link_rolls_back_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_link = generation._link_descriptor
+
+            def link_then_replace_temporary(
+                descriptor, directory_descriptor, name
+            ):
+                real_link(descriptor, directory_descriptor, name)
+                temporary_name = next(
+                    entry
+                    for entry in os.listdir(directory_descriptor)
+                    if entry.endswith(".tmp")
+                )
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+                replacement = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                os.close(replacement)
+
+            with mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=link_then_replace_temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "foreign atomic output"):
+                    generation.atomic_create_bytes(target, b"trusted\n")
+            self.assertFalse(target.exists())
+
+    def test_directory_fsync_error_rolls_back_committed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_fsync = generation.os.fsync
+            failed = False
+
+            def fail_first_directory_fsync(descriptor):
+                nonlocal failed
+                if not failed and os.path.isdir(f"/proc/self/fd/{descriptor}"):
+                    failed = True
+                    raise OSError(errno.EIO, "simulated directory fsync failure")
+                return real_fsync(descriptor)
+
+            with mock.patch.object(
+                generation.os,
+                "fsync",
+                side_effect=fail_first_directory_fsync,
+            ):
+                with self.assertRaises(OSError):
+                    generation.atomic_create_bytes(target, b"not-durable\n")
+            self.assertTrue(failed)
+            self.assertFalse(target.exists())
+
+    def test_post_link_metadata_error_rolls_back_committed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_link = generation._link_descriptor
+            real_stat = generation.os.stat
+            linked = False
+            failed = False
+
+            def publish(descriptor, directory_descriptor, name):
+                nonlocal linked
+                real_link(descriptor, directory_descriptor, name)
+                linked = True
+
+            def fail_first_target_stat(path, *args, **kwargs):
+                nonlocal failed
+                if linked and not failed and path == target.name:
+                    failed = True
+                    raise OSError(errno.EIO, "simulated NFS metadata failure")
+                return real_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    generation,
+                    "_link_descriptor",
+                    side_effect=publish,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "stat",
+                    side_effect=fail_first_target_stat,
+                ),
+                self.assertRaises(OSError),
+            ):
+                generation.atomic_create_bytes(target, b"linked-before-error\n")
+
+            self.assertTrue(failed)
+            self.assertFalse(target.exists())
+
+    def test_matching_rollback_never_deletes_a_racing_foreign_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target = parent / "receipt.json"
+            foreign = parent / "foreign.json"
+            target.write_bytes(b"owned\n")
+            foreign.write_bytes(b"foreign\n")
+            identity = generation._object_identity(target.stat())
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            real_rename = generation.os.rename
+            raced = False
+
+            def replace_before_move(
+                source,
+                destination,
+                *,
+                src_dir_fd=None,
+                dst_dir_fd=None,
+            ):
+                nonlocal raced
+                if source == target.name and not raced:
+                    raced = True
+                    os.unlink(source, dir_fd=src_dir_fd)
+                    real_rename(
+                        foreign.name,
+                        source,
+                        src_dir_fd=src_dir_fd,
+                        dst_dir_fd=src_dir_fd,
+                    )
+                return real_rename(
+                    source,
+                    destination,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation.os,
+                        "rename",
+                        side_effect=replace_before_move,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "preserved"),
+                ):
+                    generation._remove_matching_entry(
+                        descriptor,
+                        target.name,
+                        identity,
+                    )
+            finally:
+                os.close(descriptor)
+
+            preserved = list(parent.glob(".*.rollback"))
+            self.assertTrue(raced)
+            self.assertEqual(len(preserved), 1)
+            self.assertEqual(preserved[0].read_bytes(), b"foreign\n")
+
+    def test_unsupported_noreplace_uses_pinned_staging_and_claim_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            claimed = -1
+            try:
+                with mock.patch.object(
+                    generation,
+                    "_rename_directory_noreplace",
+                    side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+                ):
+                    claimed = generation._claim_pinned_directory_at(
+                        descriptor,
+                        "claimed",
+                        "fixture claim",
+                    )
+                generation._verify_directory_entry(
+                    descriptor,
+                    "claimed",
+                    claimed,
+                    "fixture claim",
+                )
+                self.assertEqual(os.listdir(claimed), [])
+                self.assertFalse((parent / ".claimed.claim").exists())
+            finally:
+                if claimed >= 0:
+                    os.close(claimed)
+                os.close(descriptor)
+
+    def test_missing_libc_renameat2_is_reported_as_unsupported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            source = parent / "source"
+            source.mkdir()
+            parent_descriptor = generation._open_pinned_directory(
+                parent, "fixture parent"
+            )
+            source_descriptor = generation._open_pinned_directory(
+                source, "fixture source"
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        generation.ctypes,
+                        "CDLL",
+                        return_value=SimpleNamespace(),
+                    ),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    generation._rename_directory_noreplace(
+                        parent_descriptor,
+                        source.name,
+                        "target",
+                        source_descriptor,
+                    )
+                self.assertEqual(raised.exception.errno, errno.ENOSYS)
+            finally:
+                os.close(source_descriptor)
+                os.close(parent_descriptor)
+
+    def test_uncertain_staging_mkdir_is_reconciled_by_random_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            real_mkdir = generation.os.mkdir
+            reported = False
+
+            def create_then_report_error(path, *args, **kwargs):
+                nonlocal reported
+                real_mkdir(path, *args, **kwargs)
+                if not reported and str(path).startswith(".claimed."):
+                    reported = True
+                    raise OSError(errno.EIO, "simulated NFS reply loss")
+
+            claimed = -1
+            try:
+                with mock.patch.object(
+                    generation.os,
+                    "mkdir",
+                    side_effect=create_then_report_error,
+                ):
+                    claimed = generation._claim_pinned_directory_at(
+                        descriptor,
+                        "claimed",
+                        "fixture claim",
+                    )
+                self.assertTrue(reported)
+                generation._verify_directory_entry(
+                    descriptor,
+                    "claimed",
+                    claimed,
+                    "fixture claim",
+                )
+            finally:
+                if claimed >= 0:
+                    os.close(claimed)
+                os.close(descriptor)
+
+    def test_directory_claim_rejects_replaced_staging_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            parent_descriptor = generation._open_pinned_directory(
+                parent, "fixture parent"
+            )
+            real_rename = generation._rename_directory_noreplace
+
+            def replace_staging_before_claim(
+                descriptor, source_name, target_name, source_descriptor
+            ):
+                displaced = f"{source_name}.displaced"
+                os.rename(
+                    source_name,
+                    displaced,
+                    src_dir_fd=descriptor,
+                    dst_dir_fd=descriptor,
+                )
+                os.mkdir(source_name, mode=0o750, dir_fd=descriptor)
+                foreign_directory = os.open(
+                    source_name,
+                    generation._directory_flags(),
+                    dir_fd=descriptor,
+                )
+                try:
+                    foreign = os.open(
+                        "foreign.txt",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=foreign_directory,
+                    )
+                    os.close(foreign)
+                finally:
+                    os.close(foreign_directory)
+                real_rename(
+                    descriptor,
+                    source_name,
+                    target_name,
+                    source_descriptor,
+                )
+
+            try:
+                with mock.patch.object(
+                    generation,
+                    "_rename_directory_noreplace",
+                    side_effect=replace_staging_before_claim,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "path identity changed"):
+                        generation._claim_pinned_directory_at(
+                            parent_descriptor,
+                            "claimed",
+                            "fixture claim",
+                        )
+                self.assertEqual(
+                    {path.name for path in (parent / "claimed").iterdir()},
+                    {"foreign.txt"},
+                )
+            finally:
+                os.close(parent_descriptor)
+
+
 class AuthorizedGenerationTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -878,6 +1273,8 @@ class AuthorizedGenerationTest(unittest.TestCase):
         fourth_verification_error=None,
         cleanup_error=None,
         trace_atomic_json=False,
+        after_generation_hook=None,
+        after_atomic_json_hook=None,
     ):
         runtime = self._runtime()
         pipe = SimpleNamespace(unet=_FakeUNet())
@@ -940,12 +1337,21 @@ class AuthorizedGenerationTest(unittest.TestCase):
 
         def revalidate(_validated, _runtime, *, phase):
             events.append(f"revalidate:{phase}")
+            if phase == "after_generation" and after_generation_hook is not None:
+                after_generation_hook()
             return {"phase": phase}
 
-        def atomic_json(path, value):
+        def atomic_json(path, value, *, directory_descriptor=None):
             if trace_atomic_json:
                 events.append(f"write:{Path(path).name}")
-            return real_atomic_json(path, value)
+            identity = real_atomic_json(
+                path,
+                value,
+                directory_descriptor=directory_descriptor,
+            )
+            if after_atomic_json_hook is not None:
+                after_atomic_json_hook(path, value, directory_descriptor, identity)
+            return identity
 
         patches = (
             mock.patch.object(
@@ -1208,24 +1614,173 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 generation._run_authorized_engineering_generation(self.validated)
         loader.assert_not_called()
 
-    def test_concurrent_output_claim_does_not_write_into_foreign_tree(self):
-        real_mkdir = generation.os.mkdir
+    def test_fd_headroom_failure_does_not_claim_output(self):
+        with (
+            mock.patch.object(
+                generation,
+                "_require_fd_headroom",
+                side_effect=RuntimeError("insufficient descriptor reserve"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "descriptor reserve"),
+        ):
+            generation._run_authorized_engineering_generation(self.validated)
+        self.assertFalse(self.output.exists())
 
-        def competing_mkdir(path, mode=0o777, *, dir_fd=None):
-            if Path(path) == self.output:
-                real_mkdir(path, mode=mode, dir_fd=dir_fd)
+    def test_concurrent_output_claim_does_not_write_into_foreign_tree(self):
+        def competing_claim(
+            parent_descriptor,
+            source_name,
+            target_name,
+            source_descriptor,
+        ):
+            del source_name, source_descriptor
+            if target_name == self.output.name:
+                os.mkdir(target_name, mode=0o750, dir_fd=parent_descriptor)
                 (self.output / "foreign.txt").write_text(
                     "foreign claimant\n", encoding="utf-8"
                 )
                 raise FileExistsError("claim lost")
-            return real_mkdir(path, mode=mode, dir_fd=dir_fd)
+            raise AssertionError("unexpected directory claim")
 
-        with mock.patch.object(generation.os, "mkdir", side_effect=competing_mkdir):
+        with mock.patch.object(
+            generation,
+            "_rename_directory_noreplace",
+            side_effect=competing_claim,
+        ):
             with self.assertRaisesRegex(FileExistsError, "resume/retry"):
                 generation._run_authorized_engineering_generation(self.validated)
         self.assertTrue((self.output / "foreign.txt").is_file())
         self.assertFalse((self.output / "attempt.json").exists())
         self.assertFalse((self.output / "failure.json").exists())
+
+    def test_output_directory_replacement_blocks_terminal_publication(self):
+        events = []
+        displaced = self.root / "displaced-engineering-run"
+
+        def replace_output_directory():
+            self.output.rename(displaced)
+            self.output.mkdir()
+            (self.output / "foreign.txt").write_text(
+                "foreign replacement\n", encoding="utf-8"
+            )
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run(
+                events,
+                after_generation_hook=replace_output_directory,
+            )
+
+        secondary = getattr(raised.exception, "secondary_errors", ())
+        self.assertTrue(
+            any("path identity changed" in str(error) for _, error in secondary)
+        )
+        self.assertEqual(
+            {path.name for path in self.output.iterdir()}, {"foreign.txt"}
+        )
+        self.assertFalse((displaced / "success.json").exists())
+        self.assertFalse((displaced / "failure.json").exists())
+
+    def test_output_parent_replacement_blocks_terminal_publication(self):
+        events = []
+        output_parent = self.output.parent
+        displaced_parent = self.root / "displaced-adaptive-oracle"
+
+        def replace_output_parent():
+            output_parent.rename(displaced_parent)
+            output_parent.mkdir()
+            foreign_output = output_parent / self.output.name
+            foreign_output.mkdir()
+            (foreign_output / "foreign.txt").write_text(
+                "foreign replacement\n", encoding="utf-8"
+            )
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run(
+                events,
+                after_generation_hook=replace_output_parent,
+            )
+
+        secondary = getattr(raised.exception, "secondary_errors", ())
+        self.assertTrue(
+            any("path identity changed" in str(error) for _, error in secondary)
+        )
+        self.assertEqual(
+            {path.name for path in self.output.iterdir()}, {"foreign.txt"}
+        )
+        displaced_output = displaced_parent / self.output.name
+        self.assertFalse((displaced_output / "success.json").exists())
+        self.assertFalse((displaced_output / "failure.json").exists())
+
+    def test_record_inode_replacement_blocks_terminal_publication(self):
+        first_task = self.design["tasks"][0]["task_id"]
+
+        def replace_record_inode():
+            target = self.output / "records" / f"{first_task}.json"
+            replacement = self.root / "replacement-record.json"
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run(
+                [],
+                after_generation_hook=replace_record_inode,
+            )
+
+        secondary = getattr(raised.exception, "secondary_errors", ())
+        self.assertTrue(
+            any("changed before terminal" in str(error) for _, error in secondary)
+        )
+        self.assertFalse((self.output / "success.json").exists())
+        self.assertTrue((self.output / "failure.json").is_file())
+
+    def test_success_fsync_error_rolls_back_before_failure_receipt(self):
+        real_fsync = generation.os.fsync
+        failed = False
+
+        def fail_success_directory_fsync(descriptor):
+            nonlocal failed
+            if (
+                not failed
+                and os.path.isdir(f"/proc/self/fd/{descriptor}")
+                and (self.output / "success.json").exists()
+            ):
+                failed = True
+                raise OSError(errno.EIO, "simulated terminal fsync failure")
+            return real_fsync(descriptor)
+
+        with (
+            mock.patch.object(
+                generation.os,
+                "fsync",
+                side_effect=fail_success_directory_fsync,
+            ),
+            self.assertRaises(OSError),
+        ):
+            self._run([])
+
+        self.assertTrue(failed)
+        self.assertFalse((self.output / "success.json").exists())
+        self.assertTrue((self.output / "failure.json").is_file())
+
+    def test_success_inode_replacement_blocks_successful_return(self):
+        replacement = self.root / "replacement-success.json"
+
+        def replace_success(path, value, _directory_descriptor, _identity):
+            if Path(path).name != "success.json":
+                return
+            replacement.write_bytes(contract.canonical_json_bytes(value) + b"\n")
+            os.replace(replacement, path)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "generation success receipt differs"
+        ):
+            self._run(
+                [],
+                after_atomic_json_hook=replace_success,
+            )
+
+        self.assertTrue((self.output / "success.json").is_file())
+        self.assertTrue((self.output / "failure.json").is_file())
 
     def test_runtime_warning_log_and_stderr_are_captured_on_failure(self):
         def noisy_runtime_load(_validated):

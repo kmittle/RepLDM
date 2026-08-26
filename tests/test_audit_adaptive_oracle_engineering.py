@@ -422,6 +422,9 @@ class EngineeringRunFixture:
             self.runtime_environment,
             self.verified_source_execution,
             self.model_stage_evidence,
+            digest(
+                contract.canonical_json_bytes(self.model_stage_evidence) + b"\n"
+            ),
         )
         manifest = audit._expected_manifest(
             self.design, summaries, block_evidence, runtime_evidence_sha256
@@ -432,6 +435,7 @@ class EngineeringRunFixture:
             manifest,
             run_config,
             runtime_evidence,
+            digest(contract.canonical_json_bytes(runtime_evidence) + b"\n"),
         )
         self._write_json(self.run / "attempt.json", attempt)
         self._write_json(self.run / "runtime_evidence.json", runtime_evidence)
@@ -673,6 +677,109 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
 
+    def test_audit_file_digests_reuse_the_validated_reads(self):
+        with mock.patch.object(
+            audit,
+            "sha256_file",
+            side_effect=AssertionError("audited paths must not be reopened"),
+        ):
+            result = self.fixture.run_audit()
+        self.assertEqual(
+            result["generation_attempt_file_sha256"],
+            digest((self.fixture.run / "attempt.json").read_bytes()),
+        )
+
+    def test_validated_sidecar_inode_replacement_is_rejected_before_return(self):
+        first_task = self.fixture.tasks[0]["task_id"]
+        target = self.fixture.run / "records" / f"{first_task}.json"
+        replacement = self.fixture.repo / "replacement-sidecar.json"
+        replacement.write_bytes(target.read_bytes())
+        block_count = 0
+
+        def replace_after_all_sidecars(records, tasks):
+            nonlocal block_count
+            result = self.fixture.block_evidence(records, tasks)
+            block_count += 1
+            if block_count == contract.PROMPT_COUNT:
+                os.replace(replacement, target)
+            return result
+
+        with self.assertRaisesRegex(
+            ValueError, "sidecar .* changed before audit publication"
+        ):
+            self.fixture.run_audit(block_validator=replace_after_all_sidecars)
+
+    def test_validated_top_level_inode_replacement_is_rejected(self):
+        target = self.fixture.run / "config.json"
+        replacement = self.fixture.repo / "replacement-config.json"
+        replacement.write_bytes(target.read_bytes())
+        replaced = False
+
+        def replace_after_config_read(record, task):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                os.replace(replacement, target)
+            return self.fixture.sidecar_summary(record, task)
+
+        with self.assertRaisesRegex(
+            ValueError, "run config changed before audit publication"
+        ):
+            self.fixture.run_audit(sidecar_validator=replace_after_config_read)
+
+    def test_run_directory_replacement_is_rejected(self):
+        displaced = self.fixture.repo / "displaced-run"
+        replaced = False
+
+        def replace_run(record, task):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                self.fixture.run.rename(displaced)
+                self.fixture.run.mkdir()
+                (self.fixture.run / "records").mkdir()
+            return self.fixture.sidecar_summary(record, task)
+
+        with self.assertRaisesRegex(RuntimeError, "run directory path identity"):
+            self.fixture.run_audit(sidecar_validator=replace_run)
+
+    def test_records_directory_replacement_is_rejected(self):
+        records = self.fixture.run / "records"
+        displaced = self.fixture.repo / "displaced-records"
+        replaced = False
+
+        def replace_records(record, task):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                records.rename(displaced)
+                records.mkdir()
+            return self.fixture.sidecar_summary(record, task)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "records directory path identity"
+        ):
+            self.fixture.run_audit(sidecar_validator=replace_records)
+
+    def test_run_parent_replacement_is_rejected(self):
+        output_parent = self.fixture.repo / "outputs"
+        displaced = self.fixture.repo / "displaced-outputs"
+        replaced = False
+
+        def replace_parent(record, task):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                output_parent.rename(displaced)
+                replacement_records = (
+                    output_parent / "adaptive_oracle" / "engineering_v1" / "records"
+                )
+                replacement_records.mkdir(parents=True)
+            return self.fixture.sidecar_summary(record, task)
+
+        with self.assertRaisesRegex(RuntimeError, "component 0 path identity"):
+            self.fixture.run_audit(sidecar_validator=replace_parent)
+
     def test_default_contract_validator_routes_are_used(self):
         with (
             mock.patch.object(
@@ -735,6 +842,95 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertEqual(
             (self.fixture.run / audit.AUDIT_SUCCESS_NAME).read_bytes(), success_before
         )
+
+    def test_malformed_generation_receipt_is_consumed_after_audit_attempt(self):
+        (self.fixture.run / "success.json").write_bytes(b"not-json\n")
+
+        with self.assertRaisesRegex(ValueError, "strict UTF-8 JSON"):
+            self.fixture.run_production_audit()
+
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+
+    def test_fd_headroom_failure_precedes_the_one_shot_audit_attempt(self):
+        with (
+            mock.patch.object(
+                generation,
+                "_require_fd_headroom",
+                side_effect=RuntimeError("insufficient descriptor reserve"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "descriptor reserve"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertFalse((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+
+    def test_production_rechecks_pins_after_core_before_success_publication(self):
+        task_id = self.fixture.tasks[0]["task_id"]
+        target = self.fixture.run / "records" / f"{task_id}.json"
+        replacement = self.fixture.repo / "pre-publication-sidecar.json"
+        replacement.write_bytes(target.read_bytes())
+        real_publish = audit._publish_audit_json
+        replaced = False
+
+        def replace_before_success(tree, name, value):
+            nonlocal replaced
+            if name == audit.AUDIT_SUCCESS_NAME and not replaced:
+                replaced = True
+                os.replace(replacement, target)
+            return real_publish(tree, name, value)
+
+        with (
+            mock.patch.object(
+                audit,
+                "_publish_audit_json",
+                side_effect=replace_before_success,
+            ),
+            self.assertRaisesRegex(ValueError, "changed before audit publication"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(replaced)
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+
+    def test_post_success_integrity_failure_publishes_audit_invalidation(self):
+        task_id = self.fixture.tasks[0]["task_id"]
+        target = self.fixture.run / "records" / f"{task_id}.json"
+        replacement = self.fixture.repo / "post-success-sidecar.json"
+        replacement.write_bytes(target.read_bytes())
+        real_atomic = audit.atomic_create_json
+        replaced = False
+
+        def publish_then_replace(path, value, *, directory_descriptor=None):
+            nonlocal replaced
+            identity = real_atomic(
+                path,
+                value,
+                directory_descriptor=directory_descriptor,
+            )
+            if Path(path).name == audit.AUDIT_SUCCESS_NAME and not replaced:
+                replaced = True
+                os.replace(replacement, target)
+            return identity
+
+        with (
+            mock.patch.object(
+                audit,
+                "atomic_create_json",
+                side_effect=publish_then_replace,
+            ),
+            self.assertRaisesRegex(ValueError, "changed before audit publication"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(replaced)
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
 
     def test_png_inspector_validates_exact_rgb_scanlines_without_pillow(self):
         path = self.fixture.repo / "complete.png"
@@ -1048,6 +1244,34 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
     def test_failure_before_model_staging_has_no_stage_evidence(self):
         self.fixture.replace_with_failure(staged=False)
         with self.assertRaises(audit.GenerationFailedTerminally):
+            self.fixture.run_audit()
+
+    def test_failure_pins_the_unpaired_atomic_png_tail(self):
+        failure = self.fixture.replace_with_failure()
+        task_id = self.fixture.tasks[0]["task_id"]
+        target = self.fixture.run / "records" / f"{task_id}.png"
+        target.write_bytes(self.fixture.png)
+        replacement = self.fixture.repo / "replacement-tail.png"
+        replacement.write_bytes(self.fixture.png)
+        self.fixture._write_json(self.fixture.run / "failure.json", failure)
+        real_inspect = audit.inspect_png_container
+
+        def replace_after_inspection(path, **kwargs):
+            result = real_inspect(path, **kwargs)
+            if Path(path).name == target.name and replacement.exists():
+                os.replace(replacement, target)
+            return result
+
+        with (
+            mock.patch.object(
+                audit,
+                "inspect_png_container",
+                side_effect=replace_after_inspection,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "PNG record changed before audit publication"
+            ),
+        ):
             self.fixture.run_audit()
 
     def test_runtime_environment_binds_the_unmasked_physical_device(self):
