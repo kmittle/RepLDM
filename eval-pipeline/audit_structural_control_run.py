@@ -9,8 +9,10 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import subprocess
+import sys
 import tempfile
 from itertools import combinations
 from pathlib import Path
@@ -80,6 +82,10 @@ STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_FIELDS = frozenset(
 )
 STRUCTURAL_CONTROL_PRE_SCORE_SEAL_SCHEMA = "structural_control_pre_score_seal_v1"
 STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME = "structural_control_pre_score_seal.json"
+STRUCTURAL_CONTROL_SCORING_ATTEMPT_SCHEMA = "structural_control_scoring_attempt_v1"
+STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME = "structural_control_scoring_attempt.json"
+STRUCTURAL_CONTROL_SCORING_SUCCESS_SCHEMA = "structural_control_scoring_success_v1"
+STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME = "structural_control_scoring_success.json"
 STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME = "run_audit.json"
 STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME = "structural_control_audit_attempt.json"
 STRUCTURAL_CONTROL_AUDIT_ATTEMPT_SCHEMA = "structural_control_audit_attempt_v1"
@@ -87,10 +93,62 @@ STRUCTURAL_CONTROL_EVALUATION_ATTEMPT_NAME = (
     "structural_control_evaluation_attempt.json"
 )
 STRUCTURAL_CONTROL_EXPECTED_TASKS = 792
+STRUCTURAL_CONTROL_FORMAL_RUN_PATH = "outputs/structural_controls/development_v1"
+STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH = (
+    "eval-pipeline/configs/"
+    "scheduler_native_structural_controls_analysis_amendment_v1.yaml"
+)
+STRUCTURAL_CONTROL_SCORE_SCRIPT_PATH = "eval-pipeline/score.py"
+STRUCTURAL_CONTROL_SCORE_SCRIPT_SHA256 = (
+    "849201edcf21d6c4f2828699b2b79cd87efb83f79f3ff2722822d5088ebf86af"
+)
+STRUCTURAL_CONTROL_SCORE_CONFIG_PATH = "eval-pipeline/configs/eval_common.yaml"
+STRUCTURAL_CONTROL_SCORE_CONFIG_SHA256 = (
+    "4901d660383f30a4e65aaceb9180eecf72aea951c3ea0abb8dd845cb65fbe932"
+)
+STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256 = (
+    "9c6858b1825c599a60be33282d99ffd4a8f75ac0ecf0fc8071bb97ad16eb61b9"
+)
+STRUCTURAL_CONTROL_SCORE_METRICS = (
+    "imagereward",
+    "pixel",
+    "clip",
+    "hps",
+    "aesthetic",
+    "iqa",
+)
+STRUCTURAL_CONTROL_SCORE_OUTPUT_KEYS = frozenset(
+    {
+        "imagereward",
+        "patch_ir_mean",
+        "patch_ir_std",
+        "patch_ir_n",
+        "colorfulness",
+        "laplacian_sharpness",
+        "mean_saturation",
+        "clipped_fraction",
+        "contrast_std",
+        "clip_cosine",
+        "clipscore",
+        "hpsv2",
+        "aesthetic",
+        "topiq_nr",
+    }
+)
+STRUCTURAL_CONTROL_SCORE_DEVICE = "cuda:7"
+STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV = (
+    "REPLDM_STRUCTURAL_SCORING_CAPABILITY"
+)
+STRUCTURAL_CONTROL_SCORING_ENVIRONMENT = {
+    "HF_HUB_OFFLINE": "1",
+    "TRANSFORMERS_OFFLINE": "1",
+    "PYTHONNOUSERSITE": "1",
+}
 STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS = frozenset(
     {
         "eval-pipeline/audit_structural_control_run.py",
         "eval-pipeline/evaluate_structural_control_run.py",
+        "eval-pipeline/scorer_provenance.py",
     }
 )
 STRUCTURAL_CONTROL_EVALUATION_BUNDLE = "structural_control_evaluation_bundle"
@@ -101,6 +159,8 @@ STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS = (
 STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_NAMES = frozenset(
     {
         "scores.jsonl",
+        STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME,
+        STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME,
         STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
         STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME,
         STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
@@ -109,18 +169,26 @@ STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_NAMES = frozenset(
     }
 )
 STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_PATTERNS = (
-    re.compile(r"\.scores\.jsonl\.[A-Za-z0-9_-]+\.tmp"),
-    re.compile(r"\.run_audit\.json\.[A-Za-z0-9_-]+\.tmp"),
-    re.compile(r"\.structural_control_evaluation_bundle\.[A-Za-z0-9_-]+"),
+    re.compile(r"\.scores\.jsonl\..+\.tmp"),
     re.compile(
-        r"\.structural_control_evaluation\.json\.[A-Za-z0-9_-]+\.tmp"
+        r"\.structural_control_scoring_attempt\.json\."
+        r".+\.tmp"
     ),
     re.compile(
-        r"\.structural_control_contrasts\.csv\.[A-Za-z0-9_-]+\.tmp"
+        r"\.structural_control_scoring_success\.json\."
+        r".+\.tmp"
+    ),
+    re.compile(r"\.run_audit\.json\..+\.tmp"),
+    re.compile(r"\.structural_control_evaluation_bundle\..+"),
+    re.compile(
+        r"\.structural_control_evaluation\.json\..+\.tmp"
+    ),
+    re.compile(
+        r"\.structural_control_contrasts\.csv\..+\.tmp"
     ),
     re.compile(
         r"\.structural_control_pre_score_seal\.json\."
-        r"[A-Za-z0-9_-]+\.tmp"
+        r".+\.tmp"
     ),
 )
 GPU_UUID_PATTERN = re.compile(
@@ -210,15 +278,26 @@ def _audit_attempt_artifacts(run_root: Path, output_path: Path) -> tuple[Path, .
     )
 
 
+def _require_canonical_audit_output(
+    run_root: Path, output_path: str | os.PathLike[str]
+) -> Path:
+    raw_output = Path(output_path)
+    output = raw_output.absolute()
+    canonical_output = run_root / STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+    if raw_output.is_symlink() or output != canonical_output:
+        raise ValueError("structural audit requires the canonical output path")
+    return output
+
+
 def create_audit_attempt_marker(
     run_dir: str | os.PathLike[str], output_path: str | os.PathLike[str]
 ) -> Path:
     """Durably consume the formal auditor's one allowed result-reading attempt."""
-    run_root = Path(run_dir).resolve()
-    output = Path(output_path).absolute()
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural audit attempt"
+    )
+    output = _require_canonical_audit_output(run_root, output_path)
     marker_path = run_root / STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
-    if output == marker_path:
-        raise ValueError("structural audit output conflicts with its attempt marker")
     if any(
         os.path.lexists(path) for path in _audit_attempt_artifacts(run_root, output)
     ):
@@ -266,6 +345,206 @@ def require_audit_attempt_marker(run_dir: str | os.PathLike[str]) -> Path:
     return marker_path
 
 
+def _read_regular_bytes(path: Path, *, label: str) -> bytes:
+    """Read one regular file without following links or blocking on a FIFO."""
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{label} is not regular")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    except OSError as exc:
+        raise ValueError(f"{label} is missing or unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _linux_process_start_ticks(pid: int) -> int:
+    """Return Linux /proc field 22 without trusting the process name layout."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("scoring launcher PID is invalid")
+    try:
+        payload = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = payload[payload.rfind(") ") + 2 :].split()
+        ticks = int(fields[19])
+    except (OSError, UnicodeError, IndexError, ValueError) as exc:
+        raise ValueError("cannot verify scoring launcher process start time") from exc
+    if ticks <= 0:
+        raise ValueError("scoring launcher process start time is invalid")
+    return ticks
+
+
+def _linux_boot_id() -> str:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("cannot verify Linux boot identity for scoring") from exc
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        value,
+    ):
+        raise ValueError("Linux boot identity for scoring is invalid")
+    return value
+
+
+def _canonical_scoring_argv(run_root: Path) -> list[str]:
+    return [
+        str(Path(sys.executable).resolve()),
+        str((ROOT / STRUCTURAL_CONTROL_SCORE_SCRIPT_PATH).resolve()),
+        "--run_dir",
+        str(run_root.resolve()),
+        "--config",
+        str((ROOT / STRUCTURAL_CONTROL_SCORE_CONFIG_PATH).resolve()),
+        "--device",
+        STRUCTURAL_CONTROL_SCORE_DEVICE,
+        "--strict",
+        "--require-scorer-provenance",
+    ]
+
+
+def _scoring_command_binding(run_root: Path) -> dict[str, Any]:
+    return {
+        "argv": _canonical_scoring_argv(run_root),
+        "cwd": str(ROOT.resolve()),
+        "environment": dict(STRUCTURAL_CONTROL_SCORING_ENVIRONMENT),
+    }
+
+
+def _scoring_attempt_marker_payload(
+    run_dir: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+    *,
+    base_commit: str = STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+    analysis_commit: str | None = None,
+    launcher_pid: int | None = None,
+    launcher_start_ticks: int | None = None,
+    boot_id: str | None = None,
+    capability_sha256: str | None = None,
+) -> bytes:
+    """Build canonical marker bytes; optional identities support CPU fixtures."""
+    run_root = Path(run_dir).resolve()
+    amendment_path = Path(analysis_amendment_path).resolve()
+    seal_path = Path(pre_score_seal_path).resolve()
+    if analysis_commit is None:
+        analysis_commit = _current_head_commit()
+    if launcher_pid is None:
+        launcher_pid = os.getpid()
+    if launcher_start_ticks is None:
+        launcher_start_ticks = _linux_process_start_ticks(launcher_pid)
+    if boot_id is None:
+        boot_id = _linux_boot_id()
+    if capability_sha256 is None:
+        capability_sha256 = _sha256_bytes(
+            b"structural-control-scoring-fixture-capability"
+        )
+    payload = {
+        "schema": STRUCTURAL_CONTROL_SCORING_ATTEMPT_SCHEMA,
+        "scope": STRUCTURAL_CONTROL_AUDITOR_SCOPE,
+        "one_shot": True,
+        "base_commit": base_commit,
+        "analysis_commit": analysis_commit,
+        "expected_score_rows": STRUCTURAL_CONTROL_EXPECTED_TASKS,
+        "command": _scoring_command_binding(run_root),
+        "launcher": {
+            "pid": launcher_pid,
+            "proc_start_ticks": launcher_start_ticks,
+            "boot_id": boot_id,
+            "capability_sha256": capability_sha256,
+        },
+        "bindings": {
+            "analysis_amendment": _seal_binding(
+                STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH,
+                base_audit.sha256_file(amendment_path),
+            ),
+            "pre_score_seal": _seal_binding(
+                STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME,
+                base_audit.sha256_file(seal_path),
+            ),
+            "score_script": _seal_binding(
+                STRUCTURAL_CONTROL_SCORE_SCRIPT_PATH,
+                STRUCTURAL_CONTROL_SCORE_SCRIPT_SHA256,
+            ),
+            "score_config": _seal_binding(
+                STRUCTURAL_CONTROL_SCORE_CONFIG_PATH,
+                STRUCTURAL_CONTROL_SCORE_CONFIG_SHA256,
+            ),
+        },
+    }
+    return (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _scoring_success_receipt_payload(
+    run_dir: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+    *,
+    base_commit: str = STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+    analysis_commit: str | None = None,
+    child_pid: int | None = None,
+    scorer_provenance_sha256: str = STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256,
+) -> bytes:
+    """Build the deterministic receipt that proves sealed scoring completed."""
+    run_root = Path(run_dir).resolve()
+    amendment_path = Path(analysis_amendment_path).resolve()
+    seal_path = Path(pre_score_seal_path).resolve()
+    if analysis_commit is None:
+        analysis_commit = _current_head_commit()
+    if child_pid is None:
+        child_pid = os.getpid()
+    payload = {
+        "schema": STRUCTURAL_CONTROL_SCORING_SUCCESS_SCHEMA,
+        "scope": STRUCTURAL_CONTROL_AUDITOR_SCOPE,
+        "base_commit": base_commit,
+        "analysis_commit": analysis_commit,
+        "score_rows": STRUCTURAL_CONTROL_EXPECTED_TASKS,
+        "child": {"pid": child_pid, "returncode": 0},
+        "scorer_provenance_sha256": scorer_provenance_sha256,
+        "command": _scoring_command_binding(run_root),
+        "bindings": {
+            "scoring_attempt": _seal_binding(
+                STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME,
+                base_audit.sha256_file(
+                    run_root / STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                ),
+            ),
+            "scores": _seal_binding(
+                "scores.jsonl", base_audit.sha256_file(run_root / "scores.jsonl")
+            ),
+            "manifest": _seal_binding(
+                "manifest.jsonl",
+                base_audit.sha256_file(run_root / "manifest.jsonl"),
+            ),
+            "analysis_amendment": _seal_binding(
+                STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH,
+                base_audit.sha256_file(amendment_path),
+            ),
+            "pre_score_seal": _seal_binding(
+                STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME,
+                base_audit.sha256_file(seal_path),
+            ),
+            "score_script": _seal_binding(
+                STRUCTURAL_CONTROL_SCORE_SCRIPT_PATH,
+                STRUCTURAL_CONTROL_SCORE_SCRIPT_SHA256,
+            ),
+            "score_config": _seal_binding(
+                STRUCTURAL_CONTROL_SCORE_CONFIG_PATH,
+                STRUCTURAL_CONTROL_SCORE_CONFIG_SHA256,
+            ),
+        },
+    }
+    return (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
 def _pre_score_forbidden_artifact_exists(run_root: Path) -> bool:
     for entry in run_root.iterdir():
         if entry.name in STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_NAMES or any(
@@ -290,6 +569,92 @@ def _repository_relative(path: Path, *, label: str) -> str:
         return resolved.relative_to(ROOT.resolve()).as_posix()
     except ValueError as exc:
         raise ValueError(f"{label} must remain inside the repository") from exc
+
+
+def _require_canonical_formal_run(
+    run_dir: str | os.PathLike[str], *, label: str
+) -> Path:
+    raw_run = Path(run_dir)
+    lexical_run = raw_run.absolute()
+    run_root = raw_run.resolve()
+    canonical_run = (ROOT / STRUCTURAL_CONTROL_FORMAL_RUN_PATH).resolve()
+    if raw_run.is_symlink() or lexical_run != run_root or run_root != canonical_run:
+        raise ValueError(f"{label} requires the canonical non-symlink formal run")
+    return run_root
+
+
+def _require_canonical_regular_input(
+    path: str | os.PathLike[str],
+    expected_path: Path,
+    *,
+    label: str,
+) -> Path:
+    """Validate path identity and file type without reading input bytes."""
+    raw_path = Path(path)
+    lexical_path = raw_path.absolute()
+    resolved_path = raw_path.resolve()
+    canonical_path = expected_path.resolve()
+    try:
+        mode = os.lstat(raw_path).st_mode
+    except OSError as exc:
+        raise ValueError(f"{label} is missing or unsafe") from exc
+    if (
+        raw_path.is_symlink()
+        or lexical_path != resolved_path
+        or resolved_path != canonical_path
+        or not stat.S_ISREG(mode)
+    ):
+        raise ValueError(f"{label} requires the canonical non-symlink regular file")
+    return resolved_path
+
+
+def _preflight_formal_audit_paths(
+    run_dir: str | os.PathLike[str],
+    prompts_path: str | os.PathLike[str],
+    source_actions_path: str | os.PathLike[str],
+    registration_actions_path: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str] | None,
+) -> dict[str, Path]:
+    """Reject path mistakes before consuming the one formal audit attempt."""
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural audit CLI"
+    )
+    requested_output = (
+        output_path
+        if output_path is not None
+        else run_root / STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+    )
+    return {
+        "run": run_root,
+        "output": _require_canonical_audit_output(run_root, requested_output),
+        "prompts": _require_canonical_regular_input(
+            prompts_path,
+            ROOT / generate.STRUCTURAL_CONTROL_PROMPTS,
+            label="formal audit development prompts",
+        ),
+        "actions": _require_canonical_regular_input(
+            source_actions_path,
+            ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH,
+            label="formal audit structural actions",
+        ),
+        "registration": _require_canonical_regular_input(
+            registration_actions_path,
+            ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+            label="formal audit structural registration",
+        ),
+        "analysis_amendment": _require_canonical_regular_input(
+            analysis_amendment_path,
+            ROOT / STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH,
+            label="formal audit analysis amendment",
+        ),
+        "pre_score_seal": _require_canonical_regular_input(
+            pre_score_seal_path,
+            run_root / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME,
+            label="formal audit pre-score seal",
+        ),
+    }
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -378,6 +743,9 @@ def validate_pre_score_seal(
     seal_path = supplied_seal_path.resolve()
     if seal_path.name != STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME:
         raise ValueError("pre-score seal must use its canonical filename")
+    run_root = _require_canonical_formal_run(
+        seal_path.parent, label="pre-score seal validation"
+    )
     seal = _load_json(seal_path, label="pre-score seal")
     _require_exact_fields(
         seal,
@@ -409,7 +777,6 @@ def validate_pre_score_seal(
         fields={"config", "manifest", "actions", "registration", "analysis_amendment"},
     )
 
-    run_root = seal_path.parent
     config_path = run_root / "config.json"
     manifest_path = run_root / "manifest.jsonl"
     actions_path = (ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH).resolve()
@@ -420,6 +787,11 @@ def validate_pre_score_seal(
     if supplied_amendment_path.is_symlink():
         raise ValueError("analysis amendment must not be a symbolic link")
     amendment_path = supplied_amendment_path.resolve()
+    canonical_amendment_path = (
+        ROOT / STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH
+    ).resolve()
+    if amendment_path != canonical_amendment_path:
+        raise ValueError("pre-score seal requires the canonical analysis amendment")
     amendment_relative = _repository_relative(
         amendment_path, label="analysis amendment"
     )
@@ -480,13 +852,20 @@ def create_pre_score_seal(
     base_commit: str = STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
 ) -> Mapping[str, Any]:
     """Atomically create the one-shot seal while generation/scoring are excluded."""
-    run_root = Path(run_dir).resolve()
+    run_root = _require_canonical_formal_run(
+        run_dir, label="pre-score seal creation"
+    )
     actions_path = Path(source_actions_path).resolve()
     registration_path = Path(registration_actions_path).resolve()
     supplied_amendment_path = Path(analysis_amendment_path)
     if supplied_amendment_path.is_symlink():
         raise ValueError("analysis amendment must not be a symbolic link")
     amendment_path = supplied_amendment_path.resolve()
+    canonical_amendment_path = (
+        ROOT / STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH
+    ).resolve()
+    if amendment_path != canonical_amendment_path:
+        raise ValueError("pre-score seal requires the canonical analysis amendment")
     seal_path = (
         Path(output_path).resolve()
         if output_path is not None
@@ -572,6 +951,532 @@ def create_pre_score_seal(
             analysis_amendment_path=amendment_path,
             base_commit=base_commit,
         )
+
+
+def _exclusive_durable_write(path: Path, payload: bytes, *, label: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise ValueError(f"{label} already exists") from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def _scoring_temporary_artifact_exists(run_root: Path) -> bool:
+    for entry in run_root.iterdir():
+        name = entry.name
+        if (
+            name.startswith(".scores.jsonl.")
+            and name.endswith(".tmp")
+        ) or (
+            name.startswith(f".{STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME}.")
+            and name.endswith(".tmp")
+        ) or (
+            name.startswith(f".{STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME}.")
+            and name.endswith(".tmp")
+        ):
+            return True
+    return False
+
+
+def _require_initial_scoring_artifacts_absent(run_root: Path) -> None:
+    for name in (
+        "scores.jsonl",
+        STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME,
+        STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME,
+    ):
+        if os.path.lexists(run_root / name):
+            raise ValueError("sealed scoring is one-shot; score or receipt exists")
+    if _scoring_temporary_artifact_exists(run_root):
+        raise ValueError("sealed scoring rejects score or receipt temporary debris")
+    if _pre_score_forbidden_artifact_exists(run_root):
+        raise ValueError(
+            "sealed scoring requires all score, audit, and evaluation artifacts absent"
+        )
+
+
+def _validate_scoring_sources(
+    *, base_commit: str = STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+) -> str:
+    if base_commit != STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT:
+        raise ValueError("sealed scoring base commit differs from the frozen run")
+    head_commit = _current_head_commit()
+    for relative_path, expected_sha256 in (
+        (STRUCTURAL_CONTROL_SCORE_SCRIPT_PATH, STRUCTURAL_CONTROL_SCORE_SCRIPT_SHA256),
+        (STRUCTURAL_CONTROL_SCORE_CONFIG_PATH, STRUCTURAL_CONTROL_SCORE_CONFIG_SHA256),
+    ):
+        path = ROOT / relative_path
+        current = _read_regular_bytes(path, label=f"sealed scoring {relative_path}")
+        if _sha256_bytes(current) != expected_sha256:
+            raise ValueError(f"sealed scoring source hash differs: {relative_path}")
+        if current != _git_bytes(base_commit, relative_path):
+            raise ValueError(f"sealed scoring source differs from base: {relative_path}")
+        if current != _git_bytes(head_commit, relative_path):
+            raise ValueError(f"sealed scoring source differs from analysis HEAD: {relative_path}")
+    return head_commit
+
+
+def _validate_scoring_inputs(
+    run_root: Path,
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+    *,
+    base_commit: str = STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+    require_canonical_amendment: bool,
+) -> tuple[Path, Path, str]:
+    raw_amendment = Path(analysis_amendment_path)
+    raw_seal = Path(pre_score_seal_path)
+    if raw_amendment.is_symlink():
+        raise ValueError("sealed scoring analysis amendment must not be a symlink")
+    amendment_path = raw_amendment.resolve()
+    canonical_amendment = (ROOT / STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH).resolve()
+    if require_canonical_amendment and amendment_path != canonical_amendment:
+        raise ValueError("sealed scoring requires the canonical analysis amendment")
+    if raw_seal.is_symlink() or raw_seal.resolve() != (
+        run_root / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+    ):
+        raise ValueError("sealed scoring requires the canonical pre-score seal")
+    seal_path = raw_seal.resolve()
+    head_commit = _validate_scoring_sources(base_commit=base_commit)
+    validate_analysis_amendment(amendment_path, base_commit=base_commit)
+    validate_pre_score_seal(
+        seal_path,
+        analysis_amendment_path=amendment_path,
+        base_commit=base_commit,
+    )
+    return amendment_path, seal_path, head_commit
+
+
+def _parse_scoring_attempt_payload(payload: bytes) -> Mapping[str, Any]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical structural scoring attempt marker is invalid") from exc
+    attempt = _require_exact_fields(
+        value,
+        label="structural scoring attempt marker",
+        fields={
+            "schema",
+            "scope",
+            "one_shot",
+            "base_commit",
+            "analysis_commit",
+            "expected_score_rows",
+            "command",
+            "launcher",
+            "bindings",
+        },
+    )
+    launcher = _require_exact_fields(
+        attempt.get("launcher"),
+        label="structural scoring attempt launcher",
+        fields={"pid", "proc_start_ticks", "boot_id", "capability_sha256"},
+    )
+    if (
+        attempt.get("schema") != STRUCTURAL_CONTROL_SCORING_ATTEMPT_SCHEMA
+        or attempt.get("scope") != STRUCTURAL_CONTROL_AUDITOR_SCOPE
+        or attempt.get("one_shot") is not True
+        or attempt.get("base_commit") != STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+        or attempt.get("expected_score_rows") != STRUCTURAL_CONTROL_EXPECTED_TASKS
+        or not isinstance(launcher.get("pid"), int)
+        or isinstance(launcher.get("pid"), bool)
+        or launcher["pid"] <= 0
+        or not isinstance(launcher.get("proc_start_ticks"), int)
+        or isinstance(launcher.get("proc_start_ticks"), bool)
+        or launcher["proc_start_ticks"] <= 0
+        or not re.fullmatch(r"[0-9a-f]{64}", str(launcher.get("capability_sha256", "")))
+        or launcher.get("capability_sha256") == "0" * 64
+        or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            str(launcher.get("boot_id", "")),
+        )
+        or not re.fullmatch(r"[0-9a-f]{40}", str(attempt.get("analysis_commit", "")))
+    ):
+        raise ValueError("canonical structural scoring attempt marker is invalid")
+    return attempt
+
+
+def require_scoring_attempt_marker(
+    run_dir: str | os.PathLike[str],
+    *,
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> Path:
+    """Validate the sealed-scoring attempt without consuming another attempt."""
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural scoring attempt validation"
+    )
+    marker_path = run_root / STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+    marker_payload = _read_regular_bytes(
+        marker_path, label="canonical structural scoring attempt marker"
+    )
+    attempt = _parse_scoring_attempt_payload(marker_payload)
+    amendment_path, seal_path, head_commit = _validate_scoring_inputs(
+        run_root,
+        analysis_amendment_path,
+        pre_score_seal_path,
+        require_canonical_amendment=True,
+    )
+    if attempt.get("analysis_commit") != head_commit:
+        raise ValueError("canonical structural scoring attempt analysis commit differs")
+    launcher = attempt["launcher"]
+    expected = _scoring_attempt_marker_payload(
+        run_root,
+        amendment_path,
+        seal_path,
+        analysis_commit=head_commit,
+        launcher_pid=int(launcher["pid"]),
+        launcher_start_ticks=int(launcher["proc_start_ticks"]),
+        boot_id=str(launcher["boot_id"]),
+        capability_sha256=str(launcher["capability_sha256"]),
+    )
+    if marker_payload != expected:
+        raise ValueError("canonical structural scoring attempt marker is invalid")
+    return marker_path
+
+
+def _parse_scoring_success_payload(payload: bytes) -> Mapping[str, Any]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical structural scoring success receipt is invalid") from exc
+    receipt = _require_exact_fields(
+        value,
+        label="structural scoring success receipt",
+        fields={
+            "schema",
+            "scope",
+            "base_commit",
+            "analysis_commit",
+            "score_rows",
+            "child",
+            "scorer_provenance_sha256",
+            "command",
+            "bindings",
+        },
+    )
+    child = _require_exact_fields(
+        receipt.get("child"),
+        label="structural scoring success child",
+        fields={"pid", "returncode"},
+    )
+    if (
+        receipt.get("schema") != STRUCTURAL_CONTROL_SCORING_SUCCESS_SCHEMA
+        or receipt.get("scope") != STRUCTURAL_CONTROL_AUDITOR_SCOPE
+        or receipt.get("base_commit") != STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+        or receipt.get("score_rows") != STRUCTURAL_CONTROL_EXPECTED_TASKS
+        or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("analysis_commit", "")))
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(receipt.get("scorer_provenance_sha256", ""))
+        )
+        or not isinstance(child.get("pid"), int)
+        or isinstance(child.get("pid"), bool)
+        or child["pid"] <= 0
+        or child.get("returncode") != 0
+    ):
+        raise ValueError("canonical structural scoring success receipt is invalid")
+    return receipt
+
+
+def require_scoring_success_receipt(
+    run_dir: str | os.PathLike[str],
+    *,
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> Path:
+    """Validate the zero-exit scoring receipt before parsing score outcomes."""
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural scoring success validation"
+    )
+    receipt_path = run_root / STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+    receipt_payload = _read_regular_bytes(
+        receipt_path, label="canonical structural scoring success receipt"
+    )
+    receipt = _parse_scoring_success_payload(receipt_payload)
+    attempt_path = require_scoring_attempt_marker(
+        run_root,
+        analysis_amendment_path=analysis_amendment_path,
+        pre_score_seal_path=pre_score_seal_path,
+    )
+    attempt = _parse_scoring_attempt_payload(
+        _read_regular_bytes(
+            attempt_path, label="canonical structural scoring attempt marker"
+        )
+    )
+    source = _load_yaml(
+        ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH,
+        label="structural executable actions",
+    )
+    registered_scorer_hash = (source.get("scoring") or {}).get(
+        "registered_scorer_provenance_sha256"
+    )
+    if (
+        registered_scorer_hash != STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256
+        or receipt.get("scorer_provenance_sha256") != registered_scorer_hash
+    ):
+        raise ValueError("canonical structural scoring success scorer hash differs")
+    scores_path = run_root / "scores.jsonl"
+    _read_regular_bytes(scores_path, label="canonical structural scores")
+    if _scoring_temporary_artifact_exists(run_root):
+        raise ValueError("canonical structural scoring has temporary debris")
+    head_commit = _validate_scoring_sources()
+    if (
+        receipt.get("analysis_commit") != head_commit
+        or receipt.get("analysis_commit") != attempt.get("analysis_commit")
+    ):
+        raise ValueError("canonical structural scoring success analysis commit differs")
+    child = receipt["child"]
+    expected = _scoring_success_receipt_payload(
+        run_root,
+        analysis_amendment_path,
+        pre_score_seal_path,
+        analysis_commit=head_commit,
+        child_pid=int(child["pid"]),
+        scorer_provenance_sha256=str(receipt["scorer_provenance_sha256"]),
+    )
+    if receipt_payload != expected:
+        raise ValueError("canonical structural scoring success receipt is invalid")
+    return receipt_path
+
+
+def require_scoring_child_authorization(
+    run_dir: str | os.PathLike[str],
+    *,
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> Path:
+    """Authenticate the one child allowed to enter the formal metric loop."""
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural scoring child authorization"
+    )
+    marker_path = require_scoring_attempt_marker(
+        run_root,
+        analysis_amendment_path=analysis_amendment_path,
+        pre_score_seal_path=pre_score_seal_path,
+    )
+    attempt = _parse_scoring_attempt_payload(
+        _read_regular_bytes(
+            marker_path, label="canonical structural scoring attempt marker"
+        )
+    )
+    launcher = attempt["launcher"]
+    if _linux_boot_id() != launcher["boot_id"]:
+        raise ValueError("sealed scoring launcher boot identity differs")
+    parent_pid = os.getppid()
+    if parent_pid != launcher["pid"] or _linux_process_start_ticks(parent_pid) != (
+        launcher["proc_start_ticks"]
+    ):
+        raise ValueError("sealed scoring child does not match its launcher process")
+    if [str(Path(sys.executable).resolve()), *sys.argv] != attempt["command"]["argv"]:
+        raise ValueError("sealed scoring child argv differs from the registered command")
+    if str(Path.cwd().resolve()) != attempt["command"]["cwd"]:
+        raise ValueError("sealed scoring child working directory differs")
+    for key, expected_value in attempt["command"]["environment"].items():
+        if os.environ.get(key) != expected_value:
+            raise ValueError("sealed scoring child environment differs")
+    capability = os.environ.pop(STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV, None)
+    if (
+        launcher["capability_sha256"] == "0" * 64
+        or not isinstance(capability, str)
+        or _sha256_bytes(capability.encode("ascii", errors="strict"))
+        != launcher["capability_sha256"]
+    ):
+        raise ValueError("sealed scoring child capability is invalid")
+    if os.path.lexists(run_root / "scores.jsonl") or os.path.lexists(
+        run_root / STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+    ):
+        raise ValueError("sealed scoring child requires scores and receipt absent")
+    if _scoring_temporary_artifact_exists(run_root):
+        raise ValueError("sealed scoring child rejects temporary debris")
+    return marker_path
+
+
+def _validate_completed_scoring(run_root: Path) -> str:
+    scores_path = run_root / "scores.jsonl"
+    _read_regular_bytes(scores_path, label="canonical structural scores")
+    manifest = _load_jsonl(run_root / "manifest.jsonl", label="manifest")
+    scores = _load_jsonl(scores_path, label="scores")
+    if len(manifest) != STRUCTURAL_CONTROL_EXPECTED_TASKS or len(scores) != (
+        STRUCTURAL_CONTROL_EXPECTED_TASKS
+    ):
+        raise ValueError("sealed scoring did not produce exactly 792 bound rows")
+    source_path = (ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH).resolve()
+    source = _load_yaml(source_path, label="structural executable actions")
+    config = _load_json(run_root / "config.json", label="run config")
+    normalized_actions, _ = generate.load_actions(str(source_path), 50)
+    scorer_hash = _validate_registered_artifact_bindings(
+        run_root, config, source, manifest, normalized_actions
+    )
+    if scorer_hash != STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256:
+        raise ValueError("sealed scoring scorer provenance differs from the frozen contract")
+    provenance = scores[0].get("scorer_provenance")
+    scorer_records = provenance.get("scorers") if isinstance(provenance, Mapping) else None
+    if not isinstance(scorer_records, list):
+        raise ValueError("sealed scoring lacks a unified scorer provenance contract")
+    score_config = _load_yaml(
+        ROOT / STRUCTURAL_CONTROL_SCORE_CONFIG_PATH,
+        label="sealed scoring config",
+    )
+    configured_metrics = score_config.get("metrics")
+    if (
+        not isinstance(configured_metrics, list)
+        or not configured_metrics
+        or any(not isinstance(name, str) for name in configured_metrics)
+        or len(configured_metrics) != len(set(configured_metrics))
+        or configured_metrics != list(STRUCTURAL_CONTROL_SCORE_METRICS)
+        or provenance.get("metrics") != configured_metrics
+    ):
+        raise ValueError("sealed scoring metric order differs from the frozen recipe")
+    output_names: list[str] = []
+    for scorer in scorer_records:
+        outputs = scorer.get("output_keys") if isinstance(scorer, Mapping) else None
+        if not isinstance(outputs, list):
+            raise ValueError("sealed scoring scorer output contract is invalid")
+        for output in outputs:
+            if not isinstance(output, Mapping) or not isinstance(output.get("name"), str):
+                raise ValueError("sealed scoring scorer output key is invalid")
+            output_names.append(str(output["name"]))
+    required_outputs = set(output_names)
+    if (
+        required_outputs != set(STRUCTURAL_CONTROL_SCORE_OUTPUT_KEYS)
+        or len(required_outputs) != len(output_names)
+    ):
+        raise ValueError("sealed scoring scorer output keys differ from the frozen recipe")
+    for score in scores:
+        if score.get("scorer_provenance") != provenance:
+            raise ValueError(f"{score.get('id')}: scorer provenance contract drifted")
+        for key in required_outputs:
+            value = score.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(
+                    f"{score.get('id')}: required score {key!r} is missing or non-finite"
+                )
+    return scorer_hash
+
+
+def _scoring_child_environment(capability: str) -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in (
+        STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV,
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONBREAKPOINT",
+        "LD_PRELOAD",
+    ):
+        environment.pop(key, None)
+    environment.update(STRUCTURAL_CONTROL_SCORING_ENVIRONMENT)
+    environment[STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV] = capability
+    return environment
+
+
+def launch_sealed_scoring(
+    run_dir: str | os.PathLike[str],
+    source_actions_path: str | os.PathLike[str],
+    registration_actions_path: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> Path:
+    """Consume the one scoring attempt, run the fixed child, and seal success."""
+    run_root = _require_canonical_formal_run(
+        run_dir, label="sealed scoring launcher"
+    )
+    actions_path = Path(source_actions_path)
+    registration_path = Path(registration_actions_path)
+    if actions_path.is_symlink() or actions_path.resolve() != (
+        ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH
+    ).resolve():
+        raise ValueError("sealed scoring actions path differs from the canonical source")
+    if registration_path.is_symlink() or registration_path.resolve() != (
+        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE
+    ).resolve():
+        raise ValueError(
+            "sealed scoring registration path differs from the canonical source"
+        )
+
+    capability = secrets.token_urlsafe(32)
+    capability_sha256 = _sha256_bytes(capability.encode("ascii"))
+    launcher_pid = os.getpid()
+    launcher_start_ticks = _linux_process_start_ticks(launcher_pid)
+    boot_id = _linux_boot_id()
+    with pre_score_seal_lock(run_root):
+        amendment_path, seal_path, head_commit = _validate_scoring_inputs(
+            run_root,
+            analysis_amendment_path,
+            pre_score_seal_path,
+            require_canonical_amendment=True,
+        )
+        _require_initial_scoring_artifacts_absent(run_root)
+        marker_path = run_root / STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+        marker_payload = _scoring_attempt_marker_payload(
+            run_root,
+            amendment_path,
+            seal_path,
+            analysis_commit=head_commit,
+            launcher_pid=launcher_pid,
+            launcher_start_ticks=launcher_start_ticks,
+            boot_id=boot_id,
+            capability_sha256=capability_sha256,
+        )
+        _exclusive_durable_write(
+            marker_path, marker_payload, label="sealed scoring attempt marker"
+        )
+
+    argv = _canonical_scoring_argv(run_root)
+    child = subprocess.Popen(
+        argv,
+        cwd=str(ROOT.resolve()),
+        env=_scoring_child_environment(capability),
+        shell=False,
+    )
+    return_code = child.wait()
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, argv)
+
+    with pre_score_seal_lock(run_root):
+        require_scoring_attempt_marker(
+            run_root,
+            analysis_amendment_path=amendment_path,
+            pre_score_seal_path=seal_path,
+        )
+        if os.path.lexists(run_root / STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME):
+            raise ValueError("sealed scoring success receipt already exists")
+        if _scoring_temporary_artifact_exists(run_root):
+            raise ValueError("sealed scoring completion has temporary debris")
+        scorer_provenance_sha256 = _validate_completed_scoring(run_root)
+        receipt_path = run_root / STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+        receipt_payload = _scoring_success_receipt_payload(
+            run_root,
+            amendment_path,
+            seal_path,
+            analysis_commit=head_commit,
+            child_pid=int(child.pid),
+            scorer_provenance_sha256=scorer_provenance_sha256,
+        )
+        _exclusive_durable_write(
+            receipt_path, receipt_payload, label="sealed scoring success receipt"
+        )
+        require_scoring_success_receipt(
+            run_root,
+            analysis_amendment_path=amendment_path,
+            pre_score_seal_path=seal_path,
+        )
+    return receipt_path
 
 
 def _require_finite_number(value: Any, *, label: str, positive: bool = False) -> float:
@@ -1733,17 +2638,31 @@ def audit_run(
     pre_score_seal_path: str | os.PathLike[str],
 ) -> dict:
     """Run the generic S7 audit and all structural-control-specific checks."""
-    run_path = Path(run_dir).resolve()
+    run_path = _require_canonical_formal_run(
+        run_dir, label="formal structural audit"
+    )
     audit_attempt_path = require_audit_attempt_marker(run_path)
-    source_path = Path(source_actions_path).resolve()
-    registration_path = Path(registration_actions_path).resolve()
     supplied_seal_path = Path(pre_score_seal_path)
     if supplied_seal_path.is_symlink() or supplied_seal_path.resolve() != (
         run_path / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
     ):
         raise ValueError("formal audit requires the canonical pre-score seal path")
+    scoring_attempt_path = require_scoring_attempt_marker(
+        run_path,
+        analysis_amendment_path=analysis_amendment_path,
+        pre_score_seal_path=supplied_seal_path,
+    )
+    scoring_success_path = require_scoring_success_receipt(
+        run_path,
+        analysis_amendment_path=analysis_amendment_path,
+        pre_score_seal_path=supplied_seal_path,
+    )
+    source_path = Path(source_actions_path).resolve()
+    registration_path = Path(registration_actions_path).resolve()
     input_paths = {
         "audit_attempt_sha256": audit_attempt_path,
+        "scoring_attempt_sha256": scoring_attempt_path,
+        "scoring_success_sha256": scoring_success_path,
         "config_sha256": run_path / "config.json",
         "manifest_sha256": run_path / "manifest.jsonl",
         "scores_sha256": run_path / "scores.jsonl",
@@ -1831,6 +2750,16 @@ def audit_run(
         expected_blocks=99,
     )
     require_audit_attempt_marker(run_path)
+    require_scoring_attempt_marker(
+        run_path,
+        analysis_amendment_path=analysis_amendment_path,
+        pre_score_seal_path=supplied_seal_path,
+    )
+    require_scoring_success_receipt(
+        run_path,
+        analysis_amendment_path=analysis_amendment_path,
+        pre_score_seal_path=supplied_seal_path,
+    )
     final_hashes = {
         label: base_audit.sha256_file(path) for label, path in input_paths.items()
     }
@@ -1860,6 +2789,8 @@ def audit_run(
             "analysis_amendment_sha256": base_audit.sha256_file(
                 analysis_amendment_path
             ),
+            "scoring_attempt_sha256": final_hashes["scoring_attempt_sha256"],
+            "scoring_success_sha256": final_hashes["scoring_success_sha256"],
             "audit_attempt_sha256": final_hashes["audit_attempt_sha256"],
             "pre_score_seal_sha256": base_audit.sha256_file(pre_score_seal_path),
             "duplicate_action_pngs_are_failure": False,
@@ -1892,6 +2823,7 @@ def main() -> None:
     parser.add_argument("--registration", default=str(DEFAULT_REGISTRATION))
     parser.add_argument("--output")
     parser.add_argument("--engineering_smoke", action="store_true")
+    parser.add_argument("--score-sealed", action="store_true")
     parser.add_argument(
         "--create-pre-score-seal",
         "--create-seal",
@@ -1906,6 +2838,29 @@ def main() -> None:
             "analysis-amended structural-control auditor v2 is formal-only; "
             "engineering smoke remains frozen pre-amendment evidence"
         )
+    if args.score_sealed:
+        if args.create_pre_score_seal:
+            parser.error("sealed scoring conflicts with pre-score seal creation")
+        if args.output or args.prompts:
+            parser.error("sealed scoring does not accept audit input/output options")
+        if args.analysis_amendment is None or args.pre_score_seal is None:
+            parser.error(
+                "--analysis-amendment and --pre-score-seal are required for sealed scoring"
+            )
+        receipt_path = launch_sealed_scoring(
+            args.run_dir,
+            args.actions,
+            args.registration,
+            args.analysis_amendment,
+            args.pre_score_seal,
+        )
+        print(
+            json.dumps(
+                {"scored": True, "success_receipt": str(receipt_path)},
+                sort_keys=True,
+            )
+        )
+        return
     if args.create_pre_score_seal:
         if args.output:
             parser.error("seal creation does not accept an audit output path")
@@ -1938,18 +2893,26 @@ def main() -> None:
         parser.error(
             "--analysis-amendment and --pre-score-seal are required for the formal audit"
         )
-    output_path = Path(args.output).absolute() if args.output else (
-        Path(args.run_dir).resolve() / STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+    paths = _preflight_formal_audit_paths(
+        args.run_dir,
+        args.prompts,
+        args.actions,
+        args.registration,
+        args.analysis_amendment,
+        args.pre_score_seal,
+        args.output,
     )
-    with audit_lock(args.run_dir):
-        create_audit_attempt_marker(args.run_dir, output_path)
+    run_root = paths["run"]
+    output_path = paths["output"]
+    with audit_lock(run_root):
+        create_audit_attempt_marker(run_root, output_path)
         report = audit_run(
-            args.run_dir,
-            args.prompts,
-            args.actions,
-            registration_actions_path=args.registration,
-            analysis_amendment_path=args.analysis_amendment,
-            pre_score_seal_path=args.pre_score_seal,
+            run_root,
+            paths["prompts"],
+            paths["actions"],
+            registration_actions_path=paths["registration"],
+            analysis_amendment_path=paths["analysis_amendment"],
+            pre_score_seal_path=paths["pre_score_seal"],
         )
         payload = (
             json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"

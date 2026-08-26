@@ -294,19 +294,34 @@ evaluation staging directory exists:
   --analysis-amendment "$AMENDMENT" --pre-score-seal "$SEAL"
 ```
 
-Only a successfully validated seal permits strict offline scoring:
+Only a successfully validated seal permits strict offline scoring. Formal
+scoring must use the sealed launcher below; invoking `score.py` directly is
+prohibited:
 
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/score.py \
-  --run_dir "$RUN" \
-  --device cuda:7 --strict --require-scorer-provenance
+  /home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/audit_structural_control_run.py --score-sealed \
+  --run_dir "$RUN" --actions "$ACTIONS" --registration "$REGISTRATION" \
+  --analysis-amendment "$AMENDMENT" --pre-score-seal "$SEAL"
 ```
 
+While holding the generation/scoring lock, the launcher validates the canonical
+run, amendment, seal, scorer runner, and scoring config; requires all score,
+temporary, attempt, and receipt artifacts absent; then exclusively creates and
+fsyncs `$RUN/structural_control_scoring_attempt.json`. The fixed offline child
+must authenticate the launcher process and one-use capability before its first
+metric computation. The launcher never removes the attempt marker: a launcher
+error, child error, process termination, or post-score validation failure
+permanently consumes the attempt and forbids retry. Only a zero-exit child with
+exactly 792 manifest-bound, finite, provenance-valid score rows receives the
+fsynced `$RUN/structural_control_scoring_success.json` receipt.
+
 Then run the dedicated audit before any metric comparison. The formal audit is
-schema `scheduler_native_structural_control_audit_v2`; it binds both amendment
-and seal hashes and must report `auditor_scope: formal_development_only` and
-`outcome_details_disclosed: false`. Before reading outcome bytes, the CLI
+schema `scheduler_native_structural_control_audit_v2`; it binds amendment,
+seal, scoring-attempt, and scoring-success hashes and must report
+`auditor_scope: formal_development_only` and `outcome_details_disclosed: false`.
+Before parsing outcome rows, the CLI
 exclusively creates and fsyncs
 `$RUN/structural_control_audit_attempt.json`; the report binds that marker's
 SHA256. A failed audit attempt consumes the one allowed attempt, so do not remove
@@ -349,12 +364,14 @@ A successful attempt publishes exactly one canonical directory,
 `$RUN/structural_control_evaluation_bundle/`, containing only
 `structural_control_evaluation.json` and `structural_control_contrasts.csv`.
 JSON binds the CSV filename, schema, scope, row count, and SHA256; every CSV row
-carries the non-authorization envelope and all 12 input hashes, including both
-attempt markers. `--verify-bundle` requires both markers but neither creates nor
-removes them. Under the lock it rehashes the 12 current inputs, reruns the formal
+carries the non-authorization envelope and all 14 input hashes, including the
+scoring attempt/success, audit attempt, and evaluation attempt artifacts.
+`--verify-bundle` requires all four but neither creates nor removes them. Under
+the lock it rehashes the 14 current inputs, reruns the formal
 audit and frozen statistics, deterministically rebuilds the complete JSON and
-CSV, and requires both files to match byte for byte. It then rechecks both input
-markers and the canonical bundle's directory identity, exact regular-file
+CSV, and requires both files to match byte for byte. It then rechecks all four
+scoring/audit/evaluation evidence artifacts and the canonical bundle's directory
+identity, exact regular-file
 entries, and bytes. Thus input drift or a coordinated replacement during replay
 cannot validate rewritten contrasts, action summaries, provenance, or CSV
 bindings.
@@ -362,7 +379,8 @@ bindings.
 Stop on any nonzero exit, warning, missing artifact, schema/hash mismatch, input
 drift, or unexpected legacy output at `$RUN/structural_control_evaluation.json`
 or `$RUN/structural_control_contrasts.csv`. Do not delete, rewrite, reseal, rerun
-the one-shot audit/evaluator, or remove either attempt marker after a failure. The
+sealed scoring or the one-shot audit/evaluator, or remove any attempt/receipt
+artifact after a failure. The
 low-level bundle publisher has atomic recovery tests, but this does not authorize
 a second formal CLI attempt. Do not inspect outcomes, select a method, begin
 validation, or authorize RL after a failure. An action pair identical across all

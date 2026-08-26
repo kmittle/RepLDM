@@ -4,6 +4,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -21,9 +22,29 @@ spec = importlib.util.spec_from_file_location(
 score = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(score)
+scorer_provenance = sys.modules["scorer_provenance"]
 
 
 class CFGScoringTest(unittest.TestCase):
+    def structural_gate_config(self, run_dir):
+        config = {
+            "structural_control_registered": True,
+            "action_schema": "scheduler_native_structural_controls_actions_v1",
+            "structural_control_registration_schema": (
+                "scheduler_native_structural_controls_v1"
+            ),
+            "split_role": "development",
+            "scorer_provenance_binding_required": True,
+            "out_dir": str(pathlib.Path(run_dir).resolve()),
+            "run_contract": {
+                "action_schema": "scheduler_native_structural_controls_actions_v1"
+            },
+        }
+        (pathlib.Path(run_dir) / "config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        return config
+
     def scoring_yaml(self):
         return {
             "schema": score.CFG_ACTION_SCHEMA,
@@ -484,6 +505,367 @@ class CFGScoringTest(unittest.TestCase):
                     result["scorer_provenance"]["schema"],
                     score.SCORER_PROVENANCE_SCHEMA,
                 )
+
+    def test_structural_scorer_gate_rejects_unknown_process_context(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            config = self.structural_gate_config(run_dir)
+            with mock.patch.object(
+                scorer_provenance,
+                "_STRUCTURAL_FORMAL_RUN_PATH",
+                str(run_dir),
+            ), mock.patch.object(
+                sys, "argv", ["-c"]
+            ), self.assertRaisesRegex(ValueError, "process context"):
+                score.registered_scorer_provenance_contract(config)
+
+    def test_structural_scorer_gate_uses_live_child_auth_once(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            config = self.structural_gate_config(run_dir)
+            child_auth = mock.Mock()
+            static_attempt = mock.Mock()
+            static_success = mock.Mock()
+            fake_audit = types.SimpleNamespace(
+                STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH="candidate.yaml",
+                STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME="seal.json",
+                require_scoring_child_authorization=child_auth,
+                require_scoring_attempt_marker=static_attempt,
+                require_scoring_success_receipt=static_success,
+            )
+            with mock.patch.object(
+                scorer_provenance,
+                "_STRUCTURAL_FORMAL_RUN_PATH",
+                str(run_dir),
+            ), mock.patch.object(
+                sys,
+                "argv",
+                [str(EVAL_PIPELINE / "score.py"), "--fixed-fixture"],
+            ), mock.patch.dict(
+                sys.modules, {"audit_structural_control_run": fake_audit}
+            ):
+                self.assertEqual(
+                    score.registered_scorer_provenance_contract(config),
+                    (None, None),
+                )
+            child_auth.assert_called_once_with(
+                run_dir.resolve(),
+                analysis_amendment_path=ROOT / "candidate.yaml",
+                pre_score_seal_path=run_dir.resolve() / "seal.json",
+            )
+            static_attempt.assert_not_called()
+            static_success.assert_not_called()
+
+    def test_structural_scorer_gate_allows_frozen_shared_config_then_authenticates_run(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            run_config = self.structural_gate_config(run_dir)
+            with (EVAL_PIPELINE / "configs" / "eval_common.yaml").open(
+                encoding="utf-8"
+            ) as handle:
+                shared_config = yaml.safe_load(handle)
+            child_auth = mock.Mock()
+            fake_audit = types.SimpleNamespace(
+                STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH="candidate.yaml",
+                STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME="seal.json",
+                require_scoring_child_authorization=child_auth,
+                require_scoring_attempt_marker=mock.Mock(),
+                require_scoring_success_receipt=mock.Mock(),
+            )
+            argv = [
+                str(EVAL_PIPELINE / "score.py"),
+                "--run_dir",
+                str(run_dir),
+            ]
+            with mock.patch.object(
+                scorer_provenance,
+                "_STRUCTURAL_FORMAL_RUN_PATH",
+                str(run_dir),
+            ), mock.patch.object(sys, "argv", argv), mock.patch.dict(
+                sys.modules, {"audit_structural_control_run": fake_audit}
+            ):
+                self.assertEqual(
+                    score.registered_scorer_provenance_contract(shared_config),
+                    (None, None),
+                )
+                child_auth.assert_not_called()
+                self.assertEqual(
+                    score.registered_scorer_provenance_contract(run_config),
+                    (None, None),
+                )
+            child_auth.assert_called_once()
+
+    def test_structural_scorer_gate_rejects_missing_signatures_and_signal_stripping(self):
+        attacks = (
+            "missing_registration_flag",
+            "false_registration_flag",
+            "missing_action_schema",
+            "missing_registration_schema",
+            "missing_run_contract_schema",
+            "missing_out_dir",
+            "missing_split_role",
+            "missing_provenance_binding",
+            "all_signals_removed",
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                config = self.structural_gate_config(run_dir)
+                if attack == "missing_registration_flag":
+                    config.pop("structural_control_registered")
+                elif attack == "false_registration_flag":
+                    config["structural_control_registered"] = False
+                elif attack == "missing_action_schema":
+                    config.pop("action_schema")
+                elif attack == "missing_registration_schema":
+                    config.pop("structural_control_registration_schema")
+                elif attack == "missing_run_contract_schema":
+                    config["run_contract"] = {}
+                elif attack == "missing_out_dir":
+                    config.pop("out_dir")
+                elif attack == "missing_split_role":
+                    config.pop("split_role")
+                elif attack == "missing_provenance_binding":
+                    config.pop("scorer_provenance_binding_required")
+                else:
+                    for key in (
+                        "structural_control_registered",
+                        "action_schema",
+                        "structural_control_registration_schema",
+                        "out_dir",
+                        "split_role",
+                        "scorer_provenance_binding_required",
+                    ):
+                        config.pop(key)
+                    config["run_contract"] = {}
+                (run_dir / "config.json").write_text(
+                    json.dumps(config), encoding="utf-8"
+                )
+                argv = [
+                    str(EVAL_PIPELINE / "score.py"),
+                    "--run_dir",
+                    str(run_dir),
+                ]
+                with mock.patch.object(
+                    scorer_provenance,
+                    "_STRUCTURAL_FORMAL_RUN_PATH",
+                    str(run_dir),
+                ), mock.patch.object(sys, "argv", argv), self.assertRaisesRegex(
+                    ValueError, "formal structural"
+                ):
+                    score.registered_scorer_provenance_contract(config)
+
+    def test_structural_scorer_gate_rejects_stripped_run_after_shared_config(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            stripped_run_config = {
+                "split_role": "development",
+                "scorer_provenance_binding_required": True,
+                "run_contract": {},
+            }
+            (run_dir / "config.json").write_text(
+                json.dumps(stripped_run_config), encoding="utf-8"
+            )
+            with (EVAL_PIPELINE / "configs" / "eval_common.yaml").open(
+                encoding="utf-8"
+            ) as handle:
+                shared_config = yaml.safe_load(handle)
+            argv = [
+                str(EVAL_PIPELINE / "score.py"),
+                "--run_dir",
+                str(run_dir),
+            ]
+            with mock.patch.object(
+                scorer_provenance,
+                "_STRUCTURAL_FORMAL_RUN_PATH",
+                str(run_dir),
+            ), mock.patch.object(sys, "argv", argv):
+                self.assertEqual(
+                    score.registered_scorer_provenance_contract(shared_config),
+                    (None, None),
+                )
+                with self.assertRaisesRegex(ValueError, "formal structural"):
+                    score.registered_scorer_provenance_contract(stripped_run_config)
+
+    def test_structural_scorer_gate_rejects_shared_config_as_run_config(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            with (EVAL_PIPELINE / "configs" / "eval_common.yaml").open(
+                encoding="utf-8"
+            ) as handle:
+                shared_config = yaml.safe_load(handle)
+            (run_dir / "config.json").write_text(
+                json.dumps(shared_config), encoding="utf-8"
+            )
+            argv = [
+                str(EVAL_PIPELINE / "score.py"),
+                "--run_dir",
+                str(run_dir),
+            ]
+            with mock.patch.object(
+                scorer_provenance,
+                "_STRUCTURAL_FORMAL_RUN_PATH",
+                str(run_dir),
+            ), mock.patch.object(sys, "argv", argv), self.assertRaisesRegex(
+                ValueError, "formal structural"
+            ):
+                score.registered_scorer_provenance_contract(shared_config)
+
+    def test_structural_scorer_gate_requires_static_receipts_in_audit_contexts(self):
+        for process_name in (
+            "audit_structural_control_run.py",
+            "evaluate_structural_control_run.py",
+        ):
+            with self.subTest(process_name=process_name), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                config = self.structural_gate_config(run_dir)
+                child_auth = mock.Mock()
+                static_attempt = mock.Mock()
+                static_success = mock.Mock()
+                fake_audit = types.SimpleNamespace(
+                    STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH="candidate.yaml",
+                    STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME="seal.json",
+                    require_scoring_child_authorization=child_auth,
+                    require_scoring_attempt_marker=static_attempt,
+                    require_scoring_success_receipt=static_success,
+                )
+                with mock.patch.object(
+                    scorer_provenance,
+                    "_STRUCTURAL_FORMAL_RUN_PATH",
+                    str(run_dir),
+                ), mock.patch.object(
+                    sys, "argv", [str(EVAL_PIPELINE / process_name)]
+                ), mock.patch.dict(
+                    sys.modules, {"audit_structural_control_run": fake_audit}
+                ):
+                    score.registered_scorer_provenance_contract(config)
+                child_auth.assert_not_called()
+                static_attempt.assert_called_once()
+                static_success.assert_called_once()
+
+    def test_structural_scorer_gate_allows_frozen_actions_then_authenticates_audit_run(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            run_config = self.structural_gate_config(run_dir)
+            with (
+                EVAL_PIPELINE
+                / "configs"
+                / "scheduler_native_structural_controls_development_authorized_v1.yaml"
+            ).open(encoding="utf-8") as handle:
+                actions_config = yaml.safe_load(handle)
+            static_attempt = mock.Mock()
+            static_success = mock.Mock()
+            fake_audit = types.SimpleNamespace(
+                STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH="candidate.yaml",
+                STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME="seal.json",
+                require_scoring_child_authorization=mock.Mock(),
+                require_scoring_attempt_marker=static_attempt,
+                require_scoring_success_receipt=static_success,
+            )
+            with mock.patch.object(
+                scorer_provenance,
+                "_STRUCTURAL_FORMAL_RUN_PATH",
+                str(run_dir),
+            ), mock.patch.object(
+                sys,
+                "argv",
+                [str(EVAL_PIPELINE / "audit_structural_control_run.py")],
+            ), mock.patch.dict(
+                sys.modules, {"audit_structural_control_run": fake_audit}
+            ):
+                self.assertEqual(
+                    score.registered_scorer_provenance_contract(actions_config),
+                    (None, actions_config["scoring"]["registered_scorer_provenance_sha256"]),
+                )
+                static_attempt.assert_not_called()
+                static_success.assert_not_called()
+                score.registered_scorer_provenance_contract(run_config)
+            static_attempt.assert_called_once()
+            static_success.assert_called_once()
+
+    def test_structural_scorer_gate_redundant_signals_activate_unknown_context(self):
+        signals = (
+            {"schema": "scheduler_native_structural_controls_actions_v1"},
+            {"registration_schema": "scheduler_native_structural_controls_v1"},
+        )
+        for registration in signals:
+            with self.subTest(registration=registration), mock.patch.object(
+                sys, "argv", ["-c"]
+            ), self.assertRaisesRegex(ValueError, "process context"):
+                score.registered_scorer_provenance_contract(registration)
+
+    def test_native_renderer_development_provenance_flags_do_not_activate_gate(self):
+        registration = {
+            "native_renderer_registered": True,
+            "split_role": "development",
+            "scorer_provenance_binding_required": True,
+        }
+        with mock.patch.object(sys, "argv", ["-c"]):
+            self.assertEqual(
+                score.registered_scorer_provenance_contract(registration),
+                (None, None),
+            )
+
+    def test_structural_scorer_gate_rejects_copied_run_and_config_drift(self):
+        for attack in ("copied_run", "config_drift"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                root = pathlib.Path(temporary)
+                canonical_run = root / "canonical"
+                selected_run = root / ("copy" if attack == "copied_run" else "canonical")
+                canonical_run.mkdir()
+                if selected_run != canonical_run:
+                    selected_run.mkdir()
+                config = self.structural_gate_config(selected_run)
+                if attack == "config_drift":
+                    config = {**config, "post_load_edit": True}
+                with mock.patch.object(
+                    scorer_provenance,
+                    "_STRUCTURAL_FORMAL_RUN_PATH",
+                    str(canonical_run),
+                ), mock.patch.object(
+                    sys, "argv", [str(EVAL_PIPELINE / "score.py")]
+                ), self.assertRaisesRegex(
+                    ValueError, "canonical non-symlink|changed after loading"
+                ):
+                    score.registered_scorer_provenance_contract(config)
+
+    def test_nonstructural_scorer_contract_does_not_activate_gate(self):
+        child_auth = mock.Mock()
+        fake_audit = types.SimpleNamespace(
+            STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH="candidate.yaml",
+            STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME="seal.json",
+            require_scoring_child_authorization=child_auth,
+            require_scoring_attempt_marker=mock.Mock(),
+            require_scoring_success_receipt=mock.Mock(),
+        )
+        with mock.patch.object(
+            sys, "argv", [str(EVAL_PIPELINE / "score.py")]
+        ), mock.patch.dict(
+            sys.modules, {"audit_structural_control_run": fake_audit}
+        ):
+            self.assertEqual(
+                score.registered_scorer_provenance_contract(
+                    {"cfg_baseline_registered": True}
+                ),
+                (None, None),
+            )
+        child_auth.assert_not_called()
+        fake_audit.require_scoring_attempt_marker.assert_not_called()
+        fake_audit.require_scoring_success_receipt.assert_not_called()
 
     def test_output_lock_and_atomic_writer_protect_scores(self):
         with tempfile.TemporaryDirectory() as tmp:

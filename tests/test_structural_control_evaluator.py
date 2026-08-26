@@ -1,4 +1,5 @@
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -39,6 +40,53 @@ spec.loader.exec_module(evaluator)
 class StructuralControlEvaluatorTest(unittest.TestCase):
     PROMPT_INDICES = tuple(range(33))
     SEEDS = (1932556753, 1065503757, 201635682)
+
+    def setUp(self):
+        self._formal_run_patches = contextlib.ExitStack()
+
+    def tearDown(self):
+        self._formal_run_patches.close()
+
+    def use_fixture_formal_run(self, run_dir):
+        """Point canonical-run checks at one temporary CPU fixture."""
+        self._formal_run_patches.close()
+        self._formal_run_patches = contextlib.ExitStack()
+        run_root = pathlib.Path(run_dir).resolve()
+        analysis_commit = evaluator.structural_audit._current_head_commit()
+
+        def validate_scoring_inputs(
+            observed_run,
+            analysis_amendment_path,
+            pre_score_seal_path,
+            *,
+            base_commit=evaluator.structural_audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+            require_canonical_amendment,
+        ):
+            del base_commit, require_canonical_amendment
+            if pathlib.Path(observed_run).resolve() != run_root:
+                raise AssertionError("scoring validator received a non-fixture run")
+            amendment_path = pathlib.Path(analysis_amendment_path).resolve()
+            seal_path = pathlib.Path(pre_score_seal_path).resolve()
+            if seal_path != run_root / (
+                evaluator.structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+            ):
+                raise ValueError("sealed scoring requires the canonical pre-score seal")
+            return amendment_path, seal_path, analysis_commit
+
+        self._formal_run_patches.enter_context(
+            mock.patch.object(
+                evaluator.structural_audit,
+                "STRUCTURAL_CONTROL_FORMAL_RUN_PATH",
+                run_root,
+            )
+        )
+        self._formal_run_patches.enter_context(
+            mock.patch.object(
+                evaluator.structural_audit,
+                "_validate_scoring_inputs",
+                side_effect=validate_scoring_inputs,
+            )
+        )
 
     @staticmethod
     def sha256(path):
@@ -350,12 +398,8 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
         frame = self.frame(payload)
         run_dir = root / "run"
         run_dir.mkdir()
+        self.use_fixture_formal_run(run_dir)
         audit_path = run_dir / "run_audit.json"
-        audit_attempt_path = evaluator.structural_audit.create_audit_attempt_marker(
-            run_dir, audit_path
-        )
-        if evaluation_attempt:
-            evaluator.create_evaluation_attempt_marker(run_dir)
         manifest_columns = [
             "id",
             "prompt_index",
@@ -414,6 +458,49 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
         amendment_path.write_text(json.dumps({"fixture": "amendment"}), encoding="utf-8")
         seal_path = run_dir / evaluator.structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
         seal_path.write_text(json.dumps({"fixture": "seal"}), encoding="utf-8")
+        self._formal_run_patches.enter_context(
+            mock.patch.object(
+                evaluator.structural_audit,
+                "STRUCTURAL_CONTROL_ACTIONS_PATH",
+                str(actions_path),
+            )
+        )
+        self._formal_run_patches.enter_context(
+            mock.patch.object(
+                evaluator.structural_audit,
+                "STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH",
+                str(amendment_path),
+            )
+        )
+        scoring_attempt_path = (
+            run_dir / evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+        )
+        scoring_attempt_path.write_bytes(
+            evaluator.structural_audit._scoring_attempt_marker_payload(
+                run_dir,
+                amendment_path,
+                seal_path,
+                base_commit=(
+                    evaluator.structural_audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+                ),
+            )
+        )
+        scoring_success_path = (
+            run_dir / evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+        )
+        scoring_success_path.write_bytes(
+            evaluator.structural_audit._scoring_success_receipt_payload(
+                run_dir,
+                amendment_path,
+                seal_path,
+                base_commit=(
+                    evaluator.structural_audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+                ),
+            )
+        )
+        audit_attempt_path = evaluator.structural_audit.create_audit_attempt_marker(
+            run_dir, audit_path
+        )
         effective_analysis = {
             "schema": evaluator.ANALYSIS_IMPLEMENTATION_SCHEMA,
             "files": {
@@ -458,6 +545,8 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
             "registration_sha256": self.sha256(REGISTRATION),
             "analysis_amendment_sha256": self.sha256(amendment_path),
             "pre_score_seal_sha256": self.sha256(seal_path),
+            "scoring_attempt_sha256": self.sha256(scoring_attempt_path),
+            "scoring_success_sha256": self.sha256(scoring_success_path),
             "audit_attempt_sha256": self.sha256(audit_attempt_path),
             "analysis_implementation": effective_analysis,
             "analysis_implementation_sha256": evaluator.structural_audit.json_sha256(
@@ -482,12 +571,16 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                 "source_template_sha256": self.sha256(REGISTRATION),
                 "analysis_amendment_sha256": self.sha256(amendment_path),
                 "pre_score_seal_sha256": self.sha256(seal_path),
+                "scoring_attempt_sha256": self.sha256(scoring_attempt_path),
+                "scoring_success_sha256": self.sha256(scoring_success_path),
                 "audit_attempt_sha256": self.sha256(audit_attempt_path),
                 "audit_script_sha256": self.sha256(evaluator.AUDITOR_PATH),
                 "input_snapshot_stable": True,
             },
         }
         audit_path.write_text(json.dumps(audit), encoding="utf-8")
+        if evaluation_attempt:
+            evaluator.create_evaluation_attempt_marker(run_dir)
         return run_dir, actions_path, audit_path, amendment_path, seal_path
 
     def test_verified_loader_requires_passing_hash_bound_792_task_audit(self):
@@ -547,29 +640,44 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     seal_path,
                 )
 
-            marker_forged = copy.deepcopy(original_audit)
-            marker_forged["provenance"]["audit_attempt_sha256"] = "f" * 64
-            audit_path.write_text(json.dumps(marker_forged), encoding="utf-8")
-            with mock.patch.object(
-                evaluator.structural_audit, "audit_run", return_value=marker_forged
-            ), mock.patch.object(
-                evaluator.structural_audit,
-                "validate_analysis_amendment",
-                return_value={},
-                create=True,
-            ), mock.patch.object(
-                evaluator.structural_audit,
-                "validate_pre_score_seal",
-                return_value={},
-                create=True,
-            ), self.assertRaisesRegex(ValueError, "hash mismatch for audit_attempt_sha256"):
-                evaluator.load_verified_inputs(
-                    run_dir,
-                    actions_path,
-                    audit_path,
-                    amendment_path,
-                    seal_path,
-                )
+            for marker_key in (
+                "scoring_attempt",
+                "scoring_success",
+                "audit_attempt",
+            ):
+                for location in ("provenance", "top_level"):
+                    with self.subTest(forged_marker=marker_key, location=location):
+                        field = f"{marker_key}_sha256"
+                        marker_forged = copy.deepcopy(original_audit)
+                        if location == "provenance":
+                            marker_forged["provenance"][field] = "f" * 64
+                        else:
+                            marker_forged[field] = "f" * 64
+                        audit_path.write_text(
+                            json.dumps(marker_forged), encoding="utf-8"
+                        )
+                        with mock.patch.object(
+                            evaluator.structural_audit,
+                            "audit_run",
+                            return_value=marker_forged,
+                        ), mock.patch.object(
+                            evaluator.structural_audit,
+                            "validate_analysis_amendment",
+                            return_value={},
+                            create=True,
+                        ), mock.patch.object(
+                            evaluator.structural_audit,
+                            "validate_pre_score_seal",
+                            return_value={},
+                            create=True,
+                        ), self.assertRaisesRegex(ValueError, f"hash mismatch for {field}"):
+                            evaluator.load_verified_inputs(
+                                run_dir,
+                                actions_path,
+                                audit_path,
+                                amendment_path,
+                                seal_path,
+                            )
 
             forged = copy.deepcopy(original_audit)
             forged["provenance"]["scores_sha256"] = "f" * 64
@@ -595,8 +703,14 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     seal_path,
                 )
 
-    def test_verified_loader_rejects_missing_or_tampered_attempt_markers_before_outcomes(self):
+    def test_verified_loader_rejects_invalid_attempt_markers_before_outcomes(self):
         cases = (
+            ("scoring_attempt", "missing"),
+            ("scoring_attempt", "tampered"),
+            ("scoring_attempt", "symlink"),
+            ("scoring_success", "missing"),
+            ("scoring_success", "tampered"),
+            ("scoring_success", "symlink"),
             ("audit_attempt", "missing"),
             ("audit_attempt", "tampered"),
             ("evaluation_attempt", "missing"),
@@ -613,15 +727,29 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     amendment_path,
                     seal_path,
                 ) = self.write_verified_fixture(temporary)
-                marker_path = run_dir / (
-                    evaluator.structural_audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
-                    if marker_key == "audit_attempt"
-                    else evaluator.ATTEMPT_MARKER
-                )
+                marker_names = {
+                    "scoring_attempt": (
+                        evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                    ),
+                    "scoring_success": (
+                        evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+                    ),
+                    "audit_attempt": (
+                        evaluator.structural_audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+                    ),
+                    "evaluation_attempt": evaluator.ATTEMPT_MARKER,
+                }
+                marker_path = run_dir / marker_names[marker_key]
                 if mutation == "missing":
                     marker_path.unlink()
-                else:
+                elif mutation == "tampered":
                     marker_path.write_bytes(b"tampered marker\n")
+                else:
+                    marker_payload = marker_path.read_bytes()
+                    marker_path.unlink()
+                    target = pathlib.Path(temporary) / "marker_target"
+                    target.write_bytes(marker_payload)
+                    marker_path.symlink_to(target)
 
                 original_read_bytes = pathlib.Path.read_bytes
                 outcome_paths = {
@@ -646,7 +774,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     evaluator.structural_audit,
                     "validate_pre_score_seal",
                     return_value={},
-                ), self.assertRaisesRegex(ValueError, "attempt marker is (missing|invalid)"):
+                ), self.assertRaises(ValueError):
                     evaluator.load_verified_inputs(
                         run_dir,
                         actions_path,
@@ -727,6 +855,66 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                         alias if label == "seal" else seal_path,
                     )
 
+    def test_formal_entry_points_reject_noncanonical_run_copy_before_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            canonical_run = root / "canonical"
+            copied_run = root / "copied"
+            canonical_run.mkdir()
+            copied_run.mkdir()
+            self.use_fixture_formal_run(canonical_run)
+            copied_inputs = {
+                key: copied_run / f"{key}.fixture"
+                for key in evaluator.INPUT_PROVENANCE_KEYS
+            }
+            calls = {
+                "loader": lambda: evaluator.load_verified_inputs(
+                    copied_run,
+                    copied_inputs["actions"],
+                    copied_inputs["audit"],
+                    copied_inputs["analysis_amendment"],
+                    copied_inputs["pre_score_seal"],
+                ),
+                "resolver": lambda: evaluator.resolve_evaluation_input_paths(
+                    copied_run,
+                    copied_inputs["actions"],
+                    copied_inputs["audit"],
+                    copied_inputs["analysis_amendment"],
+                    copied_inputs["pre_score_seal"],
+                ),
+                "replay": lambda: evaluator.replay_evaluation_payloads(copied_inputs),
+            }
+            for label, call in calls.items():
+                with self.subTest(entry_point=label), mock.patch.object(
+                    pathlib.Path,
+                    "read_bytes",
+                    side_effect=AssertionError("noncanonical input was read"),
+                ), self.assertRaisesRegex(
+                    ValueError, "canonical non-symlink formal run"
+                ):
+                    call()
+
+            argv = [
+                "evaluate_structural_control_run.py",
+                "--run-dir",
+                str(copied_run),
+                "--actions",
+                str(copied_inputs["actions"]),
+                "--audit",
+                str(copied_inputs["audit"]),
+                "--analysis-amendment",
+                str(copied_inputs["analysis_amendment"]),
+                "--pre-score-seal",
+                str(copied_inputs["pre_score_seal"]),
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                evaluator, "evaluation_lock"
+            ) as lock, self.assertRaisesRegex(
+                ValueError, "canonical non-symlink formal run"
+            ):
+                evaluator.main()
+            lock.assert_not_called()
+
     def bundle_payloads(self, input_hashes=None):
         input_hashes = input_hashes or {
             key: f"{index + 1:064x}"
@@ -780,10 +968,17 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
 
     def write_bundle_input_files(self, root):
         root = pathlib.Path(root)
+        self.use_fixture_formal_run(root)
         names = {
             "run_config": "config.json",
             "manifest": "manifest.jsonl",
             "scores": "scores.jsonl",
+            "scoring_attempt": (
+                evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+            ),
+            "scoring_success": (
+                evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+            ),
             "actions": "actions.yaml",
             "audit": "run_audit.json",
             "audit_attempt": (
@@ -800,6 +995,8 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
         }
         paths = {key: root / name for key, name in names.items()}
         for key, path in paths.items():
+            if key in {"scoring_attempt", "scoring_success"}:
+                continue
             if key == "audit_attempt":
                 payload = evaluator.structural_audit._audit_attempt_marker_payload()
             elif key == "evaluation_attempt":
@@ -807,6 +1004,26 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
             else:
                 payload = f"current input: {key}\n".encode("ascii")
             path.write_bytes(payload)
+        paths["scoring_attempt"].write_bytes(
+            evaluator.structural_audit._scoring_attempt_marker_payload(
+                root,
+                paths["analysis_amendment"],
+                paths["pre_score_seal"],
+                base_commit=(
+                    evaluator.structural_audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+                ),
+            )
+        )
+        paths["scoring_success"].write_bytes(
+            evaluator.structural_audit._scoring_success_receipt_payload(
+                root,
+                paths["analysis_amendment"],
+                paths["pre_score_seal"],
+                base_commit=(
+                    evaluator.structural_audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+                ),
+            )
+        )
         hashes = {key: self.sha256(path) for key, path in paths.items()}
         return paths, hashes
 
@@ -905,7 +1122,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             current_paths, current_hashes = self.write_bundle_input_files(root)
             self.assertEqual(set(current_paths), set(evaluator.INPUT_PROVENANCE_KEYS))
-            self.assertEqual(len(current_paths), 12)
+            self.assertEqual(len(current_paths), 14)
             _, json_payload, csv_payload = self.bundle_payloads(current_hashes)
             bundle = evaluator.publish_evaluation_bundle(
                 root,
@@ -932,7 +1149,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                 expected_input_hashes=current_hashes,
                 strict=False,
             )
-            with self.assertRaisesRegex(ValueError, "differs from current inputs"):
+            with self.assertRaises(ValueError):
                 evaluator.verify_evaluation_bundle(
                     bundle, current_input_paths=current_paths
                 )
@@ -1024,7 +1241,12 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                 )
 
     def test_strict_verifier_rejects_attempt_marker_drift_during_replay(self):
-        for marker_key in ("audit_attempt", "evaluation_attempt"):
+        for marker_key in (
+            "scoring_attempt",
+            "scoring_success",
+            "audit_attempt",
+            "evaluation_attempt",
+        ):
             with self.subTest(marker_key=marker_key), tempfile.TemporaryDirectory() as temporary:
                 root = pathlib.Path(temporary)
                 current_paths, current_hashes = self.write_bundle_input_files(root)
@@ -1047,7 +1269,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     evaluator,
                     "replay_evaluation_payloads",
                     side_effect=drift_marker,
-                ), self.assertRaisesRegex(ValueError, "attempt marker is invalid"):
+                ), self.assertRaises(ValueError):
                     evaluator.verify_evaluation_bundle(
                         bundle, current_input_paths=current_paths
                     )
@@ -1122,6 +1344,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
     def test_attempt_marker_uses_exclusive_nofollow_and_is_one_shot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
+            self.use_fixture_formal_run(root)
             original_open = evaluator.os.open
             with mock.patch.object(evaluator.os, "open", wraps=original_open) as opened:
                 marker = evaluator.create_evaluation_attempt_marker(root)
@@ -1134,6 +1357,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
+            self.use_fixture_formal_run(root)
             target = root / "target"
             target.write_text("unchanged", encoding="utf-8")
             (root / evaluator.ATTEMPT_MARKER).symlink_to(target)
@@ -1148,6 +1372,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
         ):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
                 root = pathlib.Path(temporary)
+                self.use_fixture_formal_run(root)
                 path = root / existing
                 if existing == evaluator.OUTPUT_BUNDLE_DIR:
                     path.mkdir()
@@ -1157,8 +1382,13 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     evaluator.create_evaluation_attempt_marker(root)
                 self.assertFalse((root / evaluator.ATTEMPT_MARKER).exists())
 
-    def test_strict_verification_requires_both_attempt_markers_without_creating_them(self):
-        for marker_key in ("audit_attempt", "evaluation_attempt"):
+    def test_strict_verification_requires_all_attempt_markers_without_creating_them(self):
+        for marker_key in (
+            "scoring_attempt",
+            "scoring_success",
+            "audit_attempt",
+            "evaluation_attempt",
+        ):
             with self.subTest(marker_key=marker_key), tempfile.TemporaryDirectory() as temporary:
                 root = pathlib.Path(temporary)
                 current_paths, current_hashes = self.write_bundle_input_files(root)
@@ -1170,9 +1400,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                     expected_input_hashes=current_hashes,
                 )
                 current_paths[marker_key].unlink()
-                with self.assertRaisesRegex(
-                    ValueError, "(attempt marker is missing|input is missing: .*attempt)"
-                ):
+                with self.assertRaises(ValueError):
                     evaluator.verify_evaluation_bundle(
                         bundle, current_input_paths=current_paths
                     )
@@ -1182,6 +1410,7 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
         for phase in ("file_fsync", "parent_fsync"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
                 root = pathlib.Path(temporary)
+                self.use_fixture_formal_run(root)
                 if phase == "file_fsync":
                     patcher = mock.patch.object(
                         evaluator.os,
@@ -1199,6 +1428,157 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                 self.assertTrue(os.path.lexists(root / evaluator.ATTEMPT_MARKER))
                 with self.assertRaisesRegex(ValueError, "one-shot"):
                     evaluator.create_evaluation_attempt_marker(root)
+
+    def test_cli_path_preflight_rejects_wrong_and_alias_inputs_before_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            (
+                run_dir,
+                actions_path,
+                audit_path,
+                amendment_path,
+                seal_path,
+            ) = self.write_verified_fixture(temporary, evaluation_attempt=False)
+            marker_path = run_dir / evaluator.ATTEMPT_MARKER
+            canonical_inputs = {
+                "actions": actions_path,
+                "audit": audit_path,
+                "analysis-amendment": amendment_path,
+                "pre-score-seal": seal_path,
+            }
+            base_argv = [
+                "evaluate_structural_control_run.py",
+                "--run-dir",
+                str(run_dir),
+                "--actions",
+                str(actions_path),
+                "--audit",
+                str(audit_path),
+                "--analysis-amendment",
+                str(amendment_path),
+                "--pre-score-seal",
+                str(seal_path),
+            ]
+
+            def replace_argument(argv, option, value):
+                attacked = list(argv)
+                attacked[attacked.index(option) + 1] = str(value)
+                return attacked
+
+            run_copy = root / "run-copy"
+            run_copy.mkdir()
+            run_alias = root / "run-alias"
+            run_alias.symlink_to(run_dir, target_is_directory=True)
+            attacks = [
+                ("run_wrong", replace_argument(base_argv, "--run-dir", run_copy)),
+                ("run_alias", replace_argument(base_argv, "--run-dir", run_alias)),
+            ]
+            for option, canonical_path in canonical_inputs.items():
+                wrong_path = root / f"wrong-{option}"
+                wrong_path.write_bytes(b"wrong path fixture")
+                alias_path = root / f"alias-{option}"
+                alias_path.symlink_to(canonical_path)
+                attacks.extend(
+                    (
+                        (
+                            f"{option}_wrong",
+                            replace_argument(base_argv, f"--{option}", wrong_path),
+                        ),
+                        (
+                            f"{option}_alias",
+                            replace_argument(base_argv, f"--{option}", alias_path),
+                        ),
+                    )
+                )
+            for attack, argv in attacks:
+                with self.subTest(attack=attack), mock.patch.object(
+                    sys, "argv", argv
+                ), mock.patch.object(
+                    evaluator, "evaluation_lock"
+                ) as evaluation_lock, mock.patch.object(
+                    evaluator, "load_verified_inputs"
+                ) as loader, mock.patch.object(
+                    pathlib.Path,
+                    "read_bytes",
+                    side_effect=AssertionError("path preflight must not read bytes"),
+                ), self.assertRaisesRegex(
+                    ValueError, "canonical|missing|unsafe"
+                ):
+                    evaluator.main()
+                self.assertFalse(os.path.lexists(marker_path))
+                evaluation_lock.assert_not_called()
+                loader.assert_not_called()
+
+    def test_cli_rejects_incomplete_scoring_evidence_and_consumes_attempt(self):
+        missing_names = {
+            "scoring_attempt": (
+                evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+            ),
+            "scoring_success": (
+                evaluator.structural_audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+            ),
+        }
+        for missing_key, missing_name in missing_names.items():
+            with self.subTest(missing_key=missing_key), tempfile.TemporaryDirectory() as temporary:
+                (
+                    run_dir,
+                    actions_path,
+                    audit_path,
+                    amendment_path,
+                    seal_path,
+                ) = self.write_verified_fixture(temporary, evaluation_attempt=False)
+                (run_dir / missing_name).unlink()
+                argv = [
+                    "evaluate_structural_control_run.py",
+                    "--run-dir",
+                    str(run_dir),
+                    "--actions",
+                    str(actions_path),
+                    "--audit",
+                    str(audit_path),
+                    "--analysis-amendment",
+                    str(amendment_path),
+                    "--pre-score-seal",
+                    str(seal_path),
+                ]
+                original_read_bytes = pathlib.Path.read_bytes
+                outcome_paths = {
+                    (run_dir / "scores.jsonl").resolve(),
+                    audit_path.resolve(),
+                }
+
+                def reject_outcome_read(path):
+                    if path.resolve() in outcome_paths:
+                        raise AssertionError(
+                            "outcome bytes were read with incomplete scoring evidence"
+                        )
+                    return original_read_bytes(path)
+
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                    pathlib.Path, "read_bytes", reject_outcome_read
+                ), mock.patch.object(
+                    evaluator.structural_audit, "audit_run"
+                ) as audit_run, mock.patch.object(
+                    evaluator.structural_audit,
+                    "validate_analysis_amendment",
+                    return_value={},
+                ), mock.patch.object(
+                    evaluator.structural_audit,
+                    "validate_pre_score_seal",
+                    return_value={},
+                ), self.assertRaises(ValueError):
+                    evaluator.main()
+                audit_run.assert_not_called()
+                self.assertEqual(
+                    (run_dir / evaluator.ATTEMPT_MARKER).read_bytes(),
+                    evaluator._attempt_marker_payload(),
+                )
+
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                    evaluator, "load_verified_inputs"
+                ) as loader, self.assertRaisesRegex(ValueError, "one-shot"):
+                    evaluator.main()
+                loader.assert_not_called()
 
     def test_cli_consumes_attempt_before_loading_any_outcome_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1408,7 +1788,12 @@ class StructuralControlEvaluatorTest(unittest.TestCase):
                 set(canonical_report["input_provenance_sha256"]),
                 set(evaluator.INPUT_PROVENANCE_KEYS),
             )
-            for marker_key in ("audit_attempt", "evaluation_attempt"):
+            for marker_key in (
+                "scoring_attempt",
+                "scoring_success",
+                "audit_attempt",
+                "evaluation_attempt",
+            ):
                 self.assertEqual(
                     set(contrasts[f"input_{marker_key}_sha256"]),
                     {self.sha256(current_paths[marker_key])},

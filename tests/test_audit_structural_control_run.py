@@ -7,6 +7,7 @@ import json
 import math
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,10 @@ class StructuralControlAuditTest(unittest.TestCase):
     AUTHORIZATION_COMMIT = "b" * 40
 
     def setUp(self):
+        self.original_formal_run_path = audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH
+        self.original_analysis_amendment_path = (
+            audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH
+        )
         self.real_git_bytes = audit._git_bytes
         self.timesteps = [float(value) for value in range(50, 0, -1)]
         self.sigmas = [float(value) / 10.0 for value in range(51, 0, -1)]
@@ -196,6 +201,12 @@ class StructuralControlAuditTest(unittest.TestCase):
             },
         }
         self.records = [self.record(action) for action in self.actions]
+
+    def tearDown(self):
+        audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = self.original_formal_run_path
+        audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH = (
+            self.original_analysis_amendment_path
+        )
 
     def record(self, action):
         record = {
@@ -488,6 +499,7 @@ class StructuralControlAuditTest(unittest.TestCase):
         root = pathlib.Path(root)
         run_dir = root / "run"
         run_dir.mkdir()
+        audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
         (run_dir / "config.json").write_text(
             json.dumps(
                 {"git_commit": audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT}
@@ -502,7 +514,30 @@ class StructuralControlAuditTest(unittest.TestCase):
             encoding="utf-8",
         )
         amendment_path, _ = self.write_analysis_amendment(root)
+        audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH = str(amendment_path)
         return run_dir, amendment_path
+
+    def write_scoring_launcher_inputs(self, root):
+        run_dir, amendment_path = self.write_pre_score_inputs(root)
+        seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+        seal_path.write_bytes(b"sealed fixture\n")
+        return run_dir, amendment_path, seal_path
+
+    @contextmanager
+    def mocked_scoring_validation(self, run_dir, amendment_path, seal_path):
+        head_commit = "c" * 40
+        with mock.patch.object(
+            audit,
+            "_validate_scoring_inputs",
+            return_value=(
+                amendment_path.resolve(),
+                seal_path.resolve(),
+                head_commit,
+            ),
+        ), mock.patch.object(
+            audit, "_validate_scoring_sources", return_value=head_commit
+        ):
+            yield head_commit
 
     def test_complete_structural_record_contract_passes(self):
         report = audit.audit_structural_records(
@@ -1015,11 +1050,31 @@ class StructuralControlAuditTest(unittest.TestCase):
                 )
 
     @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
+    def test_pre_score_seal_rejects_noncanonical_amendment_before_publication(
+        self, _validate_amendment
+    ):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+            alternate_amendment = pathlib.Path(temporary) / "alternate-amendment.yaml"
+            alternate_amendment.write_bytes(amendment_path.read_bytes())
+            seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+            with self.assertRaisesRegex(ValueError, "canonical analysis amendment"):
+                audit.create_pre_score_seal(
+                    run_dir,
+                    ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                    alternate_amendment,
+                )
+            self.assertFalse(os.path.lexists(seal_path))
+
+    @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
     def test_pre_score_seal_rejects_outcomes_and_active_generation_lock(
         self, _validate_amendment
     ):
         forbidden_names = (
             "scores.jsonl",
+            audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME,
+            audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME,
             audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
             audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME,
             audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
@@ -1027,6 +1082,8 @@ class StructuralControlAuditTest(unittest.TestCase):
             *audit.STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
             f".{audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.staging",
             ".scores.jsonl.crash.tmp",
+            ".structural_control_scoring_attempt.json.crash.tmp",
+            ".structural_control_scoring_success.json.crash.tmp",
             ".run_audit.json.crash.tmp",
             ".structural_control_evaluation.json.crash.tmp",
             ".structural_control_contrasts.csv.crash.tmp",
@@ -1112,11 +1169,548 @@ class StructuralControlAuditTest(unittest.TestCase):
             self.assertFalse(
                 (run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME).exists()
             )
+            self.assertFalse(
+                (run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME).exists()
+            )
+            self.assertFalse(
+                (run_dir / audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME).exists()
+            )
+
+    def test_sealed_scoring_rejects_invalid_inputs_before_marker_or_child(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            with mock.patch.object(
+                audit,
+                "_validate_scoring_inputs",
+                side_effect=ValueError("invalid sealed inputs"),
+            ), mock.patch.object(audit.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(ValueError, "invalid sealed inputs"):
+                    audit.launch_sealed_scoring(
+                        run_dir,
+                        ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                        amendment_path,
+                        seal_path,
+                    )
+            popen.assert_not_called()
+            self.assertFalse(
+                os.path.lexists(
+                    run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                )
+            )
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = self.original_formal_run_path
+            with mock.patch.object(audit.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(ValueError, "canonical non-symlink"):
+                    audit.launch_sealed_scoring(
+                        run_dir,
+                        ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                        amendment_path,
+                        seal_path,
+                    )
+            popen.assert_not_called()
+
+    def test_sealed_scoring_rejects_existing_scores_temps_and_marker_nodes(self):
+        artifact_states = ("scores", "temp", "marker_symlink", "marker_fifo")
+        for state in artifact_states:
+            with self.subTest(state=state), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                    temporary
+                )
+                marker_path = (
+                    run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                )
+                if state == "scores":
+                    (run_dir / "scores.jsonl").write_bytes(b"partial score\n")
+                elif state == "temp":
+                    (run_dir / ".scores.jsonl.any punctuation!.tmp").write_bytes(
+                        b"partial temp\n"
+                    )
+                elif state == "marker_symlink":
+                    marker_path.symlink_to(run_dir / "missing-target")
+                else:
+                    os.mkfifo(marker_path)
+                with self.mocked_scoring_validation(
+                    run_dir, amendment_path, seal_path
+                ), mock.patch.object(audit.subprocess, "Popen") as popen:
+                    with self.assertRaisesRegex(
+                        ValueError, "one-shot|temporary debris"
+                    ):
+                        audit.launch_sealed_scoring(
+                            run_dir,
+                            ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                            ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                            amendment_path,
+                            seal_path,
+                        )
+                popen.assert_not_called()
+
+    def test_sealed_scoring_rejects_audit_and_evaluation_debris_before_attempt(self):
+        debris_names = (
+            audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
+            audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME,
+            audit.STRUCTURAL_CONTROL_EVALUATION_ATTEMPT_NAME,
+            audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+            *audit.STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
+            ".run_audit.json.interrupted output.tmp",
+            f".{audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.staging output",
+            ".structural_control_evaluation.json.interrupted output.tmp",
+            ".structural_control_contrasts.csv.interrupted output.tmp",
+            ".structural_control_pre_score_seal.json.interrupted output.tmp",
+        )
+        directory_names = {
+            audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+            f".{audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.staging output",
+        }
+        for debris_name in debris_names:
+            with self.subTest(debris_name=debris_name), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                    temporary
+                )
+                debris_path = run_dir / debris_name
+                if debris_name in directory_names:
+                    debris_path.mkdir()
+                else:
+                    debris_path.write_bytes(b"pre-existing post-seal debris")
+                marker_path = (
+                    run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                )
+                with self.mocked_scoring_validation(
+                    run_dir, amendment_path, seal_path
+                ), mock.patch.object(audit.subprocess, "Popen") as popen:
+                    with self.assertRaisesRegex(
+                        ValueError, "score, audit, and evaluation artifacts absent"
+                    ):
+                        audit.launch_sealed_scoring(
+                            run_dir,
+                            ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                            ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                            amendment_path,
+                            seal_path,
+                        )
+                self.assertFalse(os.path.lexists(marker_path))
+                popen.assert_not_called()
+
+    def test_sealed_scoring_launch_is_durable_fixed_and_releases_lock(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            marker_path = run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+
+            class Child:
+                pid = 4321
+
+                @staticmethod
+                def wait():
+                    return 0
+
+            def popen_child(argv, **kwargs):
+                marker = json.loads(marker_path.read_bytes())
+                self.assertEqual(argv, audit._canonical_scoring_argv(run_dir))
+                self.assertFalse(kwargs["shell"])
+                self.assertEqual(kwargs["cwd"], str(ROOT.resolve()))
+                capability = kwargs["env"][audit.STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV]
+                self.assertEqual(
+                    hashlib.sha256(capability.encode("ascii")).hexdigest(),
+                    marker["launcher"]["capability_sha256"],
+                )
+                for key, value in audit.STRUCTURAL_CONTROL_SCORING_ENVIRONMENT.items():
+                    self.assertEqual(kwargs["env"][key], value)
+                with (run_dir / ".generate.lock").open("a+") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                (run_dir / "scores.jsonl").write_bytes(b"{}\n")
+                return Child()
+
+            with self.mocked_scoring_validation(
+                run_dir, amendment_path, seal_path
+            ), mock.patch.object(
+                audit, "_validate_completed_scoring",
+                return_value=audit.STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256,
+            ), mock.patch.object(
+                audit.subprocess, "Popen", side_effect=popen_child
+            ) as popen, mock.patch.object(
+                audit.os, "open", wraps=audit.os.open
+            ) as open_file, mock.patch.object(
+                audit.os, "fsync", wraps=audit.os.fsync
+            ) as fsync, mock.patch.object(
+                audit, "_fsync_directory", wraps=audit._fsync_directory
+            ) as fsync_directory:
+                receipt_path = audit.launch_sealed_scoring(
+                    run_dir,
+                    ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                    amendment_path,
+                    seal_path,
+                )
+            popen.assert_called_once()
+            self.assertEqual(
+                receipt_path,
+                run_dir / audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME,
+            )
+            for output_path in (marker_path, receipt_path):
+                exclusive_calls = [
+                    call
+                    for call in open_file.call_args_list
+                    if call.args and pathlib.Path(call.args[0]) == output_path
+                    and len(call.args) > 1
+                    and call.args[1] & audit.os.O_WRONLY
+                ]
+                self.assertEqual(len(exclusive_calls), 1)
+                self.assertTrue(exclusive_calls[0].args[1] & audit.os.O_EXCL)
+                self.assertTrue(exclusive_calls[0].args[1] & audit.os.O_NOFOLLOW)
+            self.assertGreaterEqual(fsync.call_count, 4)
+            self.assertGreaterEqual(fsync_directory.call_count, 2)
+            receipt = json.loads(receipt_path.read_bytes())
+            self.assertEqual(receipt["child"], {"pid": 4321, "returncode": 0})
+            self.assertEqual(
+                receipt["bindings"]["scoring_attempt"]["sha256"],
+                hashlib.sha256(marker_path.read_bytes()).hexdigest(),
+            )
+
+    def test_sealed_scoring_child_failure_consumes_attempt_and_blocks_retry(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            child = mock.Mock(pid=7654)
+            child.wait.return_value = 9
+            with self.mocked_scoring_validation(
+                run_dir, amendment_path, seal_path
+            ), mock.patch.object(audit.subprocess, "Popen", return_value=child) as popen:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    audit.launch_sealed_scoring(
+                        run_dir,
+                        ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                        amendment_path,
+                        seal_path,
+                    )
+                self.assertTrue(
+                    (run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME).is_file()
+                )
+                self.assertFalse(
+                    (run_dir / audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME).exists()
+                )
+                with self.assertRaisesRegex(ValueError, "one-shot"):
+                    audit.launch_sealed_scoring(
+                        run_dir,
+                        ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                        amendment_path,
+                        seal_path,
+                    )
+            self.assertEqual(popen.call_count, 1)
+
+    def test_scoring_attempt_fsync_failures_leave_terminal_nodes(self):
+        for failure_point in ("file", "directory"):
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                marker_path = pathlib.Path(temporary) / "attempt.json"
+                if failure_point == "file":
+                    failure = mock.patch.object(
+                        audit.os, "fsync", side_effect=OSError("file fsync failed")
+                    )
+                else:
+                    failure = mock.patch.object(
+                        audit,
+                        "_fsync_directory",
+                        side_effect=OSError("directory fsync failed"),
+                    )
+                with failure, self.assertRaisesRegex(OSError, "fsync failed"):
+                    audit._exclusive_durable_write(
+                        marker_path, b"attempt\n", label="fixture marker"
+                    )
+                self.assertTrue(os.path.lexists(marker_path))
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    audit._exclusive_durable_write(
+                        marker_path, b"retry\n", label="fixture marker"
+                    )
+
+    def test_completed_scoring_accepts_structural_rows_without_cfg_contract(self):
+        scorer_outputs = {
+            "imagereward": (
+                "imagereward",
+                "patch_ir_mean",
+                "patch_ir_std",
+                "patch_ir_n",
+            ),
+            "pixel": (
+                "colorfulness",
+                "laplacian_sharpness",
+                "clipped_fraction",
+                "mean_saturation",
+                "contrast_std",
+            ),
+            "clip": ("clip_cosine", "clipscore"),
+            "hps": ("hpsv2",),
+            "aesthetic": ("aesthetic",),
+            "iqa": ("topiq_nr",),
+        }
+        provenance = {
+            "metrics": list(audit.STRUCTURAL_CONTROL_SCORE_METRICS),
+            "scorers": [
+                {
+                    "name": name,
+                    "output_keys": [
+                        {"name": key, "direction": "higher"} for key in keys
+                    ],
+                }
+                for name, keys in scorer_outputs.items()
+            ],
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            manifest = [
+                {"id": f"fixture-{index}"}
+                for index in range(audit.STRUCTURAL_CONTROL_EXPECTED_TASKS)
+            ]
+            scores = [
+                {
+                    "id": row["id"],
+                    "scorer_provenance": provenance,
+                    **{
+                        key: 0.5
+                        for key in audit.STRUCTURAL_CONTROL_SCORE_OUTPUT_KEYS
+                    },
+                }
+                for row in manifest
+            ]
+            (run_dir / "manifest.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in manifest),
+                encoding="utf-8",
+            )
+            scores_path = run_dir / "scores.jsonl"
+
+            def write_scores(rows):
+                scores_path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+
+            patches = (
+                mock.patch.object(audit, "_load_json", return_value={}),
+                mock.patch.object(generate, "load_actions", return_value=([], [])),
+                mock.patch.object(
+                    audit,
+                    "_validate_registered_artifact_bindings",
+                    return_value=audit.STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256,
+                ),
+            )
+            write_scores(scores)
+            with patches[0], patches[1], patches[2]:
+                self.assertEqual(
+                    audit._validate_completed_scoring(run_dir),
+                    audit.STRUCTURAL_CONTROL_SCORER_PROVENANCE_SHA256,
+                )
+
+            for attack in ("missing", "nan"):
+                attacked = copy.deepcopy(scores)
+                if attack == "missing":
+                    attacked[0].pop("topiq_nr")
+                else:
+                    attacked[0]["topiq_nr"] = float("nan")
+                write_scores(attacked)
+                with patches[0], patches[1], patches[2], self.assertRaisesRegex(
+                    ValueError, "missing or non-finite"
+                ):
+                    audit._validate_completed_scoring(run_dir)
+
+    def test_scoring_marker_read_rejects_symlink_fifo_and_directory_without_blocking(self):
+        for node_type in ("symlink", "fifo", "directory"):
+            with self.subTest(node_type=node_type), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                    temporary
+                )
+                marker_path = run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                if node_type == "symlink":
+                    marker_path.symlink_to(run_dir / "missing-target")
+                elif node_type == "fifo":
+                    os.mkfifo(marker_path)
+                else:
+                    marker_path.mkdir()
+                with mock.patch.object(
+                    audit, "_validate_scoring_inputs"
+                ) as validate_inputs, self.assertRaisesRegex(
+                    ValueError, "missing or unsafe|not regular"
+                ):
+                    audit.require_scoring_attempt_marker(
+                        run_dir,
+                        analysis_amendment_path=amendment_path,
+                        pre_score_seal_path=seal_path,
+                    )
+                validate_inputs.assert_not_called()
+
+    def test_scoring_static_artifacts_reject_zero_capability_and_forged_scorer_hash(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            marker_path = run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+            attempt = json.loads(
+                audit._scoring_attempt_marker_payload(
+                    run_dir,
+                    amendment_path,
+                    seal_path,
+                    analysis_commit="c" * 40,
+                )
+            )
+            attempt["launcher"]["capability_sha256"] = "0" * 64
+            marker_path.write_bytes(
+                (json.dumps(attempt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            )
+            with mock.patch.object(
+                audit, "_validate_scoring_inputs"
+            ) as validate_inputs, self.assertRaisesRegex(ValueError, "attempt marker"):
+                audit.require_scoring_attempt_marker(
+                    run_dir,
+                    analysis_amendment_path=amendment_path,
+                    pre_score_seal_path=seal_path,
+                )
+            validate_inputs.assert_not_called()
+
+            marker_path.write_bytes(
+                audit._scoring_attempt_marker_payload(
+                    run_dir,
+                    amendment_path,
+                    seal_path,
+                    analysis_commit="c" * 40,
+                )
+            )
+            (run_dir / "scores.jsonl").write_bytes(b"{}\n")
+            receipt = json.loads(
+                audit._scoring_success_receipt_payload(
+                    run_dir,
+                    amendment_path,
+                    seal_path,
+                    analysis_commit="c" * 40,
+                )
+            )
+            receipt["scorer_provenance_sha256"] = "f" * 64
+            (run_dir / audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME).write_bytes(
+                (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            )
+            with self.mocked_scoring_validation(
+                run_dir, amendment_path, seal_path
+            ), self.assertRaisesRegex(ValueError, "scorer hash differs"):
+                audit.require_scoring_success_receipt(
+                    run_dir,
+                    analysis_amendment_path=amendment_path,
+                    pre_score_seal_path=seal_path,
+                )
+
+    def test_scoring_child_authorization_binds_parent_token_argv_and_cwd(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            capability = "one-use-test-capability"
+            parent_pid = 4242
+            parent_ticks = 8675309
+            boot_id = "12345678-1234-1234-1234-123456789abc"
+            head_commit = "c" * 40
+            marker_path = run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+            marker_path.write_bytes(
+                audit._scoring_attempt_marker_payload(
+                    run_dir,
+                    amendment_path,
+                    seal_path,
+                    analysis_commit=head_commit,
+                    launcher_pid=parent_pid,
+                    launcher_start_ticks=parent_ticks,
+                    boot_id=boot_id,
+                    capability_sha256=hashlib.sha256(
+                        capability.encode("ascii")
+                    ).hexdigest(),
+                )
+            )
+            child_argv = audit._canonical_scoring_argv(run_dir)
+            child_environment = {
+                **audit.STRUCTURAL_CONTROL_SCORING_ENVIRONMENT,
+                audit.STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV: capability,
+            }
+            with self.mocked_scoring_validation(
+                run_dir, amendment_path, seal_path
+            ), mock.patch.object(
+                audit.os, "getppid", return_value=parent_pid
+            ), mock.patch.object(
+                audit, "_linux_process_start_ticks", return_value=parent_ticks
+            ), mock.patch.object(
+                audit, "_linux_boot_id", return_value=boot_id
+            ), mock.patch.object(
+                sys, "argv", child_argv[1:]
+            ), mock.patch.dict(
+                audit.os.environ, child_environment, clear=True
+            ):
+                self.assertEqual(
+                    audit.require_scoring_child_authorization(
+                        run_dir,
+                        analysis_amendment_path=amendment_path,
+                        pre_score_seal_path=seal_path,
+                    ),
+                    marker_path,
+                )
+                self.assertNotIn(
+                    audit.STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV,
+                    audit.os.environ,
+                )
+
+            for attack in ("parent", "token", "argv", "cwd"):
+                with self.subTest(attack=attack), self.mocked_scoring_validation(
+                    run_dir, amendment_path, seal_path
+                ), mock.patch.object(
+                    audit.os,
+                    "getppid",
+                    return_value=parent_pid + (1 if attack == "parent" else 0),
+                ), mock.patch.object(
+                    audit, "_linux_process_start_ticks", return_value=parent_ticks
+                ), mock.patch.object(
+                    audit, "_linux_boot_id", return_value=boot_id
+                ), mock.patch.object(
+                    sys,
+                    "argv",
+                    child_argv[1:] + (["--metrics", "pixel"] if attack == "argv" else []),
+                ), mock.patch.dict(
+                    audit.os.environ,
+                    {
+                        **child_environment,
+                        audit.STRUCTURAL_CONTROL_SCORING_CAPABILITY_ENV: (
+                            "wrong" if attack == "token" else capability
+                        ),
+                    },
+                    clear=True,
+                ), mock.patch.object(
+                    audit.Path,
+                    "cwd",
+                    return_value=(ROOT.parent if attack == "cwd" else ROOT),
+                ), self.assertRaises(ValueError):
+                    audit.require_scoring_child_authorization(
+                        run_dir,
+                        analysis_amendment_path=amendment_path,
+                        pre_score_seal_path=seal_path,
+                    )
 
     def test_audit_attempt_marker_is_durable_and_one_shot(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             run_dir = pathlib.Path(temporary) / "run"
             run_dir.mkdir()
+            audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
             output_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
             with mock.patch.object(
                 audit.os, "open", wraps=audit.os.open
@@ -1142,21 +1736,15 @@ class StructuralControlAuditTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "one-shot"):
                 audit.create_audit_attempt_marker(run_dir, output_path)
 
-        for existing_name in (
-            audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
-            "custom-audit.json",
-        ):
+        for existing_name in (audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,):
             with self.subTest(existing_output=existing_name), tempfile.TemporaryDirectory(
                 dir=ROOT
             ) as temporary:
                 run_dir = pathlib.Path(temporary) / "run"
                 run_dir.mkdir()
                 (run_dir / existing_name).write_bytes(b"existing output")
-                selected_output = (
-                    run_dir / "custom-audit.json"
-                    if existing_name == audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
-                    else run_dir / existing_name
-                )
+                audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
+                selected_output = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
                 with self.assertRaisesRegex(ValueError, "one-shot"):
                     audit.create_audit_attempt_marker(run_dir, selected_output)
 
@@ -1164,6 +1752,7 @@ class StructuralControlAuditTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             run_dir = pathlib.Path(temporary) / "run"
             run_dir.mkdir()
+            audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
             marker_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
             marker_path.symlink_to(run_dir / "missing-marker-target")
             with self.assertRaisesRegex(ValueError, "one-shot"):
@@ -1175,6 +1764,7 @@ class StructuralControlAuditTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             run_dir = pathlib.Path(temporary) / "run"
             run_dir.mkdir()
+            audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
             with mock.patch.object(
                 audit.os.path, "lexists", return_value=False
             ), mock.patch.object(
@@ -1191,6 +1781,7 @@ class StructuralControlAuditTest(unittest.TestCase):
             ) as temporary:
                 run_dir = pathlib.Path(temporary) / "run"
                 run_dir.mkdir()
+                audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
                 output_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
                 if failure_point == "file":
                     failure_patch = mock.patch.object(
@@ -1211,6 +1802,97 @@ class StructuralControlAuditTest(unittest.TestCase):
                 self.assertFalse(output_path.exists())
                 with self.assertRaisesRegex(ValueError, "one-shot"):
                     audit.create_audit_attempt_marker(run_dir, output_path)
+
+    def test_audit_cli_rejects_noncanonical_output_and_run_alias_before_attempt(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            root = pathlib.Path(temporary)
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
+            marker_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+            canonical_inputs = {
+                "prompts": ROOT / generate.STRUCTURAL_CONTROL_PROMPTS,
+                "actions": ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                "registration": (
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE
+                ),
+                "analysis-amendment": amendment_path,
+                "pre-score-seal": seal_path,
+            }
+            base_argv = [
+                "audit_structural_control_run.py",
+                "--run_dir",
+                str(run_dir),
+                "--prompts",
+                str(canonical_inputs["prompts"]),
+                "--actions",
+                str(canonical_inputs["actions"]),
+                "--registration",
+                str(canonical_inputs["registration"]),
+                "--analysis-amendment",
+                str(canonical_inputs["analysis-amendment"]),
+                "--pre-score-seal",
+                str(canonical_inputs["pre-score-seal"]),
+            ]
+
+            def replace_argument(argv, option, value):
+                attacked = list(argv)
+                attacked[attacked.index(option) + 1] = str(value)
+                return attacked
+
+            run_copy = root / "run-copy"
+            run_copy.mkdir()
+            (root / "run-alias").symlink_to(run_dir, target_is_directory=True)
+            output_alias = root / "output-alias.json"
+            output_alias.symlink_to(run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME)
+            attacks = [
+                ("run_wrong", replace_argument(base_argv, "--run_dir", run_copy)),
+                (
+                    "run_alias",
+                    replace_argument(base_argv, "--run_dir", root / "run-alias"),
+                ),
+                (
+                    "output_wrong",
+                    [*base_argv, "--output", str(root / "custom.json")],
+                ),
+                (
+                    "output_alias",
+                    [*base_argv, "--output", str(output_alias)],
+                ),
+            ]
+            for option, canonical_path in canonical_inputs.items():
+                wrong_path = root / f"wrong-{option}"
+                wrong_path.write_bytes(b"wrong path fixture")
+                alias_path = root / f"alias-{option}"
+                alias_path.symlink_to(canonical_path)
+                attacks.extend(
+                    (
+                        (
+                            f"{option}_wrong",
+                            replace_argument(base_argv, f"--{option}", wrong_path),
+                        ),
+                        (
+                            f"{option}_alias",
+                            replace_argument(base_argv, f"--{option}", alias_path),
+                        ),
+                    )
+                )
+            for attack, argv in attacks:
+                with self.subTest(attack=attack), mock.patch.object(
+                    sys, "argv", argv
+                ), mock.patch.object(audit, "audit_lock") as audit_lock, mock.patch.object(
+                    audit, "audit_run"
+                ) as audit_run, mock.patch.object(
+                    pathlib.Path,
+                    "read_bytes",
+                    side_effect=AssertionError("path preflight must not read bytes"),
+                ), self.assertRaisesRegex(
+                    ValueError, "canonical|missing|unsafe"
+                ):
+                    audit.main()
+                self.assertFalse(os.path.lexists(marker_path))
+                audit_lock.assert_not_called()
+                audit_run.assert_not_called()
 
     def test_require_audit_attempt_marker_rejects_missing_tampered_and_nonregular(self):
         for marker_state in ("missing", "tampered", "symlink", "directory"):
@@ -1243,6 +1925,7 @@ class StructuralControlAuditTest(unittest.TestCase):
             ) as temporary:
                 run_dir = pathlib.Path(temporary) / "run"
                 run_dir.mkdir()
+                audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
                 if marker_state == "tampered":
                     (
                         run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
@@ -1260,10 +1943,63 @@ class StructuralControlAuditTest(unittest.TestCase):
                         pre_score_seal_path="missing-seal.json",
                     )
 
+    def test_audit_rejects_scoring_bypass_before_parsing_outcomes(self):
+        for state in (
+            "missing_attempt",
+            "tampered_attempt",
+            "missing_success",
+            "tampered_success",
+        ):
+            with self.subTest(state=state), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
+                amendment_path = pathlib.Path(temporary) / "amendment.yaml"
+                amendment_path.write_bytes(b"amendment\n")
+                seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+                seal_path.write_bytes(b"seal\n")
+                audit.create_audit_attempt_marker(
+                    run_dir, run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+                )
+                scoring_marker_path = (
+                    run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+                )
+                if state != "missing_attempt":
+                    scoring_marker_path.write_bytes(
+                        b"tampered marker"
+                        if state == "tampered_attempt"
+                        else audit._scoring_attempt_marker_payload(
+                            run_dir,
+                            amendment_path,
+                            seal_path,
+                            analysis_commit="c" * 40,
+                        )
+                    )
+                success_path = run_dir / audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+                if state == "tampered_success":
+                    success_path.write_bytes(b"tampered receipt")
+                with self.mocked_scoring_validation(
+                    run_dir, amendment_path, seal_path
+                ), mock.patch.object(
+                    audit,
+                    "_load_jsonl",
+                    side_effect=AssertionError("outcomes must not be parsed"),
+                ), self.assertRaises(ValueError):
+                    audit.audit_run(
+                        run_dir,
+                        "missing-prompts.csv",
+                        "missing-actions.yaml",
+                        analysis_amendment_path=amendment_path,
+                        pre_score_seal_path=seal_path,
+                    )
+
     def test_formal_audit_consumes_attempt_before_read_and_preserves_failure(self):
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
-            run_dir = pathlib.Path(temporary) / "run"
-            run_dir.mkdir()
+            run_dir, amendment_path, seal_path = self.write_scoring_launcher_inputs(
+                temporary
+            )
             marker_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
             output_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
             argv = [
@@ -1271,13 +2007,15 @@ class StructuralControlAuditTest(unittest.TestCase):
                 "--run_dir",
                 str(run_dir),
                 "--prompts",
-                "prompts.csv",
+                str(ROOT / generate.STRUCTURAL_CONTROL_PROMPTS),
                 "--actions",
-                "actions.yaml",
+                str(ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH),
+                "--registration",
+                str(ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE),
                 "--analysis-amendment",
-                "amendment.yaml",
+                str(amendment_path),
                 "--pre-score-seal",
-                "seal.json",
+                str(seal_path),
             ]
 
             def fail_after_marker(*_args, **_kwargs):
@@ -1327,6 +2065,7 @@ class StructuralControlAuditTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             run_dir = root / "run"
             run_dir.mkdir()
+            audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH = str(run_dir)
             (run_dir / "config.json").write_text(
                 json.dumps({"git_commit": audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT}),
                 encoding="utf-8",
@@ -1355,8 +2094,29 @@ class StructuralControlAuditTest(unittest.TestCase):
             )
             amendment_path = root / "amendment.yaml"
             amendment_path.write_text("schema: fixture\n", encoding="utf-8")
+            audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH = str(amendment_path)
             seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
             seal_path.write_text("{}\n", encoding="utf-8")
+            scoring_marker_path = (
+                run_dir / audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+            )
+            scoring_marker_path.write_bytes(
+                audit._scoring_attempt_marker_payload(
+                    run_dir,
+                    amendment_path,
+                    seal_path,
+                )
+            )
+            scoring_success_path = (
+                run_dir / audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+            )
+            scoring_success_path.write_bytes(
+                audit._scoring_success_receipt_payload(
+                    run_dir,
+                    amendment_path,
+                    seal_path,
+                )
+            )
             marker_path = audit.create_audit_attempt_marker(
                 run_dir, run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
             )
@@ -1434,9 +2194,29 @@ class StructuralControlAuditTest(unittest.TestCase):
             self.assertFalse(report["outcome_details_disclosed"])
             self.assertTrue(report["full_action_collapse_check_passed"])
             marker_hash = hashlib.sha256(marker_path.read_bytes()).hexdigest()
+            scoring_marker_hash = hashlib.sha256(
+                scoring_marker_path.read_bytes()
+            ).hexdigest()
+            scoring_success_hash = hashlib.sha256(
+                scoring_success_path.read_bytes()
+            ).hexdigest()
+            self.assertEqual(
+                report["scoring_attempt_sha256"], scoring_marker_hash
+            )
+            self.assertEqual(
+                report["scoring_success_sha256"], scoring_success_hash
+            )
             self.assertEqual(report["audit_attempt_sha256"], marker_hash)
             self.assertEqual(
                 report["provenance"]["audit_attempt_sha256"], marker_hash
+            )
+            self.assertEqual(
+                report["provenance"]["scoring_attempt_sha256"],
+                scoring_marker_hash,
+            )
+            self.assertEqual(
+                report["provenance"]["scoring_success_sha256"],
+                scoring_success_hash,
             )
             for leaked_field in (
                 "duplicate_action_png_pair_counts",

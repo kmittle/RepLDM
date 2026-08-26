@@ -16,6 +16,7 @@ import os
 import platform
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence
@@ -34,6 +35,231 @@ _TRANSFORM_ATTRIBUTES = (
     "inplace",
     "crop_pct",
 )
+_STRUCTURAL_ACTION_SCHEMA = "scheduler_native_structural_controls_actions_v1"
+_STRUCTURAL_REGISTRATION_SCHEMA = "scheduler_native_structural_controls_v1"
+_STRUCTURAL_SPLIT_ROLE = "development"
+_STRUCTURAL_FORMAL_RUN_PATH = "outputs/structural_controls/development_v1"
+_STRUCTURAL_SCORE_CONFIG_PATH = "configs/eval_common.yaml"
+_STRUCTURAL_SCORE_CONFIG_SHA256 = (
+    "4901d660383f30a4e65aaceb9180eecf72aea951c3ea0abb8dd845cb65fbe932"
+)
+_STRUCTURAL_ACTIONS_CONFIG_PATH = (
+    "configs/scheduler_native_structural_controls_development_authorized_v1.yaml"
+)
+_STRUCTURAL_ACTIONS_CONFIG_SHA256 = (
+    "c18524d99933d0444edaa0469f8937bb57bdd3834cab798f0685f0f6741898ea"
+)
+
+
+def _read_structural_gate_bytes(path: Path, *, label: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{label} is not regular")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    except OSError as exc:
+        raise ValueError(f"{label} is missing or unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _score_cli_targets_run(score_path: Path, canonical_run_root: Path) -> bool:
+    if Path(sys.argv[0]).resolve() != score_path:
+        return False
+    candidates: list[str] = []
+    for index, argument in enumerate(sys.argv):
+        if argument == "--run_dir" and index + 1 < len(sys.argv):
+            candidates.append(sys.argv[index + 1])
+        elif argument.startswith("--run_dir="):
+            candidates.append(argument.split("=", 1)[1])
+    return any(
+        candidate and Path(candidate).resolve() == canonical_run_root
+        for candidate in candidates
+    )
+
+
+def _is_frozen_auxiliary_config(
+    registration: Mapping[str, Any],
+    *,
+    pipeline_root: Path,
+    run_root: Path,
+    relative_path: str,
+    expected_sha256: str,
+    label: str,
+) -> bool:
+    """Identify one frozen first-pass config without exempting run config."""
+    auxiliary_path = pipeline_root / relative_path
+    auxiliary_bytes = _read_structural_gate_bytes(
+        auxiliary_path, label=label
+    )
+    if hashlib.sha256(auxiliary_bytes).hexdigest() != expected_sha256:
+        raise ValueError(f"{label} hash differs")
+    try:
+        import yaml
+
+        auxiliary_config = yaml.safe_load(auxiliary_bytes.decode("utf-8")) or {}
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"{label} is unreadable") from exc
+    if not isinstance(auxiliary_config, Mapping):
+        raise ValueError(f"{label} is not a mapping")
+
+    run_config_bytes = _read_structural_gate_bytes(
+        run_root / "config.json", label="formal structural scoring config"
+    )
+    try:
+        run_config = json.loads(run_config_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("formal structural scoring config is unreadable") from exc
+    if not isinstance(run_config, Mapping):
+        raise ValueError("formal structural scoring config is not a mapping")
+    current = dict(registration)
+    return current == dict(auxiliary_config) and current != dict(run_config)
+
+
+def _structural_control_scoring_gate(
+    registration: Mapping[str, Any],
+) -> None:
+    """Gate only the canonical formal score/audit processes for this protocol."""
+    pipeline_root = Path(__file__).resolve().parent
+    repository_root = pipeline_root.parent
+    process_path = Path(sys.argv[0]).resolve()
+    score_path = (pipeline_root / "score.py").resolve()
+    audit_paths = {
+        (pipeline_root / "audit_structural_control_run.py").resolve(),
+        (pipeline_root / "evaluate_structural_control_run.py").resolve(),
+    }
+    canonical_run_root = (
+        repository_root / _STRUCTURAL_FORMAL_RUN_PATH
+    ).resolve()
+    out_dir = registration.get("out_dir")
+    out_dir_is_canonical = False
+    if isinstance(out_dir, str) and out_dir:
+        raw_out_dir = Path(out_dir)
+        candidate = (
+            raw_out_dir
+            if raw_out_dir.is_absolute()
+            else repository_root / raw_out_dir
+        ).resolve()
+        out_dir_is_canonical = candidate == canonical_run_root
+    cli_run_is_canonical = _score_cli_targets_run(score_path, canonical_run_root)
+    run_contract = registration.get("run_contract")
+    intrinsic_structural_signals = (
+        registration.get("structural_control_registered") is True,
+        registration.get("action_schema") == _STRUCTURAL_ACTION_SCHEMA,
+        registration.get("schema") == _STRUCTURAL_ACTION_SCHEMA,
+        registration.get("structural_control_registration_schema")
+        == _STRUCTURAL_REGISTRATION_SCHEMA,
+        registration.get("registration_schema")
+        == _STRUCTURAL_REGISTRATION_SCHEMA,
+        isinstance(run_contract, Mapping)
+        and run_contract.get("action_schema") == _STRUCTURAL_ACTION_SCHEMA,
+        out_dir_is_canonical,
+    )
+    if not any(intrinsic_structural_signals) and not cli_run_is_canonical:
+        return
+    if process_path != score_path and process_path not in audit_paths:
+        raise ValueError("formal structural scorer contract rejects this process context")
+    if (
+        process_path == score_path
+        and cli_run_is_canonical
+        and _is_frozen_auxiliary_config(
+            registration,
+            pipeline_root=pipeline_root,
+            run_root=canonical_run_root,
+            relative_path=_STRUCTURAL_SCORE_CONFIG_PATH,
+            expected_sha256=_STRUCTURAL_SCORE_CONFIG_SHA256,
+            label="formal structural shared score config",
+        )
+    ):
+        return
+    if process_path in audit_paths and _is_frozen_auxiliary_config(
+        registration,
+        pipeline_root=pipeline_root,
+        run_root=canonical_run_root,
+        relative_path=_STRUCTURAL_ACTIONS_CONFIG_PATH,
+        expected_sha256=_STRUCTURAL_ACTIONS_CONFIG_SHA256,
+        label="formal structural executable actions",
+    ):
+        return
+
+    expected_signature = {
+        "structural_control_registered": True,
+        "action_schema": _STRUCTURAL_ACTION_SCHEMA,
+        "structural_control_registration_schema": _STRUCTURAL_REGISTRATION_SCHEMA,
+        "split_role": _STRUCTURAL_SPLIT_ROLE,
+        "scorer_provenance_binding_required": True,
+    }
+    if any(registration.get(key) != value for key, value in expected_signature.items()):
+        raise ValueError("formal structural scoring signature is incomplete or inconsistent")
+    if not isinstance(run_contract, Mapping) or run_contract.get(
+        "action_schema"
+    ) != _STRUCTURAL_ACTION_SCHEMA:
+        raise ValueError("formal structural run contract signature is inconsistent")
+
+    if not isinstance(out_dir, str) or not out_dir:
+        raise ValueError("formal structural scoring run config lacks out_dir")
+    raw_out_dir = Path(out_dir)
+    if not raw_out_dir.is_absolute() and (
+        raw_out_dir == Path(".") or ".." in raw_out_dir.parts
+    ):
+        raise ValueError("formal structural scoring out_dir is not canonical")
+    lexical_run_root = (
+        raw_out_dir if raw_out_dir.is_absolute() else repository_root / raw_out_dir
+    ).absolute()
+    run_root = lexical_run_root.resolve()
+    try:
+        run_root.relative_to(repository_root.resolve())
+    except ValueError as exc:
+        raise ValueError("formal structural scoring out_dir leaves the repository") from exc
+    if lexical_run_root != run_root or run_root != canonical_run_root:
+        raise ValueError(
+            "formal structural scoring out_dir is not the canonical non-symlink run"
+        )
+    config_path = run_root / "config.json"
+    try:
+        disk_config = json.loads(
+            _read_structural_gate_bytes(
+                config_path, label="formal structural scoring config"
+            )
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("formal structural scoring config is unreadable") from exc
+    if not isinstance(disk_config, Mapping):
+        raise ValueError("formal structural scoring config is not a mapping")
+    if disk_config != dict(registration):
+        raise ValueError("formal structural scoring config changed after loading")
+
+    # Lazy import avoids the audit -> scorer_provenance import cycle.
+    import audit_structural_control_run as structural_audit
+
+    amendment_path = (
+        repository_root
+        / structural_audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH
+    )
+    seal_path = run_root / structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+    if process_path == score_path:
+        structural_audit.require_scoring_child_authorization(
+            run_root,
+            analysis_amendment_path=amendment_path,
+            pre_score_seal_path=seal_path,
+        )
+        return
+    structural_audit.require_scoring_attempt_marker(
+        run_root,
+        analysis_amendment_path=amendment_path,
+        pre_score_seal_path=seal_path,
+    )
+    structural_audit.require_scoring_success_receipt(
+        run_root,
+        analysis_amendment_path=amendment_path,
+        pre_score_seal_path=seal_path,
+    )
 
 
 def canonical_json(value: Any) -> str:
@@ -591,6 +817,7 @@ def registered_scorer_provenance_contract(
     """
     if not isinstance(registration, Mapping):
         return None, None
+    _structural_control_scoring_gate(registration)
     mappings = [registration]
     for key in ("scoring", "scoring_contract", "executable_scoring"):
         value = registration.get(key)

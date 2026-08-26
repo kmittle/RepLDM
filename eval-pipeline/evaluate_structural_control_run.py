@@ -68,6 +68,8 @@ INPUT_PROVENANCE_KEYS = (
     "run_config",
     "manifest",
     "scores",
+    "scoring_attempt",
+    "scoring_success",
     "actions",
     "audit",
     "audit_attempt",
@@ -1102,6 +1104,82 @@ def _validate_effective_analysis_implementation(
     return implementation
 
 
+def _require_canonical_formal_run(
+    run_dir: str | os.PathLike[str], *, label: str
+) -> Path:
+    """Require the exact non-symlink formal run registered by the auditor."""
+    raw_run = Path(run_dir)
+    lexical_run = raw_run.absolute()
+    run_root = raw_run.resolve()
+    canonical_run = (
+        ROOT / structural_audit.STRUCTURAL_CONTROL_FORMAL_RUN_PATH
+    ).resolve()
+    if raw_run.is_symlink() or lexical_run != run_root or run_root != canonical_run:
+        raise ValueError(f"{label} requires the canonical non-symlink formal run")
+    return run_root
+
+
+def _require_canonical_regular_input(
+    path: str | os.PathLike[str],
+    expected_path: Path,
+    *,
+    label: str,
+) -> Path:
+    """Validate path identity and type without reading result bytes."""
+    raw_path = Path(path)
+    lexical_path = raw_path.absolute()
+    resolved_path = raw_path.resolve()
+    canonical_path = expected_path.resolve()
+    try:
+        mode = os.lstat(raw_path).st_mode
+    except OSError as exc:
+        raise ValueError(f"{label} is missing or unsafe") from exc
+    if (
+        raw_path.is_symlink()
+        or lexical_path != resolved_path
+        or resolved_path != canonical_path
+        or not stat.S_ISREG(mode)
+    ):
+        raise ValueError(f"{label} requires the canonical non-symlink regular file")
+    return resolved_path
+
+
+def _preflight_evaluation_paths(
+    run_dir: str | os.PathLike[str],
+    actions_path: str | os.PathLike[str],
+    audit_path: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> dict[str, Path]:
+    """Reject path mistakes before consuming the formal evaluation attempt."""
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural evaluator CLI"
+    )
+    return {
+        "run": run_root,
+        "actions": _require_canonical_regular_input(
+            actions_path,
+            ROOT / structural_audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+            label="structural evaluator actions",
+        ),
+        "audit": _require_canonical_regular_input(
+            audit_path,
+            run_root / structural_audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
+            label="structural evaluator run audit",
+        ),
+        "analysis_amendment": _require_canonical_regular_input(
+            analysis_amendment_path,
+            ROOT / structural_audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_PATH,
+            label="structural evaluator analysis amendment",
+        ),
+        "pre_score_seal": _require_canonical_regular_input(
+            pre_score_seal_path,
+            run_root / structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME,
+            label="structural evaluator pre-score seal",
+        ),
+    }
+
+
 def load_verified_inputs(
     run_dir: str | os.PathLike[str],
     actions_path: str | os.PathLike[str],
@@ -1110,7 +1188,9 @@ def load_verified_inputs(
     pre_score_seal_path: str | os.PathLike[str],
 ) -> VerifiedInputs:
     """Bind a complete run, scores, executable design, and passing run audit."""
-    run_root = Path(run_dir).resolve()
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural evaluator input loading"
+    )
     raw_amendment_path = Path(analysis_amendment_path)
     raw_seal_path = Path(pre_score_seal_path)
     if raw_amendment_path.is_symlink() or raw_seal_path.is_symlink():
@@ -1216,10 +1296,11 @@ def load_verified_inputs(
         analysis_amendment_path=paths["analysis_amendment"],
         base_commit=generation_commit,
     )
-    marker_paths = {
-        "audit_attempt": structural_audit.require_audit_attempt_marker(run_root),
-        "evaluation_attempt": require_evaluation_attempt_marker(run_root),
-    }
+    marker_paths = _require_formal_evaluation_evidence(
+        run_root,
+        analysis_amendment_path=paths["analysis_amendment"],
+        pre_score_seal_path=paths["pre_score_seal"],
+    )
     for label, path in marker_paths.items():
         paths[label] = path
         payloads[label] = path.read_bytes()
@@ -1287,6 +1368,8 @@ def load_verified_inputs(
         ("source_template_sha256", "registration"),
         ("analysis_amendment_sha256", "analysis_amendment"),
         ("pre_score_seal_sha256", "pre_score_seal"),
+        ("scoring_attempt_sha256", "scoring_attempt"),
+        ("scoring_success_sha256", "scoring_success"),
         ("audit_attempt_sha256", "audit_attempt"),
     ):
         _require_hash(audit_provenance, audit_key, hashes[payload_key], "run audit")
@@ -1314,6 +1397,18 @@ def load_verified_inputs(
         audit,
         "pre_score_seal_sha256",
         hashes["pre_score_seal"],
+        "dedicated run audit",
+    )
+    _require_hash(
+        audit,
+        "scoring_attempt_sha256",
+        hashes["scoring_attempt"],
+        "dedicated run audit",
+    )
+    _require_hash(
+        audit,
+        "scoring_success_sha256",
+        hashes["scoring_success"],
         "dedicated run audit",
     )
     _require_hash(
@@ -1539,7 +1634,9 @@ def _evaluation_attempt_artifacts(run_root: Path) -> tuple[Path, ...]:
 
 def create_evaluation_attempt_marker(run_dir: str | os.PathLike[str]) -> Path:
     """Durably consume the formal evaluator's one allowed attempt."""
-    run_root = Path(run_dir).resolve()
+    run_root = _require_canonical_formal_run(
+        run_dir, label="structural evaluation attempt"
+    )
     if any(os.path.lexists(path) for path in _evaluation_attempt_artifacts(run_root)):
         raise ValueError("structural-control development evaluation is one-shot")
     marker_path = run_root / ATTEMPT_MARKER
@@ -1586,6 +1683,30 @@ def require_evaluation_attempt_marker(run_dir: str | os.PathLike[str]) -> Path:
     if payload != _attempt_marker_payload():
         raise ValueError("structural-control evaluation attempt marker is invalid")
     return marker_path
+
+
+def _require_formal_evaluation_evidence(
+    run_dir: str | os.PathLike[str],
+    *,
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> dict[str, Path]:
+    """Validate the durable scoring, audit, and evaluation evidence chain."""
+    run_root = Path(run_dir).resolve()
+    return {
+        "scoring_attempt": structural_audit.require_scoring_attempt_marker(
+            run_root,
+            analysis_amendment_path=analysis_amendment_path,
+            pre_score_seal_path=pre_score_seal_path,
+        ),
+        "scoring_success": structural_audit.require_scoring_success_receipt(
+            run_root,
+            analysis_amendment_path=analysis_amendment_path,
+            pre_score_seal_path=pre_score_seal_path,
+        ),
+        "audit_attempt": structural_audit.require_audit_attempt_marker(run_root),
+        "evaluation_attempt": require_evaluation_attempt_marker(run_root),
+    }
 
 
 def _bundle_snapshot(bundle_path: Path) -> BundleSnapshot:
@@ -1797,6 +1918,10 @@ def build_evaluation_payloads(
         "actions_sha256": inputs.hashes["actions"],
         "audit_path": inputs.paths["audit"],
         "audit_sha256": inputs.hashes["audit"],
+        "scoring_attempt_path": inputs.paths["scoring_attempt"],
+        "scoring_attempt_sha256": inputs.hashes["scoring_attempt"],
+        "scoring_success_path": inputs.paths["scoring_success"],
+        "scoring_success_sha256": inputs.hashes["scoring_success"],
         "audit_attempt_path": inputs.paths["audit_attempt"],
         "audit_attempt_sha256": inputs.hashes["audit_attempt"],
         "evaluation_attempt_path": inputs.paths["evaluation_attempt"],
@@ -1875,6 +2000,10 @@ def _strict_input_snapshot(
 ) -> tuple[dict[str, Path], dict[str, str]]:
     if set(input_paths) != set(INPUT_PROVENANCE_KEYS):
         raise ValueError("strict bundle verification input paths differ from the v2 schema")
+    run_root = _require_canonical_formal_run(
+        Path(input_paths["run_config"]).parent,
+        label="strict bundle verification",
+    )
     resolved: dict[str, Path] = {}
     for key in INPUT_PROVENANCE_KEYS:
         raw_path = Path(input_paths[key])
@@ -1886,11 +2015,16 @@ def _strict_input_snapshot(
         resolved[key] = path
     if len(set(resolved.values())) != len(resolved):
         raise ValueError("strict bundle verification inputs must be distinct files")
-    run_root = resolved["run_config"].parent
     canonical_run_paths = {
         "run_config": run_root / "config.json",
         "manifest": run_root / "manifest.jsonl",
         "scores": run_root / "scores.jsonl",
+        "scoring_attempt": (
+            run_root / structural_audit.STRUCTURAL_CONTROL_SCORING_ATTEMPT_NAME
+        ),
+        "scoring_success": (
+            run_root / structural_audit.STRUCTURAL_CONTROL_SCORING_SUCCESS_NAME
+        ),
         "audit": run_root / "run_audit.json",
         "audit_attempt": (
             run_root / structural_audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
@@ -1914,11 +2048,11 @@ def resolve_evaluation_input_paths(
     analysis_amendment_path: str | os.PathLike[str],
     pre_score_seal_path: str | os.PathLike[str],
 ) -> dict[str, Path]:
-    """Resolve the 12 current files required for strict external verification."""
+    """Resolve the 14 current files required for strict external verification."""
     raw_run_root = Path(run_dir)
-    if raw_run_root.is_symlink():
-        raise ValueError("strict bundle verification rejects a symlink run directory")
-    run_root = raw_run_root.resolve()
+    run_root = _require_canonical_formal_run(
+        raw_run_root, label="strict bundle verification input resolution"
+    )
     if not run_root.is_dir():
         raise ValueError("strict bundle verification run directory is missing")
     raw_external = {
@@ -1929,13 +2063,18 @@ def resolve_evaluation_input_paths(
     }
     if any(path.is_symlink() for path in raw_external.values()):
         raise ValueError("strict bundle verification rejects symlink inputs")
+    resolved_external = {key: path.resolve() for key, path in raw_external.items()}
+    marker_paths = _require_formal_evaluation_evidence(
+        run_root,
+        analysis_amendment_path=resolved_external["analysis_amendment"],
+        pre_score_seal_path=resolved_external["pre_score_seal"],
+    )
     paths: dict[str, Path] = {
         "run_config": run_root / "config.json",
         "manifest": run_root / "manifest.jsonl",
         "scores": run_root / "scores.jsonl",
-        "audit_attempt": structural_audit.require_audit_attempt_marker(run_root),
-        "evaluation_attempt": require_evaluation_attempt_marker(run_root),
-        **{key: path.resolve() for key, path in raw_external.items()},
+        **marker_paths,
+        **resolved_external,
     }
     if paths["audit"] != run_root / "run_audit.json":
         raise ValueError("strict bundle verification requires canonical run_audit.json")
@@ -2011,8 +2150,11 @@ def verify_evaluation_bundle(
         run_root = snapshot_paths["run_config"].parent
         if bundle_path.resolve() != run_root / OUTPUT_BUNDLE_DIR:
             raise ValueError("strict bundle verification requires the canonical bundle path")
-        structural_audit.require_audit_attempt_marker(run_root)
-        require_evaluation_attempt_marker(run_root)
+        _require_formal_evaluation_evidence(
+            run_root,
+            analysis_amendment_path=snapshot_paths["analysis_amendment"],
+            pre_score_seal_path=snapshot_paths["pre_score_seal"],
+        )
         if expected_input_hashes is not None and _validated_input_hashes(
             expected_input_hashes
         ) != trusted_hashes:
@@ -2139,8 +2281,11 @@ def verify_evaluation_bundle(
             raise ValueError("semantic replay input hashes differ from current inputs")
         if replayed.json_payload != json_payload or replayed.csv_payload != csv_payload:
             raise ValueError("evaluation bundle differs from deterministic semantic replay")
-        structural_audit.require_audit_attempt_marker(run_root)
-        require_evaluation_attempt_marker(run_root)
+        _require_formal_evaluation_evidence(
+            run_root,
+            analysis_amendment_path=snapshot_paths["analysis_amendment"],
+            pre_score_seal_path=snapshot_paths["pre_score_seal"],
+        )
         _, final_hashes = _strict_input_snapshot(snapshot_paths)
         if final_hashes != trusted_hashes:
             raise ValueError("bundle verification inputs changed during verification")
@@ -2207,16 +2352,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run_dir = Path(args.run_dir).resolve()
+    paths = _preflight_evaluation_paths(
+        args.run_dir,
+        args.actions,
+        args.audit,
+        args.analysis_amendment,
+        args.pre_score_seal,
+    )
+    run_dir = paths["run"]
     bundle_path = run_dir / OUTPUT_BUNDLE_DIR
     if args.verify_bundle:
         with evaluation_lock(run_dir):
             current_paths = resolve_evaluation_input_paths(
-                args.run_dir,
-                args.actions,
-                args.audit,
-                args.analysis_amendment,
-                args.pre_score_seal,
+                run_dir,
+                paths["actions"],
+                paths["audit"],
+                paths["analysis_amendment"],
+                paths["pre_score_seal"],
             )
             result = verify_evaluation_bundle(
                 bundle_path, current_input_paths=current_paths
@@ -2238,10 +2390,10 @@ def main() -> None:
         create_evaluation_attempt_marker(run_dir)
         inputs = load_verified_inputs(
             run_dir,
-            args.actions,
-            args.audit,
-            args.analysis_amendment,
-            args.pre_score_seal,
+            paths["actions"],
+            paths["audit"],
+            paths["analysis_amendment"],
+            paths["pre_score_seal"],
         )
         payloads = build_evaluation_payloads(
             inputs,
