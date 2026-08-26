@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import struct
 import traceback
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -117,22 +118,91 @@ class GenerationFailedTerminally(RuntimeError):
     """Raised after a valid terminal generation-failure receipt is observed."""
 
 
+def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _consume_regular_file(
+    path: Path, label: str, consumer: Callable[[int], Any]
+) -> Any:
+    """Consume one stable regular file through a single non-following descriptor."""
+
+    descriptor = -1
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        path_before = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(path_before.st_mode)
+            or (before.st_dev, before.st_ino)
+            != (path_before.st_dev, path_before.st_ino)
+        ):
+            raise ValueError(f"{label} must be a regular non-symlink file")
+
+        result = consumer(descriptor)
+
+        after = os.fstat(descriptor)
+        path_after = os.stat(path, follow_symlinks=False)
+        if (
+            _stable_file_metadata(after) != _stable_file_metadata(before)
+            or not stat.S_ISREG(path_after.st_mode)
+            or (path_after.st_dev, path_after.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise ValueError(f"{label} changed while it was read")
+        return result
+    except OSError as exc:
+        raise ValueError(
+            f"{label} must be a stable regular non-symlink file"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+    def consume(descriptor: int) -> str:
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return digest.hexdigest()
             digest.update(chunk)
-    return digest.hexdigest()
+
+    return _consume_regular_file(path, f"hashed file {path}", consume)
 
 
 def _require_regular_file(path: Path, label: str) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be a regular non-symlink file")
+    _consume_regular_file(path, label, lambda descriptor: None)
 
 
 def _read_regular_bytes(path: Path, label: str) -> bytes:
-    _require_regular_file(path, label)
-    return path.read_bytes()
+    def consume(descriptor: int) -> bytes:
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+    return _consume_regular_file(path, label, consume)
 
 
 def _unique_object(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:

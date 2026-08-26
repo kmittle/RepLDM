@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -496,20 +497,25 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertEqual(record["stderr_sha256"], digest(raw))
         contract.canonical_json_bytes(record)
 
-    def test_capture_exit_does_not_wait_for_inheriting_live_child(self):
+    def test_capture_exit_fails_for_inheriting_live_child(self):
         capture = generation._RuntimeEvidenceCapture()
         child = None
         try:
-            with capture:
-                child = subprocess.Popen(
-                    [
-                        sys.executable,
-                        "-c",
-                        "import sys; sys.stdin.buffer.read(1)",
-                    ],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                )
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                RuntimeError, "runtime evidence capture finalization failed"
+            ):
+                with capture:
+                    child = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            "import sys; sys.stdin.buffer.read(1)",
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                    )
+            self.assertLess(time.monotonic() - started, 3.0)
             self.assertIsNone(child.poll())
             self.assertIsNone(capture._stderr_thread)
         finally:

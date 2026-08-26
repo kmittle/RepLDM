@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -83,6 +84,63 @@ def png_bytes(
         + idat_chunks
         + png_chunk(b"IEND", b"")
     )
+
+
+class StableRegularFileReadTest(unittest.TestCase):
+    def test_symlink_is_rejected_without_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.json"
+            target.write_bytes(b"target\n")
+            link = root / "link.json"
+            link.symlink_to(target)
+
+            with self.assertRaisesRegex(ValueError, "non-symlink"):
+                audit._read_regular_bytes(link, "fixture input")
+            with self.assertRaisesRegex(ValueError, "non-symlink"):
+                audit.sha256_file(link)
+
+    def test_path_replacement_during_read_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            source.write_bytes(b"original\n")
+            replacement = root / "replacement.json"
+            replacement.write_bytes(b"replacement\n")
+            original_read = os.read
+            replaced = False
+
+            def replace_after_read(descriptor, count):
+                nonlocal replaced
+                chunk = original_read(descriptor, count)
+                if not replaced:
+                    replaced = True
+                    source.unlink()
+                    source.symlink_to(replacement)
+                return chunk
+
+            with mock.patch.object(audit.os, "read", side_effect=replace_after_read):
+                with self.assertRaisesRegex(ValueError, "changed while it was read"):
+                    audit._read_regular_bytes(source, "fixture input")
+
+    def test_in_place_mutation_during_hash_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"original")
+            original_read = os.read
+            mutated = False
+
+            def mutate_after_read(descriptor, count):
+                nonlocal mutated
+                chunk = original_read(descriptor, count)
+                if not mutated:
+                    mutated = True
+                    source.write_bytes(b"mutated-and-longer")
+                return chunk
+
+            with mock.patch.object(audit.os, "read", side_effect=mutate_after_read):
+                with self.assertRaisesRegex(ValueError, "changed while it was read"):
+                    audit.sha256_file(source)
 
 
 class EngineeringRunFixture:

@@ -23,6 +23,7 @@ import re
 import select
 import sys
 import threading
+import time
 import traceback
 from types import SimpleNamespace
 from typing import Any, Mapping, Optional, Sequence
@@ -268,14 +269,25 @@ class _RuntimeEvidenceCapture:
         descriptor = self._stderr_read_fd
         if descriptor is None:
             return
+        eof_deadline: Optional[float] = None
         try:
             while True:
+                if self._stderr_stop.is_set():
+                    if eof_deadline is None:
+                        eof_deadline = time.monotonic() + 0.5
+                    elif time.monotonic() >= eof_deadline:
+                        raise RuntimeError(
+                            "OS stderr pipe did not reach EOF after parent writers closed"
+                        )
                 try:
                     chunk = os.read(descriptor, 64 * 1024)
                 except BlockingIOError:
-                    readable, _, _ = select.select((descriptor,), (), (), 0.1)
-                    if not readable and self._stderr_stop.is_set():
-                        break
+                    timeout = 0.1
+                    if eof_deadline is not None:
+                        timeout = max(
+                            0.0, min(timeout, eof_deadline - time.monotonic())
+                        )
+                    select.select((descriptor,), (), (), timeout)
                     continue
                 if not chunk:
                     break

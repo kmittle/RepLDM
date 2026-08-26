@@ -441,7 +441,7 @@ directory descriptor exposed as `/proc/self/fd/<n>`; recursive pre/post tree
 signatures bind file bytes and file/directory identity metadata, so replacement
 or mutation fails the attempt. This is fail-closed detection, not a claim of
 noninterference against another same-UID process. The warning-as-error CPU suite
-currently passes `237/237`; the remaining legacy suite passes `333/333`.
+currently passes `240/240`; the remaining legacy suite passes `333/333`.
 Prompt assets replay byte-for-byte from the pinned PartiPrompts
 source using the committed exclusion inventory without reading `outputs/`.
 That inventory freezes sorted, unique per-file prompt, source-row, and seed
