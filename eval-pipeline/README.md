@@ -306,7 +306,11 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 Then run the dedicated audit before any metric comparison. The formal audit is
 schema `scheduler_native_structural_control_audit_v2`; it binds both amendment
 and seal hashes and must report `auditor_scope: formal_development_only` and
-`outcome_details_disclosed: false`:
+`outcome_details_disclosed: false`. Before reading outcome bytes, the CLI
+exclusively creates and fsyncs
+`$RUN/structural_control_audit_attempt.json`; the report binds that marker's
+SHA256. A failed audit attempt consumes the one allowed attempt, so do not remove
+the marker or retry:
 
 ```bash
 /home/bycao/miniforge3/envs/repldm_eval/bin/python \
@@ -333,21 +337,37 @@ Only a warning-free audit may enter the one-shot evaluator:
 ```
 
 The evaluator reports every registered action and guard, reruns the dedicated
-audit, and never emits a selected action. It publishes exactly one canonical
-directory, `$RUN/structural_control_evaluation_bundle/`, containing only
+audit, requires its valid one-shot marker, and never emits a selected action.
+While holding the evaluation lock, it first creates and fsyncs the canonical
+`$RUN/structural_control_evaluation_attempt.json` with exclusive, no-follow
+creation. This happens before reading score, audit, or other outcome bytes. The
+marker permanently consumes the CLI attempt: it remains after write/fsync
+failure, analysis failure, or process termination, and its presence forbids a
+rerun even when no bundle was published.
+
+A successful attempt publishes exactly one canonical directory,
+`$RUN/structural_control_evaluation_bundle/`, containing only
 `structural_control_evaluation.json` and `structural_control_contrasts.csv`.
 JSON binds the CSV filename, schema, scope, row count, and SHA256; every CSV row
-carries the non-authorization envelope and all input hashes. `--verify-bundle`
-strictly rehashes the ten current input files before and after verification, so
-an internally consistent bundle still fails after any input drift.
+carries the non-authorization envelope and all 12 input hashes, including both
+attempt markers. `--verify-bundle` requires both markers but neither creates nor
+removes them. Under the lock it rehashes the 12 current inputs, reruns the formal
+audit and frozen statistics, deterministically rebuilds the complete JSON and
+CSV, and requires both files to match byte for byte. It then rechecks both input
+markers and the canonical bundle's directory identity, exact regular-file
+entries, and bytes. Thus input drift or a coordinated replacement during replay
+cannot validate rewritten contrasts, action summaries, provenance, or CSV
+bindings.
 
 Stop on any nonzero exit, warning, missing artifact, schema/hash mismatch, input
 drift, or unexpected legacy output at `$RUN/structural_control_evaluation.json`
 or `$RUN/structural_control_contrasts.csv`. Do not delete, rewrite, reseal, rerun
-the one-shot audit/evaluator, inspect outcomes, select a method, begin validation,
-or authorize RL after a failure. An action pair identical across all 99 formal
-blocks is an intervention-activation failure; pair identities/counts are not
-disclosed in the v2 result-blind audit.
+the one-shot audit/evaluator, or remove either attempt marker after a failure. The
+low-level bundle publisher has atomic recovery tests, but this does not authorize
+a second formal CLI attempt. Do not inspect outcomes, select a method, begin
+validation, or authorize RL after a failure. An action pair identical across all
+99 formal blocks is an intervention-activation failure; pair identities/counts
+are not disclosed in the v2 result-blind audit.
 
 ## Prepare Scorers
 

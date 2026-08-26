@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from itertools import combinations
@@ -46,6 +47,9 @@ STRUCTURAL_CONTROL_AMENDMENT_STATUS = "authorized_pre_score"
 STRUCTURAL_CONTROL_AMENDMENT_CANDIDATE_STATUS = (
     "blocked_pending_independent_review"
 )
+STRUCTURAL_CONTROL_REVIEWER_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}"
+)
 STRUCTURAL_CONTROL_UNCHANGED_INVARIANTS = frozenset(
     {
         "generation",
@@ -76,6 +80,12 @@ STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_FIELDS = frozenset(
 )
 STRUCTURAL_CONTROL_PRE_SCORE_SEAL_SCHEMA = "structural_control_pre_score_seal_v1"
 STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME = "structural_control_pre_score_seal.json"
+STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME = "run_audit.json"
+STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME = "structural_control_audit_attempt.json"
+STRUCTURAL_CONTROL_AUDIT_ATTEMPT_SCHEMA = "structural_control_audit_attempt_v1"
+STRUCTURAL_CONTROL_EVALUATION_ATTEMPT_NAME = (
+    "structural_control_evaluation_attempt.json"
+)
 STRUCTURAL_CONTROL_EXPECTED_TASKS = 792
 STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS = frozenset(
     {
@@ -87,6 +97,31 @@ STRUCTURAL_CONTROL_EVALUATION_BUNDLE = "structural_control_evaluation_bundle"
 STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS = (
     "structural_control_evaluation.json",
     "structural_control_contrasts.csv",
+)
+STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_NAMES = frozenset(
+    {
+        "scores.jsonl",
+        STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
+        STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME,
+        STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+        STRUCTURAL_CONTROL_EVALUATION_ATTEMPT_NAME,
+        *STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
+    }
+)
+STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_PATTERNS = (
+    re.compile(r"\.scores\.jsonl\.[A-Za-z0-9_-]+\.tmp"),
+    re.compile(r"\.run_audit\.json\.[A-Za-z0-9_-]+\.tmp"),
+    re.compile(r"\.structural_control_evaluation_bundle\.[A-Za-z0-9_-]+"),
+    re.compile(
+        r"\.structural_control_evaluation\.json\.[A-Za-z0-9_-]+\.tmp"
+    ),
+    re.compile(
+        r"\.structural_control_contrasts\.csv\.[A-Za-z0-9_-]+\.tmp"
+    ),
+    re.compile(
+        r"\.structural_control_pre_score_seal\.json\."
+        r"[A-Za-z0-9_-]+\.tmp"
+    ),
 )
 GPU_UUID_PATTERN = re.compile(
     r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -150,6 +185,95 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _audit_attempt_marker_payload() -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema": STRUCTURAL_CONTROL_AUDIT_ATTEMPT_SCHEMA,
+                "scope": STRUCTURAL_CONTROL_AUDITOR_SCOPE,
+                "one_shot": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _audit_attempt_artifacts(run_root: Path, output_path: Path) -> tuple[Path, ...]:
+    return (
+        run_root / STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME,
+        run_root / STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
+        output_path,
+    )
+
+
+def create_audit_attempt_marker(
+    run_dir: str | os.PathLike[str], output_path: str | os.PathLike[str]
+) -> Path:
+    """Durably consume the formal auditor's one allowed result-reading attempt."""
+    run_root = Path(run_dir).resolve()
+    output = Path(output_path).absolute()
+    marker_path = run_root / STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+    if output == marker_path:
+        raise ValueError("structural audit output conflicts with its attempt marker")
+    if any(
+        os.path.lexists(path) for path in _audit_attempt_artifacts(run_root, output)
+    ):
+        raise ValueError("structural audit is one-shot; attempt or output exists")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(marker_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise ValueError("structural audit is one-shot; attempt or output exists") from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(_audit_attempt_marker_payload())
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _fsync_directory(run_root)
+    return marker_path
+
+
+def require_audit_attempt_marker(run_dir: str | os.PathLike[str]) -> Path:
+    """Validate the durable canonical marker without consuming another attempt."""
+    run_root = Path(run_dir).resolve()
+    marker_path = run_root / STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            marker_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("canonical structural audit attempt marker is not regular")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            payload = handle.read()
+    except OSError as exc:
+        raise ValueError("canonical structural audit attempt marker is missing") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if payload != _audit_attempt_marker_payload():
+        raise ValueError("canonical structural audit attempt marker is invalid")
+    return marker_path
+
+
+def _pre_score_forbidden_artifact_exists(run_root: Path) -> bool:
+    for entry in run_root.iterdir():
+        if entry.name in STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_NAMES or any(
+            pattern.fullmatch(entry.name)
+            for pattern in STRUCTURAL_CONTROL_PRE_SCORE_FORBIDDEN_PATTERNS
+        ):
+            return True
+    return False
 
 
 def _require_exact_fields(
@@ -383,16 +507,7 @@ def create_pre_score_seal(
     with pre_score_seal_lock(run_root):
         if os.path.lexists(seal_path):
             raise ValueError("pre-score seal is one-shot; output already exists")
-        forbidden = (
-            "scores.jsonl",
-            "run_audit.json",
-            STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
-            *STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
-        )
-        if any(os.path.lexists(run_root / name) for name in forbidden) or any(
-            entry.name.startswith(f".{STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.")
-            for entry in run_root.iterdir()
-        ):
+        if _pre_score_forbidden_artifact_exists(run_root):
             raise ValueError(
                 "pre-score seal requires all score, audit, and evaluation artifacts absent"
             )
@@ -520,6 +635,114 @@ def _require_git_ancestor(
         raise ValueError(f"{label} ancestry verification failed")
 
 
+def _git_command_bytes(arguments: Sequence[str], *, label: str) -> bytes:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(ROOT), *arguments], stderr=subprocess.PIPE
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f"{label} verification failed") from exc
+
+
+def _validate_analysis_authorization_topology(
+    reviewed_commit: str, head_commit: str, amendment_relative: str
+) -> None:
+    """Require one direct authorization commit changing only the amendment blob."""
+    parent_row = _git_command_bytes(
+        ["rev-list", "--parents", "--max-count=1", head_commit],
+        label="analysis amendment authorization parent",
+    )
+    if parent_row.split() != [
+        head_commit.encode("ascii"),
+        reviewed_commit.encode("ascii"),
+    ]:
+        raise ValueError(
+            "analysis amendment authorization commit must have reviewed_commit "
+            "as its sole parent"
+        )
+
+    raw_diff = _git_command_bytes(
+        [
+            "diff-tree",
+            "--no-commit-id",
+            "--raw",
+            "-r",
+            "-z",
+            "--abbrev=40",
+            "-M",
+            "-C",
+            reviewed_commit,
+            head_commit,
+        ],
+        label="analysis amendment authorization diff",
+    )
+    fields = raw_diff.split(b"\0")
+    if len(fields) != 3 or fields[-1] != b"":
+        raise ValueError(
+            "analysis amendment authorization commit must modify only the amendment file"
+        )
+    metadata, changed_path = fields[:2]
+    try:
+        metadata_fields = metadata.decode("ascii").split()
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "analysis amendment authorization commit has an invalid raw diff"
+        ) from exc
+    if (
+        len(metadata_fields) != 5
+        or metadata_fields[0] != ":100644"
+        or metadata_fields[1] != "100644"
+        or not re.fullmatch(r"[0-9a-f]{40}", metadata_fields[2])
+        or not re.fullmatch(r"[0-9a-f]{40}", metadata_fields[3])
+        or metadata_fields[2] == metadata_fields[3]
+        or metadata_fields[4] != "M"
+        or changed_path != amendment_relative.encode("utf-8")
+    ):
+        raise ValueError(
+            "analysis amendment authorization commit must be one ordinary 100644 "
+            "amendment modification"
+        )
+
+
+def _reconstruct_analysis_authorization(
+    candidate_bytes: bytes, *, reviewer: str, reviewed_commit: str
+) -> bytes:
+    """Apply exactly the three permitted scalar-line authorization edits."""
+    replacements = (
+        (
+            b"status: blocked_pending_independent_review",
+            b"status: authorized_pre_score",
+        ),
+        (b"reviewer: null", f"reviewer: {reviewer}".encode("ascii")),
+        (
+            b"reviewed_commit: null",
+            f"reviewed_commit: {reviewed_commit}".encode("ascii"),
+        ),
+    )
+    lines = candidate_bytes.splitlines(keepends=True)
+
+    def line_body(line: bytes) -> bytes:
+        if line.endswith(b"\r\n"):
+            return line[:-2]
+        if line.endswith((b"\n", b"\r")):
+            return line[:-1]
+        return line
+
+    for blocked_line, authorized_line in replacements:
+        matches = [
+            index for index, line in enumerate(lines) if line_body(line) == blocked_line
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "reviewed amendment candidate must contain each authorization line "
+                "exactly once"
+            )
+        index = matches[0]
+        ending = lines[index][len(blocked_line) :]
+        lines[index] = authorized_line + ending
+    return b"".join(lines)
+
+
 def _load_yaml_bytes(payload: bytes, *, label: str) -> dict:
     try:
         value = yaml.safe_load(payload) or {}
@@ -570,7 +793,11 @@ def validate_analysis_amendment(
     amendment_relative = _repository_relative(
         amendment_path, label="analysis amendment"
     )
-    amendment = _load_yaml(amendment_path, label="analysis amendment")
+    try:
+        amendment_bytes = amendment_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("analysis amendment is not readable YAML") from exc
+    amendment = _load_yaml_bytes(amendment_bytes, label="analysis amendment")
     _require_exact_fields(
         amendment,
         label="analysis amendment",
@@ -581,12 +808,10 @@ def validate_analysis_amendment(
     if amendment.get("status") != STRUCTURAL_CONTROL_AMENDMENT_STATUS:
         raise ValueError("analysis amendment is not authorized_pre_score")
     reviewer = amendment.get("reviewer")
-    if (
-        not isinstance(reviewer, str)
-        or not reviewer.strip()
-        or reviewer != reviewer.strip()
+    if not isinstance(reviewer, str) or not STRUCTURAL_CONTROL_REVIEWER_PATTERN.fullmatch(
+        reviewer
     ):
-        raise ValueError("analysis amendment reviewer must be a non-empty identity")
+        raise ValueError("analysis amendment reviewer must be a safe ASCII identity")
     reviewed_commit = amendment.get("reviewed_commit")
     if not isinstance(reviewed_commit, str) or not re.fullmatch(
         r"[0-9a-f]{40}", reviewed_commit
@@ -625,15 +850,13 @@ def validate_analysis_amendment(
         label="analysis amendment base-to-review",
         strict=False,
     )
-    _require_git_ancestor(
-        reviewed_commit,
-        head_commit,
-        label="analysis amendment review-to-authorization",
-        strict=True,
+    _validate_analysis_authorization_topology(
+        reviewed_commit, head_commit, amendment_relative
     )
     try:
+        candidate_bytes = _git_bytes(reviewed_commit, amendment_relative)
         candidate = _load_yaml_bytes(
-            _git_bytes(reviewed_commit, amendment_relative),
+            candidate_bytes,
             label="reviewed blocked amendment candidate",
         )
     except ValueError as exc:
@@ -656,8 +879,17 @@ def validate_analysis_amendment(
         - authorization_fields
     ):
         raise ValueError("reviewed amendment candidate content differs from authorization")
-    if _git_bytes(head_commit, amendment_relative) != amendment_path.read_bytes():
+    committed_amendment_bytes = _git_bytes(head_commit, amendment_relative)
+    if committed_amendment_bytes != amendment_bytes:
         raise ValueError("analysis amendment bytes differ from current HEAD")
+    reconstructed_amendment = _reconstruct_analysis_authorization(
+        candidate_bytes, reviewer=reviewer, reviewed_commit=reviewed_commit
+    )
+    if reconstructed_amendment != committed_amendment_bytes:
+        raise ValueError(
+            "analysis amendment authorization changes bytes outside the three "
+            "permitted lines"
+        )
 
     for relative_path in (
         STRUCTURAL_CONTROL_ACTIONS_PATH,
@@ -1502,6 +1734,7 @@ def audit_run(
 ) -> dict:
     """Run the generic S7 audit and all structural-control-specific checks."""
     run_path = Path(run_dir).resolve()
+    audit_attempt_path = require_audit_attempt_marker(run_path)
     source_path = Path(source_actions_path).resolve()
     registration_path = Path(registration_actions_path).resolve()
     supplied_seal_path = Path(pre_score_seal_path)
@@ -1510,6 +1743,7 @@ def audit_run(
     ):
         raise ValueError("formal audit requires the canonical pre-score seal path")
     input_paths = {
+        "audit_attempt_sha256": audit_attempt_path,
         "config_sha256": run_path / "config.json",
         "manifest_sha256": run_path / "manifest.jsonl",
         "scores_sha256": run_path / "scores.jsonl",
@@ -1596,6 +1830,7 @@ def audit_run(
         [str(action["id"]) for action in normalized_actions],
         expected_blocks=99,
     )
+    require_audit_attempt_marker(run_path)
     final_hashes = {
         label: base_audit.sha256_file(path) for label, path in input_paths.items()
     }
@@ -1625,6 +1860,7 @@ def audit_run(
             "analysis_amendment_sha256": base_audit.sha256_file(
                 analysis_amendment_path
             ),
+            "audit_attempt_sha256": final_hashes["audit_attempt_sha256"],
             "pre_score_seal_sha256": base_audit.sha256_file(pre_score_seal_path),
             "duplicate_action_pngs_are_failure": False,
             "isolated_duplicate_action_pngs_are_failure": False,
@@ -1702,13 +1938,11 @@ def main() -> None:
         parser.error(
             "--analysis-amendment and --pre-score-seal are required for the formal audit"
         )
-    default_name = "run_audit.json"
-    output_path = Path(args.output).resolve() if args.output else (
-        Path(args.run_dir).resolve() / default_name
+    output_path = Path(args.output).absolute() if args.output else (
+        Path(args.run_dir).resolve() / STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
     )
     with audit_lock(args.run_dir):
-        if output_path.exists():
-            raise ValueError(f"structural audit is one-shot; output exists: {output_path}")
+        create_audit_attempt_marker(args.run_dir, output_path)
         report = audit_run(
             args.run_dir,
             args.prompts,

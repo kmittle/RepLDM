@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import sys
 import tempfile
@@ -34,8 +35,8 @@ generate = sys.modules["generate"]
 
 
 class StructuralControlAuditTest(unittest.TestCase):
-    REVIEWED_COMMIT = "1" * 40
-    AUTHORIZATION_COMMIT = "2" * 40
+    REVIEWED_COMMIT = "a" * 40
+    AUTHORIZATION_COMMIT = "b" * 40
 
     def setUp(self):
         self.real_git_bytes = audit._git_bytes
@@ -403,6 +404,26 @@ class StructuralControlAuditTest(unittest.TestCase):
         path.write_text(yaml.safe_dump(payload, sort_keys=True), encoding="utf-8")
         return path, payload
 
+    def blocked_amendment_bytes(self, authorized_bytes):
+        replacements = (
+            (b"status: authorized_pre_score", b"status: blocked_pending_independent_review"),
+            (
+                b"reviewer: independent-analysis-reviewer",
+                b"reviewer: null",
+            ),
+            (
+                f"reviewed_commit: {self.REVIEWED_COMMIT}".encode("ascii"),
+                b"reviewed_commit: null",
+            ),
+        )
+        candidate_bytes = authorized_bytes
+        for authorized_line, blocked_line in replacements:
+            self.assertEqual(candidate_bytes.count(authorized_line), 1)
+            candidate_bytes = candidate_bytes.replace(
+                authorized_line, blocked_line, 1
+            )
+        return candidate_bytes
+
     @contextmanager
     def authorized_git_state(
         self,
@@ -421,15 +442,7 @@ class StructuralControlAuditTest(unittest.TestCase):
         reviewed_overrides = dict(reviewed_overrides or {})
         head_overrides = dict(head_overrides or {})
         head_commit = head_commit or self.AUTHORIZATION_COMMIT
-        candidate = yaml.safe_load(amendment_path.read_bytes())
-        candidate.update(
-            {
-                "status": audit.STRUCTURAL_CONTROL_AMENDMENT_CANDIDATE_STATUS,
-                "reviewer": None,
-                "reviewed_commit": None,
-            }
-        )
-        candidate_bytes = yaml.safe_dump(candidate, sort_keys=True).encode("utf-8")
+        candidate_bytes = self.blocked_amendment_bytes(amendment_path.read_bytes())
 
         def git_bytes(commit, relative_path):
             if commit == audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT:
@@ -466,6 +479,8 @@ class StructuralControlAuditTest(unittest.TestCase):
             audit, "_git_bytes", side_effect=git_bytes
         ), mock.patch.object(
             audit, "_require_git_ancestor", side_effect=require_ancestor
+        ), mock.patch.object(
+            audit, "_validate_analysis_authorization_topology"
         ):
             yield
 
@@ -621,7 +636,10 @@ class StructuralControlAuditTest(unittest.TestCase):
 
             scalar_cases = (
                 ("status", "blocked_candidate", "authorized_pre_score"),
-                ("reviewer", "", "non-empty identity"),
+                ("reviewer", "", "safe ASCII identity"),
+                ("reviewer", "reviewer name", "safe ASCII identity"),
+                ("reviewer", "审稿人", "safe ASCII identity"),
+                ("reviewer", "r" * 129, "safe ASCII identity"),
                 ("reviewed_commit", "abc", "full lowercase 40-hex"),
                 ("result_access_before_authorization", True, "not result-blind"),
                 (
@@ -673,14 +691,6 @@ class StructuralControlAuditTest(unittest.TestCase):
                 yaml.safe_dump(payload, sort_keys=True), encoding="utf-8"
             )
             with self.authorized_git_state(
-                amendment_path, head_commit=self.REVIEWED_COMMIT
-            ), self.assertRaisesRegex(ValueError, "strict two-commit"):
-                audit.validate_analysis_amendment(
-                    amendment_path,
-                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
-                )
-
-            with self.authorized_git_state(
                 amendment_path, ancestry_returncode=1
             ), self.assertRaisesRegex(ValueError, "ancestry verification failed"):
                 audit.validate_analysis_amendment(
@@ -701,6 +711,51 @@ class StructuralControlAuditTest(unittest.TestCase):
                     amendment_path,
                     base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
                 )
+
+            authorized_bytes = amendment_path.read_bytes()
+            candidate_bytes = self.blocked_amendment_bytes(authorized_bytes)
+            for label, malformed_candidate in (
+                (
+                    "missing",
+                    candidate_bytes.replace(b"reviewer: null", b"reviewer: ~", 1),
+                ),
+                ("duplicate", candidate_bytes + b"reviewer: null\n"),
+            ):
+                with self.subTest(candidate_authorization_line=label):
+                    with self.authorized_git_state(
+                        amendment_path,
+                        reviewed_overrides={
+                            amendment_relative: malformed_candidate
+                        },
+                    ), self.assertRaisesRegex(ValueError, "exactly once"):
+                        audit.validate_analysis_amendment(
+                            amendment_path,
+                            base_commit=(
+                                audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+                            ),
+                        )
+
+            for label, drifted_authorization in (
+                ("comment", b"# unauthorized drift\n" + authorized_bytes),
+                (
+                    "whitespace",
+                    authorized_bytes.replace(b"schema: ", b"schema:  ", 1),
+                ),
+            ):
+                with self.subTest(authorization_drift=label):
+                    amendment_path.write_bytes(drifted_authorization)
+                    with self.authorized_git_state(
+                        amendment_path,
+                        committed_amendment_bytes=drifted_authorization,
+                        reviewed_overrides={amendment_relative: candidate_bytes},
+                    ), self.assertRaisesRegex(ValueError, "outside the three permitted"):
+                        audit.validate_analysis_amendment(
+                            amendment_path,
+                            base_commit=(
+                                audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+                            ),
+                        )
+            amendment_path.write_bytes(authorized_bytes)
 
             with self.authorized_git_state(
                 amendment_path,
@@ -799,6 +854,109 @@ class StructuralControlAuditTest(unittest.TestCase):
                 strict=True,
             )
 
+    def test_analysis_authorization_topology_requires_one_direct_file_change(self):
+        amendment_relative = "eval-pipeline/configs/amendment.yaml"
+        parent_row = (
+            f"{self.AUTHORIZATION_COMMIT} {self.REVIEWED_COMMIT}\n".encode("ascii")
+        )
+
+        def modification(
+            path=amendment_relative,
+            *,
+            old_mode="100644",
+            new_mode="100644",
+            status="M",
+            old_hash="a" * 40,
+            new_hash="b" * 40,
+            extra_paths=(),
+        ):
+            metadata = (
+                f":{old_mode} {new_mode} {old_hash} {new_hash} {status}"
+            ).encode("ascii")
+            return b"\0".join(
+                (metadata, path.encode("utf-8"), *(p.encode("utf-8") for p in extra_paths))
+            ) + b"\0"
+
+        with mock.patch.object(
+            audit, "_git_command_bytes", side_effect=[parent_row, modification()]
+        ) as git_command:
+            audit._validate_analysis_authorization_topology(
+                self.REVIEWED_COMMIT,
+                self.AUTHORIZATION_COMMIT,
+                amendment_relative,
+            )
+        self.assertEqual(git_command.call_count, 2)
+
+        for label, invalid_parent in (
+            (
+                "intermediate",
+                f"{self.AUTHORIZATION_COMMIT} {'3' * 40}\n".encode("ascii"),
+            ),
+            (
+                "merge",
+                (
+                    f"{self.AUTHORIZATION_COMMIT} {self.REVIEWED_COMMIT} "
+                    f"{'4' * 40}\n"
+                ).encode("ascii"),
+            ),
+        ):
+            with self.subTest(parent_attack=label), mock.patch.object(
+                audit, "_git_command_bytes", return_value=invalid_parent
+            ), self.assertRaisesRegex(ValueError, "sole parent"):
+                audit._validate_analysis_authorization_topology(
+                    self.REVIEWED_COMMIT,
+                    self.AUTHORIZATION_COMMIT,
+                    amendment_relative,
+                )
+
+        ordinary = modification()
+        attacks = (
+            ("extra", ordinary + modification("extra.txt")),
+            ("add", modification(old_mode="000000", status="A", old_hash="0" * 40)),
+            ("delete", modification(new_mode="000000", status="D", new_hash="0" * 40)),
+            (
+                "rename",
+                modification(
+                    "old.yaml",
+                    status="R100",
+                    extra_paths=(amendment_relative,),
+                ),
+            ),
+            (
+                "copy",
+                modification(
+                    "source.yaml",
+                    status="C100",
+                    extra_paths=(amendment_relative,),
+                ),
+            ),
+            ("mode", modification(new_mode="100755")),
+            ("wrong_path", modification("other.yaml")),
+            ("same_blob", modification(new_hash="a" * 40)),
+        )
+        for label, raw_diff in attacks:
+            with self.subTest(diff_attack=label), mock.patch.object(
+                audit,
+                "_git_command_bytes",
+                side_effect=[parent_row, raw_diff],
+            ), self.assertRaisesRegex(ValueError, "authorization commit"):
+                audit._validate_analysis_authorization_topology(
+                    self.REVIEWED_COMMIT,
+                    self.AUTHORIZATION_COMMIT,
+                    amendment_relative,
+                )
+
+        with mock.patch.object(
+            audit,
+            "_git_command_bytes",
+            side_effect=ValueError("parent verification failed"),
+        ), self.assertRaisesRegex(ValueError, "verification failed"):
+            audit._validate_analysis_authorization_topology(
+                self.REVIEWED_COMMIT,
+                self.AUTHORIZATION_COMMIT,
+                amendment_relative,
+            )
+
     @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
     def test_pre_score_seal_is_one_shot_and_hash_bound(self, _validate_amendment):
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
@@ -862,10 +1020,17 @@ class StructuralControlAuditTest(unittest.TestCase):
     ):
         forbidden_names = (
             "scores.jsonl",
-            "run_audit.json",
+            audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
+            audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME,
             audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+            audit.STRUCTURAL_CONTROL_EVALUATION_ATTEMPT_NAME,
             *audit.STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
             f".{audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.staging",
+            ".scores.jsonl.crash.tmp",
+            ".run_audit.json.crash.tmp",
+            ".structural_control_evaluation.json.crash.tmp",
+            ".structural_control_contrasts.csv.crash.tmp",
+            ".structural_control_pre_score_seal.json.crash.tmp",
         )
         for forbidden_name in forbidden_names:
             with self.subTest(forbidden_name=forbidden_name), tempfile.TemporaryDirectory(
@@ -873,10 +1038,13 @@ class StructuralControlAuditTest(unittest.TestCase):
             ) as temporary:
                 run_dir, amendment_path = self.write_pre_score_inputs(temporary)
                 forbidden_path = run_dir / forbidden_name
-                if forbidden_name == audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE:
+                if forbidden_name in {
+                    audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+                    f".{audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.staging",
+                }:
                     forbidden_path.mkdir()
                 else:
-                    forbidden_path.write_text("fixture", encoding="utf-8")
+                    forbidden_path.write_bytes(b"partial outcome bytes")
                 with self.assertRaisesRegex(ValueError, "artifacts absent"):
                     audit.create_pre_score_seal(
                         run_dir,
@@ -897,6 +1065,22 @@ class StructuralControlAuditTest(unittest.TestCase):
                         amendment_path,
                     )
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+            for allowed_name in (
+                ".generate.lock",
+                ".structural_control_audit.lock",
+                ".structural_control_evaluation.lock",
+                ".unrelated.tmp",
+            ):
+                (run_dir / allowed_name).write_bytes(b"not an outcome artifact")
+            audit.create_pre_score_seal(
+                run_dir,
+                ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                amendment_path,
+            )
 
     @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
     def test_create_seal_cli_publishes_only_the_canonical_seal(
@@ -922,7 +1106,198 @@ class StructuralControlAuditTest(unittest.TestCase):
                 (run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME).is_file()
             )
             self.assertFalse((run_dir / "scores.jsonl").exists())
-            self.assertFalse((run_dir / "run_audit.json").exists())
+            self.assertFalse(
+                (run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME).exists()
+            )
+            self.assertFalse(
+                (run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME).exists()
+            )
+
+    def test_audit_attempt_marker_is_durable_and_one_shot(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            output_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+            with mock.patch.object(
+                audit.os, "open", wraps=audit.os.open
+            ) as open_file, mock.patch.object(
+                audit.os, "fsync", wraps=audit.os.fsync
+            ) as fsync, mock.patch.object(
+                audit, "_fsync_directory", wraps=audit._fsync_directory
+            ) as fsync_directory:
+                marker_path = audit.create_audit_attempt_marker(
+                    run_dir, output_path
+                )
+            marker_open = open_file.call_args_list[0]
+            self.assertTrue(marker_open.args[1] & audit.os.O_EXCL)
+            self.assertTrue(marker_open.args[1] & audit.os.O_NOFOLLOW)
+            self.assertGreaterEqual(fsync.call_count, 2)
+            fsync_directory.assert_called_once_with(run_dir.resolve())
+            self.assertEqual(
+                marker_path.read_bytes(), audit._audit_attempt_marker_payload()
+            )
+            self.assertEqual(
+                audit.require_audit_attempt_marker(run_dir), marker_path
+            )
+            with self.assertRaisesRegex(ValueError, "one-shot"):
+                audit.create_audit_attempt_marker(run_dir, output_path)
+
+        for existing_name in (
+            audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME,
+            "custom-audit.json",
+        ):
+            with self.subTest(existing_output=existing_name), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                (run_dir / existing_name).write_bytes(b"existing output")
+                selected_output = (
+                    run_dir / "custom-audit.json"
+                    if existing_name == audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+                    else run_dir / existing_name
+                )
+                with self.assertRaisesRegex(ValueError, "one-shot"):
+                    audit.create_audit_attempt_marker(run_dir, selected_output)
+
+    def test_audit_attempt_marker_rejects_symlink_and_creation_race(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            marker_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+            marker_path.symlink_to(run_dir / "missing-marker-target")
+            with self.assertRaisesRegex(ValueError, "one-shot"):
+                audit.create_audit_attempt_marker(
+                    run_dir, run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+                )
+            self.assertTrue(marker_path.is_symlink())
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            with mock.patch.object(
+                audit.os.path, "lexists", return_value=False
+            ), mock.patch.object(
+                audit.os, "open", side_effect=FileExistsError("racing marker")
+            ), self.assertRaisesRegex(ValueError, "one-shot"):
+                audit.create_audit_attempt_marker(
+                    run_dir, run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+                )
+
+    def test_audit_attempt_marker_fsync_failures_remain_terminal(self):
+        for failure_point in ("file", "directory"):
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                output_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+                if failure_point == "file":
+                    failure_patch = mock.patch.object(
+                        audit.os, "fsync", side_effect=OSError("file fsync failed")
+                    )
+                else:
+                    failure_patch = mock.patch.object(
+                        audit,
+                        "_fsync_directory",
+                        side_effect=OSError("directory fsync failed"),
+                    )
+                with failure_patch, self.assertRaisesRegex(OSError, "fsync failed"):
+                    audit.create_audit_attempt_marker(run_dir, output_path)
+                marker_path = (
+                    run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+                )
+                self.assertTrue(os.path.lexists(marker_path))
+                self.assertFalse(output_path.exists())
+                with self.assertRaisesRegex(ValueError, "one-shot"):
+                    audit.create_audit_attempt_marker(run_dir, output_path)
+
+    def test_require_audit_attempt_marker_rejects_missing_tampered_and_nonregular(self):
+        for marker_state in ("missing", "tampered", "symlink", "directory"):
+            with self.subTest(marker_state=marker_state), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                marker_path = (
+                    run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+                )
+                expected_message = "missing"
+                if marker_state == "tampered":
+                    marker_path.write_bytes(b"tampered marker")
+                    expected_message = "invalid"
+                elif marker_state == "symlink":
+                    marker_path.symlink_to(run_dir / "missing-target")
+                elif marker_state == "directory":
+                    marker_path.mkdir()
+                    expected_message = "not regular"
+                with self.assertRaisesRegex(ValueError, expected_message):
+                    audit.require_audit_attempt_marker(run_dir)
+                if marker_state == "missing":
+                    self.assertFalse(os.path.lexists(marker_path))
+
+    def test_audit_run_requires_marker_before_reading_outcomes(self):
+        for marker_state in ("missing", "tampered"):
+            with self.subTest(marker_state=marker_state), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir = pathlib.Path(temporary) / "run"
+                run_dir.mkdir()
+                if marker_state == "tampered":
+                    (
+                        run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+                    ).write_bytes(b"tampered marker")
+                with mock.patch.object(
+                    audit,
+                    "_load_jsonl",
+                    side_effect=AssertionError("outcomes must not be read"),
+                ), self.assertRaisesRegex(ValueError, "attempt marker"):
+                    audit.audit_run(
+                        run_dir,
+                        "missing-prompts.csv",
+                        "missing-actions.yaml",
+                        analysis_amendment_path="missing-amendment.yaml",
+                        pre_score_seal_path="missing-seal.json",
+                    )
+
+    def test_formal_audit_consumes_attempt_before_read_and_preserves_failure(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir = pathlib.Path(temporary) / "run"
+            run_dir.mkdir()
+            marker_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+            output_path = run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+            argv = [
+                "audit_structural_control_run.py",
+                "--run_dir",
+                str(run_dir),
+                "--prompts",
+                "prompts.csv",
+                "--actions",
+                "actions.yaml",
+                "--analysis-amendment",
+                "amendment.yaml",
+                "--pre-score-seal",
+                "seal.json",
+            ]
+
+            def fail_after_marker(*_args, **_kwargs):
+                self.assertEqual(
+                    marker_path.read_bytes(), audit._audit_attempt_marker_payload()
+                )
+                raise RuntimeError("audit failed after reading began")
+
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                audit, "audit_run", side_effect=fail_after_marker
+            ), self.assertRaisesRegex(RuntimeError, "audit failed"):
+                audit.main()
+            self.assertTrue(marker_path.is_file())
+            self.assertFalse(output_path.exists())
+
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                audit, "audit_run"
+            ) as audit_run, self.assertRaisesRegex(ValueError, "one-shot"):
+                audit.main()
+            audit_run.assert_not_called()
 
     def test_v2_audit_removes_all_outcome_detail_fields(self):
         action_ids = ["left", "right"]
@@ -982,6 +1357,9 @@ class StructuralControlAuditTest(unittest.TestCase):
             amendment_path.write_text("schema: fixture\n", encoding="utf-8")
             seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
             seal_path.write_text("{}\n", encoding="utf-8")
+            marker_path = audit.create_audit_attempt_marker(
+                run_dir, run_dir / audit.STRUCTURAL_CONTROL_AUDIT_OUTPUT_NAME
+            )
             base_report = {
                 "passed": True,
                 "split_role": "development",
@@ -1055,6 +1433,11 @@ class StructuralControlAuditTest(unittest.TestCase):
             )
             self.assertFalse(report["outcome_details_disclosed"])
             self.assertTrue(report["full_action_collapse_check_passed"])
+            marker_hash = hashlib.sha256(marker_path.read_bytes()).hexdigest()
+            self.assertEqual(report["audit_attempt_sha256"], marker_hash)
+            self.assertEqual(
+                report["provenance"]["audit_attempt_sha256"], marker_hash
+            )
             for leaked_field in (
                 "duplicate_action_png_pair_counts",
                 "fully_collapsed_action_pairs",

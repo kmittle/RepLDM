@@ -23,6 +23,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -54,6 +55,8 @@ OUTPUT_BUNDLE_SCHEMA = "structural_control_evaluation_output_bundle_v2"
 CONTRAST_ARTIFACT_SCHEMA = "structural_control_contrast_artifact_v2"
 EVALUATION_SCOPE = "development_evidence_reporting_only"
 OUTPUT_BUNDLE_DIR = "structural_control_evaluation_bundle"
+ATTEMPT_MARKER = "structural_control_evaluation_attempt.json"
+ATTEMPT_SCHEMA = "structural_control_evaluation_attempt_v1"
 OUTPUT_JSON = "structural_control_evaluation.json"
 OUTPUT_CSV = "structural_control_contrasts.csv"
 AUDITOR_PATH = ROOT / "eval-pipeline" / "audit_structural_control_run.py"
@@ -67,6 +70,8 @@ INPUT_PROVENANCE_KEYS = (
     "scores",
     "actions",
     "audit",
+    "audit_attempt",
+    "evaluation_attempt",
     "registration",
     "prompts",
     "prompt_manifest",
@@ -308,6 +313,22 @@ class VerifiedInputs:
     seeds: tuple[int, ...]
     hashes: Mapping[str, str]
     paths: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class EvaluationPayloads:
+    result: Mapping[str, Any]
+    json_payload: bytes
+    csv_payload: bytes
+    input_hashes: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class BundleSnapshot:
+    directory_identity: tuple[int, int]
+    entry_identities: Mapping[str, tuple[int, int]]
+    json_payload: bytes
+    csv_payload: bytes
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -1195,6 +1216,14 @@ def load_verified_inputs(
         analysis_amendment_path=paths["analysis_amendment"],
         base_commit=generation_commit,
     )
+    marker_paths = {
+        "audit_attempt": structural_audit.require_audit_attempt_marker(run_root),
+        "evaluation_attempt": require_evaluation_attempt_marker(run_root),
+    }
+    for label, path in marker_paths.items():
+        paths[label] = path
+        payloads[label] = path.read_bytes()
+        hashes[label] = sha256_bytes(payloads[label])
     for label in ("manifest", "scores", "audit"):
         payloads[label] = paths[label].read_bytes()
         hashes[label] = sha256_bytes(payloads[label])
@@ -1258,6 +1287,7 @@ def load_verified_inputs(
         ("source_template_sha256", "registration"),
         ("analysis_amendment_sha256", "analysis_amendment"),
         ("pre_score_seal_sha256", "pre_score_seal"),
+        ("audit_attempt_sha256", "audit_attempt"),
     ):
         _require_hash(audit_provenance, audit_key, hashes[payload_key], "run audit")
     if audit_provenance.get("input_snapshot_stable") is not True:
@@ -1284,6 +1314,12 @@ def load_verified_inputs(
         audit,
         "pre_score_seal_sha256",
         hashes["pre_score_seal"],
+        "dedicated run audit",
+    )
+    _require_hash(
+        audit,
+        "audit_attempt_sha256",
+        hashes["audit_attempt"],
         "dedicated run audit",
     )
     effective_analysis = _validate_effective_analysis_implementation(
@@ -1477,6 +1513,170 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _attempt_marker_payload() -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema": ATTEMPT_SCHEMA,
+                "scope": EVALUATION_SCOPE,
+                "one_shot": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _evaluation_attempt_artifacts(run_root: Path) -> tuple[Path, ...]:
+    return (
+        run_root / ATTEMPT_MARKER,
+        run_root / OUTPUT_BUNDLE_DIR,
+        run_root / OUTPUT_JSON,
+        run_root / OUTPUT_CSV,
+    )
+
+
+def create_evaluation_attempt_marker(run_dir: str | os.PathLike[str]) -> Path:
+    """Durably consume the formal evaluator's one allowed attempt."""
+    run_root = Path(run_dir).resolve()
+    if any(os.path.lexists(path) for path in _evaluation_attempt_artifacts(run_root)):
+        raise ValueError("structural-control development evaluation is one-shot")
+    marker_path = run_root / ATTEMPT_MARKER
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(marker_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise ValueError("structural-control development evaluation is one-shot") from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(_attempt_marker_payload())
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _fsync_directory(run_root)
+    return marker_path
+
+
+def require_evaluation_attempt_marker(run_dir: str | os.PathLike[str]) -> Path:
+    run_root = Path(run_dir).resolve()
+    marker_path = run_root / ATTEMPT_MARKER
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            marker_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(
+                "canonical structural-control evaluation attempt marker is not regular"
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            payload = handle.read()
+    except OSError as exc:
+        raise ValueError(
+            "canonical structural-control evaluation attempt marker is missing"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if payload != _attempt_marker_payload():
+        raise ValueError("structural-control evaluation attempt marker is invalid")
+    return marker_path
+
+
+def _bundle_snapshot(bundle_path: Path) -> BundleSnapshot:
+    """Read an exact regular-file bundle and bind its filesystem identities."""
+    directory_descriptor = -1
+    try:
+        directory_descriptor = os.open(
+            bundle_path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0),
+        )
+        directory_stat = os.fstat(directory_descriptor)
+    except OSError as exc:
+        raise ValueError(
+            "structural-control evaluation bundle is missing or not a directory"
+        ) from exc
+    try:
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise ValueError(
+                "structural-control evaluation bundle is missing or not a directory"
+            )
+        directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
+        expected_names = {OUTPUT_JSON, OUTPUT_CSV}
+        try:
+            names = set(os.listdir(directory_descriptor))
+        except OSError as exc:
+            raise ValueError("structural-control evaluation bundle cannot be read") from exc
+        if names != expected_names:
+            raise ValueError("structural-control evaluation bundle has unexpected contents")
+
+        payloads: dict[str, bytes] = {}
+        identities: dict[str, tuple[int, int]] = {}
+        for name in (OUTPUT_JSON, OUTPUT_CSV):
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_descriptor,
+                )
+                before = os.fstat(descriptor)
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError(
+                        "structural-control evaluation bundle entries must be regular files"
+                    )
+                identity = (before.st_dev, before.st_ino)
+                with os.fdopen(descriptor, "rb") as handle:
+                    descriptor = -1
+                    payloads[name] = handle.read()
+                current = os.stat(
+                    name, dir_fd=directory_descriptor, follow_symlinks=False
+                )
+                if not stat.S_ISREG(current.st_mode) or (
+                    current.st_dev,
+                    current.st_ino,
+                ) != identity:
+                    raise ValueError("evaluation bundle changed while it was read")
+                identities[name] = identity
+            except OSError as exc:
+                raise ValueError(
+                    "structural-control evaluation bundle entries must be regular files"
+                ) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+        if set(os.listdir(directory_descriptor)) != expected_names:
+            raise ValueError("evaluation bundle changed while it was read")
+        for name, identity in identities.items():
+            current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != identity:
+                raise ValueError("evaluation bundle changed while it was read")
+        final_directory_stat = os.lstat(bundle_path)
+        if not stat.S_ISDIR(final_directory_stat.st_mode) or (
+            final_directory_stat.st_dev,
+            final_directory_stat.st_ino,
+        ) != directory_identity:
+            raise ValueError("evaluation bundle changed while it was read")
+        return BundleSnapshot(
+            directory_identity=directory_identity,
+            entry_identities=identities,
+            json_payload=payloads[OUTPUT_JSON],
+            csv_payload=payloads[OUTPUT_CSV],
+        )
+    finally:
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+
 def _require_committed_inputs(paths: Sequence[str | os.PathLike[str]]) -> str:
     commit = subprocess.check_output(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
@@ -1560,6 +1760,116 @@ def _csv_payload(
     return frame.to_csv(index=False).encode("utf-8")
 
 
+def _committed_evaluator_version(inputs: VerifiedInputs) -> str:
+    registered_analysis_files = inputs.actions_config["analysis_implementation"][
+        "files"
+    ]
+    return _require_committed_inputs(
+        (
+            inputs.paths["actions"],
+            inputs.paths["registration"],
+            inputs.paths["prompts"],
+            inputs.paths["prompt_manifest"],
+            inputs.paths["analysis_amendment"],
+            *(ROOT / relative_path for relative_path in registered_analysis_files),
+        )
+    )
+
+
+def build_evaluation_payloads(
+    inputs: VerifiedInputs, *, evaluator_git_commit: str
+) -> EvaluationPayloads:
+    """Deterministically build the complete canonical evaluation artifacts."""
+    run_dir = Path(inputs.paths["run_config"]).resolve().parent
+    result = evaluate_frame(
+        inputs.frame,
+        inputs.protocol,
+        expected_prompt_indices=inputs.prompt_indices,
+        expected_seeds=inputs.seeds,
+        audit=inputs.audit,
+    )
+    result["provenance"] = {
+        "run_dir": str(run_dir),
+        "run_config_sha256": inputs.hashes["run_config"],
+        "manifest_sha256": inputs.hashes["manifest"],
+        "scores_sha256": inputs.hashes["scores"],
+        "actions_path": inputs.paths["actions"],
+        "actions_sha256": inputs.hashes["actions"],
+        "audit_path": inputs.paths["audit"],
+        "audit_sha256": inputs.hashes["audit"],
+        "audit_attempt_path": inputs.paths["audit_attempt"],
+        "audit_attempt_sha256": inputs.hashes["audit_attempt"],
+        "evaluation_attempt_path": inputs.paths["evaluation_attempt"],
+        "evaluation_attempt_sha256": inputs.hashes["evaluation_attempt"],
+        "analysis_amendment_path": inputs.paths["analysis_amendment"],
+        "analysis_amendment_sha256": inputs.hashes["analysis_amendment"],
+        "pre_score_seal_path": inputs.paths["pre_score_seal"],
+        "pre_score_seal_sha256": inputs.hashes["pre_score_seal"],
+        "registration_path": inputs.paths["registration"],
+        "registration_sha256": inputs.hashes["registration"],
+        "prompts_path": inputs.paths["prompts"],
+        "prompts_sha256": inputs.hashes["prompts"],
+        "prompt_manifest_path": inputs.paths["prompt_manifest"],
+        "prompt_manifest_sha256": inputs.hashes["prompt_manifest"],
+        "dedicated_auditor_path": str(AUDITOR_PATH.resolve()),
+        "dedicated_auditor_sha256": sha256_file(AUDITOR_PATH),
+        "base_auditor_path": str(BASE_AUDITOR_PATH.resolve()),
+        "base_auditor_sha256": sha256_file(BASE_AUDITOR_PATH),
+        "compare_actions_path": str(COMPARE_ACTIONS_PATH.resolve()),
+        "compare_actions_sha256": sha256_file(COMPARE_ACTIONS_PATH),
+        "evaluator_script_sha256": sha256_file(__file__),
+        "evaluator_git_commit": evaluator_git_commit,
+        "base_analysis_implementation": inputs.actions_config[
+            "analysis_implementation"
+        ],
+        "effective_analysis_implementation": inputs.audit[
+            "analysis_implementation"
+        ],
+        "runtime_versions": _runtime_versions(),
+    }
+    input_hashes = {key: inputs.hashes[key] for key in INPUT_PROVENANCE_KEYS}
+    result["input_provenance_sha256"] = input_hashes
+    csv_payload = _csv_payload(result["contrasts"], input_hashes)
+    result["output_bundle"] = {
+        "schema": OUTPUT_BUNDLE_SCHEMA,
+        "scope": EVALUATION_SCOPE,
+        "csv": {
+            "filename": OUTPUT_CSV,
+            "sha256": sha256_bytes(csv_payload),
+            "row_count": len(result["contrasts"]),
+            "artifact_schema": CONTRAST_ARTIFACT_SCHEMA,
+            "scope": EVALUATION_SCOPE,
+        },
+    }
+    json_payload = (
+        json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    return EvaluationPayloads(
+        result=result,
+        json_payload=json_payload,
+        csv_payload=csv_payload,
+        input_hashes=input_hashes,
+    )
+
+
+def replay_evaluation_payloads(
+    current_input_paths: Mapping[str, str | os.PathLike[str]],
+) -> EvaluationPayloads:
+    """Recompute the formal audit, statistics, and bytes from current inputs."""
+    paths, _ = _strict_input_snapshot(current_input_paths)
+    run_dir = paths["run_config"].parent
+    inputs = load_verified_inputs(
+        run_dir,
+        paths["actions"],
+        paths["audit"],
+        paths["analysis_amendment"],
+        paths["pre_score_seal"],
+    )
+    return build_evaluation_payloads(
+        inputs, evaluator_git_commit=_committed_evaluator_version(inputs)
+    )
+
+
 def _strict_input_snapshot(
     input_paths: Mapping[str, str | os.PathLike[str]],
 ) -> tuple[dict[str, Path], dict[str, str]]:
@@ -1582,6 +1892,10 @@ def _strict_input_snapshot(
         "manifest": run_root / "manifest.jsonl",
         "scores": run_root / "scores.jsonl",
         "audit": run_root / "run_audit.json",
+        "audit_attempt": (
+            run_root / structural_audit.STRUCTURAL_CONTROL_AUDIT_ATTEMPT_NAME
+        ),
+        "evaluation_attempt": run_root / ATTEMPT_MARKER,
         "pre_score_seal": (
             run_root / structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
         ),
@@ -1600,7 +1914,7 @@ def resolve_evaluation_input_paths(
     analysis_amendment_path: str | os.PathLike[str],
     pre_score_seal_path: str | os.PathLike[str],
 ) -> dict[str, Path]:
-    """Resolve the ten current files required for strict external verification."""
+    """Resolve the 12 current files required for strict external verification."""
     raw_run_root = Path(run_dir)
     if raw_run_root.is_symlink():
         raise ValueError("strict bundle verification rejects a symlink run directory")
@@ -1619,6 +1933,8 @@ def resolve_evaluation_input_paths(
         "run_config": run_root / "config.json",
         "manifest": run_root / "manifest.jsonl",
         "scores": run_root / "scores.jsonl",
+        "audit_attempt": structural_audit.require_audit_attempt_marker(run_root),
+        "evaluation_attempt": require_evaluation_attempt_marker(run_root),
         **{key: path.resolve() for key, path in raw_external.items()},
     }
     if paths["audit"] != run_root / "run_audit.json":
@@ -1685,8 +2001,6 @@ def verify_evaluation_bundle(
 ) -> Mapping[str, Any]:
     """Verify the v2 bundle, anchored to a stable current-input snapshot."""
     bundle_path = Path(bundle_dir)
-    if bundle_path.is_symlink() or not bundle_path.is_dir():
-        raise ValueError("structural-control evaluation bundle is missing or not a directory")
     snapshot_paths: dict[str, Path] | None = None
     if strict:
         if current_input_paths is None:
@@ -1697,6 +2011,8 @@ def verify_evaluation_bundle(
         run_root = snapshot_paths["run_config"].parent
         if bundle_path.resolve() != run_root / OUTPUT_BUNDLE_DIR:
             raise ValueError("strict bundle verification requires the canonical bundle path")
+        structural_audit.require_audit_attempt_marker(run_root)
+        require_evaluation_attempt_marker(run_root)
         if expected_input_hashes is not None and _validated_input_hashes(
             expected_input_hashes
         ) != trusted_hashes:
@@ -1707,14 +2023,9 @@ def verify_evaluation_bundle(
                 "internal bundle verification requires caller-supplied input hashes"
             )
         trusted_hashes = _validated_input_hashes(expected_input_hashes)
-    entries = list(bundle_path.iterdir())
-    if {entry.name for entry in entries} != {OUTPUT_JSON, OUTPUT_CSV}:
-        raise ValueError("structural-control evaluation bundle has unexpected contents")
-    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
-        raise ValueError("structural-control evaluation bundle entries must be regular files")
-
-    json_payload = (bundle_path / OUTPUT_JSON).read_bytes()
-    csv_payload = (bundle_path / OUTPUT_CSV).read_bytes()
+    initial_bundle = _bundle_snapshot(bundle_path)
+    json_payload = initial_bundle.json_payload
+    csv_payload = initial_bundle.csv_payload
     report = _load_json(json_payload, "structural-control evaluation JSON")
     if report.get("schema") != EVALUATION_SCHEMA:
         raise ValueError("structural-control evaluation JSON schema differs from v2")
@@ -1823,9 +2134,27 @@ def verify_evaluation_bundle(
         if {key: row.get(key) for key in CSV_ENVELOPE_FIELDS} != expected_envelope:
             raise ValueError("evaluation bundle CSV row envelope differs")
     if snapshot_paths is not None:
+        replayed = replay_evaluation_payloads(snapshot_paths)
+        if dict(replayed.input_hashes) != trusted_hashes:
+            raise ValueError("semantic replay input hashes differ from current inputs")
+        if replayed.json_payload != json_payload or replayed.csv_payload != csv_payload:
+            raise ValueError("evaluation bundle differs from deterministic semantic replay")
+        structural_audit.require_audit_attempt_marker(run_root)
+        require_evaluation_attempt_marker(run_root)
         _, final_hashes = _strict_input_snapshot(snapshot_paths)
         if final_hashes != trusted_hashes:
             raise ValueError("bundle verification inputs changed during verification")
+        final_bundle = _bundle_snapshot(bundle_path)
+        if (
+            final_bundle.directory_identity != initial_bundle.directory_identity
+            or dict(final_bundle.entry_identities)
+            != dict(initial_bundle.entry_identities)
+            or final_bundle.json_payload != json_payload
+            or final_bundle.csv_payload != csv_payload
+            or final_bundle.json_payload != replayed.json_payload
+            or final_bundle.csv_payload != replayed.csv_payload
+        ):
+            raise ValueError("evaluation bundle changed during semantic replay")
     return report
 
 
@@ -1906,11 +2235,7 @@ def main() -> None:
         print(f"verified evaluation bundle -> {bundle_path}")
         return
     with evaluation_lock(run_dir):
-        if os.path.lexists(bundle_path):
-            raise ValueError("structural-control development evaluation is one-shot")
-        legacy_outputs = (run_dir / OUTPUT_JSON, run_dir / OUTPUT_CSV)
-        if any(os.path.lexists(path) for path in legacy_outputs):
-            raise ValueError("legacy structural-control evaluation output exists")
+        create_evaluation_attempt_marker(run_dir)
         inputs = load_verified_inputs(
             run_dir,
             args.actions,
@@ -1918,89 +2243,17 @@ def main() -> None:
             args.analysis_amendment,
             args.pre_score_seal,
         )
-        registered_analysis_files = inputs.actions_config[
-            "analysis_implementation"
-        ]["files"]
-        evaluator_git_commit = _require_committed_inputs(
-            (
-                inputs.paths["actions"],
-                inputs.paths["registration"],
-                inputs.paths["prompts"],
-                inputs.paths["prompt_manifest"],
-                inputs.paths["analysis_amendment"],
-                *(ROOT / relative_path for relative_path in registered_analysis_files),
-            )
+        payloads = build_evaluation_payloads(
+            inputs,
+            evaluator_git_commit=_committed_evaluator_version(inputs),
         )
-        result = evaluate_frame(
-            inputs.frame,
-            inputs.protocol,
-            expected_prompt_indices=inputs.prompt_indices,
-            expected_seeds=inputs.seeds,
-            audit=inputs.audit,
-        )
-        result["provenance"] = {
-            "run_dir": str(run_dir),
-            "run_config_sha256": inputs.hashes["run_config"],
-            "manifest_sha256": inputs.hashes["manifest"],
-            "scores_sha256": inputs.hashes["scores"],
-            "actions_path": inputs.paths["actions"],
-            "actions_sha256": inputs.hashes["actions"],
-            "audit_path": inputs.paths["audit"],
-            "audit_sha256": inputs.hashes["audit"],
-            "analysis_amendment_path": inputs.paths["analysis_amendment"],
-            "analysis_amendment_sha256": inputs.hashes["analysis_amendment"],
-            "pre_score_seal_path": inputs.paths["pre_score_seal"],
-            "pre_score_seal_sha256": inputs.hashes["pre_score_seal"],
-            "registration_path": inputs.paths["registration"],
-            "registration_sha256": inputs.hashes["registration"],
-            "prompts_path": inputs.paths["prompts"],
-            "prompts_sha256": inputs.hashes["prompts"],
-            "prompt_manifest_path": inputs.paths["prompt_manifest"],
-            "prompt_manifest_sha256": inputs.hashes["prompt_manifest"],
-            "dedicated_auditor_path": str(AUDITOR_PATH.resolve()),
-            "dedicated_auditor_sha256": sha256_file(AUDITOR_PATH),
-            "base_auditor_path": str(BASE_AUDITOR_PATH.resolve()),
-            "base_auditor_sha256": sha256_file(BASE_AUDITOR_PATH),
-            "compare_actions_path": str(COMPARE_ACTIONS_PATH.resolve()),
-            "compare_actions_sha256": sha256_file(COMPARE_ACTIONS_PATH),
-            "evaluator_script_sha256": sha256_file(__file__),
-            "evaluator_git_commit": evaluator_git_commit,
-            "base_analysis_implementation": inputs.actions_config[
-                "analysis_implementation"
-            ],
-            "effective_analysis_implementation": inputs.audit[
-                "analysis_implementation"
-            ],
-            "runtime_versions": _runtime_versions(),
-        }
-        input_hashes = {
-            key: inputs.hashes[key] for key in INPUT_PROVENANCE_KEYS
-        }
-        result["input_provenance_sha256"] = input_hashes
-        csv_payload = _csv_payload(result["contrasts"], input_hashes)
-        result["output_bundle"] = {
-            "schema": OUTPUT_BUNDLE_SCHEMA,
-            "scope": EVALUATION_SCOPE,
-            "csv": {
-                "filename": OUTPUT_CSV,
-                "sha256": sha256_bytes(csv_payload),
-                "row_count": len(result["contrasts"]),
-                "artifact_schema": CONTRAST_ARTIFACT_SCHEMA,
-                "scope": EVALUATION_SCOPE,
-            },
-        }
-        json_payload = (
-            json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
-        ).encode("utf-8")
         bundle_path = publish_evaluation_bundle(
             run_dir,
-            json_payload,
-            csv_payload,
-            expected_input_hashes=input_hashes,
+            payloads.json_payload,
+            payloads.csv_payload,
+            expected_input_hashes=payloads.input_hashes,
         )
-        verify_evaluation_bundle(
-            bundle_path, current_input_paths=inputs.paths
-        )
+        result = payloads.result
     print(
         json.dumps(
             {

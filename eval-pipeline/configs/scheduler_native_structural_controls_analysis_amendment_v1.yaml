@@ -23,7 +23,7 @@ authorizations:
 replacements:
   eval-pipeline/audit_structural_control_run.py:
     base_sha256: 8a7983f4953e9e668fe773c6011a35b07f4c9264d6abde43535f413fba1426ae
-    amended_sha256: cac46c287dd4fe55ea357c2e20a127b2a4667824dc57d0fffff6e345bc3f2426
+    amended_sha256: 53ea19fa2f8b8a7eed957a04732b983caa7f21ce1eb75c0f1b1bbea7e669d32a
   eval-pipeline/evaluate_structural_control_run.py:
     base_sha256: ac8d18fc07cdaa14c702159e67ce74683296764c75be8cb34b7c83678e342c50
-    amended_sha256: a68d9d612bd5d8a0881f0079f6bdadb2fb949fc4788ca76ca83e6700cdb6e7b1
+    amended_sha256: b02cfc648cc998a710096346984cca0d3b52a0f1308c45c38f797f4a39fda3f5
