@@ -23,10 +23,25 @@ timestep-conditioned spectral residuals. [iREPA](https://arxiv.org/abs/2512.1079
 [SARA](https://arxiv.org/abs/2503.08253), [SGA](https://arxiv.org/abs/2605.20808),
 and [sREPA](https://arxiv.org/abs/2605.16949) provide evidence, in their
 training-time settings, that spatial relations can outperform pointwise or
-global semantic alignment. [Diffusing in the Right Space](https://arxiv.org/abs/2606.03578)
+global semantic alignment. [SPARE](https://arxiv.org/abs/2608.01990v1) goes
+further: during from-scratch SiT training it matches all non-self within-image
+affinities, plus same-position cross-image affinities, to true clean VAE latent
+affinities without an encoder or projection head. It does not perform frozen-
+model inference transport; sREPA mentions local relation matching only as
+future work. Together they establish pairwise-affinity prior art and explicitly
+anticipate local matching, requiring uniform-local and predicted-clean-affinity
+controls here. [Diffusing in the Right Space](https://arxiv.org/abs/2606.03578)
 finds diffusability is multifactorial and proposes velocity irreducible
 variance (VIV); we therefore do not treat a DCT slope as a sufficient causal
 explanation.
+
+The proposed residual `W z - z` is also the negative random-walk graph
+Laplacian, with feature-conditioned local weights closely related to
+[bilateral filtering](https://doi.org/10.1109/ICCV.1998.710815) and
+[guided filtering](https://doi.org/10.1109/TPAMI.2012.213). Graph smoothing is
+therefore not a novelty claim. The open question is whether an ordinary frozen
+U-Net supplies a better guide than uniform or self-guided predicted-clean
+weights when the same operator is mapped into scheduler coordinates.
 
 ## Frozen Inference and Scheduler Controls
 
@@ -82,16 +97,19 @@ SDXL forward, emits a bounded residual in scheduler clean-endpoint coordinates,
 and obeys trust and moment bounds. Size, zero initialization, a frozen backbone,
 and structural or spectral control are already covered. A defensible
 differentiation would require a significant descriptor-by-scheduler-coordinate
-interaction under one-call accounting; it is not established novelty in
-advance of that test and a matched SteeringDiffusion-style adapter.
+interaction under one-call accounting and feature-affinity gains over both a
+uniform local graph and a predicted-clean latent-affinity graph. It is not
+established novelty in advance of those tests and a matched
+SteeringDiffusion-style adapter.
 
 Before learning, freeze a prompt-disjoint action and require TOPIQ-NR delta
 `>= +0.005`, a crossed prompt/seed interval above zero, Holm-adjusted prompt
 significance, HPSv2/CLIP non-inferiority, structural/detail evidence, and
 clipping, saturation, diversity, moment, and off-target guards. Include no-op,
 conference TFSA, fixed scalar/2-stage schedules, SPA/FreSca/FDG, FreeU, pointwise
-and relational descriptors, shuffled features, per-step RMS- and trust-cap-
-matched random directions, and a compute-matched extra-U-Net reference. Only
+and relational descriptors, shuffled features, uniform-local and predicted-
+clean-affinity graphs, per-step RMS- and trust-cap-matched random directions,
+and a compute-matched extra-U-Net reference. Only
 after a fixed action passes should common-random-number search,
 search-then-distill, and then RL be attempted; use antithetic pairs only if they
 demonstrably reduce estimator variance. RL must beat fixed search and

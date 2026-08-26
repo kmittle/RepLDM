@@ -47,6 +47,8 @@ cannot substitute for a positive causal interaction, transfer, or human evidence
 |---|---|---|
 | [SteeringDiffusion, 2605.01653v1](https://arxiv.org/abs/2605.01653v1) | Freezes SD1.5/SDXL U-Nets; a prompt MLP emits a shared code for zero-initialized FiLM/AdaGN modulation with timestep gating. The default SD1.5 `k=16` arm has 0.88M trainable parameters and adds about 3 ms (C1). Validation is style control, not generic quality. | This is the closest learned-module precedent. Match parameters, training steps/data, layer placement, gate, and runtime with a Steering-style FiLM baseline. Do not claim first small module, frozen intervention, zero-init adapter, or one-call learned control. |
 | [DUNE, 2607.09753v1](https://arxiv.org/abs/2607.09753v1) | Detects early abrupt changes in SDXL U-Net h-space using a score-normalized EMA and suppresses selected channels inside the same forward; it is training-free and single-pass (C0). | This is the closest non-attention internal correction. Reproduce detect-only, suppress-only, shuffled-mask, density-matched random-mask, and full DUNE arms. A learned feature reader must beat it. |
+| [SPARE, 2608.01990v1](https://arxiv.org/abs/2608.01990v1), [sREPA, 2605.16949v1](https://arxiv.org/abs/2605.16949v1), and [SGA, 2605.20808v1](https://arxiv.org/abs/2605.20808v1) | Match pairwise token affinities or spatial Gram matrices during diffusion/flow training. SPARE uses true clean VAE latents as a parameter-free target; sREPA uses an external teacher and names local relation matching as future work. None performs frozen-SDXL inference transport. | Pairwise affinity, self-similarity, and Gram structure are occupied components; local-relation matching is explicitly anticipated. A feature-specific claim must beat uniform-local and predicted-clean latent-affinity controls on separately generated trajectories; the latter is not an exact SPARE reproduction. |
+| [Bilateral filtering](https://doi.org/10.1109/ICCV.1998.710815) and [guided filtering](https://doi.org/10.1109/TPAMI.2012.213) | Classical edge-aware operators average local values using content- or guide-dependent weights. The proposed `W z - z` is a negative random-walk graph-Laplacian residual of this general form. | Do not claim the local transport operator or feature-guided smoothing itself. Uniform, predicted-clean self-guided, and matched-random graphs are required to attribute a gain to frozen U-Net relations and scheduler placement. |
 | [FreSca, 2504.02154v3](https://arxiv.org/abs/2504.02154v3) and [FDG, 2506.19713v1](https://arxiv.org/abs/2506.19713v1) | Decompose the ordinary CFG conditional-unconditional difference into low/high frequency bands and rescale them. Both are training-free; both demonstrate SDXL without another denoiser (C0). | Low/high spectral residuals, structure/detail allocation, and frequency-dependent CFG are not novel. Reproduce both operators or justify one faithful implementation plus a fixed DCT/wavelet factorial. |
 | [SPA, 2607.22091v1](https://arxiv.org/abs/2607.22091v1) | Fits a timestep/channel spectral prior offline, then applies an analytic FFT-gradient correction. It uses no extra neural evaluation or backbone backpropagation and reports `+3.86%` SDXL runtime (C0). | Compare a training-split-fitted SPA prior, shuffled prior, and no prior. Report spectral error separately from image quality; charge prior fitting and FFT cost. |
 | [Guidance Interval, 2404.07724](https://arxiv.org/abs/2404.07724), [CFG++, 2406.08070](https://arxiv.org/abs/2406.08070), and [APG, 2410.02416](https://arxiv.org/abs/2410.02416) | Restrict guidance to useful noise levels, constrain CFG toward the data manifold, or decompose/rescale/momentum-filter its parallel and orthogonal components. They support SDXL or SDXL-Lightning and add little tensor cost (C0). | A timestep schedule, projection, rescaling, momentum, or manifold language is not sufficient novelty. Tune these controls on the same development budget. |
@@ -107,8 +109,11 @@ they do not validate a frozen SDXL inference residual or a test-time low-pass.
 [iREPA, 2512.10794v1](https://arxiv.org/abs/2512.10794v1) finds pairwise patch
 self-similarity more predictive of representation-aligned generation than global
 linear-probe accuracy. [SGA, 2605.20808v1](https://arxiv.org/abs/2605.20808v1)
-aligns spatial Gram structure instead of pointwise features. [Diffusing in the
-Right Space, 2606.03578v1](https://arxiv.org/abs/2606.03578v1) compares spatial,
+aligns spatial Gram structure instead of pointwise features. [SPARE,
+2608.01990v1](https://arxiv.org/abs/2608.01990v1) directly aligns diffusion-token
+affinities to true clean-latent affinities during training, while sREPA explicitly
+proposes local relation matching as a scaling direction. [Diffusing in the Right
+Space, 2606.03578v1](https://arxiv.org/abs/2606.03578v1) compares spatial,
 spectral, equivariant, distributional, semantic, and velocity-ambiguity factors
 and finds diffusability multi-factorial. These are strong motivations for a
 relational descriptor, but correlation or training-time alignment is not evidence
@@ -119,8 +124,8 @@ U-Net structural baseline linking this direction to the conference narrative.
 
 Do not claim the first latent renderer, frozen-backbone intervention, small
 diffusion controller, zero-initialized adapter, one-call guidance, internal-feature
-correction, spectral/coarse-to-fine residual, relational descriptor, equivariant
-latent method, manifold-preserving update, or scheduler-aware correction. Do not
+correction, spectral/coarse-to-fine residual, relational descriptor, local graph
+filter, equivariant latent method, manifold-preserving update, or scheduler-aware correction. Do not
 claim that a better DCT/Gram statistic proves the mechanism. The potential
 contribution is only the complete SDXL operator and its verified causal
 interaction at a stricter parameter/call budget than the closest controls.
@@ -164,8 +169,9 @@ latents. The minimum matrix is:
 1. **Reference:** no-op, conference TFSA, tuned constant CFG, 2-3-stage CFG,
    Guidance Interval, CFG++, APG, FDG/FreSca, MOG/Auto-MOG, DUNE, and SPA.
 2. **Fixed structure:** DCT, wavelet, pointwise feature statistics, relational
-   lag/Gram descriptors, fixed searched coefficients, and FreeU; each paired
-   with shuffled features and L2/norm-matched random directions.
+   lag/Gram descriptors, fixed searched coefficients, and FreeU; pair feature-
+   affinity transport with uniform-local, predicted-clean-affinity, shuffled-
+   feature, and L2/norm-matched random controls on real trajectories.
 3. **Causal factorial:** no descriptor/no injection, descriptor-only,
    injection-only, and full descriptor plus scheduler injection. Compare naive
    Euclidean, clean-latent, and scheduler-mapped injection.
