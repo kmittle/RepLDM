@@ -832,6 +832,153 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), payload)
             self.assertEqual(identity, generation._object_identity(target.stat()))
 
+    def test_uncertain_temporary_create_never_adopts_a_foreign_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target = parent / "receipt.json"
+            foreign = parent / "foreign.tmp"
+            foreign.write_bytes(b"")
+            real_open = generation.os.open
+            injected = False
+
+            def replace_created_temporary(path, flags, *args, **kwargs):
+                nonlocal injected
+                if not injected and flags & os.O_EXCL and flags & os.O_CREAT:
+                    injected = True
+                    descriptor = real_open(path, flags, *args, **kwargs)
+                    os.close(descriptor)
+                    os.unlink(path, dir_fd=kwargs.get("dir_fd"))
+                    os.link(
+                        foreign.name,
+                        path,
+                        src_dir_fd=kwargs.get("dir_fd"),
+                        dst_dir_fd=kwargs.get("dir_fd"),
+                        follow_symlinks=False,
+                    )
+                    raise OSError(errno.EIO, "simulated ambiguous exclusive create")
+                return real_open(path, flags, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    generation.os,
+                    "open",
+                    side_effect=replace_created_temporary,
+                ),
+                self.assertRaises(OSError),
+            ):
+                generation.atomic_create_bytes(target, b"must-not-reach-foreign\n")
+
+            self.assertTrue(injected)
+            self.assertFalse(target.exists())
+            self.assertEqual(foreign.read_bytes(), b"")
+            temporary = [path for path in parent.iterdir() if path.name.endswith(".tmp")]
+            self.assertEqual(len(temporary), 2)
+            self.assertEqual(
+                generation._object_identity(temporary[0].stat()),
+                generation._object_identity(temporary[1].stat()),
+            )
+
+    def test_external_staging_cleanup_failure_does_not_pollute_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target_directory = parent / "target"
+            staging_directory = parent / "staging"
+            target_directory.mkdir()
+            staging_directory.mkdir()
+            target_descriptor = generation._open_pinned_directory(
+                target_directory, "fixture target"
+            )
+            staging_descriptor = generation._open_pinned_directory(
+                staging_directory, "fixture staging"
+            )
+            real_remove = generation._remove_matching_entry
+
+            def fail_temporary_cleanup(directory_descriptor, name, identity):
+                if directory_descriptor == staging_descriptor and name.endswith(".tmp"):
+                    raise OSError(errno.EIO, "simulated external staging cleanup failure")
+                return real_remove(directory_descriptor, name, identity)
+
+            try:
+                with mock.patch.object(
+                    generation,
+                    "_remove_matching_entry",
+                    side_effect=fail_temporary_cleanup,
+                ):
+                    identity = generation.atomic_create_bytes(
+                        target_directory / "receipt.json",
+                        b"committed\n",
+                        directory_descriptor=target_descriptor,
+                        staging_directory_descriptor=staging_descriptor,
+                    )
+            finally:
+                os.close(staging_descriptor)
+                os.close(target_descriptor)
+
+            self.assertEqual(
+                {path.name for path in target_directory.iterdir()}, {"receipt.json"}
+            )
+            self.assertEqual(
+                identity,
+                generation._object_identity((target_directory / "receipt.json").stat()),
+            )
+            staging_entries = list(staging_directory.iterdir())
+            self.assertEqual(len(staging_entries), 1)
+            self.assertTrue(staging_entries[0].name.endswith(".tmp"))
+
+    def test_committed_output_is_not_masked_by_source_close_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_close = generation.os.close
+            failed = False
+
+            def close_then_report_error(descriptor):
+                nonlocal failed
+                if target.exists() and not failed and not os.path.isdir(
+                    f"/proc/self/fd/{descriptor}"
+                ):
+                    failed = True
+                    real_close(descriptor)
+                    raise OSError(errno.EIO, "simulated source close error")
+                return real_close(descriptor)
+
+            with mock.patch.object(
+                generation.os,
+                "close",
+                side_effect=close_then_report_error,
+            ):
+                identity = generation.atomic_create_bytes(target, b"committed\n")
+
+            self.assertTrue(failed)
+            self.assertEqual(target.read_bytes(), b"committed\n")
+            self.assertEqual(identity, generation._object_identity(target.stat()))
+
+    def test_committed_output_is_not_masked_by_parent_close_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_close = generation.os.close
+            failed = False
+
+            def close_then_report_error(descriptor):
+                nonlocal failed
+                if target.exists() and not failed and os.path.isdir(
+                    f"/proc/self/fd/{descriptor}"
+                ):
+                    failed = True
+                    real_close(descriptor)
+                    raise OSError(errno.EIO, "simulated parent close error")
+                return real_close(descriptor)
+
+            with mock.patch.object(
+                generation.os,
+                "close",
+                side_effect=close_then_report_error,
+            ):
+                identity = generation.atomic_create_bytes(target, b"committed\n")
+
+            self.assertTrue(failed)
+            self.assertEqual(target.read_bytes(), b"committed\n")
+            self.assertEqual(identity, generation._object_identity(target.stat()))
+
     def test_temporary_name_replacement_before_link_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "receipt.json"
@@ -871,7 +1018,7 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
 
             self.assertFalse(target.exists())
 
-    def test_temporary_name_replacement_after_link_rolls_back_output(self):
+    def test_temporary_name_replacement_after_commit_preserves_output(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "receipt.json"
             real_link = generation._link_descriptor
@@ -899,9 +1046,12 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                 "_link_descriptor",
                 side_effect=link_then_replace_temporary,
             ):
-                with self.assertRaisesRegex(RuntimeError, "foreign atomic output"):
-                    generation.atomic_create_bytes(target, b"trusted\n")
-            self.assertFalse(target.exists())
+                identity = generation.atomic_create_bytes(target, b"trusted\n")
+            self.assertEqual(target.read_bytes(), b"trusted\n")
+            self.assertEqual(identity, generation._object_identity(target.stat()))
+            temporary = [entry for entry in target.parent.iterdir() if entry.name.endswith(".tmp")]
+            self.assertEqual(len(temporary), 1)
+            self.assertEqual(temporary[0].read_bytes(), b"")
 
     def test_directory_fsync_error_rolls_back_committed_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1155,6 +1305,89 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
+    def test_fallback_reconciles_an_ambiguous_final_mkdir_under_its_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            real_mkdir = generation.os.mkdir
+            reported = False
+            claimed = -1
+
+            def create_final_then_report_error(path, *args, **kwargs):
+                nonlocal reported
+                real_mkdir(path, *args, **kwargs)
+                if path == "claimed" and not reported:
+                    reported = True
+                    raise OSError(errno.EIO, "simulated final mkdir reply loss")
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_rename_directory_noreplace",
+                        side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+                    ),
+                    mock.patch.object(
+                        generation.os,
+                        "mkdir",
+                        side_effect=create_final_then_report_error,
+                    ),
+                ):
+                    claimed = generation._claim_pinned_directory_at(
+                        descriptor, "claimed", "fixture claim"
+                    )
+                self.assertTrue(reported)
+                generation._verify_directory_entry(
+                    descriptor, "claimed", claimed, "fixture claim"
+                )
+                self.assertTrue((parent / ".claimed.claim").is_file())
+            finally:
+                if claimed >= 0:
+                    os.close(claimed)
+                os.close(descriptor)
+
+    def test_fallback_reconciles_an_ambiguous_marker_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            real_atomic = generation.atomic_create_bytes
+            reported = False
+            claimed = -1
+
+            def publish_marker_then_report_error(path, payload, **kwargs):
+                nonlocal reported
+                identity = real_atomic(path, payload, **kwargs)
+                if Path(path).name == ".claimed.claim" and not reported:
+                    reported = True
+                    raise OSError(errno.EIO, "simulated marker publication reply loss")
+                return identity
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_rename_directory_noreplace",
+                        side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+                    ),
+                    mock.patch.object(
+                        generation,
+                        "atomic_create_bytes",
+                        side_effect=publish_marker_then_report_error,
+                    ),
+                ):
+                    claimed = generation._claim_pinned_directory_at(
+                        descriptor, "claimed", "fixture claim"
+                    )
+                self.assertTrue(reported)
+                generation._verify_directory_entry(
+                    descriptor, "claimed", claimed, "fixture claim"
+                )
+                self.assertTrue((parent / ".claimed.claim").is_file())
+            finally:
+                if claimed >= 0:
+                    os.close(claimed)
+                os.close(descriptor)
+
     def test_missing_libc_renameat2_is_reported_as_unsupported(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -1177,6 +1410,7 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                 ):
                     generation._rename_directory_noreplace(
                         parent_descriptor,
+                        parent_descriptor,
                         source.name,
                         "target",
                         source_descriptor,
@@ -1186,7 +1420,7 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                 os.close(source_descriptor)
                 os.close(parent_descriptor)
 
-    def test_uncertain_staging_mkdir_is_reconciled_by_random_name(self):
+    def test_uncertain_staging_mkdir_is_not_adopted_by_random_name(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
             descriptor = generation._open_pinned_directory(parent, "fixture parent")
@@ -1200,28 +1434,24 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                     reported = True
                     raise OSError(errno.EIO, "simulated NFS reply loss")
 
-            claimed = -1
             try:
-                with mock.patch.object(
-                    generation.os,
-                    "mkdir",
-                    side_effect=create_then_report_error,
+                with (
+                    mock.patch.object(
+                        generation.os,
+                        "mkdir",
+                        side_effect=create_then_report_error,
+                    ),
+                    self.assertRaises(OSError),
                 ):
-                    claimed = generation._claim_pinned_directory_at(
-                        descriptor,
-                        "claimed",
-                        "fixture claim",
+                    generation._claim_pinned_directory_at(
+                        descriptor, "claimed", "fixture claim"
                     )
                 self.assertTrue(reported)
-                generation._verify_directory_entry(
-                    descriptor,
-                    "claimed",
-                    claimed,
-                    "fixture claim",
-                )
+                self.assertFalse((parent / "claimed").exists())
+                staging = list(parent.glob(".claimed.*.claim"))
+                self.assertEqual(len(staging), 1)
+                self.assertTrue(staging[0].is_dir())
             finally:
-                if claimed >= 0:
-                    os.close(claimed)
                 os.close(descriptor)
 
     def test_directory_claim_rejects_replaced_staging_name(self):
@@ -1233,20 +1463,24 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             real_rename = generation._rename_directory_noreplace
 
             def replace_staging_before_claim(
-                descriptor, source_name, target_name, source_descriptor
+                source_parent,
+                target_parent,
+                source_name,
+                target_name,
+                source_descriptor,
             ):
                 displaced = f"{source_name}.displaced"
                 os.rename(
                     source_name,
                     displaced,
-                    src_dir_fd=descriptor,
-                    dst_dir_fd=descriptor,
+                    src_dir_fd=source_parent,
+                    dst_dir_fd=source_parent,
                 )
-                os.mkdir(source_name, mode=0o750, dir_fd=descriptor)
+                os.mkdir(source_name, mode=0o750, dir_fd=source_parent)
                 foreign_directory = os.open(
                     source_name,
                     generation._directory_flags(),
-                    dir_fd=descriptor,
+                    dir_fd=source_parent,
                 )
                 try:
                     foreign = os.open(
@@ -1259,7 +1493,8 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                 finally:
                     os.close(foreign_directory)
                 real_rename(
-                    descriptor,
+                    source_parent,
+                    target_parent,
                     source_name,
                     target_name,
                     source_descriptor,
@@ -1465,13 +1700,22 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 after_generation_hook()
             return {"phase": phase}
 
-        def atomic_json(path, value, *, directory_descriptor=None):
+        def atomic_json(
+            path,
+            value,
+            *,
+            directory_descriptor=None,
+            staging_directory_descriptor=None,
+            ownership_candidates=None,
+        ):
             if trace_atomic_json:
                 events.append(f"write:{Path(path).name}")
             identity = real_atomic_json(
                 path,
                 value,
                 directory_descriptor=directory_descriptor,
+                staging_directory_descriptor=staging_directory_descriptor,
+                ownership_candidates=ownership_candidates,
             )
             if after_atomic_json_hook is not None:
                 after_atomic_json_hook(path, value, directory_descriptor, identity)
@@ -1623,7 +1867,7 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertTrue((self.output / "failure.json").is_file())
         self.assertFalse((self.output / "success.json").exists())
 
-    def test_failure_receipt_precedes_runtime_and_model_cleanup(self):
+    def test_failure_receipt_follows_runtime_and_model_cleanup(self):
         events = []
         with self.assertRaisesRegex(RuntimeError, "task failed"):
             self._run(
@@ -1631,11 +1875,15 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 task_error=RuntimeError("task failed"),
                 trace_atomic_json=True,
             )
-        self.assertLess(events.index("write:failure.json"), events.index("runtime_cleanup"))
-        self.assertLess(events.index("write:failure.json"), events.index("model_cleanup"))
+        self.assertLess(events.index("runtime_cleanup"), events.index("write:failure.json"))
+        self.assertLess(events.index("model_cleanup"), events.index("write:failure.json"))
         self.assertLess(
             events.index("model_cleanup"),
             events.index("write:model_stage_evidence.json"),
+        )
+        self.assertLess(
+            events.index("write:model_stage_evidence.json"),
+            events.index("write:failure.json"),
         )
         failure = json.loads((self.output / "failure.json").read_text())
         self.assertEqual(failure["launcher_evidence"], self.launcher_evidence)
@@ -1651,7 +1899,11 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 cleanup_error=OSError("cleanup denied"),
                 trace_atomic_json=True,
             )
-        self.assertLess(events.index("write:failure.json"), events.index("model_cleanup"))
+        self.assertLess(events.index("model_cleanup"), events.index("write:failure.json"))
+        self.assertLess(
+            events.index("write:model_stage_evidence.json"),
+            events.index("write:failure.json"),
+        )
         evidence = json.loads(
             (self.output / "model_stage_evidence.json").read_text()
         )
@@ -1682,7 +1934,11 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 trace_atomic_json=True,
             )
 
-        self.assertLess(events.index("write:failure.json"), events.index("model_cleanup"))
+        self.assertLess(events.index("model_cleanup"), events.index("write:failure.json"))
+        self.assertLess(
+            events.index("write:model_stage_evidence.json"),
+            events.index("write:failure.json"),
+        )
         failure = json.loads((self.output / "failure.json").read_text())
         self.assertEqual(failure["model_stage"], partial_stage)
         self.assertEqual(failure["model_stage_verifications"], [])
@@ -1752,14 +2008,15 @@ class AuthorizedGenerationTest(unittest.TestCase):
 
     def test_concurrent_output_claim_does_not_write_into_foreign_tree(self):
         def competing_claim(
-            parent_descriptor,
+            source_parent_descriptor,
+            target_parent_descriptor,
             source_name,
             target_name,
             source_descriptor,
         ):
-            del source_name, source_descriptor
+            del source_parent_descriptor, source_name, source_descriptor
             if target_name == self.output.name:
-                os.mkdir(target_name, mode=0o750, dir_fd=parent_descriptor)
+                os.mkdir(target_name, mode=0o750, dir_fd=target_parent_descriptor)
                 (self.output / "foreign.txt").write_text(
                     "foreign claimant\n", encoding="utf-8"
                 )
@@ -1776,6 +2033,42 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertTrue((self.output / "foreign.txt").is_file())
         self.assertFalse((self.output / "attempt.json").exists())
         self.assertFalse((self.output / "failure.json").exists())
+
+    def test_claim_validation_error_is_reconciled_to_attempt_and_failure(self):
+        real_listdir = generation.os.listdir
+        failed = False
+
+        def fail_claimed_output_validation(descriptor):
+            nonlocal failed
+            if self.output.exists() and not failed:
+                opened = os.fstat(descriptor)
+                observed = self.output.stat()
+                if generation._object_identity(opened) == generation._object_identity(
+                    observed
+                ):
+                    failed = True
+                    raise OSError(errno.EIO, "simulated claimed-directory validation error")
+            return real_listdir(descriptor)
+
+        with (
+            mock.patch.object(
+                generation,
+                "_rename_directory_noreplace",
+                side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+            ),
+            mock.patch.object(
+                generation.os,
+                "listdir",
+                side_effect=fail_claimed_output_validation,
+            ),
+            self.assertRaisesRegex(OSError, "claimed-directory validation"),
+        ):
+            generation._run_authorized_engineering_generation(self.validated)
+
+        self.assertTrue(failed)
+        self.assertTrue((self.output / "attempt.json").is_file())
+        self.assertTrue((self.output / "failure.json").is_file())
+        self.assertFalse((self.output / "success.json").exists())
 
     def test_output_directory_replacement_blocks_terminal_publication(self):
         events = []
@@ -1886,25 +2179,29 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertFalse((self.output / "success.json").exists())
         self.assertTrue((self.output / "failure.json").is_file())
 
-    def test_success_inode_replacement_blocks_successful_return(self):
-        replacement = self.root / "replacement-success.json"
+    def test_ambiguous_success_is_rolled_back_before_failure_receipt(self):
+        reported = False
 
-        def replace_success(path, value, _directory_descriptor, _identity):
-            if Path(path).name != "success.json":
-                return
-            replacement.write_bytes(contract.canonical_json_bytes(value) + b"\n")
-            os.replace(replacement, path)
+        def report_after_success(path, _value, _directory_descriptor, _identity):
+            nonlocal reported
+            if Path(path).name == "success.json" and not reported:
+                reported = True
+                raise OSError(errno.EIO, "simulated committed success error")
 
-        with self.assertRaisesRegex(
-            RuntimeError, "generation success receipt differs"
-        ):
-            self._run(
-                [],
-                after_atomic_json_hook=replace_success,
-            )
+        with self.assertRaisesRegex(OSError, "committed success"):
+            self._run([], after_atomic_json_hook=report_after_success)
 
-        self.assertTrue((self.output / "success.json").is_file())
+        self.assertTrue(reported)
+        self.assertFalse((self.output / "success.json").exists())
         self.assertTrue((self.output / "failure.json").is_file())
+
+    def test_success_receipt_is_the_final_publication(self):
+        events = []
+        success, _runtime = self._run(events, trace_atomic_json=True)
+        self.assertEqual(events[-1], "write:success.json")
+        self.assertEqual(success["status"], "complete_generation_only_unscored")
+        self.assertTrue((self.output / "success.json").is_file())
+        self.assertFalse((self.output / "failure.json").exists())
 
     def test_runtime_warning_log_and_stderr_are_captured_on_failure(self):
         def noisy_runtime_load(_validated):

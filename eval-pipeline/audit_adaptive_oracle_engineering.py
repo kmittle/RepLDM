@@ -148,16 +148,16 @@ class _AuditSession:
 
 
 def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
+    # External staging cleanup can make NFS refresh nlink and ctime after the
+    # receipt is pinned. Path identity and parsed raw bytes are bound separately.
     return (
         value.st_dev,
         value.st_ino,
         value.st_mode,
-        value.st_nlink,
         value.st_uid,
         value.st_gid,
         value.st_size,
         value.st_mtime_ns,
-        value.st_ctime_ns,
     )
 
 
@@ -997,6 +997,8 @@ def atomic_create_json(
     value: Any,
     *,
     directory_descriptor: Optional[int] = None,
+    staging_directory_descriptor: Optional[int] = None,
+    ownership_candidates: Optional[list[tuple[int, int]]] = None,
 ) -> tuple[int, int]:
     """Publish canonical JSON without replacing an existing receipt."""
 
@@ -1004,6 +1006,8 @@ def atomic_create_json(
         path,
         contract.canonical_json_bytes(value) + b"\n",
         directory_descriptor=directory_descriptor,
+        staging_directory_descriptor=staging_directory_descriptor,
+        ownership_candidates=ownership_candidates,
     )
 
 
@@ -1298,9 +1302,9 @@ def _publish_audit_json(
         tree.run / name,
         value,
         directory_descriptor=tree.run_descriptor,
+        staging_directory_descriptor=tree.run_parent_descriptor,
+        ownership_candidates=ownership,
     )
-    if ownership is not None:
-        ownership.append(identity)
     tree.add_published_entry(name, identity)
     observed = _read_regular_bytes(
         tree.run / name,
@@ -1312,6 +1316,25 @@ def _publish_audit_json(
         raise RuntimeError(f"published audit receipt bytes differ: {name}")
     tree.verify()
     return identity
+
+
+def _publish_audit_success(
+    tree: _PinnedRunTree,
+    value: Mapping[str, Any],
+    *,
+    ownership: list[tuple[int, int]],
+) -> tuple[int, int]:
+    tree.verify()
+    for name in (AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME):
+        if generation._entry_exists(tree.run_descriptor, name):
+            raise FileExistsError(f"audit terminal receipt already exists: {name}")
+    return atomic_create_json(
+        tree.run / AUDIT_SUCCESS_NAME,
+        value,
+        directory_descriptor=tree.run_descriptor,
+        staging_directory_descriptor=tree.run_parent_descriptor,
+        ownership_candidates=ownership,
+    )
 
 
 def _publish_audit_failure(
@@ -1328,6 +1351,7 @@ def _publish_audit_failure(
         tree.run / AUDIT_FAILURE_NAME,
         value,
         directory_descriptor=tree.run_descriptor,
+        staging_directory_descriptor=tree.run_parent_descriptor,
     )
     tree.add_published_entry(AUDIT_FAILURE_NAME, identity)
     observed = _read_regular_bytes(
@@ -2316,6 +2340,7 @@ def _audit_launcher_validated_run(
         )
         if session.audit_attempt is None:
             raise RuntimeError("audit preflight omitted its one-shot attempt")
+        success_ownership: list[tuple[int, int]] = []
         try:
             result = _audit_validated_run(
                 tree,
@@ -2329,18 +2354,33 @@ def _audit_launcher_validated_run(
             result["audit_attempt_sha256"] = contract.canonical_sha256(
                 session.audit_attempt
             )
-            _publish_audit_json(tree, AUDIT_SUCCESS_NAME, result)
+            _publish_audit_success(
+                tree,
+                result,
+                ownership=success_ownership,
+            )
             return result
         except BaseException as exc:
+            if len(success_ownership) == 1:
+                try:
+                    generation._remove_matching_entry(
+                        tree.run_descriptor,
+                        AUDIT_SUCCESS_NAME,
+                        success_ownership[0],
+                    )
+                except BaseException as rollback_exc:
+                    generation._add_exception_note(
+                        exc,
+                        "audit success rollback also failed: "
+                        f"{type(rollback_exc).__name__}: {rollback_exc}",
+                    )
             try:
                 final_names = _directory_names(
                     tree.run_descriptor, "engineering run directory"
                 ).intersection({AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME})
             except BaseException:
                 final_names = frozenset({"untrusted-directory-state"})
-            if AUDIT_FAILURE_NAME not in final_names and final_names != frozenset(
-                {"untrusted-directory-state"}
-            ):
+            if not final_names:
                 try:
                     _publish_audit_failure(
                         tree,

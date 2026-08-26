@@ -1,4 +1,5 @@
 import copy
+import errno
 import hashlib
 import importlib.util
 import inspect
@@ -9,6 +10,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import zlib
@@ -844,43 +846,57 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         )
 
     def test_concurrent_audit_loser_does_not_publish_failure_for_winner(self):
-        real_atomic = audit.atomic_create_json
-        winner_bytes = None
+        barrier = threading.Barrier(2)
+        real_link = generation._link_descriptor
+        sessions = []
+        errors = []
 
-        def publish_winner_before_loser(path, value, *, directory_descriptor=None):
-            nonlocal winner_bytes
-            if Path(path).name == audit.AUDIT_ATTEMPT_NAME and winner_bytes is None:
-                real_atomic(
-                    path,
-                    value,
-                    directory_descriptor=directory_descriptor,
-                )
-                winner_bytes = Path(path).read_bytes()
-            return real_atomic(
-                path,
-                value,
-                directory_descriptor=directory_descriptor,
+        def synchronize_attempt_links(descriptor, directory_descriptor, name):
+            if name == audit.AUDIT_ATTEMPT_NAME:
+                barrier.wait(timeout=10)
+            return real_link(descriptor, directory_descriptor, name)
+
+        def run_preflight():
+            _root, tree = audit._resolve_run_dir(
+                self.fixture.run,
+                self.fixture.repo,
             )
+            try:
+                sessions.append(
+                    audit._preflight_audit(
+                        tree,
+                        copy.deepcopy(self.fixture.validated),
+                        auditor_sha256=self.fixture.validated["source_hashes"][
+                            "engineering_auditor"
+                        ]["sha256"],
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                tree.close()
 
-        with (
-            mock.patch.object(
-                audit,
-                "atomic_create_json",
-                side_effect=publish_winner_before_loser,
-            ),
-            mock.patch.object(audit, "_publish_audit_failure") as publish_failure,
-            self.assertRaises(FileExistsError),
+        threads = [threading.Thread(target=run_preflight) for _ in range(2)]
+        with mock.patch.object(
+            generation,
+            "_link_descriptor",
+            side_effect=synchronize_attempt_links,
         ):
-            self.fixture.run_production_audit()
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
 
-        self.assertIsNotNone(winner_bytes)
-        self.assertEqual(
-            (self.fixture.run / audit.AUDIT_ATTEMPT_NAME).read_bytes(),
-            winner_bytes,
-        )
-        publish_failure.assert_not_called()
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], FileExistsError)
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
         self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertFalse(
+            any(path.name.endswith(".tmp") for path in self.fixture.run.iterdir())
+        )
 
     def test_malformed_generation_receipt_is_consumed_after_audit_attempt(self):
         (self.fixture.run / "success.json").write_bytes(b"not-json\n")
@@ -912,20 +928,20 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         target = self.fixture.run / "records" / f"{task_id}.json"
         replacement = self.fixture.repo / "pre-publication-sidecar.json"
         replacement.write_bytes(target.read_bytes())
-        real_publish = audit._publish_audit_json
+        real_publish = audit._publish_audit_success
         replaced = False
 
-        def replace_before_success(tree, name, value, **kwargs):
+        def replace_before_success(tree, value, **kwargs):
             nonlocal replaced
-            if name == audit.AUDIT_SUCCESS_NAME and not replaced:
+            if not replaced:
                 replaced = True
                 os.replace(replacement, target)
-            return real_publish(tree, name, value, **kwargs)
+            return real_publish(tree, value, **kwargs)
 
         with (
             mock.patch.object(
                 audit,
-                "_publish_audit_json",
+                "_publish_audit_success",
                 side_effect=replace_before_success,
             ),
             self.assertRaisesRegex(ValueError, "changed before audit publication"),
@@ -937,38 +953,85 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
 
-    def test_post_success_integrity_failure_publishes_audit_invalidation(self):
-        task_id = self.fixture.tasks[0]["task_id"]
-        target = self.fixture.run / "records" / f"{task_id}.json"
-        replacement = self.fixture.repo / "post-success-sidecar.json"
-        replacement.write_bytes(target.read_bytes())
-        real_atomic = audit.atomic_create_json
-        replaced = False
+    def test_committed_audit_success_ignores_external_staging_cleanup_error(self):
+        real_remove = generation._remove_matching_entry
+        failed = False
 
-        def publish_then_replace(path, value, *, directory_descriptor=None):
-            nonlocal replaced
-            identity = real_atomic(
-                path,
-                value,
-                directory_descriptor=directory_descriptor,
-            )
-            if Path(path).name == audit.AUDIT_SUCCESS_NAME and not replaced:
-                replaced = True
-                os.replace(replacement, target)
+        def fail_success_staging_cleanup(directory_descriptor, name, identity):
+            nonlocal failed
+            if (
+                not failed
+                and name.endswith(".tmp")
+                and (self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists()
+            ):
+                failed = True
+                raise OSError("simulated audit staging cleanup failure")
+            return real_remove(directory_descriptor, name, identity)
+
+        with mock.patch.object(
+            generation,
+            "_remove_matching_entry",
+            side_effect=fail_success_staging_cleanup,
+        ):
+            result = self.fixture.run_production_audit()
+
+        self.assertTrue(failed)
+        self.assertEqual(result["status"], "passed_generation_integrity_only_unscored")
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+        self.assertFalse(
+            any(path.name.endswith(".tmp") for path in self.fixture.run.iterdir())
+        )
+        self.assertTrue(
+            any(path.name.endswith(".tmp") for path in self.fixture.run.parent.iterdir())
+        )
+
+    def test_audit_success_publication_error_produces_failure_only(self):
+        real_atomic = audit.atomic_create_json
+
+        def fail_before_success_commit(path, value, **kwargs):
+            if Path(path).name == audit.AUDIT_SUCCESS_NAME:
+                raise OSError(errno.EIO, "simulated audit success publication error")
+            return real_atomic(path, value, **kwargs)
+
+        with (
+            mock.patch.object(
+                audit,
+                "atomic_create_json",
+                side_effect=fail_before_success_commit,
+            ),
+            self.assertRaisesRegex(OSError, "success publication"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+
+    def test_ambiguous_audit_success_is_rolled_back_before_failure(self):
+        real_atomic = audit.atomic_create_json
+        reported = False
+
+        def commit_success_then_report_error(path, value, **kwargs):
+            nonlocal reported
+            identity = real_atomic(path, value, **kwargs)
+            if Path(path).name == audit.AUDIT_SUCCESS_NAME and not reported:
+                reported = True
+                raise OSError(errno.EIO, "simulated committed audit success error")
             return identity
 
         with (
             mock.patch.object(
                 audit,
                 "atomic_create_json",
-                side_effect=publish_then_replace,
+                side_effect=commit_success_then_report_error,
             ),
-            self.assertRaisesRegex(ValueError, "changed before audit publication"),
+            self.assertRaisesRegex(OSError, "committed audit success"),
         ):
             self.fixture.run_production_audit()
 
-        self.assertTrue(replaced)
-        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertTrue(reported)
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
 
     def test_png_inspector_validates_exact_rgb_scanlines_without_pillow(self):
