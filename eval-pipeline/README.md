@@ -224,11 +224,11 @@ drift or the Git worktree is dirty. Every arm is scheduler-isolated and must
 record exactly 50 one-call denoising steps. These development controls calibrate
 baselines only; they cannot select a renderer or authorize RL.
 
-After an independent reviewer issues and commits
+After an independent reviewer issued and committed
 `configs/scheduler_native_structural_controls_development_authorized_v1.yaml`,
-run the engineering profile first. It reuses the exact eight actions and
-sampling contract from that YAML at 1024px and 50 steps; it does not permit
-quality scoring:
+the engineering profile was run first at commit `e0b323f`. It reused the exact
+eight actions and sampling contract from that YAML at 1024px and 50 steps; it
+did not permit quality scoring:
 
 ```bash
 ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
@@ -238,68 +238,116 @@ ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_a
   --out_dir outputs/structural_controls/engineering_smoke_v1 \
   --actions "$ACTIONS" --split_role engineering_smoke \
   --seeds 1798464083 --resolution 1024 --num_inference_steps 50
-
-/home/bycao/miniforge3/envs/repldm_eval/bin/python \
-  eval-pipeline/audit_structural_control_run.py --engineering_smoke \
-  --run_dir outputs/structural_controls/engineering_smoke_v1 \
-  --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_smoke.csv \
-  --actions "$ACTIONS"
 ```
 
-The smoke must report `88/88`, complete runtime ledgers, and eight distinct
-PNGs in every prompt block. A shared abort signal stops sibling workers after
+The frozen smoke reported `88/88`, complete runtime ledgers, and eight distinct
+PNGs in every prompt block. A shared abort signal stopped sibling workers after
 the first task failure. Its config and every sidecar bind
 `engineering_only=true`, `formal_matrix_evidence=false`,
 `quality_claim_allowed=false`, and `method_selection_allowed=false`; the scorer
 rejects this scope before loading metric models. The audit also recomputes each
-action's deterministic execution rank and requires the disk sidecar to equal its
-manifest row. Only a passing smoke permits the formal development generation
-and strict scoring:
+action's deterministic execution rank and requires the disk sidecar to equal
+its manifest row.
+
+The amended v2 auditor is formal-development only and rejects
+`--engineering_smoke` before reading run artifacts or taking a lock. Reproduce
+the historical gate only in a detached `e0b323f` worktree and a fresh output
+directory, using that commit's auditor; never point it at the canonical run.
+The already-passing frozen smoke permitted the formal development generation
+below. Do not score or inspect outcome artifacts yet:
 
 ```bash
 ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
+REGISTRATION=eval-pipeline/configs/scheduler_native_structural_controls_development_registration_v1.yaml
+AMENDMENT=eval-pipeline/configs/scheduler_native_structural_controls_analysis_amendment_v1.yaml
+RUN=outputs/structural_controls/development_v1
+SEAL="$RUN/structural_control_pre_score_seal.json"
+
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
   --devices 7 \
   --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv \
-  --out_dir outputs/structural_controls/development_v1 \
+  --out_dir "$RUN" \
   --actions "$ACTIONS" --split_role development \
   --seeds 1932556753,1065503757,201635682 \
   --resolution 1024 --num_inference_steps 50
+```
 
+Keep `ACTIONS`, `REGISTRATION`, `AMENDMENT`, `RUN`, and `SEAL` defined in the
+same shell for every command below.
+
+The analysis amendment has a two-commit authorization protocol. Commit A adds
+the final auditor/evaluator hashes but keeps `status: blocked_pending_independent_review`.
+An independent reviewer must review commit A without accessing outcomes. Commit
+B may change only the amendment authorization fields: set
+`status: authorized_pre_score` and bind `reviewed_commit` to commit A. The
+amendment keeps method selection, validation, RL, and publication authorization
+false. Do not create the seal from the blocked candidate.
+
+After commit B, create the canonical one-shot pre-score seal. This command must
+run before `scores.jsonl`, `run_audit.json`, any evaluation output, or hidden
+evaluation staging directory exists:
+
+```bash
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/audit_structural_control_run.py --create-pre-score-seal \
+  --run_dir "$RUN" --actions "$ACTIONS" --registration "$REGISTRATION" \
+  --analysis-amendment "$AMENDMENT" --pre-score-seal "$SEAL"
+```
+
+Only a successfully validated seal permits strict offline scoring:
+
+```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/score.py \
-  --run_dir outputs/structural_controls/development_v1 \
+  --run_dir "$RUN" \
   --device cuda:7 --strict --require-scorer-provenance
 ```
 
-Then run the dedicated result-blind audit before any metric comparison:
+Then run the dedicated audit before any metric comparison. The formal audit is
+schema `scheduler_native_structural_control_audit_v2`; it binds both amendment
+and seal hashes and must report `auditor_scope: formal_development_only` and
+`outcome_details_disclosed: false`:
 
 ```bash
-ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
 /home/bycao/miniforge3/envs/repldm_eval/bin/python \
   eval-pipeline/audit_structural_control_run.py \
-  --run_dir outputs/structural_controls/development_v1 \
+  --run_dir "$RUN" \
   --prompts eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv \
-  --actions "$ACTIONS" \
-  --registration eval-pipeline/configs/scheduler_native_structural_controls_development_registration_v1.yaml \
-  --output outputs/structural_controls/development_v1/run_audit.json
+  --actions "$ACTIONS" --registration "$REGISTRATION" \
+  --analysis-amendment "$AMENDMENT" --pre-score-seal "$SEAL" \
+  --output "$RUN/run_audit.json"
 ```
 
 Only a warning-free audit may enter the one-shot evaluator:
 
 ```bash
-ACTIONS=eval-pipeline/configs/scheduler_native_structural_controls_development_authorized_v1.yaml
 /home/bycao/miniforge3/envs/repldm_eval/bin/python \
   eval-pipeline/evaluate_structural_control_run.py \
-  --run-dir outputs/structural_controls/development_v1 \
-  --actions "$ACTIONS" \
-  --audit outputs/structural_controls/development_v1/run_audit.json
+  --run-dir "$RUN" --actions "$ACTIONS" --audit "$RUN/run_audit.json" \
+  --analysis-amendment "$AMENDMENT" --pre-score-seal "$SEAL"
+
+/home/bycao/miniforge3/envs/repldm_eval/bin/python \
+  eval-pipeline/evaluate_structural_control_run.py --verify-bundle \
+  --run-dir "$RUN" --actions "$ACTIONS" --audit "$RUN/run_audit.json" \
+  --analysis-amendment "$AMENDMENT" --pre-score-seal "$SEAL"
 ```
 
 The evaluator reports every registered action and guard, reruns the dedicated
-audit, and never emits a selected action. Isolated duplicate PNGs are reported
-without deleting samples; an action pair that is identical across all 99 formal
-blocks fails as an intervention-activation error.
+audit, and never emits a selected action. It publishes exactly one canonical
+directory, `$RUN/structural_control_evaluation_bundle/`, containing only
+`structural_control_evaluation.json` and `structural_control_contrasts.csv`.
+JSON binds the CSV filename, schema, scope, row count, and SHA256; every CSV row
+carries the non-authorization envelope and all input hashes. `--verify-bundle`
+strictly rehashes the ten current input files before and after verification, so
+an internally consistent bundle still fails after any input drift.
+
+Stop on any nonzero exit, warning, missing artifact, schema/hash mismatch, input
+drift, or unexpected legacy output at `$RUN/structural_control_evaluation.json`
+or `$RUN/structural_control_contrasts.csv`. Do not delete, rewrite, reseal, rerun
+the one-shot audit/evaluator, inspect outcomes, select a method, begin validation,
+or authorize RL after a failure. An action pair identical across all 99 formal
+blocks is an intervention-activation failure; pair identities/counts are not
+disclosed in the v2 result-blind audit.
 
 ## Prepare Scorers
 

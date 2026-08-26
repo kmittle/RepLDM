@@ -9,6 +9,7 @@ the blocked registration template is deliberately rejected as an input run.
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -46,15 +48,52 @@ REGISTRATION_FILE_SCHEMA = "structural_control_registration_v1"
 EXPERIMENT_ID = "scheduler_native_structural_controls_development_v1"
 AUTH_SCOPE = "development_only_baseline_calibration"
 SCORER_SCHEMA = "repldm_scorer_provenance_v1"
-EVALUATION_SCHEMA = "structural_control_development_evaluation_v1"
-EVALUATOR_VERSION = "structural_control_evaluator_v1"
+EVALUATION_SCHEMA = "structural_control_development_evaluation_v2"
+EVALUATOR_VERSION = "structural_control_evaluator_v2"
+OUTPUT_BUNDLE_SCHEMA = "structural_control_evaluation_output_bundle_v2"
+CONTRAST_ARTIFACT_SCHEMA = "structural_control_contrast_artifact_v2"
+EVALUATION_SCOPE = "development_evidence_reporting_only"
+OUTPUT_BUNDLE_DIR = "structural_control_evaluation_bundle"
 OUTPUT_JSON = "structural_control_evaluation.json"
 OUTPUT_CSV = "structural_control_contrasts.csv"
 AUDITOR_PATH = ROOT / "eval-pipeline" / "audit_structural_control_run.py"
 BASE_AUDITOR_PATH = ROOT / "eval-pipeline" / "audit_latent_renderer_run.py"
 COMPARE_ACTIONS_PATH = ROOT / "eval-pipeline" / "compare_actions.py"
-AUDIT_SCHEMA = "scheduler_native_structural_control_audit_v1"
+AUDIT_SCHEMA = "scheduler_native_structural_control_audit_v2"
 ANALYSIS_IMPLEMENTATION_SCHEMA = "structural_control_analysis_implementation_v1"
+INPUT_PROVENANCE_KEYS = (
+    "run_config",
+    "manifest",
+    "scores",
+    "actions",
+    "audit",
+    "registration",
+    "prompts",
+    "prompt_manifest",
+    "analysis_amendment",
+    "pre_score_seal",
+)
+CSV_ENVELOPE_FIELDS = (
+    "artifact_schema",
+    "scope",
+    "screen_only",
+    "method_selection_authorized",
+    "method_selection_performed",
+    "validation_authorized",
+    "rl_authorized",
+    "publication_claim_authorized",
+    "publication_superiority_established",
+    "global_multiplicity_across_families_controlled",
+    *(f"input_{key}_sha256" for key in INPUT_PROVENANCE_KEYS),
+)
+EXPECTED_EVALUATION_CLAIMS = {
+    "point_estimate_threshold_is_not_effect_lower_bound": True,
+    "population_generalization_established": False,
+    "cross_cfg_rankings_are_causal": False,
+    "equal_nfe_implies_equal_compute": False,
+    "challenge_inference_is_descriptive_only": True,
+    "global_multiplicity_across_families_controlled": False,
+}
 EXPECTED_ANALYSIS_PATHS = (
     "AttentionGuidance/__init__.py",
     "eval-pipeline/audit_latent_renderer_run.py",
@@ -904,21 +943,15 @@ def evaluate_frame(
     return {
         "schema": EVALUATION_SCHEMA,
         "evaluator_version": EVALUATOR_VERSION,
-        "scope": "development_evidence_reporting_only",
+        "scope": EVALUATION_SCOPE,
         "screen_only": True,
         "method_selection_authorized": False,
         "method_selection_performed": False,
         "validation_authorized": False,
         "rl_authorized": False,
+        "publication_claim_authorized": False,
         "publication_superiority_established": False,
-        "claims": {
-            "point_estimate_threshold_is_not_effect_lower_bound": True,
-            "population_generalization_established": False,
-            "cross_cfg_rankings_are_causal": False,
-            "equal_nfe_implies_equal_compute": False,
-            "challenge_inference_is_descriptive_only": True,
-            "global_multiplicity_across_families_controlled": False,
-        },
+        "claims": dict(EXPECTED_EVALUATION_CLAIMS),
         "task_accounting": {
             "expected_tasks": EXPECTED_TASKS,
             "observed_manifest_score_pairs": int(len(frame)),
@@ -1017,10 +1050,34 @@ def _validate_analysis_implementation(
             path.relative_to(ROOT.resolve())
         except ValueError as exc:
             raise ValueError("analysis implementation path is outside the repository") from exc
-        if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)):
             raise ValueError(f"analysis implementation entry is invalid: {relative_path}")
+    return implementation
+
+
+def _validate_effective_analysis_implementation(
+    value: Any,
+) -> Mapping[str, Any]:
+    implementation = _require_exact_fields(
+        value,
+        "effective analysis implementation",
+        {"schema", "files"},
+    )
+    if implementation.get("schema") != ANALYSIS_IMPLEMENTATION_SCHEMA:
+        raise ValueError("effective analysis implementation schema differs")
+    files = _require_mapping(implementation.get("files"), "effective analysis files")
+    if set(files) != set(EXPECTED_ANALYSIS_PATHS):
+        raise ValueError("effective analysis implementation paths differ")
+    for relative_path, expected_hash in files.items():
+        path = (ROOT / str(relative_path)).resolve()
+        try:
+            path.relative_to(ROOT.resolve())
+        except ValueError as exc:
+            raise ValueError("effective analysis path is outside the repository") from exc
+        if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)):
+            raise ValueError(f"effective analysis entry is invalid: {relative_path}")
         if sha256_file(path) != expected_hash:
-            raise ValueError(f"analysis implementation hash differs: {relative_path}")
+            raise ValueError(f"effective analysis bytes differ: {relative_path}")
     return implementation
 
 
@@ -1028,22 +1085,39 @@ def load_verified_inputs(
     run_dir: str | os.PathLike[str],
     actions_path: str | os.PathLike[str],
     audit_path: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
 ) -> VerifiedInputs:
     """Bind a complete run, scores, executable design, and passing run audit."""
     run_root = Path(run_dir).resolve()
+    raw_amendment_path = Path(analysis_amendment_path)
+    raw_seal_path = Path(pre_score_seal_path)
+    if raw_amendment_path.is_symlink() or raw_seal_path.is_symlink():
+        raise ValueError("analysis amendment and pre-score seal cannot be symlinks")
     paths: dict[str, Path] = {
         "run_config": run_root / "config.json",
         "manifest": run_root / "manifest.jsonl",
         "scores": run_root / "scores.jsonl",
         "actions": Path(actions_path).resolve(),
         "audit": Path(audit_path).resolve(),
+        "analysis_amendment": raw_amendment_path.resolve(),
+        "pre_score_seal": raw_seal_path.resolve(),
     }
     if paths["audit"] != run_root / "run_audit.json":
         raise ValueError("structural evaluator requires the canonical run_audit.json")
+    expected_seal = run_root / structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+    if paths["pre_score_seal"] != expected_seal:
+        raise ValueError("structural evaluator requires the canonical pre-score seal")
     for label, path in paths.items():
         if not path.is_file():
             raise ValueError(f"required {label} file is missing: {path}")
-    payloads = {label: path.read_bytes() for label, path in paths.items()}
+    pre_score_labels = (
+        "run_config",
+        "actions",
+        "analysis_amendment",
+        "pre_score_seal",
+    )
+    payloads = {label: paths[label].read_bytes() for label in pre_score_labels}
     hashes = {label: sha256_bytes(payload) for label, payload in payloads.items()}
 
     try:
@@ -1110,12 +1184,28 @@ def load_verified_inputs(
     )
 
     run_config = _load_json(payloads["run_config"], "run config")
+    generation_commit = str(run_config.get("git_commit", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", generation_commit):
+        raise ValueError("run config generation commit is invalid")
+    structural_audit.validate_analysis_amendment(
+        paths["analysis_amendment"], base_commit=generation_commit
+    )
+    structural_audit.validate_pre_score_seal(
+        paths["pre_score_seal"],
+        analysis_amendment_path=paths["analysis_amendment"],
+        base_commit=generation_commit,
+    )
+    for label in ("manifest", "scores", "audit"):
+        payloads[label] = paths[label].read_bytes()
+        hashes[label] = sha256_bytes(payloads[label])
     audit = _load_json(payloads["audit"], "run audit")
     recomputed_audit = structural_audit.audit_run(
         run_root,
         prompts_path,
         paths["actions"],
         registration_actions_path=registration_path,
+        analysis_amendment_path=paths["analysis_amendment"],
+        pre_score_seal_path=paths["pre_score_seal"],
     )
     if audit != recomputed_audit:
         raise ValueError("supplied run audit differs from an in-lock recomputation")
@@ -1124,6 +1214,7 @@ def load_verified_inputs(
     if audit.get("audit_schema") != AUDIT_SCHEMA:
         raise ValueError("dedicated structural-control audit schema is required")
     dedicated_checks = {
+        "auditor_scope": "formal_development_only",
         "structural_control_contract_passed": True,
         "image_decode_verified": True,
         "quality_results_inspected": False,
@@ -1134,14 +1225,29 @@ def load_verified_inputs(
         "duplicate_action_pngs_are_failure": False,
         "isolated_duplicate_action_pngs_are_failure": False,
         "full_action_collapse_is_failure": True,
-        "duplicate_action_png_policy": "reject_action_pair_equal_in_all_99_blocks",
-        "fully_collapsed_action_pairs": [],
+        "duplicate_action_png_policy": (
+            "reject_any_action_pair_equal_in_all_registered_blocks"
+        ),
+        "full_action_collapse_check_passed": True,
+        "outcome_details_disclosed": False,
     }
     for key, expected in dedicated_checks.items():
         if audit.get(key) != expected:
             raise ValueError(f"dedicated structural-control audit field {key!r} differs")
     if audit.get("warnings") != []:
         raise ValueError("dedicated structural-control audit must be warning-free")
+    forbidden_outcome_fields = {
+        "all_action_png_hashes_distinct_within_block",
+        "allowed_identity_pairs",
+        "observed_identity_pairs",
+        "registered_identity_pair",
+        "identity_pair_png_hashes_equal",
+        "duplicate_action_png_pair_counts",
+        "fully_collapsed_action_pairs",
+    }
+    disclosed = sorted(forbidden_outcome_fields & set(audit))
+    if disclosed:
+        raise ValueError(f"dedicated run audit discloses outcome details: {disclosed}")
     audit_provenance = _require_mapping(audit.get("provenance"), "audit.provenance")
     for audit_key, payload_key in (
         ("config_sha256", "run_config"),
@@ -1150,6 +1256,8 @@ def load_verified_inputs(
         ("prompts_sha256", "prompts"),
         ("source_actions_sha256", "actions"),
         ("source_template_sha256", "registration"),
+        ("analysis_amendment_sha256", "analysis_amendment"),
+        ("pre_score_seal_sha256", "pre_score_seal"),
     ):
         _require_hash(audit_provenance, audit_key, hashes[payload_key], "run audit")
     if audit_provenance.get("input_snapshot_stable") is not True:
@@ -1166,10 +1274,23 @@ def load_verified_inputs(
     _require_hash(
         audit, "registration_sha256", hashes["registration"], "dedicated run audit"
     )
-    if audit.get("analysis_implementation") != analysis_implementation:
-        raise ValueError("dedicated run audit analysis implementation differs")
+    _require_hash(
+        audit,
+        "analysis_amendment_sha256",
+        hashes["analysis_amendment"],
+        "dedicated run audit",
+    )
+    _require_hash(
+        audit,
+        "pre_score_seal_sha256",
+        hashes["pre_score_seal"],
+        "dedicated run audit",
+    )
+    effective_analysis = _validate_effective_analysis_implementation(
+        audit.get("analysis_implementation")
+    )
     if audit.get("analysis_implementation_sha256") != structural_audit.json_sha256(
-        analysis_implementation
+        effective_analysis
     ):
         raise ValueError("dedicated run audit analysis implementation hash differs")
 
@@ -1195,9 +1316,6 @@ def load_verified_inputs(
         raise ValueError("run config registration schema differs from structural-control v1")
     if run_config.get("split_role") != "development":
         raise ValueError("run config is not the development split")
-    generation_commit = str(run_config.get("git_commit", ""))
-    if not re.fullmatch(r"[0-9a-f]{40}", generation_commit):
-        raise ValueError("run config generation commit is invalid")
     if audit.get("generation_commit") != generation_commit:
         raise ValueError("dedicated audit generation commit differs from run config")
     if run_config.get("scorer_provenance_binding_required") is not True:
@@ -1266,8 +1384,6 @@ def load_verified_inputs(
         raise ValueError("run audit did not establish hardened scorer provenance")
     if audit.get("scorer_provenance_sha256") != scorer_hash:
         raise ValueError("run audit scorer provenance differs from executable YAML")
-    if audit.get("all_action_png_hashes_distinct_within_block") is not False:
-        raise ValueError("run audit used an outcome-dependent distinct-image gate")
     if audit.get("scheduler_schedule_sha256") != actions_config.get(
         "scheduler_runtime", {}
     ).get("schedule_sha256"):
@@ -1346,22 +1462,19 @@ def evaluation_lock(run_dir: str | os.PathLike[str]):
             generation_handle.close()
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
-    descriptor, temporary = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
+def _write_fsynced_file(path: Path, payload: bytes) -> None:
+    with open(path, "xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _require_committed_inputs(paths: Sequence[str | os.PathLike[str]]) -> str:
@@ -1397,8 +1510,46 @@ def _runtime_versions() -> dict[str, str]:
     }
 
 
-def _csv_payload(rows: Sequence[Mapping[str, Any]]) -> bytes:
-    frame = pd.DataFrame(rows).copy()
+def _validated_input_hashes(hashes: Mapping[str, str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key in INPUT_PROVENANCE_KEYS:
+        value = str(hashes.get(key, ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"input provenance hash is missing or invalid: {key}")
+        result[key] = value
+    return result
+
+
+def _csv_payload(
+    rows: Sequence[Mapping[str, Any]], input_hashes: Mapping[str, str]
+) -> bytes:
+    if not rows:
+        raise ValueError("structural-control contrast CSV cannot be empty")
+    validated_hashes = _validated_input_hashes(input_hashes)
+    envelope: dict[str, Any] = {
+        "artifact_schema": CONTRAST_ARTIFACT_SCHEMA,
+        "scope": EVALUATION_SCOPE,
+        "screen_only": True,
+        "method_selection_authorized": False,
+        "method_selection_performed": False,
+        "validation_authorized": False,
+        "rl_authorized": False,
+        "publication_claim_authorized": False,
+        "publication_superiority_established": False,
+        "global_multiplicity_across_families_controlled": False,
+        **{
+            f"input_{key}_sha256": value
+            for key, value in validated_hashes.items()
+        },
+    }
+    payload_fields = sorted({key for row in rows for key in row})
+    collisions = set(payload_fields) & set(CSV_ENVELOPE_FIELDS)
+    if collisions:
+        raise ValueError(f"contrast fields collide with the CSV envelope: {sorted(collisions)}")
+    normalized_rows = [{**envelope, **dict(row)} for row in rows]
+    frame = pd.DataFrame(
+        normalized_rows, columns=[*CSV_ENVELOPE_FIELDS, *payload_fields]
+    ).copy()
     for column in frame.columns:
         if frame[column].map(lambda value: isinstance(value, (dict, list))).any():
             frame[column] = frame[column].map(
@@ -1409,20 +1560,364 @@ def _csv_payload(rows: Sequence[Mapping[str, Any]]) -> bytes:
     return frame.to_csv(index=False).encode("utf-8")
 
 
+def _strict_input_snapshot(
+    input_paths: Mapping[str, str | os.PathLike[str]],
+) -> tuple[dict[str, Path], dict[str, str]]:
+    if set(input_paths) != set(INPUT_PROVENANCE_KEYS):
+        raise ValueError("strict bundle verification input paths differ from the v2 schema")
+    resolved: dict[str, Path] = {}
+    for key in INPUT_PROVENANCE_KEYS:
+        raw_path = Path(input_paths[key])
+        if raw_path.is_symlink():
+            raise ValueError(f"strict bundle verification rejects symlink input: {key}")
+        path = raw_path.resolve()
+        if not path.is_file():
+            raise ValueError(f"strict bundle verification input is missing: {key}")
+        resolved[key] = path
+    if len(set(resolved.values())) != len(resolved):
+        raise ValueError("strict bundle verification inputs must be distinct files")
+    run_root = resolved["run_config"].parent
+    canonical_run_paths = {
+        "run_config": run_root / "config.json",
+        "manifest": run_root / "manifest.jsonl",
+        "scores": run_root / "scores.jsonl",
+        "audit": run_root / "run_audit.json",
+        "pre_score_seal": (
+            run_root / structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+        ),
+    }
+    for key, expected in canonical_run_paths.items():
+        if resolved[key] != expected:
+            raise ValueError(f"strict bundle verification requires canonical {key} path")
+    hashes = {key: sha256_file(path) for key, path in resolved.items()}
+    return resolved, hashes
+
+
+def resolve_evaluation_input_paths(
+    run_dir: str | os.PathLike[str],
+    actions_path: str | os.PathLike[str],
+    audit_path: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
+) -> dict[str, Path]:
+    """Resolve the ten current files required for strict external verification."""
+    raw_run_root = Path(run_dir)
+    if raw_run_root.is_symlink():
+        raise ValueError("strict bundle verification rejects a symlink run directory")
+    run_root = raw_run_root.resolve()
+    if not run_root.is_dir():
+        raise ValueError("strict bundle verification run directory is missing")
+    raw_external = {
+        "actions": Path(actions_path),
+        "audit": Path(audit_path),
+        "analysis_amendment": Path(analysis_amendment_path),
+        "pre_score_seal": Path(pre_score_seal_path),
+    }
+    if any(path.is_symlink() for path in raw_external.values()):
+        raise ValueError("strict bundle verification rejects symlink inputs")
+    paths: dict[str, Path] = {
+        "run_config": run_root / "config.json",
+        "manifest": run_root / "manifest.jsonl",
+        "scores": run_root / "scores.jsonl",
+        **{key: path.resolve() for key, path in raw_external.items()},
+    }
+    if paths["audit"] != run_root / "run_audit.json":
+        raise ValueError("strict bundle verification requires canonical run_audit.json")
+    if paths["pre_score_seal"] != (
+        run_root / structural_audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+    ):
+        raise ValueError("strict bundle verification requires canonical pre-score seal")
+    for key, path in paths.items():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"strict bundle verification input is missing: {key}")
+
+    try:
+        actions_config = yaml.safe_load(paths["actions"].read_bytes()) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError("strict bundle verification actions YAML is invalid") from exc
+    actions_config = _require_mapping(actions_config, "strict verification actions YAML")
+    source_manifest = _require_mapping(
+        actions_config.get("source_manifest"), "strict verification source_manifest"
+    )
+    registration_source = _require_mapping(
+        actions_config.get("registration_source"),
+        "strict verification registration_source",
+    )
+
+    def registered_path(value: Any, label: str) -> Path:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} path is missing")
+        raw_path = Path(value)
+        if not raw_path.is_absolute():
+            raw_path = ROOT / raw_path
+        if raw_path.is_symlink():
+            raise ValueError(f"strict bundle verification rejects symlink {label}")
+        return _resolve_registered_path(value, label)
+
+    paths.update(
+        {
+            "prompts": registered_path(
+                source_manifest.get("prompts"), "registered prompts"
+            ),
+            "prompt_manifest": registered_path(
+                source_manifest.get("path"), "prompt manifest"
+            ),
+            "registration": registered_path(
+                registration_source.get("path"), "registration source"
+            ),
+        }
+    )
+    run_config = _load_json(paths["run_config"].read_bytes(), "strict verification run config")
+    if Path(str(run_config.get("actions_yaml", ""))).resolve() != paths["actions"]:
+        raise ValueError("strict bundle verification actions path differs from run config")
+    if Path(str(run_config.get("prompts_csv", ""))).resolve() != paths["prompts"]:
+        raise ValueError("strict bundle verification prompts path differs from run config")
+    _strict_input_snapshot(paths)
+    return paths
+
+
+def verify_evaluation_bundle(
+    bundle_dir: str | os.PathLike[str],
+    *,
+    current_input_paths: Mapping[str, str | os.PathLike[str]] | None = None,
+    expected_input_hashes: Mapping[str, str] | None = None,
+    strict: bool = True,
+) -> Mapping[str, Any]:
+    """Verify the v2 bundle, anchored to a stable current-input snapshot."""
+    bundle_path = Path(bundle_dir)
+    if bundle_path.is_symlink() or not bundle_path.is_dir():
+        raise ValueError("structural-control evaluation bundle is missing or not a directory")
+    snapshot_paths: dict[str, Path] | None = None
+    if strict:
+        if current_input_paths is None:
+            raise ValueError(
+                "strict bundle verification requires current input paths"
+            )
+        snapshot_paths, trusted_hashes = _strict_input_snapshot(current_input_paths)
+        run_root = snapshot_paths["run_config"].parent
+        if bundle_path.resolve() != run_root / OUTPUT_BUNDLE_DIR:
+            raise ValueError("strict bundle verification requires the canonical bundle path")
+        if expected_input_hashes is not None and _validated_input_hashes(
+            expected_input_hashes
+        ) != trusted_hashes:
+            raise ValueError("caller hashes differ from the current input files")
+    else:
+        if expected_input_hashes is None:
+            raise ValueError(
+                "internal bundle verification requires caller-supplied input hashes"
+            )
+        trusted_hashes = _validated_input_hashes(expected_input_hashes)
+    entries = list(bundle_path.iterdir())
+    if {entry.name for entry in entries} != {OUTPUT_JSON, OUTPUT_CSV}:
+        raise ValueError("structural-control evaluation bundle has unexpected contents")
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        raise ValueError("structural-control evaluation bundle entries must be regular files")
+
+    json_payload = (bundle_path / OUTPUT_JSON).read_bytes()
+    csv_payload = (bundle_path / OUTPUT_CSV).read_bytes()
+    report = _load_json(json_payload, "structural-control evaluation JSON")
+    if report.get("schema") != EVALUATION_SCHEMA:
+        raise ValueError("structural-control evaluation JSON schema differs from v2")
+    if report.get("evaluator_version") != EVALUATOR_VERSION:
+        raise ValueError("structural-control evaluator version differs from v2")
+    if report.get("scope") != EVALUATION_SCOPE or report.get("screen_only") is not True:
+        raise ValueError("structural-control evaluation JSON scope envelope differs")
+    for key in (
+        "method_selection_authorized",
+        "method_selection_performed",
+        "validation_authorized",
+        "rl_authorized",
+        "publication_claim_authorized",
+        "publication_superiority_established",
+    ):
+        if report.get(key) is not False:
+            raise ValueError(f"structural-control evaluation JSON permits {key}")
+    authorization_fields = {key for key in report if key.endswith("_authorized")}
+    if authorization_fields != {
+        "method_selection_authorized",
+        "validation_authorized",
+        "rl_authorized",
+        "publication_claim_authorized",
+    }:
+        raise ValueError("structural-control evaluation authorization fields differ")
+    if "selected_action" in report:
+        raise ValueError("structural-control evaluation JSON contains a selected action")
+    claims = _require_mapping(report.get("claims"), "evaluation claims")
+    if dict(claims) != EXPECTED_EVALUATION_CLAIMS:
+        raise ValueError("structural-control evaluation claims differ from the v2 envelope")
+
+    input_hashes = _require_mapping(
+        report.get("input_provenance_sha256"), "input_provenance_sha256"
+    )
+    if set(input_hashes) != set(INPUT_PROVENANCE_KEYS):
+        raise ValueError("evaluation input provenance fields differ from the v2 schema")
+    validated_hashes = _validated_input_hashes(input_hashes)
+    if validated_hashes != trusted_hashes:
+        raise ValueError("evaluation input provenance differs from current inputs")
+
+    output_bundle = _require_exact_fields(
+        report.get("output_bundle"),
+        "output_bundle",
+        {"schema", "scope", "csv"},
+    )
+    if output_bundle.get("schema") != OUTPUT_BUNDLE_SCHEMA:
+        raise ValueError("evaluation output-bundle schema differs from v2")
+    if output_bundle.get("scope") != EVALUATION_SCOPE:
+        raise ValueError("evaluation output-bundle scope differs")
+    csv_binding = _require_exact_fields(
+        output_bundle.get("csv"),
+        "output_bundle.csv",
+        {"filename", "sha256", "row_count", "artifact_schema", "scope"},
+    )
+    if csv_binding.get("filename") != OUTPUT_CSV:
+        raise ValueError("evaluation bundle binds the wrong CSV filename")
+    if csv_binding.get("sha256") != sha256_bytes(csv_payload):
+        raise ValueError("evaluation bundle CSV hash mismatch")
+    if csv_binding.get("artifact_schema") != CONTRAST_ARTIFACT_SCHEMA:
+        raise ValueError("evaluation bundle CSV artifact schema differs")
+    if csv_binding.get("scope") != EVALUATION_SCOPE:
+        raise ValueError("evaluation bundle CSV scope differs")
+
+    contrasts = _require_list(report.get("contrasts"), "evaluation contrasts")
+    if any(not isinstance(row, Mapping) for row in contrasts):
+        raise ValueError("evaluation contrasts must be mappings")
+    if isinstance(csv_binding.get("row_count"), bool) or csv_binding.get(
+        "row_count"
+    ) != len(contrasts):
+        raise ValueError("evaluation bundle CSV row count differs")
+    expected_csv = _csv_payload(contrasts, validated_hashes)
+    if csv_payload != expected_csv:
+        raise ValueError("evaluation CSV differs from the JSON-bound artifact")
+
+    try:
+        csv_text = csv_payload.decode("utf-8")
+        reader = csv.DictReader(io.StringIO(csv_text, newline=""), strict=True)
+        rows = list(reader)
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ValueError("evaluation bundle CSV is invalid") from exc
+    if reader.fieldnames is None or tuple(reader.fieldnames[: len(CSV_ENVELOPE_FIELDS)]) != (
+        CSV_ENVELOPE_FIELDS
+    ):
+        raise ValueError("evaluation bundle CSV envelope columns differ")
+    if len(reader.fieldnames) != len(set(reader.fieldnames)):
+        raise ValueError("evaluation bundle CSV has duplicate columns")
+    if len(rows) != len(contrasts):
+        raise ValueError("evaluation bundle CSV parsed row count differs")
+    expected_envelope = {
+        "artifact_schema": CONTRAST_ARTIFACT_SCHEMA,
+        "scope": EVALUATION_SCOPE,
+        "screen_only": "True",
+        "method_selection_authorized": "False",
+        "method_selection_performed": "False",
+        "validation_authorized": "False",
+        "rl_authorized": "False",
+        "publication_claim_authorized": "False",
+        "publication_superiority_established": "False",
+        "global_multiplicity_across_families_controlled": "False",
+        **{
+            f"input_{key}_sha256": value
+            for key, value in validated_hashes.items()
+        },
+    }
+    for row in rows:
+        if {key: row.get(key) for key in CSV_ENVELOPE_FIELDS} != expected_envelope:
+            raise ValueError("evaluation bundle CSV row envelope differs")
+    if snapshot_paths is not None:
+        _, final_hashes = _strict_input_snapshot(snapshot_paths)
+        if final_hashes != trusted_hashes:
+            raise ValueError("bundle verification inputs changed during verification")
+    return report
+
+
+def publish_evaluation_bundle(
+    run_dir: str | os.PathLike[str],
+    json_payload: bytes,
+    csv_payload: bytes,
+    *,
+    expected_input_hashes: Mapping[str, str],
+) -> Path:
+    """Publish both artifacts with one same-filesystem directory rename."""
+    run_root = Path(run_dir).resolve()
+    bundle_path = run_root / OUTPUT_BUNDLE_DIR
+    if os.path.lexists(bundle_path):
+        raise ValueError("structural-control development evaluation is one-shot")
+    staging_path = Path(
+        tempfile.mkdtemp(prefix=f".{OUTPUT_BUNDLE_DIR}.", dir=run_root)
+    )
+    published = False
+    try:
+        _write_fsynced_file(staging_path / OUTPUT_CSV, csv_payload)
+        _write_fsynced_file(staging_path / OUTPUT_JSON, json_payload)
+        _fsync_directory(staging_path)
+        verify_evaluation_bundle(
+            staging_path,
+            expected_input_hashes=expected_input_hashes,
+            strict=False,
+        )
+        os.replace(staging_path, bundle_path)
+        published = True
+        _fsync_directory(run_root)
+    except BaseException:
+        if not published:
+            shutil.rmtree(staging_path, ignore_errors=True)
+        raise
+    return bundle_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--actions", required=True)
     parser.add_argument("--audit", required=True)
+    parser.add_argument("--analysis-amendment", required=True)
+    parser.add_argument("--pre-score-seal", required=True)
+    parser.add_argument(
+        "--verify-bundle",
+        action="store_true",
+        help="strictly verify the existing canonical bundle without evaluating",
+    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
-    json_path = run_dir / OUTPUT_JSON
-    csv_path = run_dir / OUTPUT_CSV
+    bundle_path = run_dir / OUTPUT_BUNDLE_DIR
+    if args.verify_bundle:
+        with evaluation_lock(run_dir):
+            current_paths = resolve_evaluation_input_paths(
+                args.run_dir,
+                args.actions,
+                args.audit,
+                args.analysis_amendment,
+                args.pre_score_seal,
+            )
+            result = verify_evaluation_bundle(
+                bundle_path, current_input_paths=current_paths
+            )
+        print(
+            json.dumps(
+                {
+                    "verified": True,
+                    "scope": result["scope"],
+                    "method_selection_performed": False,
+                    "rl_authorized": False,
+                },
+                indent=2,
+            )
+        )
+        print(f"verified evaluation bundle -> {bundle_path}")
+        return
     with evaluation_lock(run_dir):
-        if json_path.exists() or csv_path.exists():
+        if os.path.lexists(bundle_path):
             raise ValueError("structural-control development evaluation is one-shot")
-        inputs = load_verified_inputs(run_dir, args.actions, args.audit)
+        legacy_outputs = (run_dir / OUTPUT_JSON, run_dir / OUTPUT_CSV)
+        if any(os.path.lexists(path) for path in legacy_outputs):
+            raise ValueError("legacy structural-control evaluation output exists")
+        inputs = load_verified_inputs(
+            run_dir,
+            args.actions,
+            args.audit,
+            args.analysis_amendment,
+            args.pre_score_seal,
+        )
         registered_analysis_files = inputs.actions_config[
             "analysis_implementation"
         ]["files"]
@@ -1432,6 +1927,7 @@ def main() -> None:
                 inputs.paths["registration"],
                 inputs.paths["prompts"],
                 inputs.paths["prompt_manifest"],
+                inputs.paths["analysis_amendment"],
                 *(ROOT / relative_path for relative_path in registered_analysis_files),
             )
         )
@@ -1451,6 +1947,10 @@ def main() -> None:
             "actions_sha256": inputs.hashes["actions"],
             "audit_path": inputs.paths["audit"],
             "audit_sha256": inputs.hashes["audit"],
+            "analysis_amendment_path": inputs.paths["analysis_amendment"],
+            "analysis_amendment_sha256": inputs.hashes["analysis_amendment"],
+            "pre_score_seal_path": inputs.paths["pre_score_seal"],
+            "pre_score_seal_sha256": inputs.hashes["pre_score_seal"],
             "registration_path": inputs.paths["registration"],
             "registration_sha256": inputs.hashes["registration"],
             "prompts_path": inputs.paths["prompts"],
@@ -1465,16 +1965,42 @@ def main() -> None:
             "compare_actions_sha256": sha256_file(COMPARE_ACTIONS_PATH),
             "evaluator_script_sha256": sha256_file(__file__),
             "evaluator_git_commit": evaluator_git_commit,
-            "analysis_implementation": inputs.actions_config[
+            "base_analysis_implementation": inputs.actions_config[
+                "analysis_implementation"
+            ],
+            "effective_analysis_implementation": inputs.audit[
                 "analysis_implementation"
             ],
             "runtime_versions": _runtime_versions(),
         }
+        input_hashes = {
+            key: inputs.hashes[key] for key in INPUT_PROVENANCE_KEYS
+        }
+        result["input_provenance_sha256"] = input_hashes
+        csv_payload = _csv_payload(result["contrasts"], input_hashes)
+        result["output_bundle"] = {
+            "schema": OUTPUT_BUNDLE_SCHEMA,
+            "scope": EVALUATION_SCOPE,
+            "csv": {
+                "filename": OUTPUT_CSV,
+                "sha256": sha256_bytes(csv_payload),
+                "row_count": len(result["contrasts"]),
+                "artifact_schema": CONTRAST_ARTIFACT_SCHEMA,
+                "scope": EVALUATION_SCOPE,
+            },
+        }
         json_payload = (
             json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
         ).encode("utf-8")
-        _atomic_write(csv_path, _csv_payload(result["contrasts"]))
-        _atomic_write(json_path, json_payload)
+        bundle_path = publish_evaluation_bundle(
+            run_dir,
+            json_payload,
+            csv_payload,
+            expected_input_hashes=input_hashes,
+        )
+        verify_evaluation_bundle(
+            bundle_path, current_input_paths=inputs.paths
+        )
     print(
         json.dumps(
             {
@@ -1485,7 +2011,7 @@ def main() -> None:
             indent=2,
         )
     )
-    print(f"evaluation -> {json_path}")
+    print(f"evaluation bundle -> {bundle_path}")
 
 
 if __name__ == "__main__":

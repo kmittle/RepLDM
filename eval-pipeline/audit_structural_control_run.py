@@ -17,7 +17,6 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 import yaml
-from PIL import Image
 
 import audit_latent_renderer_run as base_audit
 import generate
@@ -33,6 +32,62 @@ from s7_provenance import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRATION = ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE
+STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT = (
+    "e0b323fab88c0cc9e24256d7bf7d466a049d2675"
+)
+STRUCTURAL_CONTROL_ACTIONS_PATH = (
+    "eval-pipeline/configs/"
+    "scheduler_native_structural_controls_development_authorized_v1.yaml"
+)
+STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_SCHEMA = (
+    "structural_control_analysis_amendment_v1"
+)
+STRUCTURAL_CONTROL_AMENDMENT_STATUS = "authorized_pre_score"
+STRUCTURAL_CONTROL_AMENDMENT_CANDIDATE_STATUS = (
+    "blocked_pending_independent_review"
+)
+STRUCTURAL_CONTROL_UNCHANGED_INVARIANTS = frozenset(
+    {
+        "generation",
+        "scorer_recipe",
+        "metrics",
+        "contrasts",
+        "multiplicity",
+        "decision_rules",
+    }
+)
+STRUCTURAL_CONTROL_UNAUTHORIZED_USES = frozenset(
+    {"method_selection", "validation", "publication_claims", "rl"}
+)
+STRUCTURAL_CONTROL_AUDITOR_SCOPE = "formal_development_only"
+STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_FIELDS = frozenset(
+    {
+        "schema",
+        "status",
+        "reviewer",
+        "reviewed_commit",
+        "base_commit",
+        "result_access_before_authorization",
+        "scoring_started_before_authorization",
+        "unchanged_invariants",
+        "authorizations",
+        "replacements",
+    }
+)
+STRUCTURAL_CONTROL_PRE_SCORE_SEAL_SCHEMA = "structural_control_pre_score_seal_v1"
+STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME = "structural_control_pre_score_seal.json"
+STRUCTURAL_CONTROL_EXPECTED_TASKS = 792
+STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS = frozenset(
+    {
+        "eval-pipeline/audit_structural_control_run.py",
+        "eval-pipeline/evaluate_structural_control_run.py",
+    }
+)
+STRUCTURAL_CONTROL_EVALUATION_BUNDLE = "structural_control_evaluation_bundle"
+STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS = (
+    "structural_control_evaluation.json",
+    "structural_control_contrasts.csv",
+)
 GPU_UUID_PATTERN = re.compile(
     r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE,
@@ -89,6 +144,34 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         raise
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _require_exact_fields(
+    value: Any, *, label: str, fields: set[str]
+) -> Mapping[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"{label} fields differ")
+    return value
+
+
+def _repository_relative(path: Path, *, label: str) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain inside the repository") from exc
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
 @contextmanager
 def audit_lock(run_dir: str | os.PathLike[str]):
     """Exclude generation, scoring, and concurrent structural audits."""
@@ -113,6 +196,269 @@ def audit_lock(run_dir: str | os.PathLike[str]):
             generation_handle.close()
 
 
+@contextmanager
+def pre_score_seal_lock(run_dir: str | os.PathLike[str]):
+    """Exclude generation and scoring while publishing the pre-score seal."""
+    run_root = Path(run_dir).resolve()
+    generation_handle = open(run_root / ".generate.lock", "a+")
+    try:
+        try:
+            fcntl.flock(generation_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"generation or scoring is active for {run_root}"
+            ) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(generation_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            generation_handle.close()
+
+
+def _seal_binding(path: str, digest: str) -> dict[str, str]:
+    return {"path": path, "sha256": digest}
+
+
+def _validate_binding(
+    value: Any, *, expected_path: str, observed_path: Path, label: str
+) -> None:
+    binding = _require_exact_fields(
+        value, label=f"pre-score seal {label} binding", fields={"path", "sha256"}
+    )
+    if binding.get("path") != expected_path:
+        raise ValueError(f"pre-score seal {label} path differs")
+    digest = binding.get("sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError(f"pre-score seal {label} hash is invalid")
+    if (
+        observed_path.is_symlink()
+        or not observed_path.is_file()
+        or base_audit.sha256_file(observed_path) != digest
+    ):
+        raise ValueError(f"pre-score seal {label} bytes differ")
+
+
+def validate_pre_score_seal(
+    path: str | os.PathLike[str],
+    *,
+    analysis_amendment_path: str | os.PathLike[str],
+    base_commit: str,
+) -> Mapping[str, Any]:
+    """Validate the immutable pre-score bindings without inspecting outcomes."""
+    if base_commit != STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT:
+        raise ValueError("pre-score seal base commit differs from the frozen run")
+    supplied_seal_path = Path(path)
+    if supplied_seal_path.is_symlink():
+        raise ValueError("pre-score seal must not be a symbolic link")
+    seal_path = supplied_seal_path.resolve()
+    if seal_path.name != STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME:
+        raise ValueError("pre-score seal must use its canonical filename")
+    seal = _load_json(seal_path, label="pre-score seal")
+    _require_exact_fields(
+        seal,
+        label="pre-score seal",
+        fields={
+            "schema",
+            "base_commit",
+            "expected_manifest_rows",
+            "outcome_artifacts_absent_at_creation",
+            "bindings",
+        },
+    )
+    if seal.get("schema") != STRUCTURAL_CONTROL_PRE_SCORE_SEAL_SCHEMA:
+        raise ValueError("pre-score seal schema differs")
+    if seal.get("base_commit") != base_commit:
+        raise ValueError("pre-score seal does not bind the frozen base commit")
+    expected_rows = seal.get("expected_manifest_rows")
+    if (
+        isinstance(expected_rows, bool)
+        or not isinstance(expected_rows, int)
+        or expected_rows != STRUCTURAL_CONTROL_EXPECTED_TASKS
+    ):
+        raise ValueError("pre-score seal manifest row declaration differs")
+    if seal.get("outcome_artifacts_absent_at_creation") is not True:
+        raise ValueError("pre-score seal lacks the outcome-absence declaration")
+    bindings = _require_exact_fields(
+        seal.get("bindings"),
+        label="pre-score seal bindings",
+        fields={"config", "manifest", "actions", "registration", "analysis_amendment"},
+    )
+
+    run_root = seal_path.parent
+    config_path = run_root / "config.json"
+    manifest_path = run_root / "manifest.jsonl"
+    actions_path = (ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH).resolve()
+    registration_path = (
+        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE
+    ).resolve()
+    supplied_amendment_path = Path(analysis_amendment_path)
+    if supplied_amendment_path.is_symlink():
+        raise ValueError("analysis amendment must not be a symbolic link")
+    amendment_path = supplied_amendment_path.resolve()
+    amendment_relative = _repository_relative(
+        amendment_path, label="analysis amendment"
+    )
+    for value, expected_path, observed_path, label in (
+        (bindings.get("config"), "config.json", config_path, "config"),
+        (bindings.get("manifest"), "manifest.jsonl", manifest_path, "manifest"),
+        (
+            bindings.get("actions"),
+            STRUCTURAL_CONTROL_ACTIONS_PATH,
+            actions_path,
+            "actions",
+        ),
+        (
+            bindings.get("registration"),
+            generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+            registration_path,
+            "registration",
+        ),
+        (
+            bindings.get("analysis_amendment"),
+            amendment_relative,
+            amendment_path,
+            "analysis amendment",
+        ),
+    ):
+        _validate_binding(
+            value,
+            expected_path=expected_path,
+            observed_path=observed_path,
+            label=label,
+        )
+
+    config = _load_json(config_path, label="sealed run config")
+    if config.get("git_commit") != base_commit:
+        raise ValueError("sealed run config generation commit differs")
+    manifest = _load_jsonl(manifest_path, label="sealed manifest")
+    if len(manifest) != STRUCTURAL_CONTROL_EXPECTED_TASKS:
+        raise ValueError(
+            f"pre-score seal requires {STRUCTURAL_CONTROL_EXPECTED_TASKS} manifest rows"
+        )
+    for relative_path, observed_path in (
+        (STRUCTURAL_CONTROL_ACTIONS_PATH, actions_path),
+        (generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE, registration_path),
+    ):
+        if observed_path.read_bytes() != _git_bytes(base_commit, relative_path):
+            raise ValueError(f"sealed frozen source bytes differ: {relative_path}")
+    validate_analysis_amendment(amendment_path, base_commit=base_commit)
+    return dict(seal)
+
+
+def create_pre_score_seal(
+    run_dir: str | os.PathLike[str],
+    source_actions_path: str | os.PathLike[str],
+    registration_actions_path: str | os.PathLike[str],
+    analysis_amendment_path: str | os.PathLike[str],
+    *,
+    output_path: str | os.PathLike[str] | None = None,
+    base_commit: str = STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+) -> Mapping[str, Any]:
+    """Atomically create the one-shot seal while generation/scoring are excluded."""
+    run_root = Path(run_dir).resolve()
+    actions_path = Path(source_actions_path).resolve()
+    registration_path = Path(registration_actions_path).resolve()
+    supplied_amendment_path = Path(analysis_amendment_path)
+    if supplied_amendment_path.is_symlink():
+        raise ValueError("analysis amendment must not be a symbolic link")
+    amendment_path = supplied_amendment_path.resolve()
+    seal_path = (
+        Path(output_path).resolve()
+        if output_path is not None
+        else run_root / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+    )
+    if seal_path != run_root / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME:
+        raise ValueError("pre-score seal output must use the canonical run path")
+    if actions_path != (ROOT / STRUCTURAL_CONTROL_ACTIONS_PATH).resolve():
+        raise ValueError("pre-score seal actions path differs from the frozen executable")
+    if registration_path != (
+        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE
+    ).resolve():
+        raise ValueError("pre-score seal registration path differs from the frozen source")
+    amendment_relative = _repository_relative(
+        amendment_path, label="analysis amendment"
+    )
+
+    with pre_score_seal_lock(run_root):
+        if os.path.lexists(seal_path):
+            raise ValueError("pre-score seal is one-shot; output already exists")
+        forbidden = (
+            "scores.jsonl",
+            "run_audit.json",
+            STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+            *STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
+        )
+        if any(os.path.lexists(run_root / name) for name in forbidden) or any(
+            entry.name.startswith(f".{STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.")
+            for entry in run_root.iterdir()
+        ):
+            raise ValueError(
+                "pre-score seal requires all score, audit, and evaluation artifacts absent"
+            )
+        config_path = run_root / "config.json"
+        manifest_path = run_root / "manifest.jsonl"
+        for label, input_path in (
+            ("config", config_path),
+            ("manifest", manifest_path),
+            ("actions", actions_path),
+            ("registration", registration_path),
+            ("analysis amendment", amendment_path),
+        ):
+            if input_path.is_symlink() or not input_path.is_file():
+                raise ValueError(f"pre-score seal {label} input is missing")
+        config = _load_json(config_path, label="run config")
+        if config.get("git_commit") != base_commit:
+            raise ValueError("run config generation commit differs from seal base")
+        manifest = _load_jsonl(manifest_path, label="manifest")
+        if len(manifest) != STRUCTURAL_CONTROL_EXPECTED_TASKS:
+            raise ValueError(
+                f"pre-score seal requires {STRUCTURAL_CONTROL_EXPECTED_TASKS} manifest rows"
+            )
+        for relative_path, input_path in (
+            (STRUCTURAL_CONTROL_ACTIONS_PATH, actions_path),
+            (generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE, registration_path),
+        ):
+            if input_path.read_bytes() != _git_bytes(base_commit, relative_path):
+                raise ValueError(f"pre-score frozen source bytes differ: {relative_path}")
+        validate_analysis_amendment(amendment_path, base_commit=base_commit)
+        seal = {
+            "schema": STRUCTURAL_CONTROL_PRE_SCORE_SEAL_SCHEMA,
+            "base_commit": base_commit,
+            "expected_manifest_rows": STRUCTURAL_CONTROL_EXPECTED_TASKS,
+            "outcome_artifacts_absent_at_creation": True,
+            "bindings": {
+                "config": _seal_binding(
+                    "config.json", base_audit.sha256_file(config_path)
+                ),
+                "manifest": _seal_binding(
+                    "manifest.jsonl", base_audit.sha256_file(manifest_path)
+                ),
+                "actions": _seal_binding(
+                    STRUCTURAL_CONTROL_ACTIONS_PATH,
+                    base_audit.sha256_file(actions_path),
+                ),
+                "registration": _seal_binding(
+                    generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                    base_audit.sha256_file(registration_path),
+                ),
+                "analysis_amendment": _seal_binding(
+                    amendment_relative, base_audit.sha256_file(amendment_path)
+                ),
+            },
+        }
+        payload = (
+            json.dumps(seal, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        _atomic_write(seal_path, payload)
+        _fsync_directory(run_root)
+        return validate_pre_score_seal(
+            seal_path,
+            analysis_amendment_path=amendment_path,
+            base_commit=base_commit,
+        )
+
+
 def _require_finite_number(value: Any, *, label: str, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be numeric")
@@ -132,6 +478,242 @@ def _git_bytes(commit: str, relative_path: str) -> bytes:
         raise ValueError(
             f"cannot read {relative_path!r} from generation commit {commit}"
         ) from exc
+
+
+def _current_head_commit() -> str:
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            stderr=subprocess.PIPE,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("cannot resolve current analysis HEAD") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("current analysis HEAD is not full lowercase 40-hex")
+    return commit
+
+
+def _require_git_ancestor(
+    ancestor: str, descendant: str, *, label: str, strict: bool
+) -> None:
+    if strict and ancestor == descendant:
+        raise ValueError(f"{label} must use a strict two-commit authorization flow")
+    try:
+        ancestry = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"{label} ancestry verification failed") from exc
+    if ancestry.returncode != 0:
+        raise ValueError(f"{label} ancestry verification failed")
+
+
+def _load_yaml_bytes(payload: bytes, *, label: str) -> dict:
+    try:
+        value = yaml.safe_load(payload) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{label} is not readable YAML") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a YAML mapping")
+    return value
+
+
+def _base_analysis_files(base_commit: str) -> Mapping[str, str]:
+    actions = _load_yaml_bytes(
+        _git_bytes(base_commit, STRUCTURAL_CONTROL_ACTIONS_PATH),
+        label="base structural actions",
+    )
+    registration = _load_yaml_bytes(
+        _git_bytes(base_commit, generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE),
+        label="base structural registration",
+    )
+    actions_implementation = actions.get("analysis_implementation")
+    if actions_implementation != registration.get("analysis_implementation"):
+        raise ValueError("base analysis implementation differs from registration")
+    implementation = _require_exact_fields(
+        actions_implementation,
+        label="base analysis implementation",
+        fields={"schema", "files"},
+    )
+    if implementation.get("schema") != generate.STRUCTURAL_CONTROL_ANALYSIS_SCHEMA:
+        raise ValueError("base analysis implementation schema differs")
+    files = implementation.get("files")
+    if not isinstance(files, dict) or set(files) != set(
+        generate.STRUCTURAL_CONTROL_ANALYSIS_PATHS
+    ):
+        raise ValueError("base analysis implementation paths differ")
+    return {str(path): str(digest) for path, digest in files.items()}
+
+
+def validate_analysis_amendment(
+    path: str | os.PathLike[str], *, base_commit: str
+) -> Mapping[str, Any]:
+    """Validate a reviewed, result-blind, two-commit analysis authorization."""
+    if base_commit != STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT:
+        raise ValueError("analysis amendment base commit differs from the frozen run")
+    supplied_amendment_path = Path(path)
+    if supplied_amendment_path.is_symlink():
+        raise ValueError("analysis amendment must not be a symbolic link")
+    amendment_path = supplied_amendment_path.resolve()
+    amendment_relative = _repository_relative(
+        amendment_path, label="analysis amendment"
+    )
+    amendment = _load_yaml(amendment_path, label="analysis amendment")
+    _require_exact_fields(
+        amendment,
+        label="analysis amendment",
+        fields=set(STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_FIELDS),
+    )
+    if amendment.get("schema") != STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_SCHEMA:
+        raise ValueError("analysis amendment schema differs")
+    if amendment.get("status") != STRUCTURAL_CONTROL_AMENDMENT_STATUS:
+        raise ValueError("analysis amendment is not authorized_pre_score")
+    reviewer = amendment.get("reviewer")
+    if (
+        not isinstance(reviewer, str)
+        or not reviewer.strip()
+        or reviewer != reviewer.strip()
+    ):
+        raise ValueError("analysis amendment reviewer must be a non-empty identity")
+    reviewed_commit = amendment.get("reviewed_commit")
+    if not isinstance(reviewed_commit, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", reviewed_commit
+    ):
+        raise ValueError("analysis amendment reviewed_commit must be full lowercase 40-hex")
+    if amendment.get("base_commit") != base_commit:
+        raise ValueError("analysis amendment does not bind the frozen base commit")
+    if amendment.get("result_access_before_authorization") is not False:
+        raise ValueError("analysis amendment authorization was not result-blind")
+    if amendment.get("scoring_started_before_authorization") is not False:
+        raise ValueError("analysis amendment was not authorized before scoring")
+    unchanged = _require_exact_fields(
+        amendment.get("unchanged_invariants"),
+        label="analysis amendment unchanged invariants",
+        fields=set(STRUCTURAL_CONTROL_UNCHANGED_INVARIANTS),
+    )
+    if any(unchanged[key] is not True for key in STRUCTURAL_CONTROL_UNCHANGED_INVARIANTS):
+        raise ValueError("analysis amendment changes a frozen study invariant")
+    authorizations = _require_exact_fields(
+        amendment.get("authorizations"),
+        label="analysis amendment authorizations",
+        fields=set(STRUCTURAL_CONTROL_UNAUTHORIZED_USES),
+    )
+    if any(authorizations[key] is not False for key in STRUCTURAL_CONTROL_UNAUTHORIZED_USES):
+        raise ValueError("analysis amendment grants an unauthorized downstream use")
+    replacements = amendment.get("replacements")
+    if not isinstance(replacements, dict) or set(replacements) != set(
+        STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS
+    ):
+        raise ValueError("analysis amendment replacement paths differ")
+
+    head_commit = _current_head_commit()
+    _require_git_ancestor(
+        base_commit,
+        reviewed_commit,
+        label="analysis amendment base-to-review",
+        strict=False,
+    )
+    _require_git_ancestor(
+        reviewed_commit,
+        head_commit,
+        label="analysis amendment review-to-authorization",
+        strict=True,
+    )
+    try:
+        candidate = _load_yaml_bytes(
+            _git_bytes(reviewed_commit, amendment_relative),
+            label="reviewed blocked amendment candidate",
+        )
+    except ValueError as exc:
+        raise ValueError("reviewed blocked amendment candidate is missing") from exc
+    _require_exact_fields(
+        candidate,
+        label="reviewed blocked amendment candidate",
+        fields=set(STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_FIELDS),
+    )
+    if (
+        candidate.get("status") != STRUCTURAL_CONTROL_AMENDMENT_CANDIDATE_STATUS
+        or candidate.get("reviewer") is not None
+        or candidate.get("reviewed_commit") is not None
+    ):
+        raise ValueError("reviewed amendment candidate was not blocked and unauthored")
+    authorization_fields = {"status", "reviewer", "reviewed_commit"}
+    if any(
+        candidate.get(field) != amendment.get(field)
+        for field in STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_FIELDS
+        - authorization_fields
+    ):
+        raise ValueError("reviewed amendment candidate content differs from authorization")
+    if _git_bytes(head_commit, amendment_relative) != amendment_path.read_bytes():
+        raise ValueError("analysis amendment bytes differ from current HEAD")
+
+    for relative_path in (
+        STRUCTURAL_CONTROL_ACTIONS_PATH,
+        generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+    ):
+        current = (ROOT / relative_path).read_bytes()
+        if current != _git_bytes(base_commit, relative_path) or current != _git_bytes(
+            head_commit, relative_path
+        ):
+            raise ValueError(f"frozen structural source bytes differ: {relative_path}")
+
+    registered_files = _base_analysis_files(base_commit)
+    for relative_path, registered_hash in registered_files.items():
+        if not re.fullmatch(r"[0-9a-f]{64}", registered_hash):
+            raise ValueError("base analysis implementation hash is invalid")
+        base_payload = _git_bytes(base_commit, relative_path)
+        base_hash = _sha256_bytes(base_payload)
+        if base_hash != registered_hash:
+            raise ValueError(
+                f"base analysis implementation hash differs: {relative_path}"
+            )
+        current_path = (ROOT / relative_path).resolve()
+        _repository_relative(current_path, label="analysis implementation")
+        if not current_path.is_file():
+            raise ValueError(f"analysis implementation is missing: {relative_path}")
+        current_payload = current_path.read_bytes()
+        current_hash = _sha256_bytes(current_payload)
+        if _git_bytes(head_commit, relative_path) != current_payload:
+            raise ValueError(
+                f"effective analysis implementation differs from current HEAD: {relative_path}"
+            )
+        if relative_path not in STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS:
+            if current_hash != base_hash:
+                raise ValueError(
+                    f"unamended analysis implementation differs: {relative_path}"
+                )
+            continue
+        replacement = _require_exact_fields(
+            replacements.get(relative_path),
+            label="analysis replacement",
+            fields={"base_sha256", "amended_sha256"},
+        )
+        if replacement.get("base_sha256") != base_hash:
+            raise ValueError(f"analysis replacement base hash differs: {relative_path}")
+        amended_hash = replacement.get("amended_sha256")
+        if not isinstance(amended_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", amended_hash
+        ):
+            raise ValueError("analysis replacement amended hash is invalid")
+        if _sha256_bytes(_git_bytes(reviewed_commit, relative_path)) != amended_hash:
+            raise ValueError(
+                f"reviewed analysis replacement blob differs: {relative_path}"
+            )
+        if amended_hash == base_hash or current_hash != amended_hash:
+            raise ValueError(f"analysis replacement bytes differ: {relative_path}")
+    return dict(amendment)
 
 
 def _validate_generation_commit(
@@ -198,6 +780,8 @@ def _validate_analysis_implementation(
     source: Mapping[str, Any],
     registration: Mapping[str, Any],
     generation_commit: str,
+    *,
+    replacements: Mapping[str, Any] | None = None,
 ) -> dict:
     registered = source.get("analysis_implementation")
     if registered != registration.get("analysis_implementation"):
@@ -211,6 +795,7 @@ def _validate_analysis_implementation(
         generate.STRUCTURAL_CONTROL_ANALYSIS_PATHS
     ):
         raise ValueError("structural analysis implementation paths differ")
+    effective_files = dict(files)
     for relative_path, expected_hash in files.items():
         if not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)):
             raise ValueError("structural analysis implementation hash is invalid")
@@ -225,11 +810,23 @@ def _validate_analysis_implementation(
         committed_hash = hashlib.sha256(
             _git_bytes(generation_commit, str(relative_path))
         ).hexdigest()
-        if current_hash != expected_hash or committed_hash != expected_hash:
+        if committed_hash != expected_hash:
             raise ValueError(
-                f"structural analysis source hash differs for {relative_path}"
+                f"committed structural analysis source hash differs for {relative_path}"
             )
-    return dict(registered)
+        replacement = None if replacements is None else replacements.get(relative_path)
+        if replacement is None:
+            if current_hash != expected_hash:
+                raise ValueError(
+                    f"structural analysis source hash differs for {relative_path}"
+                )
+        elif current_hash != replacement.get("amended_sha256"):
+            raise ValueError(
+                f"amended structural analysis source hash differs for {relative_path}"
+            )
+        else:
+            effective_files[relative_path] = current_hash
+    return {"schema": registered["schema"], "files": effective_files}
 
 
 def _validate_environment_contract(
@@ -733,13 +1330,14 @@ def audit_structural_records(
     }
 
 
-def audit_action_png_pair_counts(
+def validate_action_png_collapse(
     manifest: Sequence[Mapping[str, Any]],
     action_ids: Sequence[str],
     *,
     expected_blocks: int,
-) -> list[dict]:
-    """Report isolated equality and reject an action pair collapsed everywhere."""
+    reject_partial_equality: bool = False,
+) -> bool:
+    """Validate image-hash collapse without disclosing method labels or counts."""
     by_block: dict[tuple[int, int], dict[str, str]] = {}
     expected_actions = {str(action_id) for action_id in action_ids}
     for record in manifest:
@@ -761,25 +1359,15 @@ def audit_action_png_pair_counts(
         if set(hashes) != expected_actions:
             raise ValueError(f"structural block {block} has an incomplete action set")
 
-    pair_counts = []
     for left, right in combinations(action_ids, 2):
         matching_blocks = sum(
             hashes[str(left)] == hashes[str(right)] for hashes in by_block.values()
         )
         if matching_blocks == expected_blocks:
-            raise ValueError(
-                f"structural actions {left!r} and {right!r} produced identical "
-                f"PNGs in all {expected_blocks} blocks"
-            )
-        if matching_blocks:
-            pair_counts.append(
-                {
-                    "actions": [str(left), str(right)],
-                    "matching_blocks": matching_blocks,
-                    "total_blocks": expected_blocks,
-                }
-            )
-    return pair_counts
+            raise ValueError("structural outcome collapse validation failed")
+        if reject_partial_equality and matching_blocks:
+            raise ValueError("structural outcome distinctness validation failed")
+    return True
 
 
 def expected_execution_ranks(
@@ -896,161 +1484,11 @@ def audit_engineering_smoke(
     *,
     registration_actions_path: str | os.PathLike[str] = DEFAULT_REGISTRATION,
 ) -> dict:
-    """Audit the exact 88-task, no-scoring structural engineering profile."""
-    run_path = Path(run_dir).resolve()
-    source_path = Path(source_actions_path).resolve()
-    registration_path = Path(registration_actions_path).resolve()
-    if (run_path / "scores.jsonl").exists():
-        raise ValueError("engineering smoke must not contain quality scores")
-    input_paths = {
-        "config_sha256": run_path / "config.json",
-        "manifest_sha256": run_path / "manifest.jsonl",
-        "prompts_sha256": Path(prompts_path).resolve(),
-        "source_actions_sha256": source_path,
-        "source_template_sha256": registration_path,
-    }
-    for label, path in input_paths.items():
-        if not path.is_file():
-            raise ValueError(f"engineering smoke input for {label} is missing: {path}")
-    initial_hashes = {
-        label: base_audit.sha256_file(path) for label, path in input_paths.items()
-    }
-    source = _load_yaml(source_path, label="structural executable actions")
-    registration = _load_yaml(registration_path, label="frozen structural registration")
-    if registration.get("schema") != "structural_control_registration_v1":
-        raise ValueError("frozen structural registration schema differs")
-    generate.validate_structural_control_authorization(
-        str(source_path), require_clean=False, verify_current_source=False
+    """Reject smoke reuse: the amended v2 auditor is formal-development only."""
+    raise ValueError(
+        "analysis-amended structural-control auditor v2 is formal-only; "
+        "engineering smoke remains frozen pre-amendment evidence"
     )
-    normalized_actions, band_cutoffs = generate.load_actions(str(source_path), 50)
-    if band_cutoffs != [0.08, 0.25]:
-        raise ValueError("normalized structural frequency cutoffs differ")
-    smoke_seeds = generate.STRUCTURAL_CONTROL_SPLIT_SEEDS["engineering_smoke"]
-    generate.validate_structural_control_design(
-        str(source_path),
-        prompts_path=str(Path(prompts_path).resolve()),
-        actions=normalized_actions,
-        seeds=smoke_seeds,
-        model_name=str(source["sampling"]["model"]),
-        resolution=1024,
-        num_inference_steps=50,
-        guidance_scale=7.5,
-        negative_prompt=generate.DEFAULT_NEG,
-        power_calibrate=0,
-        stage2_enabled=False,
-        split_role="engineering_smoke",
-    )
-    config = _load_json(run_path / "config.json", label="run config")
-    if config.get("split_role") != "engineering_smoke":
-        raise ValueError("run config is not the engineering smoke profile")
-    if config.get("seeds") != smoke_seeds:
-        raise ValueError("engineering smoke seeds differ")
-    evidence_scope = {
-        key: config.get(key)
-        for key in generate.STRUCTURAL_CONTROL_EVIDENCE_SCOPE_KEYS
-    }
-    if evidence_scope != generate.STRUCTURAL_CONTROL_SMOKE_EVIDENCE_SCOPE:
-        raise ValueError("engineering smoke evidence scope differs")
-    _validate_config_contract(
-        config, source, normalized_actions, source_path, registration_path
-    )
-    generation_commit = _validate_generation_commit(
-        config, source, source_path, registration_path
-    )
-    analysis_implementation = _validate_analysis_implementation(
-        source, registration, generation_commit
-    )
-    _validate_environment_contract(config, source, generation_commit)
-    contract_hash = validate_run_contract(config)
-
-    prompts = pd.read_csv(prompts_path)
-    prompt_indices = [int(value) for value in prompts["index"]]
-    prompt_text = {
-        int(row["index"]): str(row["TEXT"]) for _, row in prompts.iterrows()
-    }
-    manifest = _load_jsonl(run_path / "manifest.jsonl", label="manifest")
-    action_ids = [str(action["id"]) for action in normalized_actions]
-    validate_manifest_sidecars(run_path, manifest)
-    validate_design_rows(
-        manifest,
-        expected_action_ids=action_ids,
-        expected_seeds=smoke_seeds,
-        expected_prompt_indices=prompt_indices,
-    )
-    validate_execution_ranks(manifest, action_ids)
-    expected_stems = {str(record["id"]) for record in manifest}
-    image_dir = run_path / "images"
-    observed_pngs = {path.stem for path in image_dir.glob("*.png")}
-    observed_sidecars = {path.stem for path in image_dir.glob("*.json")}
-    if observed_pngs != expected_stems or observed_sidecars != expected_stems:
-        raise ValueError("engineering smoke image/sidecar file set differs from its grid")
-    actions = {str(action["id"]): dict(action) for action in normalized_actions}
-    for record in manifest:
-        action_id = str(record["action_id"])
-        prompt_index = int(record["prompt_index"])
-        expected_task = {
-            "id": f"p{prompt_index}_seed{int(record['seed'])}_a{action_id}",
-            "prompt_index": prompt_index,
-            "prompt": prompt_text[prompt_index],
-            "seed": int(record["seed"]),
-            "action_id": action_id,
-            "action_type": actions[action_id]["type"],
-            "action": actions[action_id],
-        }
-        validate_sidecar(
-            record,
-            run_path,
-            expected_task=expected_task,
-            expected_contract_sha256=contract_hash,
-        )
-        generate.validate_structural_control_sidecar(
-            dict(record), config, expected_task=expected_task
-        )
-        image_path = (run_path / str(record["image_path"])).resolve()
-        with Image.open(image_path) as image:
-            if image.size != (1024, 1024) or image.mode != "RGB":
-                raise ValueError(f"{record['id']}: smoke PNG is not 1024px RGB")
-            image.verify()
-    structural_report = audit_structural_records(
-        config,
-        source,
-        manifest,
-        normalized_actions,
-        expected_tasks=88,
-    )
-    duplicate_pairs = audit_action_png_pair_counts(
-        manifest, action_ids, expected_blocks=11
-    )
-    if duplicate_pairs:
-        raise ValueError("engineering smoke requires all eight PNGs to differ per block")
-    final_hashes = {
-        label: base_audit.sha256_file(path) for label, path in input_paths.items()
-    }
-    if final_hashes != initial_hashes:
-        raise ValueError("engineering smoke inputs changed during verification")
-    return {
-        **structural_report,
-        "passed": True,
-        "audit_schema": "scheduler_native_structural_control_smoke_audit_v1",
-        "split_role": "engineering_smoke",
-        "records": 88,
-        "prompts": 11,
-        "seeds": smoke_seeds,
-        "actions": action_ids,
-        "blocks": 11,
-        "generation_commit": generation_commit,
-        **evidence_scope,
-        "quality_scoring_performed": False,
-        "all_actions_distinct_within_every_block": True,
-        "analysis_implementation": analysis_implementation,
-        "analysis_implementation_sha256": json_sha256(analysis_implementation),
-        "warnings": [],
-        "provenance": {
-            **final_hashes,
-            "audit_script_sha256": base_audit.sha256_file(__file__),
-            "input_snapshot_stable": True,
-        },
-    }
 
 
 def audit_run(
@@ -1059,11 +1497,18 @@ def audit_run(
     source_actions_path: str | os.PathLike[str],
     *,
     registration_actions_path: str | os.PathLike[str] = DEFAULT_REGISTRATION,
+    analysis_amendment_path: str | os.PathLike[str],
+    pre_score_seal_path: str | os.PathLike[str],
 ) -> dict:
     """Run the generic S7 audit and all structural-control-specific checks."""
-    run_path = Path(run_dir)
+    run_path = Path(run_dir).resolve()
     source_path = Path(source_actions_path).resolve()
     registration_path = Path(registration_actions_path).resolve()
+    supplied_seal_path = Path(pre_score_seal_path)
+    if supplied_seal_path.is_symlink() or supplied_seal_path.resolve() != (
+        run_path / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+    ):
+        raise ValueError("formal audit requires the canonical pre-score seal path")
     input_paths = {
         "config_sha256": run_path / "config.json",
         "manifest_sha256": run_path / "manifest.jsonl",
@@ -1071,6 +1516,8 @@ def audit_run(
         "prompts_sha256": Path(prompts_path).resolve(),
         "source_actions_sha256": source_path,
         "source_template_sha256": registration_path,
+        "analysis_amendment_sha256": Path(analysis_amendment_path).resolve(),
+        "pre_score_seal_sha256": supplied_seal_path.resolve(),
     }
     for label, path in input_paths.items():
         if not path.is_file():
@@ -1109,8 +1556,19 @@ def audit_run(
     generation_commit = _validate_generation_commit(
         config, source, source_path, registration_path
     )
+    amendment = validate_analysis_amendment(
+        analysis_amendment_path, base_commit=generation_commit
+    )
+    validate_pre_score_seal(
+        pre_score_seal_path,
+        analysis_amendment_path=analysis_amendment_path,
+        base_commit=generation_commit,
+    )
     analysis_implementation = _validate_analysis_implementation(
-        source, registration, generation_commit
+        source,
+        registration,
+        generation_commit,
+        replacements=amendment["replacements"],
     )
     _validate_environment_contract(config, source, generation_commit)
     base_report = base_audit.audit_run(
@@ -1133,7 +1591,7 @@ def audit_run(
     structural_report = audit_structural_records(
         config, source, manifest, normalized_actions
     )
-    duplicate_pair_counts = audit_action_png_pair_counts(
+    validate_action_png_collapse(
         manifest,
         [str(action["id"]) for action in normalized_actions],
         expected_blocks=99,
@@ -1144,10 +1602,19 @@ def audit_run(
     if final_hashes != initial_hashes:
         raise ValueError("structural audit inputs changed during verification")
     report = dict(base_report)
+    for outcome_field in (
+        "all_action_png_hashes_distinct_within_block",
+        "allowed_identity_pairs",
+        "observed_identity_pairs",
+        "registered_identity_pair",
+        "identity_pair_png_hashes_equal",
+    ):
+        report.pop(outcome_field, None)
     report.update(structural_report)
     report.update(
         {
-            "audit_schema": "scheduler_native_structural_control_audit_v1",
+            "audit_schema": "scheduler_native_structural_control_audit_v2",
+            "auditor_scope": STRUCTURAL_CONTROL_AUDITOR_SCOPE,
             "generation_commit": generation_commit,
             "executable_actions_sha256": base_audit.sha256_file(source_path),
             "registration_sha256": base_audit.sha256_file(registration_path),
@@ -1155,12 +1622,18 @@ def audit_run(
             "analysis_implementation_sha256": json_sha256(
                 analysis_implementation
             ),
+            "analysis_amendment_sha256": base_audit.sha256_file(
+                analysis_amendment_path
+            ),
+            "pre_score_seal_sha256": base_audit.sha256_file(pre_score_seal_path),
             "duplicate_action_pngs_are_failure": False,
             "isolated_duplicate_action_pngs_are_failure": False,
             "full_action_collapse_is_failure": True,
-            "duplicate_action_png_policy": "reject_action_pair_equal_in_all_99_blocks",
-            "duplicate_action_png_pair_counts": duplicate_pair_counts,
-            "fully_collapsed_action_pairs": [],
+            "duplicate_action_png_policy": (
+                "reject_any_action_pair_equal_in_all_registered_blocks"
+            ),
+            "full_action_collapse_check_passed": True,
+            "outcome_details_disclosed": False,
             "image_decode_verified": True,
             "scorer_provenance_schema": str(source["scoring"]["required_schema"]),
             "scorer_provenance_sha256": scorer_provenance_sha256,
@@ -1178,25 +1651,71 @@ def audit_run(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dir", required=True)
-    parser.add_argument("--prompts", required=True)
+    parser.add_argument("--prompts")
     parser.add_argument("--actions", required=True)
     parser.add_argument("--registration", default=str(DEFAULT_REGISTRATION))
     parser.add_argument("--output")
     parser.add_argument("--engineering_smoke", action="store_true")
+    parser.add_argument(
+        "--create-pre-score-seal",
+        "--create-seal",
+        dest="create_pre_score_seal",
+        action="store_true",
+    )
+    parser.add_argument("--analysis-amendment")
+    parser.add_argument("--pre-score-seal")
     args = parser.parse_args()
-    default_name = "engineering_smoke_audit.json" if args.engineering_smoke else "run_audit.json"
+    if args.engineering_smoke:
+        parser.error(
+            "analysis-amended structural-control auditor v2 is formal-only; "
+            "engineering smoke remains frozen pre-amendment evidence"
+        )
+    if args.create_pre_score_seal:
+        if args.output:
+            parser.error("seal creation does not accept an audit output path")
+        if args.analysis_amendment is None:
+            parser.error("--analysis-amendment is required for seal creation")
+        seal = create_pre_score_seal(
+            args.run_dir,
+            args.actions,
+            args.registration,
+            args.analysis_amendment,
+            output_path=args.pre_score_seal,
+        )
+        print(
+            json.dumps(
+                {
+                    "created": True,
+                    "schema": seal["schema"],
+                    "output": str(
+                        Path(args.run_dir).resolve()
+                        / STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    if args.prompts is None:
+        parser.error("--prompts is required for audit")
+    if args.analysis_amendment is None or args.pre_score_seal is None:
+        parser.error(
+            "--analysis-amendment and --pre-score-seal are required for the formal audit"
+        )
+    default_name = "run_audit.json"
     output_path = Path(args.output).resolve() if args.output else (
         Path(args.run_dir).resolve() / default_name
     )
     with audit_lock(args.run_dir):
         if output_path.exists():
             raise ValueError(f"structural audit is one-shot; output exists: {output_path}")
-        audit_function = audit_engineering_smoke if args.engineering_smoke else audit_run
-        report = audit_function(
+        report = audit_run(
             args.run_dir,
             args.prompts,
             args.actions,
             registration_actions_path=args.registration,
+            analysis_amendment_path=args.analysis_amendment,
+            pre_score_seal_path=args.pre_score_seal,
         )
         payload = (
             json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"

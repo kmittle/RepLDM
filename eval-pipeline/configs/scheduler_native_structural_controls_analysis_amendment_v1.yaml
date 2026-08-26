@@ -1,0 +1,29 @@
+schema: structural_control_analysis_amendment_v1
+status: blocked_pending_independent_review
+reviewer: null
+reviewed_commit: null
+base_commit: e0b323fab88c0cc9e24256d7bf7d466a049d2675
+result_access_before_authorization: false
+scoring_started_before_authorization: false
+
+unchanged_invariants:
+  generation: true
+  scorer_recipe: true
+  metrics: true
+  contrasts: true
+  multiplicity: true
+  decision_rules: true
+
+authorizations:
+  method_selection: false
+  validation: false
+  publication_claims: false
+  rl: false
+
+replacements:
+  eval-pipeline/audit_structural_control_run.py:
+    base_sha256: 8a7983f4953e9e668fe773c6011a35b07f4c9264d6abde43535f413fba1426ae
+    amended_sha256: cac46c287dd4fe55ea357c2e20a127b2a4667824dc57d0fffff6e345bc3f2426
+  eval-pipeline/evaluate_structural_control_run.py:
+    base_sha256: ac8d18fc07cdaa14c702159e67ce74683296764c75be8cb34b7c83678e342c50
+    amended_sha256: a68d9d612bd5d8a0881f0079f6bdadb2fb949fc4788ca76ca83e6700cdb6e7b1

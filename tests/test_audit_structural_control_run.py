@@ -1,4 +1,6 @@
 import copy
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -10,7 +12,6 @@ import unittest
 from unittest import mock
 
 import yaml
-from PIL import Image
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -33,7 +34,11 @@ generate = sys.modules["generate"]
 
 
 class StructuralControlAuditTest(unittest.TestCase):
+    REVIEWED_COMMIT = "1" * 40
+    AUTHORIZATION_COMMIT = "2" * 40
+
     def setUp(self):
+        self.real_git_bytes = audit._git_bytes
         self.timesteps = [float(value) for value in range(50, 0, -1)]
         self.sigmas = [float(value) / 10.0 for value in range(51, 0, -1)]
         schedule_hash = audit.json_sha256(
@@ -366,6 +371,124 @@ class StructuralControlAuditTest(unittest.TestCase):
             )
         return record
 
+    def write_analysis_amendment(self, root):
+        path = pathlib.Path(root) / "analysis_amendment.yaml"
+        base_files = audit._base_analysis_files(
+            audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT
+        )
+        replacements = {}
+        for relative_path in audit.STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS:
+            replacements[relative_path] = {
+                "base_sha256": base_files[relative_path],
+                "amended_sha256": hashlib.sha256(
+                    (ROOT / relative_path).read_bytes()
+                ).hexdigest(),
+            }
+        payload = {
+            "schema": audit.STRUCTURAL_CONTROL_ANALYSIS_AMENDMENT_SCHEMA,
+            "status": audit.STRUCTURAL_CONTROL_AMENDMENT_STATUS,
+            "reviewer": "independent-analysis-reviewer",
+            "reviewed_commit": self.REVIEWED_COMMIT,
+            "base_commit": audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+            "result_access_before_authorization": False,
+            "scoring_started_before_authorization": False,
+            "unchanged_invariants": {
+                key: True for key in audit.STRUCTURAL_CONTROL_UNCHANGED_INVARIANTS
+            },
+            "authorizations": {
+                key: False for key in audit.STRUCTURAL_CONTROL_UNAUTHORIZED_USES
+            },
+            "replacements": replacements,
+        }
+        path.write_text(yaml.safe_dump(payload, sort_keys=True), encoding="utf-8")
+        return path, payload
+
+    @contextmanager
+    def authorized_git_state(
+        self,
+        amendment_path,
+        *,
+        head_commit=None,
+        committed_amendment_bytes=None,
+        reviewed_overrides=None,
+        head_overrides=None,
+        ancestry_returncode=0,
+    ):
+        amendment_path = pathlib.Path(amendment_path).resolve()
+        amendment_relative = amendment_path.relative_to(ROOT.resolve()).as_posix()
+        if committed_amendment_bytes is None:
+            committed_amendment_bytes = amendment_path.read_bytes()
+        reviewed_overrides = dict(reviewed_overrides or {})
+        head_overrides = dict(head_overrides or {})
+        head_commit = head_commit or self.AUTHORIZATION_COMMIT
+        candidate = yaml.safe_load(amendment_path.read_bytes())
+        candidate.update(
+            {
+                "status": audit.STRUCTURAL_CONTROL_AMENDMENT_CANDIDATE_STATUS,
+                "reviewer": None,
+                "reviewed_commit": None,
+            }
+        )
+        candidate_bytes = yaml.safe_dump(candidate, sort_keys=True).encode("utf-8")
+
+        def git_bytes(commit, relative_path):
+            if commit == audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT:
+                return self.real_git_bytes(commit, relative_path)
+            if commit == self.REVIEWED_COMMIT:
+                if relative_path == amendment_relative:
+                    result = reviewed_overrides.get(relative_path, candidate_bytes)
+                else:
+                    result = reviewed_overrides.get(
+                        relative_path, (ROOT / relative_path).read_bytes()
+                    )
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+            if commit == head_commit:
+                if relative_path == amendment_relative:
+                    return committed_amendment_bytes
+                return head_overrides.get(
+                    relative_path, (ROOT / relative_path).read_bytes()
+                )
+            raise AssertionError(f"unexpected git blob request: {commit}:{relative_path}")
+
+        def require_ancestor(ancestor, descendant, *, label, strict):
+            if strict and ancestor == descendant:
+                raise ValueError(
+                    f"{label} must use a strict two-commit authorization flow"
+                )
+            if ancestry_returncode != 0:
+                raise ValueError(f"{label} ancestry verification failed")
+
+        with mock.patch.object(
+            audit, "_current_head_commit", return_value=head_commit
+        ), mock.patch.object(
+            audit, "_git_bytes", side_effect=git_bytes
+        ), mock.patch.object(
+            audit, "_require_git_ancestor", side_effect=require_ancestor
+        ):
+            yield
+
+    def write_pre_score_inputs(self, root):
+        root = pathlib.Path(root)
+        run_dir = root / "run"
+        run_dir.mkdir()
+        (run_dir / "config.json").write_text(
+            json.dumps(
+                {"git_commit": audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT}
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "manifest.jsonl").write_text(
+            "".join(
+                json.dumps({"id": f"fixture-{index}"}) + "\n"
+                for index in range(audit.STRUCTURAL_CONTROL_EXPECTED_TASKS)
+            ),
+            encoding="utf-8",
+        )
+        amendment_path, _ = self.write_analysis_amendment(root)
+        return run_dir, amendment_path
+
     def test_complete_structural_record_contract_passes(self):
         report = audit.audit_structural_records(
             self.config, self.source, self.records, self.actions
@@ -374,7 +497,7 @@ class StructuralControlAuditTest(unittest.TestCase):
         self.assertEqual(report["matched_unet_calls"], "50x1")
         self.assertFalse(report["quality_results_inspected"])
 
-    def test_duplicate_png_policy_reports_isolated_and_rejects_full_collapse(self):
+    def test_png_collapse_validator_is_result_blind_and_relabel_invariant(self):
         records = []
         for prompt_index in (0, 1):
             for action_id, image_hash in (
@@ -390,25 +513,33 @@ class StructuralControlAuditTest(unittest.TestCase):
                         "image_sha256": image_hash,
                     }
                 )
-        report = audit.audit_action_png_pair_counts(
+        passed = audit.validate_action_png_collapse(
             records, ["left", "right"], expected_blocks=2
         )
-        self.assertEqual(
-            report,
-            [
-                {
-                    "actions": ["left", "right"],
-                    "matching_blocks": 1,
-                    "total_blocks": 2,
-                }
-            ],
+        self.assertIs(passed, True)
+
+        relabeled = copy.deepcopy(records)
+        labels = {"left": "method_z", "right": "method_a"}
+        for record in relabeled:
+            record["action_id"] = labels[record["action_id"]]
+        self.assertIs(
+            audit.validate_action_png_collapse(
+                relabeled, ["method_a", "method_z"], expected_blocks=2
+            ),
+            True,
         )
 
         records[-1]["image_sha256"] = "a" * 64
-        with self.assertRaisesRegex(ValueError, "identical PNGs in all 2 blocks"):
-            audit.audit_action_png_pair_counts(
+        with self.assertRaises(ValueError) as collapse:
+            audit.validate_action_png_collapse(
                 records, ["left", "right"], expected_blocks=2
             )
+        self.assertEqual(
+            str(collapse.exception), "structural outcome collapse validation failed"
+        )
+        self.assertNotIn("left", str(collapse.exception))
+        self.assertNotIn("right", str(collapse.exception))
+        self.assertNotIn("2", str(collapse.exception))
 
         action_ids = ["left", "right"]
         for record in records:
@@ -423,128 +554,544 @@ class StructuralControlAuditTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "action-order-v1"):
             audit.validate_execution_ranks(records, action_ids)
 
-    def test_engineering_smoke_audits_scope_and_distinct_artifact_grid(self):
-        seed = generate.STRUCTURAL_CONTROL_SPLIT_SEEDS["engineering_smoke"][0]
-        evidence_scope = generate.STRUCTURAL_CONTROL_SMOKE_EVIDENCE_SCOPE
+    def test_analysis_amendment_is_strict_and_tamper_evident(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            amendment_path, payload = self.write_analysis_amendment(temporary)
+            with self.authorized_git_state(amendment_path):
+                validated = audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+            self.assertEqual(validated, payload)
+            source = yaml.safe_load(
+                (ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH).read_text(
+                    encoding="utf-8"
+                )
+            )
+            registration = yaml.safe_load(
+                (
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE
+                ).read_text(encoding="utf-8")
+            )
+            effective = audit._validate_analysis_implementation(
+                source,
+                registration,
+                audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                replacements=validated["replacements"],
+            )
+            for relative_path in audit.STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS:
+                self.assertEqual(
+                    effective["files"][relative_path],
+                    payload["replacements"][relative_path]["amended_sha256"],
+                )
+
+            tampered = copy.deepcopy(payload)
+            replacement_path = next(iter(tampered["replacements"]))
+            tampered["replacements"][replacement_path]["amended_sha256"] = "f" * 64
+            amendment_path.write_text(
+                yaml.safe_dump(tampered, sort_keys=True), encoding="utf-8"
+            )
+            with self.authorized_git_state(amendment_path), self.assertRaisesRegex(
+                ValueError, "reviewed analysis replacement blob differs"
+            ):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            tampered = copy.deepcopy(payload)
+            tampered["result_access_before_authorization"] = True
+            amendment_path.write_text(
+                yaml.safe_dump(tampered, sort_keys=True), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "not result-blind"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+            with self.assertRaisesRegex(ValueError, "not readable YAML"):
+                audit.validate_analysis_amendment(
+                    pathlib.Path(temporary) / "absent.yaml",
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+    def test_analysis_authorization_requires_two_commits_and_frozen_scope(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            amendment_path, payload = self.write_analysis_amendment(temporary)
+
+            scalar_cases = (
+                ("status", "blocked_candidate", "authorized_pre_score"),
+                ("reviewer", "", "non-empty identity"),
+                ("reviewed_commit", "abc", "full lowercase 40-hex"),
+                ("result_access_before_authorization", True, "not result-blind"),
+                (
+                    "scoring_started_before_authorization",
+                    True,
+                    "authorized before scoring",
+                ),
+            )
+            for field, value, message in scalar_cases:
+                with self.subTest(field=field):
+                    changed = copy.deepcopy(payload)
+                    changed[field] = value
+                    amendment_path.write_text(
+                        yaml.safe_dump(changed, sort_keys=True), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        audit.validate_analysis_amendment(
+                            amendment_path,
+                            base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                        )
+
+            for invariant in audit.STRUCTURAL_CONTROL_UNCHANGED_INVARIANTS:
+                with self.subTest(invariant=invariant):
+                    changed = copy.deepcopy(payload)
+                    changed["unchanged_invariants"][invariant] = False
+                    amendment_path.write_text(
+                        yaml.safe_dump(changed, sort_keys=True), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, "frozen study invariant"):
+                        audit.validate_analysis_amendment(
+                            amendment_path,
+                            base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                        )
+
+            for authorization in audit.STRUCTURAL_CONTROL_UNAUTHORIZED_USES:
+                with self.subTest(authorization=authorization):
+                    changed = copy.deepcopy(payload)
+                    changed["authorizations"][authorization] = True
+                    amendment_path.write_text(
+                        yaml.safe_dump(changed, sort_keys=True), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(ValueError, "unauthorized downstream use"):
+                        audit.validate_analysis_amendment(
+                            amendment_path,
+                            base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                        )
+
+            amendment_path.write_text(
+                yaml.safe_dump(payload, sort_keys=True), encoding="utf-8"
+            )
+            with self.authorized_git_state(
+                amendment_path, head_commit=self.REVIEWED_COMMIT
+            ), self.assertRaisesRegex(ValueError, "strict two-commit"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            with self.authorized_git_state(
+                amendment_path, ancestry_returncode=1
+            ), self.assertRaisesRegex(ValueError, "ancestry verification failed"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            amendment_relative = amendment_path.resolve().relative_to(
+                ROOT.resolve()
+            ).as_posix()
+            with self.authorized_git_state(
+                amendment_path,
+                reviewed_overrides={
+                    amendment_relative: ValueError("candidate does not exist")
+                },
+            ), self.assertRaisesRegex(ValueError, "blocked amendment candidate is missing"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            with self.authorized_git_state(
+                amendment_path,
+                reviewed_overrides={
+                    amendment_relative: amendment_path.read_bytes()
+                },
+            ), self.assertRaisesRegex(ValueError, "not blocked and unauthored"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            drifted_candidate = copy.deepcopy(payload)
+            drifted_candidate.update(
+                {
+                    "status": audit.STRUCTURAL_CONTROL_AMENDMENT_CANDIDATE_STATUS,
+                    "reviewer": None,
+                    "reviewed_commit": None,
+                }
+            )
+            drifted_candidate["unchanged_invariants"]["metrics"] = False
+            with self.authorized_git_state(
+                amendment_path,
+                reviewed_overrides={
+                    amendment_relative: yaml.safe_dump(
+                        drifted_candidate, sort_keys=True
+                    ).encode("utf-8")
+                },
+            ), self.assertRaisesRegex(ValueError, "candidate content differs"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            replacement_path = next(iter(audit.STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS))
+            with self.authorized_git_state(
+                amendment_path,
+                reviewed_overrides={replacement_path: b"unreviewed replacement"},
+            ), self.assertRaisesRegex(ValueError, "reviewed analysis replacement blob"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            with self.authorized_git_state(
+                amendment_path, committed_amendment_bytes=b"stale authorization"
+            ), self.assertRaisesRegex(ValueError, "amendment bytes differ from current HEAD"):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+            unchanged_path = next(
+                path
+                for path in generate.STRUCTURAL_CONTROL_ANALYSIS_PATHS
+                if path not in audit.STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS
+            )
+            with self.authorized_git_state(
+                amendment_path,
+                head_overrides={unchanged_path: b"uncommitted effective analysis"},
+            ), self.assertRaisesRegex(
+                ValueError, "effective analysis implementation differs from current HEAD"
+            ):
+                audit.validate_analysis_amendment(
+                    amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+    def test_git_ancestry_check_requires_a_strict_review_predecessor(self):
+        with mock.patch.object(
+            audit.subprocess, "run", return_value=mock.Mock(returncode=0)
+        ) as run:
+            audit._require_git_ancestor(
+                self.REVIEWED_COMMIT,
+                self.AUTHORIZATION_COMMIT,
+                label="fixture review",
+                strict=True,
+            )
+            run.assert_called_once()
+        with mock.patch.object(audit.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "strict two-commit"):
+                audit._require_git_ancestor(
+                    self.REVIEWED_COMMIT,
+                    self.REVIEWED_COMMIT,
+                    label="fixture review",
+                    strict=True,
+                )
+            run.assert_not_called()
+        with mock.patch.object(
+            audit.subprocess, "run", return_value=mock.Mock(returncode=1)
+        ), self.assertRaisesRegex(ValueError, "ancestry verification failed"):
+            audit._require_git_ancestor(
+                self.REVIEWED_COMMIT,
+                self.AUTHORIZATION_COMMIT,
+                label="fixture review",
+                strict=True,
+            )
+
+    @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
+    def test_pre_score_seal_is_one_shot_and_hash_bound(self, _validate_amendment):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+            with mock.patch.object(
+                audit, "_fsync_directory", wraps=audit._fsync_directory
+            ) as fsync_directory:
+                seal = audit.create_pre_score_seal(
+                    run_dir,
+                    ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                    amendment_path,
+                )
+            fsync_directory.assert_called_once_with(run_dir.resolve())
+            seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+            self.assertEqual(
+                seal["schema"], audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_SCHEMA
+            )
+            self.assertTrue(seal["outcome_artifacts_absent_at_creation"])
+            self.assertEqual(
+                set(seal["bindings"]),
+                {"config", "manifest", "actions", "registration", "analysis_amendment"},
+            )
+            audit.validate_pre_score_seal(
+                seal_path,
+                analysis_amendment_path=amendment_path,
+                base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+            )
+            with self.assertRaisesRegex(ValueError, "one-shot"):
+                audit.create_pre_score_seal(
+                    run_dir,
+                    ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                    amendment_path,
+                )
+
+            with (run_dir / "manifest.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"id": "tampered"}) + "\n")
+            with self.assertRaisesRegex(ValueError, "manifest bytes differ"):
+                audit.validate_pre_score_seal(
+                    seal_path,
+                    analysis_amendment_path=amendment_path,
+                    base_commit=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                )
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+            seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+            seal_path.symlink_to(run_dir / "missing-seal-target.json")
+            with self.assertRaisesRegex(ValueError, "one-shot"):
+                audit.create_pre_score_seal(
+                    run_dir,
+                    ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                    ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                    amendment_path,
+                )
+
+    @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
+    def test_pre_score_seal_rejects_outcomes_and_active_generation_lock(
+        self, _validate_amendment
+    ):
+        forbidden_names = (
+            "scores.jsonl",
+            "run_audit.json",
+            audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE,
+            *audit.STRUCTURAL_CONTROL_LEGACY_EVALUATION_OUTPUTS,
+            f".{audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE}.staging",
+        )
+        for forbidden_name in forbidden_names:
+            with self.subTest(forbidden_name=forbidden_name), tempfile.TemporaryDirectory(
+                dir=ROOT
+            ) as temporary:
+                run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+                forbidden_path = run_dir / forbidden_name
+                if forbidden_name == audit.STRUCTURAL_CONTROL_EVALUATION_BUNDLE:
+                    forbidden_path.mkdir()
+                else:
+                    forbidden_path.write_text("fixture", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "artifacts absent"):
+                    audit.create_pre_score_seal(
+                        run_dir,
+                        ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                        amendment_path,
+                    )
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+            with (run_dir / ".generate.lock").open("a+") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(RuntimeError, "generation or scoring"):
+                    audit.create_pre_score_seal(
+                        run_dir,
+                        ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH,
+                        ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE,
+                        amendment_path,
+                    )
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    @mock.patch.object(audit, "validate_analysis_amendment", return_value={})
+    def test_create_seal_cli_publishes_only_the_canonical_seal(
+        self, _validate_amendment
+    ):
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            run_dir, amendment_path = self.write_pre_score_inputs(temporary)
+            argv = [
+                "audit_structural_control_run.py",
+                "--run_dir",
+                str(run_dir),
+                "--actions",
+                str(ROOT / audit.STRUCTURAL_CONTROL_ACTIONS_PATH),
+                "--registration",
+                str(ROOT / generate.STRUCTURAL_CONTROL_AUTH_SOURCE_TEMPLATE),
+                "--analysis-amendment",
+                str(amendment_path),
+                "--create-seal",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print"):
+                audit.main()
+            self.assertTrue(
+                (run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME).is_file()
+            )
+            self.assertFalse((run_dir / "scores.jsonl").exists())
+            self.assertFalse((run_dir / "run_audit.json").exists())
+
+    def test_v2_audit_removes_all_outcome_detail_fields(self):
+        action_ids = ["left", "right"]
+        normalized_actions = [
+            {"id": action_id, "type": "none", "cfg_scale": 7.5}
+            for action_id in action_ids
+        ]
+        manifest = []
+        for prompt_index in range(99):
+            for action_id in action_ids:
+                manifest.append(
+                    {
+                        "id": f"p{prompt_index}_seed7_a{action_id}",
+                        "prompt_index": prompt_index,
+                        "seed": 7,
+                        "action_id": action_id,
+                        "image_sha256": (
+                            "a" * 64
+                            if prompt_index == 0
+                            else hashlib.sha256(
+                                f"{prompt_index}:{action_id}".encode("utf-8")
+                            ).hexdigest()
+                        ),
+                    }
+                )
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             run_dir = root / "run"
-            image_dir = run_dir / "images"
-            image_dir.mkdir(parents=True)
-            prompts_path = root / "smoke.csv"
-            prompts_path.write_text(
-                "index,TEXT,source_challenge,split\n"
-                + "".join(
-                    f'{index},"prompt {index}",challenge_{index:02d},engineering_smoke\n'
-                    for index in range(11)
+            run_dir.mkdir()
+            (run_dir / "config.json").write_text(
+                json.dumps({"git_commit": audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT}),
+                encoding="utf-8",
+            )
+            (run_dir / "manifest.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in manifest),
+                encoding="utf-8",
+            )
+            (run_dir / "scores.jsonl").write_text("{}\n", encoding="utf-8")
+            prompts_path = root / "prompts.csv"
+            prompts_path.write_text("index,TEXT\n0,fixture\n", encoding="utf-8")
+            source_path = root / "actions.yaml"
+            source_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "sampling": {"model": "fixture-model"},
+                        "scoring": {"required_schema": "fixture"},
+                    }
                 ),
                 encoding="utf-8",
             )
-            source_path = root / "actions.yaml"
-            source_path.write_text(yaml.safe_dump(self.source), encoding="utf-8")
             registration_path = root / "registration.yaml"
             registration_path.write_text(
                 yaml.safe_dump({"schema": "structural_control_registration_v1"}),
                 encoding="utf-8",
             )
-            config = copy.deepcopy(self.config)
-            config.update(
-                {
-                    "split_role": "engineering_smoke",
-                    "seeds": [seed],
-                    **evidence_scope,
+            amendment_path = root / "amendment.yaml"
+            amendment_path.write_text("schema: fixture\n", encoding="utf-8")
+            seal_path = run_dir / audit.STRUCTURAL_CONTROL_PRE_SCORE_SEAL_NAME
+            seal_path.write_text("{}\n", encoding="utf-8")
+            base_report = {
+                "passed": True,
+                "split_role": "development",
+                "all_action_png_hashes_distinct_within_block": False,
+                "allowed_identity_pairs": [["left", "right"]],
+                "observed_identity_pairs": [["left", "right"]],
+                "registered_identity_pair": ["left", "right"],
+                "identity_pair_png_hashes_equal": True,
+            }
+            amendment = {
+                "replacements": {
+                    relative_path: {"amended_sha256": "a" * 64}
+                    for relative_path in audit.STRUCTURAL_CONTROL_ANALYSIS_REPLACEMENTS
                 }
-            )
-            (run_dir / "config.json").write_text(
-                json.dumps(config), encoding="utf-8"
-            )
-
-            records = []
-            for prompt_index in range(11):
-                expected_ranks = audit.expected_execution_ranks(
-                    prompt_index, seed, [action["id"] for action in self.actions]
-                )
-                for action_index, action in enumerate(self.actions):
-                    record = copy.deepcopy(self.record(action))
-                    record_id = (
-                        f"p{prompt_index}_seed{seed}_a{action['id']}"
-                    )
-                    relative_image = f"images/{record_id}.png"
-                    image_path = run_dir / relative_image
-                    Image.new(
-                        "RGB",
-                        (1024, 1024),
-                        color=(action_index * 29, action_index * 17, action_index * 11),
-                    ).save(image_path)
-                    record.update(
-                        {
-                            "id": record_id,
-                            "prompt_index": prompt_index,
-                            "prompt": f"prompt {prompt_index}",
-                            "seed": seed,
-                            "action_id": action["id"],
-                            "action_type": action["type"],
-                            "action": action,
-                            "execution_rank": expected_ranks[action["id"]],
-                            "image_path": relative_image,
-                            "image_sha256": hashlib.sha256(
-                                image_path.read_bytes()
-                            ).hexdigest(),
-                            "run_contract_sha256": "contract",
-                            **evidence_scope,
-                        }
-                    )
-                    records.append(record)
-                    (image_dir / f"{record_id}.json").write_text(
-                        json.dumps(record), encoding="utf-8"
-                    )
-            (run_dir / "manifest.jsonl").write_text(
-                "".join(json.dumps(record) + "\n" for record in records),
-                encoding="utf-8",
-            )
-
+            }
             patches = (
-                mock.patch.object(
-                    generate, "validate_structural_control_authorization"
-                ),
+                mock.patch.object(generate, "validate_structural_control_authorization"),
                 mock.patch.object(
                     generate,
                     "load_actions",
-                    return_value=(self.actions, [0.08, 0.25]),
+                    return_value=(normalized_actions, [0.08, 0.25]),
                 ),
                 mock.patch.object(generate, "validate_structural_control_design"),
                 mock.patch.object(audit, "_validate_config_contract"),
                 mock.patch.object(
-                    audit, "_validate_generation_commit", return_value="a" * 40
+                    audit,
+                    "_validate_generation_commit",
+                    return_value=audit.STRUCTURAL_CONTROL_AMENDMENT_BASE_COMMIT,
+                ),
+                mock.patch.object(
+                    audit, "validate_analysis_amendment", return_value=amendment
+                ),
+                mock.patch.object(audit, "validate_pre_score_seal"),
+                mock.patch.object(
+                    audit, "_validate_analysis_implementation", return_value={}
+                ),
+                mock.patch.object(audit, "_validate_environment_contract"),
+                mock.patch.object(audit.base_audit, "audit_run", return_value=base_report),
+                mock.patch.object(audit, "validate_manifest_sidecars"),
+                mock.patch.object(audit, "validate_execution_ranks"),
+                mock.patch.object(
+                    audit,
+                    "_validate_registered_artifact_bindings",
+                    return_value="a" * 64,
                 ),
                 mock.patch.object(
                     audit,
-                    "_validate_analysis_implementation",
-                    return_value={"schema": "fixture", "files": {}},
+                    "audit_structural_records",
+                    return_value={"structural_control_contract_passed": True},
                 ),
-                mock.patch.object(audit, "_validate_environment_contract"),
-                mock.patch.object(audit, "validate_run_contract", return_value="contract"),
-                mock.patch.object(audit, "validate_sidecar"),
             )
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[
                 5
-            ], patches[6], patches[7], patches[8]:
-                report = audit.audit_engineering_smoke(
+            ], patches[6], patches[7], patches[8], patches[9], patches[10], patches[
+                11
+            ], patches[12], patches[13]:
+                report = audit.audit_run(
                     run_dir,
                     prompts_path,
                     source_path,
                     registration_actions_path=registration_path,
+                    analysis_amendment_path=amendment_path,
+                    pre_score_seal_path=seal_path,
                 )
-            self.assertTrue(report["passed"])
-            self.assertEqual(report["records"], 88)
-            self.assertTrue(report["all_actions_distinct_within_every_block"])
             self.assertEqual(
-                {key: report[key] for key in evidence_scope}, evidence_scope
+                report["audit_schema"],
+                "scheduler_native_structural_control_audit_v2",
             )
-            first_sidecar = image_dir / f"{records[0]['id']}.json"
-            first_sidecar.write_text("{}", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "differs from manifest row"):
-                audit.validate_manifest_sidecars(run_dir, records)
+            self.assertEqual(
+                report["auditor_scope"], audit.STRUCTURAL_CONTROL_AUDITOR_SCOPE
+            )
+            self.assertFalse(report["outcome_details_disclosed"])
+            self.assertTrue(report["full_action_collapse_check_passed"])
+            for leaked_field in (
+                "duplicate_action_png_pair_counts",
+                "fully_collapsed_action_pairs",
+                "allowed_identity_pairs",
+                "observed_identity_pairs",
+                "registered_identity_pair",
+                "identity_pair_png_hashes_equal",
+                "all_action_png_hashes_distinct_within_block",
+            ):
+                self.assertNotIn(leaked_field, report)
+
+    def test_v2_auditor_rejects_engineering_smoke_before_reading_inputs(self):
+        with mock.patch.object(
+            audit, "_load_json", side_effect=AssertionError("must not read inputs")
+        ):
+            with self.assertRaisesRegex(ValueError, "v2 is formal-only"):
+                audit.audit_engineering_smoke(
+                    "missing-run",
+                    "missing-prompts.csv",
+                    "missing-actions.yaml",
+                )
+
+        argv = [
+            "audit_structural_control_run.py",
+            "--run_dir",
+            "missing-run",
+            "--prompts",
+            "missing-prompts.csv",
+            "--actions",
+            "missing-actions.yaml",
+            "--engineering_smoke",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            audit, "audit_lock", side_effect=AssertionError("must not lock run")
+        ), self.assertRaises(SystemExit) as exit_context:
+            audit.main()
+        self.assertEqual(exit_context.exception.code, 2)
 
     def test_resume_and_audit_reject_missing_worker_or_nfe_provenance(self):
         for field in ("worker_determinism_provenance", "model_load_provenance"):
