@@ -630,6 +630,68 @@ class EulerCleanEndpoint:
     prediction_type: str
 
 
+@dataclass(frozen=True)
+class EulerMappedIntervention:
+    """Measured intervention after Euler output casting and ``step`` mapping."""
+
+    native_prev_sample: Tensor
+    intervention: Tensor
+    nominal_update: Tensor
+    intervention_norm: Tensor
+    nominal_update_norm: Tensor
+    ratio: Tensor
+
+
+def measure_euler_mapped_intervention(
+    sample: Tensor,
+    native_prev_sample: Tensor,
+    guided_prev_sample: Tensor,
+) -> EulerMappedIntervention:
+    """Measure a guided Euler step against its no-extra-call native baseline.
+
+    The pinned Euler scheduler computes in float32 and casts ``prev_sample`` to
+    its model-output dtype.  Reproducing that final cast yields the exact native
+    comparator without invoking ``scheduler.step`` a second time.
+    """
+
+    for value, name in (
+        (sample, "sample"),
+        (native_prev_sample, "native_prev_sample"),
+        (guided_prev_sample, "guided_prev_sample"),
+    ):
+        _require_nchw(value, name)
+    if sample.shape != native_prev_sample.shape or sample.shape != guided_prev_sample.shape:
+        raise ValueError("Euler mapped-intervention tensors must have identical shapes")
+    if sample.device != native_prev_sample.device or sample.device != guided_prev_sample.device:
+        raise ValueError("Euler mapped-intervention tensors must share one device")
+
+    work = sample.float()
+    mapped_nominal_update = native_prev_sample.float() - work
+    intervention = guided_prev_sample.float() - native_prev_sample.float()
+    nominal_norm = torch.linalg.vector_norm(
+        mapped_nominal_update.flatten(1), dim=1
+    )
+    intervention_norm = torch.linalg.vector_norm(intervention.flatten(1), dim=1)
+    if not (
+        torch.isfinite(nominal_norm).all()
+        and torch.isfinite(intervention_norm).all()
+    ):
+        raise RuntimeError("Euler mapped-intervention norms are non-finite")
+    if torch.any(nominal_norm <= 1e-12):
+        raise RuntimeError("Euler mapped native update norm is zero")
+    ratio = intervention_norm / (nominal_norm + 1e-12)
+    if not torch.isfinite(ratio).all():
+        raise RuntimeError("Euler mapped-intervention ratio is non-finite")
+    return EulerMappedIntervention(
+        native_prev_sample=native_prev_sample.detach(),
+        intervention=intervention.detach(),
+        nominal_update=mapped_nominal_update.detach(),
+        intervention_norm=intervention_norm.detach(),
+        nominal_update_norm=nominal_norm.detach(),
+        ratio=ratio.detach(),
+    )
+
+
 def prepare_euler_clean_endpoint(
     sample: Tensor,
     model_output: Tensor,
@@ -655,23 +717,25 @@ def prepare_euler_clean_endpoint(
     target = torch.as_tensor(sigma_to, device=sample.device, dtype=torch.float32)
     if source.numel() != 1 or target.numel() != 1:
         raise ValueError("Euler endpoint preparation requires scalar sigmas")
+    source = source.reshape(())
+    target = target.reshape(())
     gain = euler_clean_update_gain(source, target).to(
         device=sample.device, dtype=torch.float32
     )
     work = sample.float()
-    predicted = model_output.float()
     if prediction_type == "epsilon":
-        x0 = work - source * predicted
+        x0 = work - source * model_output
     elif prediction_type in {"sample", "original_sample"}:
-        x0 = predicted
+        x0 = model_output
     elif prediction_type == "v_prediction":
         x0 = (
-            predicted * (-source / torch.sqrt(source.square() + 1.0))
+            model_output * (-source / torch.sqrt(source.square() + 1.0))
             + work / (source.square() + 1.0)
         )
     else:
         raise ValueError(f"unsupported Euler prediction_type {prediction_type!r}")
-    nominal_update = gain * (x0 - work)
+    derivative = (work - x0) / source
+    nominal_update = derivative * (target - source)
     return EulerCleanEndpoint(
         pred_original_sample=x0,
         nominal_update=nominal_update,
@@ -714,6 +778,55 @@ def euler_model_output_from_clean_sample(
     else:
         raise ValueError(f"unsupported Euler prediction_type {prediction_type!r}")
     return converted.to(output_dtype or sample.dtype)
+
+
+def predict_euler_no_churn_prev_sample(
+    sample: Tensor,
+    model_output: Tensor,
+    *,
+    sigma_from: Tensor | float,
+    sigma_to: Tensor | float,
+    prediction_type: str,
+) -> Tensor:
+    """Mirror one pinned Euler ``step`` without advancing scheduler state."""
+
+    _require_nchw(sample, "sample")
+    _require_nchw(model_output, "model_output")
+    if sample.shape != model_output.shape or sample.device != model_output.device:
+        raise ValueError("Euler sample and model_output must share shape and device")
+    source = torch.as_tensor(
+        sigma_from, device=sample.device, dtype=torch.float32
+    )
+    target = torch.as_tensor(
+        sigma_to, device=sample.device, dtype=torch.float32
+    )
+    if source.numel() != 1 or target.numel() != 1:
+        raise ValueError("Euler no-churn prediction requires scalar sigmas")
+    source = source.reshape(())
+    target = target.reshape(())
+    if (
+        not torch.isfinite(source)
+        or not torch.isfinite(target)
+        or source <= 0
+        or target < 0
+        or target > source
+    ):
+        raise ValueError("Euler no-churn sigmas must satisfy 0 <= sigma_to <= sigma_from")
+    work = sample.float()
+    if prediction_type == "epsilon":
+        predicted_x0 = work - source * model_output
+    elif prediction_type in {"sample", "original_sample"}:
+        predicted_x0 = model_output
+    elif prediction_type == "v_prediction":
+        predicted_x0 = (
+            model_output * (-source / torch.sqrt(source.square() + 1.0))
+            + work / (source.square() + 1.0)
+        )
+    else:
+        raise ValueError(f"unsupported Euler prediction_type {prediction_type!r}")
+    derivative = (work - predicted_x0) / source
+    delta_sigma = target - source
+    return (work + derivative * delta_sigma).to(model_output.dtype)
 
 
 def inject_euler_clean_update(

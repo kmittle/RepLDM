@@ -1,6 +1,6 @@
 # Literature Survey: Frozen Latent-Trajectory Extensions
 
-**Cutoff:** 2026-08-25. This is a research memo, not evidence that any
+**Cutoff:** 2026-08-26. This is a research memo, not evidence that any
 reported result transfers to RepLDM. Links use moving arXiv records; pin the
 reviewed version and refresh version, withdrawal, and venue status before
 submission, especially for the July-August 2026 entries.
@@ -88,6 +88,32 @@ reward-scored rollout trajectories. [BranchGRPO](https://arxiv.org/abs/2509.0604
 shared-prefix branching, and [Designing RL for Diffusion](https://arxiv.org/abs/2608.14430)
 unifies reverse-trajectory and forward-matching objectives. Thus RL, dense
 credit, adaptive schedules, and search-to-distill are not individual claims.
+
+Two full texts released immediately before this update further narrow the
+learning claim. [DiffusionOPSD](https://arxiv.org/abs/2608.24646v1) collects
+low-noise queries from a frozen behavior policy, converts its prediction to a
+clean-output anchor, constructs norm-bounded positive and negative targets with
+image-reward gradients, detaches those targets, and fits them before refreshing
+the behavior policy by EMA. It explicitly measures target-construction gain and
+finite-fitting gain because a locally better target can be realized poorly after
+a parameter update. [Reward-based Velocity Matching
+(RVM)](https://arxiv.org/abs/2608.23664v1) replaces trajectory likelihood ratios
+with signed reward-weighted velocity regression plus a reference or EMA anchor;
+its analysis places RAM and DiffusionNFT inside the same update family and finds
+reward and anchor choices more consequential than several loss variants.
+
+Their reported results have not been reproduced here, and both primarily update
+the generative model rather than RepLDM's sub-1M side renderer. Nevertheless,
+reward-to-clean-target self-distillation, trajectory-free native-coordinate
+matching, signed reward regression, and EMA/reference anchoring are now occupied
+components. If the relational static and replay gates pass, the first learning
+matrix must compare the frozen search teacher with an OPSD-style bounded-target
+distillation control and must report target gain separately from realized
+renderer gain. Decoder/reward backpropagation is a `CX` training cost. RVM's
+rectified-flow velocity equations cannot be copied into SDXL epsilon-prediction
+Euler; an exact coordinate derivation and anchored native-prediction baseline
+would be required. Neither paper permits reward learning to rescue a relational
+family that failed its preregistered fixed-action gate.
 
 ## Narrow Hypothesis and Falsification
 

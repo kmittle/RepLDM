@@ -1,4 +1,4 @@
-# Registered in MODEL_ITERATIONS.md before generation. This smoke checks the
+# Registered in doc/research/MODEL_ITERATIONS.md before generation. This smoke checks the
 # mechanism and scale range; it is not a confirmatory benchmark.
 actions:
   - id: no_ag

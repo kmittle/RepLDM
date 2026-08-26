@@ -130,15 +130,15 @@ touching a GPU. The queue never terminates or signals an unrelated process.
 
 `configs/frequency_amplitude_followup.yaml` is explicitly post-hoc: it checks whether the 0.004 pilot simply used too much scalar or mid-band guidance. Treat it as search data and validate any selected amplitude on new prompts.
 
-`configs/moment_tangent_smoke.yaml` is registered in `MODEL_ITERATIONS.md`. Run it on `prompts/smoke.csv` with seed `0` before freezing a larger development grid; its two prompts may reject broken or catastrophic actions but cannot support an efficacy claim.
+`configs/moment_tangent_smoke.yaml` is registered in `../doc/research/MODEL_ITERATIONS.md`. Run it on `prompts/smoke.csv` with seed `0` before freezing a larger development grid; its two prompts may reject broken or catastrophic actions but cannot support an efficacy claim.
 
 `configs/moment_tangent_development.yaml` is the action grid frozen from that range check. Its 12-prompt, 3-seed output is development evidence; do not reuse those prompts for confirmation if an action passes the registered gate.
 
-`configs/trajectory_cone_smoke.yaml` is the registered S3 range check. Its hypothesis and action-removal rule are fixed in `MODEL_ITERATIONS.md`; do not add scales after viewing its scores.
+`configs/trajectory_cone_smoke.yaml` is the registered S3 range check. Its hypothesis and action-removal rule are fixed in `../doc/research/MODEL_ITERATIONS.md`; do not add scales after viewing its scores.
 
 `configs/trajectory_cone_development.yaml` freezes the complete non-catastrophic S3 intervals. As with S2, its 12-prompt set is development-only.
 
-`configs/stage2_engineering_smoke.yaml` is correctness-only. `configs/stage2_transfer_pilot.yaml` freezes the five-action 2048² mechanistic ladder after S3; it reuses development prompts to audit target-domain mismatch and cannot support a confirmation claim. That registered pilot was negative and is closed in `MODEL_ITERATIONS.md`; do not rerun it with new scales or schedules.
+`configs/stage2_engineering_smoke.yaml` is correctness-only. `configs/stage2_transfer_pilot.yaml` freezes the five-action 2048² mechanistic ladder after S3; it reuses development prompts to audit target-domain mismatch and cannot support a confirmation claim. That registered pilot was negative and is closed in `../doc/research/MODEL_ITERATIONS.md`; do not rerun it with new scales or schedules.
 
 ## S5 Registered Prompts and Actions
 
@@ -150,7 +150,7 @@ SHA256("repldm-s5-v1:development:" + challenge + ":" + row_index + ":" + Prompt)
 
 and retain the two smallest digests from each of `Complex`, `Fine-grained Detail`, `Properties & Positioning`, `Quantity`, `Writing & Symbols`, and `Perspective`. Exclude those 12 rows, then rank the remaining rows in those challenges by `SHA256("repldm-s5-v1:smoke:" + row_index + ":" + Prompt)` and retain the two smallest. The recorded source rows are `359,367,636,424,997,979,1045,1042,1621,1549,909,929` for development and `450,996` for smoke. Do not replace a prompt after seeing an image or score.
 
-`configs/s5_smoke.yaml` is a correctness and catastrophic-range check, not a tuning set. It fixes the self-attention layer `up_blocks.0.attentions.0.transformer_blocks.0.attn1`, mutual top-k `16`, and semantic angle candidates `0.005, 0.01, 0.02, 0.04`. It also freezes raw noisy-latent TFSA, clean latent controls, a jointly permuted semantic graph, CFG-only 5.0, and historical PLADIS/GAG reproductions. The action IDs containing `official` are preserved only for artifact provenance and must not be cited as official implementations; see `../BASELINE_PROVENANCE.md`. Run it as:
+`configs/s5_smoke.yaml` is a correctness and catastrophic-range check, not a tuning set. It fixes the self-attention layer `up_blocks.0.attentions.0.transformer_blocks.0.attn1`, mutual top-k `16`, and semantic angle candidates `0.005, 0.01, 0.02, 0.04`. It also freezes raw noisy-latent TFSA, clean latent controls, a jointly permuted semantic graph, CFG-only 5.0, and historical PLADIS/GAG reproductions. The action IDs containing `official` are preserved only for artifact provenance and must not be cited as official implementations; see `../doc/audits/BASELINE_PROVENANCE.md`. Run it as:
 
 ```bash
 /home/bycao/miniforge3/envs/diff_attn/bin/python eval-pipeline/generate.py \
@@ -444,12 +444,12 @@ Use leave-one-seed-out selection to test whether per-prompt action choices are s
 
 For each fold, the script selects a global action and one action per prompt on the other seeds, then evaluates both on the held-out seed. `no_ag` is always a candidate, so the analysis cannot create a gain by forcing guidance. It writes `adaptivity_comparisons.csv` and `adaptivity_selections.csv`, including the candidate set, objective direction, inference seed, and resampling counts. It rejects incomplete or cross-device blocks and reports the per-prompt-minus-global headroom with the same paired inference used above. This is a cross-seed consistency test on known prompts, not evidence of generalization to unseen prompts.
 
-`aggregate.py` and `visualize.py` remain available for the legacy scalar sweep. Their plots are descriptive and must not be used for the invalidated cross-device pilot in `EXPERIMENT_RESULTS.md`.
+`aggregate.py` and `visualize.py` remain available for the legacy scalar sweep. Their plots are descriptive and must not be used for the invalidated cross-device pilot in `../doc/research/EXPERIMENT_RESULTS.md`.
 
 ## Latent Renderer Registration
 
 The post-S5 latent-renderer direction is a separate hypothesis. Read
-`LATENT_RENDERER_PROTOCOL.md` and `RL_RESEARCH_DESIGN.md` before running it.
+`../doc/protocols/LATENT_RENDERER_PROTOCOL.md` and `../doc/research/RL_RESEARCH_DESIGN.md` before running it.
 `configs/latent_renderer_mechanism_audit.yaml` freezes the LR-0 mechanism
 audit and is registration-only; `generate.py` intentionally rejects it. The
 reusable CPU/GPU-safe primitives are in

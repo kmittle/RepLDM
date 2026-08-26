@@ -1,3 +1,4 @@
+import hashlib
 import math
 import unittest
 
@@ -8,7 +9,12 @@ from AttentionGuidance.local_relational_basis import (
     LOCAL_RELATIONAL_AFFINITY_SOURCES,
     LOCAL_RELATIONAL_OFFSET_ORBITS,
     LOCAL_RELATIONAL_ORBIT_NAMES,
+    RANDOM_EDGE_COUNTER_SCHEMA,
     LocalRelationalBasisProvider,
+    canonical_random_edge_nodes,
+    random_edge_counter_bytes,
+    random_edge_counter_set_sha256,
+    random_edge_uniform,
 )
 
 
@@ -17,6 +23,28 @@ REGISTERED_OFFSET_ORBITS = (
     ("diagonal-r1", ((1, 1), (1, -1))),
     ("axis-r2", ((0, 2), (2, 0))),
 )
+REGISTERED_RANDOM_EDGE_KEY = {
+    "experiment_id": "ao-search-v1",
+    "split_role": "search",
+    "prompt_row_id": "search-0001",
+    "seed": 123456789,
+    "step_index": 0,
+}
+
+
+def d4_node_maps(grid_size):
+    """Map old row-major node ids to positions after each tensor D4 action."""
+    node_ids = torch.arange(grid_size * grid_size).reshape(grid_size, grid_size)
+    positions = torch.arange(grid_size * grid_size)
+    mappings = []
+    for turns in range(4):
+        rotated = torch.rot90(node_ids, turns, dims=(-2, -1))
+        for reflected in (False, True):
+            transformed = torch.flip(rotated, dims=(-1,)) if reflected else rotated
+            mapping = torch.empty_like(positions)
+            mapping[transformed.flatten()] = positions
+            mappings.append(tuple(mapping.tolist()))
+    return tuple(mappings)
 
 
 class LocalRelationalBasisProviderTest(unittest.TestCase):
@@ -56,6 +84,47 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
                                 * control_tokens[:, target]
                             ).sum(dim=-1).clamp(-1.0, 1.0)
                             weight = affinity_floor + 0.5 * (1.0 + cosine)
+                        adjacency[:, source, target] = weight
+                        adjacency[:, target, source] = weight
+            self.assertTrue(torch.equal(adjacency, adjacency.transpose(-1, -2)))
+            transition = adjacency / adjacency.sum(dim=-1, keepdim=True)
+            torch.testing.assert_close(
+                transition.sum(dim=-1),
+                torch.ones(x0.shape[0], grid * grid),
+                rtol=0,
+                atol=2e-7,
+            )
+            residual = torch.bmm(transition, x0_tokens) - x0_tokens
+            references.append(
+                residual.transpose(1, 2).reshape(x0.shape[0], 4, grid, grid)
+            )
+        return torch.stack(references, dim=1)
+
+    def _random_dense_reference(self, x0, affinity_floor, key):
+        grid = x0.shape[-1]
+        x0_tokens = x0.float().flatten(2).transpose(1, 2)
+        references = []
+        for orbit_name, offsets in REGISTERED_OFFSET_ORBITS:
+            adjacency = torch.zeros(
+                x0.shape[0], grid * grid, grid * grid, dtype=torch.float32
+            )
+            for dy, dx in offsets:
+                for y in range(grid):
+                    for x in range(grid):
+                        target_y = y + dy
+                        target_x = x + dx
+                        if not (0 <= target_y < grid and 0 <= target_x < grid):
+                            continue
+                        source = y * grid + x
+                        target = target_y * grid + target_x
+                        low, high = sorted((source, target))
+                        low, high = canonical_random_edge_nodes(grid, low, high)
+                        weight = affinity_floor + random_edge_uniform(
+                            **key,
+                            orbit_name=orbit_name,
+                            edge_low=low,
+                            edge_high=high,
+                        )
                         adjacency[:, source, target] = weight
                         adjacency[:, target, source] = weight
             self.assertTrue(torch.equal(adjacency, adjacency.transpose(-1, -2)))
@@ -118,6 +187,10 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
         self.assertEqual(record["predicted_clean_norm_epsilon"], 1e-6)
         self.assertNotIn("temperature", record)
         self.assertNotIn("quality", record)
+        self.assertNotIn("random_edge_counter_schema", record)
+        self.assertNotIn("random_edge_actual_edge_counts", record)
+        self.assertNotIn("random_edge_unique_canonical_key_counts", record)
+        self.assertNotIn("random_edge_actual_edges_unique", record)
 
     def test_constant_clean_latent_has_exact_zero_bases(self):
         provider = LocalRelationalBasisProvider(grid_size=6)
@@ -222,10 +295,297 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
             diagnostics.to_record()["affinity_source"], "predicted_clean"
         )
 
+    def test_random_edge_counter_bytes_and_uint24_mapping_are_exact(self):
+        self.assertEqual(canonical_random_edge_nodes(16, 17, 18), (17, 18))
+        expected = (
+            b'{"edge_high":18,"edge_low":17,"experiment_id":"ao-search-v1",'
+            b'"orbit_name":"axis-r1","prompt_row_id":"search-0001",'
+            b'"schema":"ao-random-edge-counter-v1","seed":123456789,'
+            b'"split_role":"search","step_index":0}'
+        )
+        counter = random_edge_counter_bytes(
+            **REGISTERED_RANDOM_EDGE_KEY,
+            orbit_name="axis-r1",
+            edge_low=17,
+            edge_high=18,
+        )
+
+        self.assertEqual(RANDOM_EDGE_COUNTER_SCHEMA, "ao-random-edge-counter-v1")
+        self.assertEqual(counter, expected)
+        self.assertEqual(
+            hashlib.sha256(counter).hexdigest(),
+            "9f66bae057b4506b502956e16abec22a4bd24956e56ee959c90438ba190bec5f",
+        )
+        self.assertEqual(
+            random_edge_uniform(
+                **REGISTERED_RANDOM_EDGE_KEY,
+                orbit_name="axis-r1",
+                edge_low=17,
+                edge_high=18,
+            ),
+            10446522 / 2**24,
+        )
+
+    def test_random_edge_nodes_use_exhaustive_d4_canonical_representatives(self):
+        for grid in (4, 5):
+            mappings = d4_node_maps(grid)
+            self.assertEqual(len(set(mappings)), 8)
+            for low in range(grid * grid):
+                for high in range(low + 1, grid * grid):
+                    images = {
+                        tuple(sorted((mapping[low], mapping[high])))
+                        for mapping in mappings
+                    }
+                    expected = min(images)
+                    with self.subTest(grid=grid, edge=(low, high)):
+                        self.assertEqual(
+                            canonical_random_edge_nodes(grid, low, high),
+                            expected,
+                        )
+                        for image_low, image_high in images:
+                            self.assertEqual(
+                                canonical_random_edge_nodes(
+                                    grid, image_low, image_high
+                                ),
+                                expected,
+                            )
+
+    def test_random_edge_canonical_reuse_keeps_actual_edge_uniqueness(self):
+        provider = LocalRelationalBasisProvider(grid_size=4)
+        x0_tokens = torch.zeros(1, 16, 4)
+        key = (
+            REGISTERED_RANDOM_EDGE_KEY["experiment_id"],
+            REGISTERED_RANDOM_EDGE_KEY["split_role"],
+            REGISTERED_RANDOM_EDGE_KEY["prompt_row_id"],
+            REGISTERED_RANDOM_EDGE_KEY["seed"],
+            REGISTERED_RANDOM_EDGE_KEY["step_index"],
+        )
+        seen_actual_edges = set()
+        canonical_uniforms = {}
+
+        first = provider._random_edge_weights(
+            x0_tokens,
+            torch.tensor([0]),
+            torch.tensor([1]),
+            key=key,
+            orbit_name="axis-r1",
+            seen_actual_edges=seen_actual_edges,
+            canonical_uniforms=canonical_uniforms,
+        )
+        symmetric = provider._random_edge_weights(
+            x0_tokens,
+            torch.tensor([2]),
+            torch.tensor([3]),
+            key=key,
+            orbit_name="axis-r1",
+            seen_actual_edges=seen_actual_edges,
+            canonical_uniforms=canonical_uniforms,
+        )
+
+        self.assertTrue(torch.equal(first, symmetric))
+        self.assertEqual(len(seen_actual_edges), 2)
+        self.assertEqual(len(canonical_uniforms), 1)
+        with self.assertRaisesRegex(RuntimeError, "duplicate actual edge"):
+            provider._random_edge_weights(
+                x0_tokens,
+                torch.tensor([1]),
+                torch.tensor([0]),
+                key=key,
+                orbit_name="axis-r1",
+                seen_actual_edges=seen_actual_edges,
+                canonical_uniforms=canonical_uniforms,
+            )
+
+    def test_random_edge_matches_symmetric_row_normalized_dense_graph(self):
+        grid = 4
+        affinity_floor = 1e-6
+        provider = LocalRelationalBasisProvider(
+            grid_size=grid,
+            affinity_floor=affinity_floor,
+        )
+        sample = torch.randn(1, 4, grid, grid)
+        x0 = sample.expand(2, -1, -1, -1).clone()
+
+        actual, diagnostics = provider.random_edge(
+            x0, **REGISTERED_RANDOM_EDGE_KEY
+        )
+        torch.manual_seed(999999)
+        repeated, repeated_diagnostics = provider.random_edge(
+            x0, **REGISTERED_RANDOM_EDGE_KEY
+        )
+
+        torch.testing.assert_close(
+            actual,
+            self._random_dense_reference(
+                x0,
+                affinity_floor,
+                REGISTERED_RANDOM_EDGE_KEY,
+            ),
+            rtol=2e-5,
+            atol=2e-6,
+        )
+        self.assertTrue(torch.equal(actual, repeated))
+        self.assertTrue(torch.equal(actual[0], actual[1]))
+        self.assertEqual(diagnostics.affinity_source, "random_edge")
+        self.assertEqual(repeated_diagnostics.affinity_source, "random_edge")
+        self.assertEqual(diagnostics.random_edge_counter_schema, RANDOM_EDGE_COUNTER_SCHEMA)
+        self.assertEqual(diagnostics.random_edge_actual_edge_counts, (24, 18, 16))
+        self.assertEqual(
+            diagnostics.random_edge_unique_canonical_key_counts,
+            (4, 4, 2),
+        )
+        self.assertEqual(
+            diagnostics.random_edge_counter_set_sha256[0],
+            random_edge_counter_set_sha256(
+                **REGISTERED_RANDOM_EDGE_KEY,
+                orbit_name="axis-r1",
+                grid_size=grid,
+            ),
+        )
+        self.assertTrue(
+            all(
+                len(value) == 64
+                for value in diagnostics.random_edge_counter_set_sha256
+            )
+        )
+        self.assertIs(diagnostics.random_edge_actual_edges_unique, True)
+        random_record = diagnostics.to_record()
+        self.assertEqual(
+            random_record["random_edge_counter_schema"],
+            RANDOM_EDGE_COUNTER_SCHEMA,
+        )
+        self.assertEqual(random_record["random_edge_actual_edge_counts"], [24, 18, 16])
+        self.assertEqual(
+            random_record["random_edge_unique_canonical_key_counts"],
+            [4, 4, 2],
+        )
+        self.assertEqual(
+            random_record["random_edge_counter_set_sha256"],
+            list(diagnostics.random_edge_counter_set_sha256),
+        )
+        self.assertIs(random_record["random_edge_actual_edges_unique"], True)
+        self.assertTrue(torch.all(diagnostics.edge_weight_min >= affinity_floor))
+        self.assertTrue(torch.all(diagnostics.edge_weight_max < 1 + affinity_floor))
+        torch.testing.assert_close(
+            diagnostics.row_probability_sum_min,
+            torch.ones_like(diagnostics.row_probability_sum_min),
+        )
+        torch.testing.assert_close(
+            diagnostics.row_probability_sum_max,
+            torch.ones_like(diagnostics.row_probability_sum_max),
+        )
+
+    def test_random_edge_counter_changes_with_every_registered_key_dimension(self):
+        base = {
+            **REGISTERED_RANDOM_EDGE_KEY,
+            "orbit_name": "axis-r1",
+            "edge_low": 17,
+            "edge_high": 18,
+        }
+        baseline = random_edge_uniform(**base)
+        changes = {
+            "prompt_row_id": "search-0002",
+            "seed": 123456790,
+            "step_index": 1,
+            "orbit_name": "diagonal-r1",
+            "experiment_id": "ao-replay-v1",
+            "split_role": "replay",
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                changed = dict(base)
+                changed[field] = value
+                self.assertNotEqual(random_edge_uniform(**changed), baseline)
+
+    def test_repeated_truncated_values_are_valid_for_distinct_counters(self):
+        collision_key = {
+            **REGISTERED_RANDOM_EDGE_KEY,
+            "prompt_row_id": "search-00804",
+        }
+        first = {
+            **collision_key,
+            "orbit_name": "diagonal-r1",
+            "edge_low": 5,
+            "edge_high": 20,
+        }
+        second = {
+            **collision_key,
+            "orbit_name": "diagonal-r1",
+            "edge_low": 54,
+            "edge_high": 71,
+        }
+        self.assertEqual(canonical_random_edge_nodes(16, 5, 20), (5, 20))
+        self.assertEqual(canonical_random_edge_nodes(16, 54, 71), (54, 71))
+        self.assertNotEqual(
+            random_edge_counter_bytes(**first),
+            random_edge_counter_bytes(**second),
+        )
+        self.assertEqual(random_edge_uniform(**first), random_edge_uniform(**second))
+
+        provider = LocalRelationalBasisProvider(grid_size=16)
+        x0 = torch.randn(1, 4, 16, 16)
+        bases, diagnostics = provider.random_edge(x0, **collision_key)
+        self.assertTrue(torch.isfinite(bases).all())
+        self.assertEqual(diagnostics.affinity_source, "random_edge")
+        self.assertEqual(
+            diagnostics.random_edge_unique_canonical_key_counts,
+            (64, 64, 56),
+        )
+
+    def test_random_edge_counter_invalid_inputs_fail_closed(self):
+        valid = {
+            **REGISTERED_RANDOM_EDGE_KEY,
+            "orbit_name": "axis-r1",
+            "edge_low": 17,
+            "edge_high": 18,
+        }
+        allowed_punctuation = dict(valid)
+        allowed_punctuation.update(
+            {
+                "experiment_id": "AO.v1:test-run",
+                "split_role": "search_role",
+                "prompt_row_id": "prompt_0001",
+            }
+        )
+        self.assertIsInstance(
+            random_edge_counter_bytes(**allowed_punctuation), bytes
+        )
+        invalid = (
+            ("experiment_id", "", "experiment_id"),
+            ("experiment_id", "ao search", "experiment_id"),
+            ("experiment_id", "ao/search", "experiment_id"),
+            ("split_role", "search!", "split_role"),
+            ("prompt_row_id", None, "prompt_row_id"),
+            ("prompt_row_id", "search@0001", "prompt_row_id"),
+            ("orbit_name", "axis-r3", "orbit_name"),
+            ("seed", True, "seed"),
+            ("seed", -1, "seed"),
+            ("seed", 1.0, "seed"),
+            ("step_index", False, "step_index"),
+            ("step_index", -1, "step_index"),
+            ("edge_low", -1, "edge_low"),
+            ("edge_low", True, "edge_low"),
+            ("edge_high", 17, "edge_low < edge_high"),
+            ("edge_low", 19, "edge_low < edge_high"),
+        )
+        for field, value, message in invalid:
+            with self.subTest(field=field, value=value):
+                counter = dict(valid)
+                counter[field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    random_edge_counter_bytes(**counter)
+
+        provider = LocalRelationalBasisProvider(grid_size=4)
+        x0 = torch.randn(1, 4, 4, 4)
+        invalid_key = dict(REGISTERED_RANDOM_EDGE_KEY)
+        invalid_key["prompt_row_id"] = "bad prompt"
+        with self.assertRaisesRegex(ValueError, "prompt_row_id"):
+            provider.random_edge(x0, **invalid_key)
+
     def test_affinity_sources_are_explicit_and_complete(self):
         self.assertEqual(
             LOCAL_RELATIONAL_AFFINITY_SOURCES,
-            ("feature", "uniform_local", "predicted_clean"),
+            ("feature", "uniform_local", "predicted_clean", "random_edge"),
         )
 
     def test_offset_orbits_match_registered_protocol(self):
@@ -247,9 +607,14 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
         feature_tokens[0, 2] = torch.tensor([0.0, 1.0])
         feature_tokens[0, 3] = torch.tensor([0.0, 1.0])
 
-        _residual, weights, _degree, row_probability, _edges = provider._orbit_basis(
-            x0_tokens, feature_tokens, ((0, 1),)
-        )
+        (
+            _residual,
+            weights,
+            _degree,
+            row_probability,
+            _edges,
+            canonical_keys,
+        ) = provider._orbit_basis(x0_tokens, feature_tokens, ((0, 1),))
 
         torch.testing.assert_close(
             weights[0, :3],
@@ -262,6 +627,7 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
         torch.testing.assert_close(
             row_probability, torch.ones_like(row_probability), rtol=0, atol=1e-6
         )
+        self.assertIsNone(canonical_keys)
 
     def test_all_d4_rotations_and_reflections_are_equivariant(self):
         provider = LocalRelationalBasisProvider(
@@ -335,6 +701,43 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
                             atol=2e-5,
                         )
 
+    def test_random_edge_is_fully_d4_equivariant(self):
+        provider = LocalRelationalBasisProvider(grid_size=6)
+        x0 = torch.randn(1, 4, 12, 18)
+        expected, expected_diagnostics = provider.random_edge(
+            x0, **REGISTERED_RANDOM_EDGE_KEY
+        )
+
+        for turns in range(4):
+            for reflected in (False, True):
+                with self.subTest(turns=turns, reflected=reflected):
+                    transformed_x0 = torch.rot90(x0, turns, dims=(-2, -1))
+                    transformed_expected = torch.rot90(
+                        expected, turns, dims=(-2, -1)
+                    )
+                    if reflected:
+                        transformed_x0 = torch.flip(transformed_x0, dims=(-1,))
+                        transformed_expected = torch.flip(
+                            transformed_expected, dims=(-1,)
+                        )
+                    actual, diagnostics = provider.random_edge(
+                        transformed_x0, **REGISTERED_RANDOM_EDGE_KEY
+                    )
+                    torch.testing.assert_close(
+                        actual,
+                        transformed_expected,
+                        rtol=2e-5,
+                        atol=2e-5,
+                    )
+                    self.assertEqual(
+                        diagnostics.random_edge_actual_edge_counts,
+                        expected_diagnostics.random_edge_actual_edge_counts,
+                    )
+                    self.assertEqual(
+                        diagnostics.random_edge_unique_canonical_key_counts,
+                        expected_diagnostics.random_edge_unique_canonical_key_counts,
+                    )
+
     def test_boundaries_do_not_wrap(self):
         provider = LocalRelationalBasisProvider(grid_size=5)
         x0 = torch.ones(1, 4, 5, 5)
@@ -344,6 +747,10 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
             ("feature", lambda: provider(x0, feature)),
             ("uniform_local", lambda: provider.uniform_local(x0)),
             ("predicted_clean", lambda: provider.predicted_clean(x0)),
+            (
+                "random_edge",
+                lambda: provider.random_edge(x0, **REGISTERED_RANDOM_EDGE_KEY),
+            ),
         )
 
         for affinity_source, build in controls:
@@ -366,6 +773,7 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
             provider(x0, feature),
             provider.uniform_local(x0),
             provider.predicted_clean(x0),
+            provider.random_edge(x0, **REGISTERED_RANDOM_EDGE_KEY),
         )
 
         for bases, diagnostics in outputs:
@@ -394,6 +802,7 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
             provider(x0, feature),
             provider.uniform_local(x0),
             provider.predicted_clean(x0),
+            provider.random_edge(x0, **REGISTERED_RANDOM_EDGE_KEY),
         )
 
         self.assertEqual(
@@ -458,6 +867,7 @@ class LocalRelationalBasisProviderTest(unittest.TestCase):
             lambda: provider(x0, feature),
             lambda: provider.uniform_local(x0),
             lambda: provider.predicted_clean(x0),
+            lambda: provider.random_edge(x0, **REGISTERED_RANDOM_EDGE_KEY),
         )
         for build in controls:
             with self.subTest(build=build):

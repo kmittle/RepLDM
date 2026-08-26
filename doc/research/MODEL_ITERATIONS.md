@@ -216,7 +216,7 @@ S4 结束时，还没有登记 S5 的方法主张。此前四类算子加上一�
 
 ## S5：相关工作检查后的决定
 
-`S5_RELATED_WORK.md` 记录了在 24 August 2026 固定下来的全文检查结果。PLADIS 和 GAG 已经覆盖 training-free、single-forward、sparse-versus-dense attention contrast，因此是必须加入的相同 NFE 基线。SAG、PAG、SEG 和 ASAG 属于需要额外 prediction 的上限对照组。
+`../literature/S5_RELATED_WORK.md` 记录了在 24 August 2026 固定下来的全文检查结果。PLADIS 和 GAG 已经覆盖 training-free、single-forward、sparse-versus-dense attention contrast，因此是必须加入的相同 NFE 基线。SAG、PAG、SEG 和 ASAG 属于需要额外 prediction 的上限对照组。
 
 predicted `x_0`、内部特征、attention extrapolation、projection、adaptive schedule 和 RL 这些单独组件都已有相关工作。这里唯一要检验的是完整的 scheduler-consistent reciprocal semantic transport 算子，不宣称任何单个组件本身有新意。
 
@@ -273,7 +273,7 @@ step 前重建原生 prediction，不能用上面的单位增益公式表达 cle
 当时还登记了 CFG-only 5.0，以及被命名为 `pladis_official` 和
 `gag_official` 的独立实现。按论文参数登记，二者使用 CFG 5.0；所有 RepLDM
 对照保持 CFG 7.5。后续 provenance 审计证明这两个 ID 不能支持“官方代码复现”
-表述，精确边界见 `BASELINE_PROVENANCE.md`。必须报告 NFE、wall time 和 GPU
+表述，精确边界见 `../audits/BASELINE_PROVENANCE.md`。必须报告 NFE、wall time 和 GPU
 峰值显存。
 
 ## S5：冒烟测试和工程门槛
@@ -340,7 +340,7 @@ it must compete directly with no-AG and cannot be presented as a rescue of S5.
 
 ## LR-0：独立 latent renderer 的工程注册与真实模型接线检查
 
-S5 关闭后，按 `LATENT_RENDERER_PROTOCOL.md` 注册了全新的 LR-0 假设。实现
+S5 关闭后，按 `../protocols/LATENT_RENDERER_PROTOCOL.md` 注册了全新的 LR-0 假设。实现
 位于 `AttentionGuidance/latent_renderer.py`，包含六个可解释基底、固定矩
 几何、scheduler-update trust region，以及可选的 D4 对称 depthwise spatial
 head。系数-only 版本是匹配容量的对照，不是最终方法主张；没有任何 RL 或
@@ -376,7 +376,7 @@ ratio 为 `0.0007790`，moment errors 小于 `1.5e-8`。这仍然只是接线和
 冻结确认，test 只允许一次最终报告。该 YAML 目前没有任何分数或 RL 权重。
 
 为避免在评分后挑选指标，LR-1 的选择规则已预注册在
-`LATENT_RENDERER_PROTOCOL.md`：train 只以配对 HPSv2 均值选择，并要求 CLIP
+`../protocols/LATENT_RENDERER_PROTOCOL.md`：train 只以配对 HPSv2 均值选择，并要求 CLIP
 非劣（`-0.005`）、clipped fraction 增量不超过 `+0.001`、saturation 增量不超过
 `+0.005`，以及所有 moment/trust 诊断有限且合规。HPS 区间重叠时先选较小的
 renderer update ratio，再按 YAML 顺序破平。TOPIQ-NR 不参与 train 选择，只在

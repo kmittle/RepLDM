@@ -76,6 +76,14 @@ freeze_trajectory_correction = load_module(
 )
 
 
+def tearDownModule():
+    # Diffusers creates this process-global torch JIT workspace during import.
+    instantiator = sys.modules.get("torch.distributed.nn.jit.instantiator")
+    temporary = getattr(instantiator, "_TEMP_DIR", None)
+    if temporary is not None:
+        temporary.cleanup()
+
+
 class EvalPipelineTest(unittest.TestCase):
     def test_structural_engineering_smoke_rejects_scoring_before_scorer_load(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -126,44 +134,67 @@ class EvalPipelineTest(unittest.TestCase):
         self.assertIn("startup failure", traceback_text)
 
     def test_generation_environment_lock_is_exact_and_hash_bound(self):
+        lock_path = (
+            ROOT
+            / "eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml"
+        )
+        lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+        observed_environment = {
+            "platform": lock["platform"],
+            "runtime": copy.deepcopy(lock["runtime"]),
+            "packages": copy.deepcopy(lock["packages"]),
+            "hardware": copy.deepcopy(lock["reference_hardware"]),
+            "cuda_device": {},
+            "determinism": copy.deepcopy(lock["determinism"]),
+        }
         registration = {
             "environment_lock": {
                 "path": "eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml",
                 "sha256": "8f7b38ccb770880537f5080b1d3b4eb426a294458ea644ec8a4ef6b61f771da4",
             }
         }
-        record = generate.validate_registered_environment_lock(registration)
-        self.assertEqual(record["lock_id"], "diff_attn_20260825")
-        self.assertEqual(record["observed"]["packages"]["diffusers"], "0.32.1")
-        self.assertEqual(
-            record["observed"]["hardware"],
-            {
-                "gpu": "NVIDIA GeForce RTX 3090",
-                "driver": "580.126.09",
-                "compute_capability": "8.6",
-            },
-        )
-        self.assertFalse(record["observed"]["determinism"]["cudnn_benchmark"])
+        observed_mock = mock.Mock(return_value=observed_environment)
+        with mock.patch.dict(
+            generate.validate_environment_lock.__globals__,
+            {"observed_environment": observed_mock},
+        ):
+            record = generate.validate_registered_environment_lock(registration)
+            self.assertEqual(record["lock_id"], "diff_attn_20260825")
+            self.assertEqual(
+                record["observed"]["packages"]["diffusers"], "0.32.1"
+            )
+            self.assertEqual(
+                record["observed"]["hardware"],
+                {
+                    "gpu": "NVIDIA GeForce RTX 3090",
+                    "driver": "580.126.09",
+                    "compute_capability": "8.6",
+                },
+            )
+            self.assertFalse(
+                record["observed"]["determinism"]["cudnn_benchmark"]
+            )
 
-        registration["environment_lock"]["sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
-            generate.validate_registered_environment_lock(registration)
+            registration["environment_lock"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+                generate.validate_registered_environment_lock(registration)
 
-        lock_path = ROOT / "eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml"
-        lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
-        with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "lock.yaml"
-            hardware_drift = copy.deepcopy(lock)
-            hardware_drift["reference_hardware"]["compute_capability"] = "9.0"
-            path.write_text(yaml.safe_dump(hardware_drift), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "reference_hardware"):
-                generate.validate_environment_lock(str(path))
+            with tempfile.TemporaryDirectory() as directory:
+                path = pathlib.Path(directory) / "lock.yaml"
+                hardware_drift = copy.deepcopy(lock)
+                hardware_drift["reference_hardware"]["compute_capability"] = "9.0"
+                path.write_text(yaml.safe_dump(hardware_drift), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "reference_hardware"):
+                    generate.validate_environment_lock(str(path))
 
-            determinism_drift = copy.deepcopy(lock)
-            determinism_drift["determinism"]["cudnn_benchmark"] = True
-            path.write_text(yaml.safe_dump(determinism_drift), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "determinism.cudnn_benchmark"):
-                generate.validate_environment_lock(str(path))
+                determinism_drift = copy.deepcopy(lock)
+                determinism_drift["determinism"]["cudnn_benchmark"] = True
+                path.write_text(yaml.safe_dump(determinism_drift), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "determinism.cudnn_benchmark"
+                ):
+                    generate.validate_environment_lock(str(path))
+        self.assertEqual(observed_mock.call_count, 3)
 
     def test_structural_control_registration_is_not_executable(self):
         path = (

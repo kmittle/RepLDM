@@ -122,7 +122,7 @@ Stage-2 actions must share both the Stage-1 seed and explicitly seeded resamplin
 
 ## Post-S4 S5 Amendment
 
-The spectral-TFSA claim and G1-G4 ladder above are historical and failed in S0-S4. S5 may not reuse their proposal source or enter adaptive control. Its sole admissible static hypothesis is scheduler-consistent reciprocal semantic transport, preregistered in `MODEL_ITERATIONS.md` and bounded by `S5_RELATED_WORK.md`.
+The spectral-TFSA claim and G1-G4 ladder above are historical and failed in S0-S4. S5 may not reuse their proposal source or enter adaptive control. Its sole admissible static hypothesis is scheduler-consistent reciprocal semantic transport, preregistered in `../research/MODEL_ITERATIONS.md` and bounded by `../literature/S5_RELATED_WORK.md`.
 
 For S5, G1 is replaced by a stricter static gate: on new prompts, a candidate must improve TOPIQ-NR by at least `+0.005` with a positive 95% crossed-bootstrap interval and within-metric Holm significance; remain non-inferior on HPSv2 and CLIP; satisfy clipping/saturation guards; beat no-AG, conference TFSA, raw and clean latent controls, the permuted semantic control, CFG 5.0, PLADIS, and GAG; and show a structural/detail gain in a fixed montage. Failure closes the Attention Guidance extension. Success permits only prompt-disjoint confirmation and high-resolution transfer; RL still requires a later, separately registered headroom argument.
 

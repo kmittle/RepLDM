@@ -59,6 +59,11 @@ The editable install supports development. Formal 1024px experiments use the
 exact runtime in `eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml`;
 validate it with `eval-pipeline/generation_environment.py` before generation.
 
+## Research Documentation
+
+Research plans, experiment reports, protocols, literature reviews, and audits
+are indexed in [`doc/README.md`](doc/README.md).
+
 
 ## 🚀 Quik Start
 

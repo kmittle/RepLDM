@@ -1,4 +1,4 @@
-"""Build the EXPERIMENT_RESULTS.md figures from a constant-scale-sweep run.
+"""Build the doc/research/EXPERIMENT_RESULTS.md figures from a constant-scale-sweep run.
 
 Produces, under <run_dir>/figs/:
   * scale_sweep_montage.png -- one prompt per bucket x all scales (fixed seed),

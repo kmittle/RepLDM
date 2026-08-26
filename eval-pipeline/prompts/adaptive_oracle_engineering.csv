@@ -1,0 +1,12 @@
+index,TEXT,bucket,source_row,source_category,source_challenge,source_note,split,prompt_row_id,seed
+0,concurrent lines,basic,40,Illustrations,Basic,Math concepts,engineering,engineering-0001,120129238
+1,a man pouring milk into a coffee cup to make a latte with a beatiful design,complex,381,People,Complex,,engineering,engineering-0002,120129238
+2,A sunken ship becomes the homeland of fish.,fine-grained-detail,403,Vehicles,Fine-grained Detail,,engineering,engineering-0003,120129238
+3,square blue apples on a tree with circular yellow leaves,imagination,805,Produce & Plants,Imagination,,engineering,engineering-0004,120129238
+4,a brown mouse laughing at a gray cat because a 16 ton weight is about to fall on its head,linguistic-structures,878,Animals,Linguistic Structures,,engineering,engineering-0005,120129238
+5,a view of the Earth from the moon,perspective,964,Outdoor Scenes,Perspective,,engineering,engineering-0006,120129238
+6,a black background with a large yellow circle and a small red square,properties-and-positioning,1001,Illustrations,Properties & Positioning,,engineering,engineering-0007,120129238
+7,five red balls on a table,quantity,1063,Artifacts,Quantity,,engineering,engineering-0008,120129238
+8,"a farm scene with cows, ducks and a tractor.",simple-detail,1107,Outdoor Scenes,Simple Detail,,engineering,engineering-0009,120129238
+9,Downtown Austin at sunrise. detailed ink wash.,style-and-format,1344,World Knowledge,Style & Format,,engineering,engineering-0010,120129238
+10,a store front with 'Grassy Meadow' written on it,writing-and-symbols,1612,Outdoor Scenes,Writing & Symbols,,engineering,engineering-0011,120129238

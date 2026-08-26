@@ -1,6 +1,6 @@
 # 实验结果与阶段性结论
 
-> 分支：`rl-version` ｜ 方法与停止规则：[`REVIEWER_PROTOCOL.md`](./REVIEWER_PROTOCOL.md)
+> 分支：`rl-version` ｜ 方法与停止规则：[`REVIEWER_PROTOCOL.md`](../protocols/REVIEWER_PROTOCOL.md)
 > 截止提交：频谱 pilot `63184bc`，幅度 follow-up `c385223`，固定矩 pilot `65ba734`，轨迹锥 pilot `b0aa343`，Stage-2 pilot `a31cb75`。本文只记录当前产物可复核的事实。
 
 ## 阅读说明
@@ -104,7 +104,7 @@ not evidence that a later renderer or representation factorial has been tested.
 
 ## 4. 内容自适应是否还有改进空间
 
-即使所有固定动作都没有获胜，仍可能存在另一种解释：不同 prompt 适合不同动作，逐 prompt 选择也许能获得收益。[`analyze_adaptivity.py`](./eval-pipeline/analyze_adaptivity.py) 用留一 seed 交叉验证检查这一点。对每个 held-out seed，脚本只用另外两个 seed 的 TOPIQ-NR 选择一个全局统一动作，以及每个 prompt 各自的动作；`no_ag` 始终包含在候选集中。下表报告留出 seed 上的结果：
+即使所有固定动作都没有获胜，仍可能存在另一种解释：不同 prompt 适合不同动作，逐 prompt 选择也许能获得收益。[`analyze_adaptivity.py`](../../eval-pipeline/analyze_adaptivity.py) 用留一 seed 交叉验证检查这一点。对每个 held-out seed，脚本只用另外两个 seed 的 TOPIQ-NR 选择一个全局统一动作，以及每个 prompt 各自的动作；`no_ag` 始终包含在候选集中。下表报告留出 seed 上的结果：
 
 | 动作集 | 全局 vs no-AG | 逐 prompt vs no-AG | 逐 prompt vs 全局 |
 |---|---:|---:|---:|
@@ -145,7 +145,7 @@ not evidence that a later renderer or representation factorial has been tested.
   --selection_metric topiq_nr
 ```
 
-生成与严格离线评分命令见 [`eval-pipeline/README.md`](./eval-pipeline/README.md)。按照仓库规则，`outputs/` 和 checkpoint 不进入 Git。
+生成与严格离线评分命令见 [`eval-pipeline/README.md`](../../eval-pipeline/README.md)。按照仓库规则，`outputs/` 和 checkpoint 不进入 Git。
 
 ## 7. 这些结果可以和不可以说明什么
 

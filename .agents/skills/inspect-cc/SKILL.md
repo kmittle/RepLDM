@@ -22,7 +22,8 @@ loop. Never push, rewrite history, switch branches, or sweep unrelated dirty wor
 1. Run from `git rev-parse --show-toplevel` and confirm the root contains `AttentionGuidance/`,
    `InferencePipelines/`, and `eval-pipeline/`.
 2. Read applicable `AGENTS.md`, `CLAUDE.md`, `README.md`, and scoped project documents. Read
-   `eval-pipeline/README.md`, `EXPERIMENT_PLAN.md`, and `EXPERIMENT_RESULTS.md` for evaluation scope.
+   `eval-pipeline/README.md`, `doc/research/EXPERIMENT_PLAN.md`, and
+   `doc/research/EXPERIMENT_RESULTS.md` for evaluation scope.
 3. Require both `spawn_agent` and the `claude` CLI. Confirm the installed CLI supports the options
    used below. If either reviewer is unavailable, stop rather than claiming a dual-engine result.
 4. Record startup status and the index separately from the worktree. Preserve user-owned changes.

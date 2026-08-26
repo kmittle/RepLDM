@@ -82,9 +82,13 @@ class SchedulerNativeFixedHeadroomRegistrationTest(unittest.TestCase):
         observed_prior_files = {
             f"eval-pipeline/prompts/{path.name}"
             for path in PROMPT_DIR.glob("*.csv")
-            if not path.name.startswith(builder.OUTPUT_PREFIX)
+            if builder.is_prior_prompt_csv(path)
         }
         self.assertEqual(set(manifest_files), observed_prior_files)
+        self.assertNotIn(
+            "eval-pipeline/prompts/adaptive_oracle_engineering.csv",
+            observed_prior_files,
+        )
 
         old_texts = set()
         old_source_rows = set()

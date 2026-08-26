@@ -1,0 +1,100 @@
+schema: adaptive_oracle_engineering_registration_v1
+status: registration_only_gpu_not_authorized
+experiment_id: adaptive_oracle_engineering_v1
+scope:
+  gpu_generation: false
+  scoring: false
+  quality_inspection: false
+  method_selection: false
+  renderer_training: false
+  rl: false
+  executable_authorization_required: true
+authorization_boundary:
+  allowed_cuda_devices:
+  - cuda:1
+  - cuda:2
+  - cuda:3
+  - cuda:4
+  cpu_audit_path: eval-pipeline/configs/adaptive_oracle_engineering_cpu_audit_v1.json
+  executable_authorization_path: eval-pipeline/configs/adaptive_oracle_engineering_authorization_v1.yaml
+  output_dir: outputs/adaptive_oracle/engineering_v1
+  one_shot: true
+  resume: false
+inputs:
+  prompt_csv:
+    path: eval-pipeline/prompts/adaptive_oracle_engineering.csv
+    sha256: 84b723ff9e2aab6a892e23bd9780a47e97c75be2d7c3fcd3f8185620564ac1d0
+  prompt_manifest:
+    path: eval-pipeline/prompts/adaptive_oracle_prompt_manifest_v1.json
+    sha256: 132d4b26c03c69dcbf66a51b1e9efd567beaf4a667fe76d6ddb0dc49dc14c998
+  exclusion_inventory:
+    path: eval-pipeline/prompts/adaptive_oracle_exclusion_inventory_v1.json
+    sha256: d7f320b1bc9e5f1ecea9c6dbb6bae8e4c1a5277485611e26e6ab8e21393bd42a
+  environment_lock:
+    path: eval-pipeline/configs/generation_environment_adaptive_oracle_v2.yaml
+    sha256: 6ebddd587d32ede30a12256f80ead1fbc392129b3b133cec4bbc917c0d1797c6
+model:
+  model_id: stabilityai/stable-diffusion-xl-base-1.0
+  revision: 462165984030d82259a11f4367a4eed129e94a7b
+  cache_dir: pretrained_ckpts
+  local_files_only: true
+  torch_dtype: float16
+  variant: fp16
+  pipeline_class: RepLDMSDXLPipeline
+  snapshot_manifest_schema: adaptive_oracle_model_snapshot_manifest_v1
+  snapshot_manifest_sha256: 53ebd71cceb73d660ce163b94bab48f4834e494ff60cbbabcb1feffa77eb8f28
+  snapshot_loaded_file_count: 18
+execution:
+  experiment_id: adaptive_oracle_engineering_v1
+  split_role: engineering
+  output_dir: outputs/adaptive_oracle/engineering_v1
+  width: 1024
+  height: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  negative_prompt: blurry, ugly, duplicate, poorly drawn, deformed, mosaic
+  guidance_rescale: 0.0
+  scheduler_class: EulerDiscreteScheduler
+  prediction_type: epsilon
+  scheduler_churn: 0.0
+  scheduler_config_sha256_v2: 6bf0509f22d8d3a06d6493c2291af8655f6f74846b2d2eae3cf71b5cda000102
+  scheduler_schedule_sha256: 302d2452f411bf3eea64f8dd3530e232b95c23aed7b818ed6697982a4428c144
+  scheduler_construction_init_noise_sigma: 14.648818969726562
+  scheduler_effective_init_noise_sigma: 13.158469200134277
+  model_snapshot_manifest_sha256: 53ebd71cceb73d660ce163b94bab48f4834e494ff60cbbabcb1feffa77eb8f28
+  eta: 0.0
+  stage: stage1
+  stage2_enabled: false
+  power_calibrate: 0
+  batch_size: 1
+  num_images_per_prompt: 1
+  prompt_count: 11
+  tasks_per_prompt: 15
+  total_task_count: 165
+  contract_sha256: 7c5ab1f1314aa82a394ee51f2edc2b4556d2a89d80baaa6fd6dc2fd43cec49d4
+  design_sha256: 63acba7e5321b9b1681016804dc319c2ad0652e80053a23fabaa4b186eef8538
+  tasks_sha256: 8bb24f08f75258db487dc962e506a8a123dbd40392236af783b3342f5815b532
+  evidence_scope:
+    generation_only: true
+    scoring_authorized: false
+    quality_outcomes_present: false
+design:
+  prompt_count: 11
+  tasks_per_prompt: 15
+  total_task_count: 165
+  primary_action_count: 13
+  selected_control_count_per_prompt: 2
+  contract_sha256: 7c5ab1f1314aa82a394ee51f2edc2b4556d2a89d80baaa6fd6dc2fd43cec49d4
+  design_sha256: 63acba7e5321b9b1681016804dc319c2ad0652e80053a23fabaa4b186eef8538
+  tasks_sha256: 8bb24f08f75258db487dc962e506a8a123dbd40392236af783b3342f5815b532
+  primary_action_bank_sha256: ce10244eec6959e9e74764cab3990da2a685d738663b55a33d5c66fdcaca80f8
+  signed_orbit_cycle_sha256: d435b6fcfe201d60893c35b44e4c5fa3aa36c5c8acca74a44a9d2746d5f49cc1
+  target_update_ratio: 0.02
+  target_ratio_tolerance: 0.0005
+  hard_update_cap: 0.05
+interpretation:
+  generation_integrity_only: true
+  quality_claim_allowed: false
+  formal_search_authorized: false
+  distillation_authorized: false
+  rl_authorized: false

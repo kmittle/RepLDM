@@ -25,8 +25,9 @@ working branch immediately before the first loop commit; otherwise remain on the
    not the RepLDM repository containing `AttentionGuidance/`, `InferencePipelines/`, and
    `eval-pipeline/`.
 2. Read the applicable `AGENTS.md`, `CLAUDE.md`, `README.md`, and scoped design documentation. Read
-   `eval-pipeline/README.md`, `EXPERIMENT_PLAN.md`, and `EXPERIMENT_RESULTS.md` when the scope touches
-   evaluation or experiments. Treat current code and configuration as authoritative over stale
+   `eval-pipeline/README.md`, `doc/research/EXPERIMENT_PLAN.md`, and
+   `doc/research/EXPERIMENT_RESULTS.md` when the scope touches evaluation or experiments. Treat
+   current code and configuration as authoritative over stale
    prose, except that explicit experiment requirements remain requirements.
 3. Record the branch, `HEAD`, `git status --short`, separate cached and unstaged diffs, and
    non-ignored untracked paths. Record an explicit detached marker when `git symbolic-ref -q HEAD`

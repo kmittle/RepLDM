@@ -7,6 +7,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -496,12 +497,34 @@ class CFGBaselineTest(unittest.TestCase):
             }
             original_prepare = generate.prepare_scheduler_schedule_provenance
             original_generator = generate.torch.Generator
+            device_properties = SimpleNamespace(
+                name="NVIDIA GeForce RTX 3090",
+                major=8,
+                minor=6,
+                total_memory=24 * 1024**3,
+            )
+            device_identity = {
+                "requested_device": "cuda:0",
+                "logical_device_index": 0,
+                "physical_device_index": 0,
+                "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000",
+                "pci_bus_id": "00000000:01:00.0",
+                "cuda_visible_devices": None,
+            }
             with mock.patch.object(
                 generate.RepLDMSDXLPipeline,
                 "from_pretrained",
                 return_value=fake_pipe,
             ) as from_pretrained, mock.patch.object(
                 generate.torch.cuda, "set_device"
+            ), mock.patch.object(
+                generate.torch.cuda,
+                "get_device_properties",
+                return_value=device_properties,
+            ), mock.patch.object(
+                generate,
+                "cuda_device_identity",
+                return_value=device_identity,
             ), mock.patch.object(
                 generate.torch.cuda, "is_available", return_value=False
             ), mock.patch.object(

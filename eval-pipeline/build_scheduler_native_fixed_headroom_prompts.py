@@ -27,6 +27,9 @@ SEED_COUNTS = {"smoke": 1, "development": 3, "validation": 3, "final": 3}
 OBSERVED_GENERATED_SEEDS = (0, 7, 19, 42, 73, 123)
 PRIOR_REGISTERED_SEEDS = (11, 29, 101)
 OUTPUT_PREFIX = "scheduler_native_fixed_headroom_"
+# The fixed-headroom registration predates this separately governed experiment.
+# Its frozen exclusion universe must not expand when that namespace adds prompts.
+POST_REGISTRATION_PROMPT_PREFIXES = ("adaptive_oracle_",)
 CSV_FIELDS = (
     "index",
     "TEXT",
@@ -53,6 +56,14 @@ def canonical_sha256(value: Any) -> str:
 def normalize_prompt(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(value))
     return " ".join(normalized.split()).casefold()
+
+
+def is_prior_prompt_csv(path: pathlib.Path) -> bool:
+    """Return whether a CSV belongs to the fixed-headroom exclusion universe."""
+
+    return path.suffix == ".csv" and not path.name.startswith(
+        (OUTPUT_PREFIX, *POST_REGISTRATION_PROMPT_PREFIXES)
+    )
 
 
 def _read_csv(path: pathlib.Path, *, delimiter: str = ",") -> list[dict[str, str]]:
@@ -106,7 +117,7 @@ def _existing_prompt_inventory(
     excluded_texts: set[str] = set()
     explicit_source_rows: set[int] = set()
     for path in sorted(prompt_dir.glob("*.csv")):
-        if path.name.startswith(OUTPUT_PREFIX):
+        if not is_prior_prompt_csv(path):
             continue
         rows = _read_csv(path)
         if rows and "TEXT" not in rows[0]:

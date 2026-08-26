@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
+import json
+import math
 import os
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -27,7 +30,7 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import (
     FromSingleFileMixin,
-    LoraLoaderMixin,
+    StableDiffusionXLLoraLoaderMixin,
     TextualInversionLoaderMixin,
 )
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
@@ -68,6 +71,7 @@ from AttentionGuidance import (
     TrajectoryCorrectionConfig,
     apply_ancestral_correction,
 )
+from AttentionGuidance.latent_renderer import measure_euler_mapped_intervention
 from InferencePipelines.cfg_batch import (
     expand_cfg_latents,
     expand_cfg_time_ids,
@@ -75,6 +79,34 @@ from InferencePipelines.cfg_batch import (
 )
 import gc
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _tensor_sha256(value: torch.Tensor) -> str:
+    byte_tensor = value.detach().contiguous().cpu().view(torch.uint8).reshape(-1)
+    try:
+        payload = byte_tensor.numpy().tobytes()
+    except (AttributeError, RuntimeError, TypeError):
+        payload = bytes(byte_tensor.tolist())
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _scheduler_values(value: Any) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().reshape(-1).tolist()
+    return [float(item) for item in value]
 
 
 if is_invisible_watermark_available():
@@ -130,6 +162,14 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     return noise_cfg
 
 
+def _relative_l2_error(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """Return one float32 relative-L2 error per batch item."""
+
+    difference = (actual.float() - expected.float()).flatten(1)
+    denominator = torch.linalg.vector_norm(expected.float().flatten(1), dim=1)
+    return torch.linalg.vector_norm(difference, dim=1) / denominator.clamp_min(1e-12)
+
+
 def _sample_resample_noise(
     latents: torch.Tensor,
     generator: Optional[Union[torch.Generator, List[torch.Generator]]],
@@ -160,7 +200,12 @@ def _validate_trajectory_correction_generator(
         )
 
 
-class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin):
+class RepLDMSDXLPipeline(
+    DiffusionPipeline,
+    FromSingleFileMixin,
+    StableDiffusionXLLoraLoaderMixin,
+    TextualInversionLoaderMixin,
+):
     """
     Pipeline for text-to-image generation using Stable Diffusion XL.
 
@@ -340,7 +385,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
 
         # set lora scale so that monkey patched LoRA
         # function of text encoder can correctly access it
-        if lora_scale is not None and isinstance(self, LoraLoaderMixin):
+        if lora_scale is not None and isinstance(
+            self, StableDiffusionXLLoraLoaderMixin
+        ):
             self._lora_scale = lora_scale
 
             # dynamically adjust the LoRA scale
@@ -819,6 +866,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         output_type: Optional[str] = "pil",
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
+        record_latent_audit: bool = False,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         guidance_rescale: float = 0.0,
         original_size: Optional[Tuple[int, int]] = None,
@@ -932,6 +980,9 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             callback_steps (`int`, *optional*, defaults to 1):
                 The frequency at which the `callback` function will be called. If not specified, the callback will be
                 called at every step.
+            record_latent_audit (`bool`, *optional*, defaults to `False`):
+                Record direct hashes of the prepared initial latent and every
+                scheduler-step input/output for integrity auditing.
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
@@ -1049,6 +1100,14 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         self._last_trajectory_correction_diagnostics = []
         self._last_unet_calls_total = 0
         self._last_unet_calls_per_step = []
+        self._last_scheduler_calls_total = 0
+        self._last_scheduler_calls_per_step = []
+        self._last_final_decode_calls = 0
+        self._last_intermediate_decode_calls = 0
+        self._last_scheduler_schedule_record = None
+        self._last_prepared_initial_latent_sha256 = None
+        self._last_latents_before_step_sha256 = []
+        self._last_latents_after_step_sha256 = []
         # Clear renderer state on every invocation so paired non-renderer
         # actions cannot inherit a previous action's scheduler/provenance.
         self._last_latent_renderer_scheduler_mapping = None
@@ -1177,7 +1236,29 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
         )
 
         # 4. Prepare timesteps
+        scheduler_construction_init_noise_sigma = float(
+            self.scheduler.init_noise_sigma
+        )
         self.scheduler.set_timesteps(num_inference_steps, device=device)
+
+        scheduler_timesteps = _scheduler_values(self.scheduler.timesteps)
+        scheduler_sigmas = _scheduler_values(
+            getattr(self.scheduler, "sigmas", None)
+        )
+        scheduler_schedule = {
+            "timesteps": scheduler_timesteps,
+            "sigmas": scheduler_sigmas,
+        }
+        self._last_scheduler_schedule_record = {
+            **scheduler_schedule,
+            "schedule_sha256": _canonical_sha256(scheduler_schedule),
+            "construction_init_noise_sigma": (
+                scheduler_construction_init_noise_sigma
+            ),
+            "effective_init_noise_sigma": float(
+                self.scheduler.init_noise_sigma
+            ),
+        }
 
         timesteps = self.scheduler.timesteps
 
@@ -1199,6 +1280,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             generator,
             latents,
         )
+        if record_latent_audit:
+            self._last_prepared_initial_latent_sha256 = _tensor_sha256(latents)
 
         original_size = original_size or (h_resized, w_resized)
         target_size = target_size or (h_resized, w_resized)
@@ -1349,6 +1432,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     unet_calls_this_step = 0
+                    scheduler_calls_this_step = 0
     
                     if self.lowvram:
                         self.vae.cpu()
@@ -1420,12 +1504,19 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                     # Compute the previous noisy sample x_t -> x_t-1. Semantic
                     # transport must consume the scheduler's own x_0 estimate.
                     latents_before_step = latents
+                    if record_latent_audit:
+                        self._last_latents_before_step_sha256.append(
+                            _tensor_sha256(latents_before_step)
+                        )
                     scheduler_step_index = getattr(self.scheduler, "step_index", None)
                     if scheduler_step_index is None:
                         scheduler_step_index = getattr(self.scheduler, "_step_index", None)
                     if scheduler_step_index is None:
                         scheduler_step_index = i
                     native_renderer_endpoint = None
+                    native_renderer_round_trip = None
+                    scheduler_mapped_intervention = None
+                    mapped_expected_prev_sample = None
                     rendered = None
                     step_model_output = noise_pred
                     if (
@@ -1465,33 +1556,101 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             raise TypeError(
                                 "latent_renderer_basis_provider must return RendererCondition"
                             )
-                        rendered = latent_renderer(
-                            native_renderer_endpoint.pred_original_sample,
-                            condition.bases,
-                            timestep=observation.normalized_timestep,
-                            prompt_embedding=condition.prompt_embedding,
-                            state_features=condition.state_features,
-                            scheduler_update=native_renderer_endpoint.nominal_update,
-                            clean_update_gain=(
-                                native_renderer_endpoint.clean_update_gain
-                            ),
-                        )
-                        if not torch.equal(
-                            rendered.guided_x0,
-                            native_renderer_endpoint.pred_original_sample,
+                        if getattr(
+                            latent_renderer,
+                            "requires_strict_scheduler_mapped_ratio",
+                            False,
                         ):
-                            step_model_output = euler_model_output_from_clean_sample(
-                                latents_before_step,
-                                rendered.guided_x0,
+                            mapped_output = latent_renderer.forward_euler_mapped(
+                                native_renderer_endpoint.pred_original_sample,
+                                condition.bases,
+                                sample=latents_before_step,
+                                native_model_output=noise_pred,
                                 sigma_from=native_renderer_endpoint.sigma_from,
+                                sigma_to=native_renderer_endpoint.sigma_to,
                                 prediction_type=prediction_type,
-                                output_dtype=noise_pred.dtype,
+                                scheduler_update=(
+                                    native_renderer_endpoint.nominal_update
+                                ),
+                                clean_update_gain=(
+                                    native_renderer_endpoint.clean_update_gain
+                                ),
+                                timestep=observation.normalized_timestep,
+                                prompt_embedding=condition.prompt_embedding,
+                                state_features=condition.state_features,
                             )
+                            rendered = mapped_output.rendered
+                            step_model_output = mapped_output.model_output
+                            mapped_expected_prev_sample = (
+                                mapped_output.predicted_prev_sample
+                            )
+                            measured = mapped_output.mapped_intervention
+                            mapped_target = measured.ratio.new_full(
+                                measured.ratio.shape,
+                                float(latent_renderer.target_update_ratio),
+                            )
+                            mapped_target_error = (
+                                measured.ratio - mapped_target
+                            ).abs()
+                            mapped_hard_cap = float(
+                                latent_renderer.hard_update_cap
+                            )
+                            mapped_cap_hit = measured.ratio >= mapped_hard_cap
+                            scheduler_mapped_intervention = {
+                                "nominal_update_norm": (
+                                    measured.nominal_update_norm
+                                    .detach().cpu().tolist()
+                                ),
+                                "applied_update_norm": (
+                                    measured.intervention_norm
+                                    .detach().cpu().tolist()
+                                ),
+                                "applied_update_ratio": (
+                                    measured.ratio.detach().cpu().tolist()
+                                ),
+                                "target_ratio_error": (
+                                    mapped_target_error.detach().cpu().tolist()
+                                ),
+                                "cap_hit": mapped_cap_hit.detach().cpu().tolist(),
+                                "solver_target_update_ratio": [
+                                    mapped_output.solver_target_update_ratio
+                                ],
+                                "solver_evaluations": (
+                                    mapped_output.solver_evaluations
+                                ),
+                            }
+                        else:
+                            rendered = latent_renderer(
+                                native_renderer_endpoint.pred_original_sample,
+                                condition.bases,
+                                timestep=observation.normalized_timestep,
+                                prompt_embedding=condition.prompt_embedding,
+                                state_features=condition.state_features,
+                                scheduler_update=(
+                                    native_renderer_endpoint.nominal_update
+                                ),
+                                clean_update_gain=(
+                                    native_renderer_endpoint.clean_update_gain
+                                ),
+                            )
+                            if not torch.equal(
+                                rendered.guided_x0,
+                                native_renderer_endpoint.pred_original_sample,
+                            ):
+                                step_model_output = euler_model_output_from_clean_sample(
+                                    latents_before_step,
+                                    rendered.guided_x0,
+                                    sigma_from=native_renderer_endpoint.sigma_from,
+                                    prediction_type=prediction_type,
+                                    output_dtype=noise_pred.dtype,
+                                )
                     if (
                         semantic_transport is None
                         and latent_renderer is None
                         and trajectory_correction is None
                     ):
+                        scheduler_calls_this_step += 1
+                        self._last_scheduler_calls_total += 1
                         latents = self.scheduler.step(
                             step_model_output,
                             t,
@@ -1500,6 +1659,8 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             return_dict=False,
                         )[0]
                     else:
+                        scheduler_calls_this_step += 1
+                        self._last_scheduler_calls_total += 1
                         step_output = self.scheduler.step(
                             step_model_output,
                             t,
@@ -1508,6 +1669,127 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                             return_dict=True,
                         )
                         latents = step_output.prev_sample
+                    self._last_scheduler_calls_per_step.append(
+                        scheduler_calls_this_step
+                    )
+                    if record_latent_audit:
+                        self._last_latents_after_step_sha256.append(
+                            _tensor_sha256(latents)
+                        )
+
+                    if native_renderer_endpoint is not None:
+                        gain = native_renderer_endpoint.clean_update_gain.to(
+                            device=latents_before_step.device,
+                            dtype=torch.float32,
+                        ).reshape(-1, 1, 1, 1)
+                        if gain.shape[0] == 1 and latents_before_step.shape[0] != 1:
+                            gain = gain.expand(latents_before_step.shape[0], -1, -1, -1)
+                        expected_prev_sample = latents_before_step.float() + gain * (
+                            rendered.guided_x0.float() - latents_before_step.float()
+                        )
+                        if mapped_expected_prev_sample is not None and not torch.equal(
+                            step_output.prev_sample, mapped_expected_prev_sample
+                        ):
+                            raise RuntimeError(
+                                "Euler scheduler output differs from the calibrated prediction"
+                            )
+                        pred_original_error = _relative_l2_error(
+                            step_output.pred_original_sample,
+                            rendered.guided_x0,
+                        )
+                        expected_prev_error = _relative_l2_error(
+                            step_output.prev_sample,
+                            expected_prev_sample,
+                        )
+                        pred_original_max_abs = (
+                            step_output.pred_original_sample.float()
+                            - rendered.guided_x0.float()
+                        ).abs().flatten(1).amax(dim=1)
+                        expected_prev_max_abs = (
+                            step_output.prev_sample.float() - expected_prev_sample
+                        ).abs().flatten(1).amax(dim=1)
+                        round_trip_max_abs = torch.maximum(
+                            pred_original_max_abs, expected_prev_max_abs
+                        )
+                        native_renderer_round_trip = {
+                            "pred_original_sample_relative_l2_error": (
+                                pred_original_error.detach().cpu().tolist()
+                            ),
+                            "expected_prev_sample_relative_l2_error": (
+                                expected_prev_error.detach().cpu().tolist()
+                            ),
+                            "native_round_trip_max_abs_error": (
+                                round_trip_max_abs.detach().cpu().tolist()
+                            ),
+                        }
+                        round_trip_values = torch.cat(
+                            (pred_original_error, expected_prev_error, round_trip_max_abs)
+                        )
+                        if not torch.isfinite(round_trip_values).all():
+                            raise RuntimeError(
+                                "native Euler scheduler round trip is non-finite"
+                            )
+                        if getattr(
+                            latent_renderer,
+                            "requires_strict_scheduler_round_trip",
+                            False,
+                        ):
+                            pred_tolerance = float(
+                                getattr(
+                                    latent_renderer,
+                                    "scheduler_pred_original_relative_l2_tolerance",
+                                    float("nan"),
+                                )
+                            )
+                            prev_tolerance = float(
+                                getattr(
+                                    latent_renderer,
+                                    "scheduler_prev_sample_relative_l2_tolerance",
+                                    float("nan"),
+                                )
+                            )
+                            if pred_tolerance != 0.01 or prev_tolerance != 1e-3:
+                                raise RuntimeError(
+                                    "adaptive-oracle scheduler round-trip tolerance drifted"
+                                )
+                            if torch.any(
+                                pred_original_error > pred_tolerance
+                            ) or torch.any(
+                                expected_prev_error > prev_tolerance
+                            ):
+                                raise RuntimeError(
+                                    "adaptive-oracle native Euler scheduler round trip "
+                                    "exceeds tolerance"
+                                )
+                        if getattr(
+                            latent_renderer,
+                            "requires_strict_scheduler_mapped_ratio",
+                            False,
+                        ):
+                            if scheduler_mapped_intervention is None:
+                                raise RuntimeError(
+                                    "adaptive-oracle omitted mapped-ratio diagnostics"
+                                )
+                            ratio_tolerance = float(
+                                getattr(latent_renderer, "ratio_tolerance", float("nan"))
+                            )
+                            if not (
+                                math.isfinite(float(mapped_target[0]))
+                                and math.isfinite(mapped_hard_cap)
+                                and math.isfinite(ratio_tolerance)
+                                and ratio_tolerance > 0
+                            ):
+                                raise RuntimeError(
+                                    "adaptive-oracle mapped-ratio contract is invalid"
+                                )
+                            if torch.any(mapped_target_error > ratio_tolerance):
+                                raise RuntimeError(
+                                    "adaptive-oracle scheduler-mapped ratio missed target"
+                                )
+                            if torch.any(mapped_cap_hit):
+                                raise RuntimeError(
+                                    "adaptive-oracle scheduler-mapped ratio hit hard cap"
+                                )
                     denoising_update = latents - latents_before_step
 
                     if trajectory_correction is not None:
@@ -1589,6 +1871,12 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
                                     .item()
                                 ),
                                 "prediction_type": prediction_type,
+                                "native_scheduler_round_trip": (
+                                    native_renderer_round_trip
+                                ),
+                                "scheduler_mapped_intervention": (
+                                    scheduler_mapped_intervention
+                                ),
                                 **rendered.diagnostics.to_record(),
                                 "provider_diagnostics": provider_diagnostics,
                             }
@@ -1673,6 +1961,7 @@ class RepLDMSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoaderMixin
             latents = latents.cpu()
             self.empty_cache()
         if not output_type == "latent":
+            self._last_final_decode_calls += 1
             # make sure the VAE is in float32 mode, as it overflows in float16
             needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
             

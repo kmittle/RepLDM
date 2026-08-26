@@ -57,6 +57,20 @@ search-then-distill with an anchored, multi-reward objective. A later RL arm may
 use antithetic shared-prefix rollouts, but its estimator, stage partition, and
 reward aggregation are controls to be compared, not claimed contributions.
 
+The 2026-08-25 releases DiffusionOPSD (2608.24646v1) and reward-based velocity
+matching, RVM (2608.23664v1), make that comparison stricter. DiffusionOPSD
+constructs bounded positive and negative clean-output targets with reward
+gradients, detaches them, and measures target construction separately from
+finite fitting. RVM uses signed reward-weighted native-velocity regression with
+a reference or EMA anchor and subsumes several recent loss variants. If a
+static relational action and outer replay first pass, learning must therefore
+compare the frozen search teacher, an OPSD-style bounded-target teacher, and an
+anchored native-prediction regression baseline at matched reward queries and
+training cost. Report target-level reward gain separately from the gain realized
+by the small renderer. SDXL epsilon-prediction Euler requires its own exact
+coordinate derivation; rectified-flow velocity formulas are not interchangeable.
+Neither baseline may be used to rescue a failed static family.
+
 Two additional overlaps are important for the word "renderer": **LaRender
 (arXiv:2508.07647)** already performs training-free volumetric compositing of
 object-wise cross-attention features in latent space, using masks and an
@@ -112,7 +126,7 @@ renderer, the representation, or their interaction.
 ## Candidate Renderer
 
 The first implementation is frozen in `AttentionGuidance/latent_renderer.py`
-and registered separately in `LATENT_RENDERER_PROTOCOL.md`. It has a
+and registered separately in `../protocols/LATENT_RENDERER_PROTOCOL.md`. It has a
 zero-initialized basis allocator plus an optional D4-symmetrized,
 depthwise-separable spatial head; the coefficient-only path is retained as a
 matched control. This keeps the initial identity, parameter count, residual

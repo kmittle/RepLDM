@@ -1,0 +1,355 @@
+{
+  "collisions": {
+    "normalized_prompts": [],
+    "source_rows": [],
+    "used_or_reserved_seeds": []
+  },
+  "engineering": {
+    "challenge_count": 11,
+    "counts_per_challenge": 1,
+    "csv": "eval-pipeline/prompts/adaptive_oracle_engineering.csv",
+    "csv_sha256": "84b723ff9e2aab6a892e23bd9780a47e97c75be2d7c3fcd3f8185620564ac1d0",
+    "normalized_prompt_digests": [
+      "f316af80cfdefd20d1a35be2dd2add893e5d4c58c8112b6c802da6272648e36c",
+      "645b0d9dc84560fe53f50a146e10d774214ed28443083a92e137b612d5d103fa",
+      "47aebd404626b5f7cc85a05d81ebbd613c840d94a4e4c06d42fa1092593b1213",
+      "31dfc882f39f47caea6e2d769c5ca455f2dd43ba0fa33b161e4fca6bc97edf90",
+      "77d21266085768f7cbbc5c280c89c9fc5173382e4f6dc3bf7b36b01cc89ddd16",
+      "87fc70ca01a6cc209920f377b9d77802adcef6a8ce08c257925d1712fd22ef97",
+      "b8b24dd5fcf3cfc31ab1e5649d78f034adcc6fb52e5009836ee186eb6874706c",
+      "7f2990479226039b78a6b286b94126afe1aa49fa979a0cefc3c6608c1f3555e4",
+      "ab075acd33488790d7330d15a02490fff605c84c015eae21bd1aae4ad684cd5b",
+      "6fd2262fc34a0dcff480b2a14077ce455ef4bba5a290eb3daf08ab952fdeafaf",
+      "d41cb4f52517dfb1c6fdb80433ab21c9083ac359d40a88dd5d948eb295d844aa"
+    ],
+    "prompt_count": 11,
+    "prompts": [
+      {
+        "category": "Illustrations",
+        "challenge": "Basic",
+        "normalized_prompt_sha256": "f316af80cfdefd20d1a35be2dd2add893e5d4c58c8112b6c802da6272648e36c",
+        "prompt_row_id": "engineering-0001",
+        "prompt_sha256": "f316af80cfdefd20d1a35be2dd2add893e5d4c58c8112b6c802da6272648e36c",
+        "rank_within_challenge": 0,
+        "selection_digest": "000d4d72c57ee9b87efdc927f6d887fb5555dafda6b0a1abfc80982013273344",
+        "source_row": 40
+      },
+      {
+        "category": "People",
+        "challenge": "Complex",
+        "normalized_prompt_sha256": "645b0d9dc84560fe53f50a146e10d774214ed28443083a92e137b612d5d103fa",
+        "prompt_row_id": "engineering-0002",
+        "prompt_sha256": "645b0d9dc84560fe53f50a146e10d774214ed28443083a92e137b612d5d103fa",
+        "rank_within_challenge": 0,
+        "selection_digest": "00435faa1371465c7e85984a91f4fe2d96d2f10813fbbd88c4b2588ca5a0871f",
+        "source_row": 381
+      },
+      {
+        "category": "Vehicles",
+        "challenge": "Fine-grained Detail",
+        "normalized_prompt_sha256": "47aebd404626b5f7cc85a05d81ebbd613c840d94a4e4c06d42fa1092593b1213",
+        "prompt_row_id": "engineering-0003",
+        "prompt_sha256": "6b0239db8a84583ec9e86c920460295e265b7c8683228312ff3c770ff4dbcc8e",
+        "rank_within_challenge": 0,
+        "selection_digest": "0157b3eac26174dc57abad876c6894bf829cbb962f8197354fff327e03cf20cb",
+        "source_row": 403
+      },
+      {
+        "category": "Produce & Plants",
+        "challenge": "Imagination",
+        "normalized_prompt_sha256": "31dfc882f39f47caea6e2d769c5ca455f2dd43ba0fa33b161e4fca6bc97edf90",
+        "prompt_row_id": "engineering-0004",
+        "prompt_sha256": "31dfc882f39f47caea6e2d769c5ca455f2dd43ba0fa33b161e4fca6bc97edf90",
+        "rank_within_challenge": 0,
+        "selection_digest": "00a7da50c914f3e7f3153e2ffa0ed130fbe662f1e75e4dacb7a4bef13d1bbeba",
+        "source_row": 805
+      },
+      {
+        "category": "Animals",
+        "challenge": "Linguistic Structures",
+        "normalized_prompt_sha256": "77d21266085768f7cbbc5c280c89c9fc5173382e4f6dc3bf7b36b01cc89ddd16",
+        "prompt_row_id": "engineering-0005",
+        "prompt_sha256": "77d21266085768f7cbbc5c280c89c9fc5173382e4f6dc3bf7b36b01cc89ddd16",
+        "rank_within_challenge": 0,
+        "selection_digest": "052a845550334ca28fad94cda66d161673afd72ac2417c782fbbaea465bf9fd9",
+        "source_row": 878
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Perspective",
+        "normalized_prompt_sha256": "87fc70ca01a6cc209920f377b9d77802adcef6a8ce08c257925d1712fd22ef97",
+        "prompt_row_id": "engineering-0006",
+        "prompt_sha256": "4124a0345647a968386a8a2bab21b76ea4f0580a04bf31c03746749c24976a36",
+        "rank_within_challenge": 0,
+        "selection_digest": "00c392e2d4aac551dc851b5649fd214131b8999768932c8cc52621c3e6cc1a09",
+        "source_row": 964
+      },
+      {
+        "category": "Illustrations",
+        "challenge": "Properties & Positioning",
+        "normalized_prompt_sha256": "b8b24dd5fcf3cfc31ab1e5649d78f034adcc6fb52e5009836ee186eb6874706c",
+        "prompt_row_id": "engineering-0007",
+        "prompt_sha256": "b8b24dd5fcf3cfc31ab1e5649d78f034adcc6fb52e5009836ee186eb6874706c",
+        "rank_within_challenge": 0,
+        "selection_digest": "01a73e1a1ff3c57212d1803eaa58e3d29551562acff9414cefa84815e0978211",
+        "source_row": 1001
+      },
+      {
+        "category": "Artifacts",
+        "challenge": "Quantity",
+        "normalized_prompt_sha256": "7f2990479226039b78a6b286b94126afe1aa49fa979a0cefc3c6608c1f3555e4",
+        "prompt_row_id": "engineering-0008",
+        "prompt_sha256": "7f2990479226039b78a6b286b94126afe1aa49fa979a0cefc3c6608c1f3555e4",
+        "rank_within_challenge": 0,
+        "selection_digest": "012d4e5e9da7bde608ba39b6b574f2e8b1f9a18b69af7d3d37aef8d52ead0c6f",
+        "source_row": 1063
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Simple Detail",
+        "normalized_prompt_sha256": "ab075acd33488790d7330d15a02490fff605c84c015eae21bd1aae4ad684cd5b",
+        "prompt_row_id": "engineering-0009",
+        "prompt_sha256": "ab075acd33488790d7330d15a02490fff605c84c015eae21bd1aae4ad684cd5b",
+        "rank_within_challenge": 0,
+        "selection_digest": "01a29612855031c941c78b556cccb6412e9ad8c92fe5264d9a9e82ca3481d29f",
+        "source_row": 1107
+      },
+      {
+        "category": "World Knowledge",
+        "challenge": "Style & Format",
+        "normalized_prompt_sha256": "6fd2262fc34a0dcff480b2a14077ce455ef4bba5a290eb3daf08ab952fdeafaf",
+        "prompt_row_id": "engineering-0010",
+        "prompt_sha256": "f89b79cc2c85e34238d51ef65fecc832e6057b71e8837d0c3d4a8a13135c6f25",
+        "rank_within_challenge": 0,
+        "selection_digest": "00ca0a76aa459cb20f18df3da091e3b4d60334bf5ca0423659082d91bcbc5ae3",
+        "source_row": 1344
+      },
+      {
+        "category": "Outdoor Scenes",
+        "challenge": "Writing & Symbols",
+        "normalized_prompt_sha256": "d41cb4f52517dfb1c6fdb80433ab21c9083ac359d40a88dd5d948eb295d844aa",
+        "prompt_row_id": "engineering-0011",
+        "prompt_sha256": "7558f6c1df5af01163dfab6aaf54798e2f1c78ac9158d557b5f75d326a4cd04d",
+        "rank_within_challenge": 0,
+        "selection_digest": "01adecf008d6b3dd1d0da1bdef3ff7f65a025efe983f3accb0511d4f52a13096",
+        "source_row": 1612
+      }
+    ],
+    "selection_digest": "45676e947fd982cb8eaecab1865ee1612e5e3118b54fbb58d089075d0180022a"
+  },
+  "excluded_explicit_source_row_count": 254,
+  "excluded_explicit_source_row_digest": "756dc767e5373bf8590694dc28d16a53ff6b2d35cdb5b26ed1d3267157586c3d",
+  "excluded_normalized_prompt_count": 271,
+  "excluded_normalized_prompt_digest": "c3ef46f671fd382c9322c78e9ac2e757f135dfc8502996ab171675fdc8aebcd7",
+  "excluded_source_row_count": 254,
+  "excluded_source_row_digest": "756dc767e5373bf8590694dc28d16a53ff6b2d35cdb5b26ed1d3267157586c3d",
+  "excluded_text_derived_source_row_count": 253,
+  "excluded_text_derived_source_row_digest": "9a773051b83ddfbab27ac732b98623da7c5f596a4cbe7440435e105cb37b101d",
+  "exclusion_inventory": {
+    "path": "eval-pipeline/prompts/adaptive_oracle_exclusion_inventory_v1.json",
+    "schema": "adaptive_oracle_exclusion_inventory_v1",
+    "sha256": "d7f320b1bc9e5f1ecea9c6dbb6bae8e4c1a5277485611e26e6ab8e21393bd42a"
+  },
+  "experiment_id": "adaptive_oracle_engineering_v1",
+  "inventory": {
+    "dedicated_score_or_quality_files_read": 0,
+    "explicit_source_row_inventory_digest": "756dc767e5373bf8590694dc28d16a53ff6b2d35cdb5b26ed1d3267157586c3d",
+    "file_path_digest": "e8768ef876c96221b7c636f5099a4b0fa57b78425920302ae0304f8c32abccd1",
+    "forbidden_output_path_count": 26,
+    "metadata_projection_digest": "8817b55183bab4a4c44dc88162cb9f8b4cd8a48514b09d187b27a75d01c6b076",
+    "normalized_prompt_inventory_digest": "c3ef46f671fd382c9322c78e9ac2e757f135dfc8502996ab171675fdc8aebcd7",
+    "outcome_container_count_identity_only": 17773,
+    "outcome_field_values_consumed": 0,
+    "output_metadata_files_parsed_for_identity_inventory": 9306,
+    "parsed_identity_field_allowlist": [
+      "prompt",
+      "prompts",
+      "text",
+      "positive_prompt",
+      "source_row",
+      "source_rows",
+      "source_row_id",
+      "seed",
+      "seeds",
+      "*_seed",
+      "*_seeds",
+      "used_seed*",
+      "reserved_seed*",
+      "retired_seed*",
+      "observed_seed*",
+      "prior_seed*",
+      "generated_seed*",
+      "seed_list",
+      "seed_values",
+      "seeds_by_split"
+    ],
+    "repository_metadata_files_parsed_for_identity_inventory": 51,
+    "roles": {
+      "output_config": {
+        "explicit_source_row_occurrence_count": 0,
+        "file_count": 39,
+        "forbidden_fields_skipped": 0,
+        "prompt_occurrence_count": 0,
+        "record_count": 39,
+        "seed_occurrence_count": 191
+      },
+      "output_manifest": {
+        "explicit_source_row_occurrence_count": 0,
+        "file_count": 36,
+        "forbidden_fields_skipped": 8754,
+        "prompt_occurrence_count": 8962,
+        "record_count": 8964,
+        "seed_occurrence_count": 12583
+      },
+      "output_sidecar": {
+        "explicit_source_row_occurrence_count": 0,
+        "file_count": 9231,
+        "forbidden_fields_skipped": 9019,
+        "prompt_occurrence_count": 9231,
+        "record_count": 9231,
+        "seed_occurrence_count": 12995
+      },
+      "repository_config": {
+        "explicit_source_row_occurrence_count": 0,
+        "file_count": 33,
+        "forbidden_fields_skipped": 0,
+        "prompt_occurrence_count": 17,
+        "record_count": 33,
+        "seed_occurrence_count": 72
+      },
+      "repository_prompt_csv": {
+        "explicit_source_row_occurrence_count": 253,
+        "file_count": 14,
+        "forbidden_fields_skipped": 0,
+        "prompt_occurrence_count": 268,
+        "record_count": 268,
+        "seed_occurrence_count": 0
+      },
+      "repository_prompt_manifest": {
+        "explicit_source_row_occurrence_count": 229,
+        "file_count": 4,
+        "forbidden_fields_skipped": 0,
+        "prompt_occurrence_count": 44,
+        "record_count": 4,
+        "seed_occurrence_count": 30
+      }
+    },
+    "scanned_file_count": 9357,
+    "scanned_record_count": 18539,
+    "unique_explicit_source_row_count": 254,
+    "unique_normalized_prompt_count": 271,
+    "unique_used_reserved_seed_count": 22,
+    "used_reserved_seed_digest": "81e8a082086c6e40f4d1a81b4b8192c6973faa3ab4b33b309366d74a62cfb1ab"
+  },
+  "inventory_policy": {
+    "allowed_projection": [
+      "prompt",
+      "source_row",
+      "used_or_reserved_seed"
+    ],
+    "dedicated_score_or_quality_files_read": 0,
+    "forbidden_field_fragments": [
+      "aggregate",
+      "analysis",
+      "aesthetic",
+      "audit",
+      "evaluation",
+      "hps",
+      "imagereward",
+      "metric",
+      "outcome",
+      "preference",
+      "quality",
+      "rank",
+      "report",
+      "result",
+      "reward",
+      "score",
+      "statistic",
+      "topiq"
+    ],
+    "forbidden_output_path_fragments": [
+      "quality",
+      "score"
+    ],
+    "historical_output_scope": "outputs/** config/manifest/sidecar metadata",
+    "outcome_container_policy": "traverse mappings only to project allowlisted identity fields; do not consume score, quality, reward, metric, or result scalars",
+    "outcome_field_values_consumed": 0,
+    "parsed_identity_field_allowlist": [
+      "prompt",
+      "prompts",
+      "text",
+      "positive_prompt",
+      "source_row",
+      "source_rows",
+      "source_row_id",
+      "seed",
+      "seeds",
+      "*_seed",
+      "*_seeds",
+      "used_seed*",
+      "reserved_seed*",
+      "retired_seed*",
+      "observed_seed*",
+      "prior_seed*",
+      "generated_seed*",
+      "seed_list",
+      "seed_values",
+      "seeds_by_split"
+    ],
+    "repository_prompt_scope": "eval-pipeline/prompts/**/*.csv|json|jsonl",
+    "repository_seed_scope": "eval-pipeline/configs/**/*.{yaml,yml,json,jsonl} plus prompt manifests",
+    "self_metadata_excluded_names": [
+      "adaptive_oracle_engineering_authorization_v1.yaml",
+      "adaptive_oracle_engineering_cpu_audit_v1.json",
+      "adaptive_oracle_engineering_registration_v1.yaml",
+      "generation_environment_adaptive_oracle_v2.yaml"
+    ],
+    "self_output_excluded_prefixes": [
+      "adaptive_oracle/engineering_v1"
+    ]
+  },
+  "normalization_rule": "Unicode NFKC, collapse whitespace, then casefold",
+  "schema": "adaptive_oracle_prompt_manifest_v1",
+  "seed_registration": {
+    "engineering_seed": {
+      "counter": 0,
+      "retired_on_use": true,
+      "retirement_trigger": "first_generation_attempt_regardless_of_outcome",
+      "seed": 120129238,
+      "selection_digest": "072906d6767137277c40f8ebbcbf6a8e361170f1540f37579ed680a5cd7df4c8",
+      "status": "reserved_retired_on_use"
+    },
+    "global_seed_count": 1,
+    "namespace": "repldm-adaptive-oracle-engineering-v1-seed",
+    "reuse_policy": "forbidden_after_the_first_generation_attempt",
+    "selection_rule": "for counter starting at zero compute SHA256(namespace:engineering:counter), map the first eight hex digits with & 0x7fffffff, and take the first positive value absent from the frozen used/reserved seed inventory",
+    "used_reserved_seed_count": 22,
+    "used_reserved_seed_digest": "81e8a082086c6e40f4d1a81b4b8192c6973faa3ab4b33b309366d74a62cfb1ab"
+  },
+  "selection_namespace": "repldm-adaptive-oracle-engineering-v1",
+  "selection_rule": "exclude every normalized prompt and explicit or text-derived source_row from repository prompt CSV/JSON metadata and historical output manifest/sidecar metadata; globally deduplicate the frozen source by normalized text using the lowest source_row; within each challenge sort SHA256(namespace:prompt:challenge:source_row:normalized_prompt) and take rank zero",
+  "source": {
+    "challenge_count": 11,
+    "challenges": [
+      "Basic",
+      "Complex",
+      "Fine-grained Detail",
+      "Imagination",
+      "Linguistic Structures",
+      "Perspective",
+      "Properties & Positioning",
+      "Quantity",
+      "Simple Detail",
+      "Style & Format",
+      "Writing & Symbols"
+    ],
+    "file": "PartiPrompts.tsv",
+    "file_sha256": "fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb",
+    "repository": "https://github.com/google-research/parti",
+    "revision": "5a657978134374ce28973948331b319adef164bd",
+    "revision_verified_by_builder": true,
+    "row_count": 1632
+  },
+  "status": "registration_only_gpu_not_authorized"
+}

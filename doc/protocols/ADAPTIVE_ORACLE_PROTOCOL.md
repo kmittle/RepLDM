@@ -1,8 +1,8 @@
 # Adaptive Oracle Protocol
 
-**Status (2026-08-25): `blocked_registration_only`.** This document authorizes
+**Status (2026-08-26): `blocked_registration_only`.** This document authorizes
 no GPU use, image generation, scoring, renderer training, or RL. It defines the
-evidence required before an executable registration can be reviewed. Formal
+evidence required before an executable authorization can be reviewed. Formal
 outputs and scores from other studies are out of scope.
 
 ## Claim Boundary and Historical Nulls
@@ -20,6 +20,12 @@ coordinates. It uses new prompt and seed namespaces, a different feature,
 operator, action bank, and causal design. Any paper connection to the conference
 version is the principle of model-native latent-trajectory reprogramming, not a
 claim that this operator rescues or extends a positive historical action.
+
+DUNE is the closest training-free intervention at the same SDXL `h`-space. The
+current engineering smoke does not compare efficacy, but any later formal
+search must add a preregistered, same-hook and compute-matched temporal-anomaly
+control. Otherwise a positive result cannot distinguish local relations from a
+generic benefit of detecting abrupt feature changes over time.
 
 ## Frozen Candidate Operator
 
@@ -59,17 +65,28 @@ adaptive average pooling, and let `U16` be bilinear upsampling with
 b^o_t=U_{16}(W^o_t z_t-z_t).
 \]
 
-For each latent channel, remove the spatial mean from `b` and project away its
-component along \(q=\hat x_0-\operatorname{mean}(\hat x_0)\). This is the tangent
-projection \(v=T_{\hat x_0}(b)\). The candidate endpoint follows the fixed-moment
-sphere geodesic
+Remove the spatial mean independently from every channel of `b` and
+\(\hat x_0\), then flatten the spatial dimensions to obtain matrices
+\(B,Q\in\mathbb R^{4\times HW}\). Let \(G_Q=QQ^T\) and project the basis away
+from the complete channel row space,
 
 \[
-y_c=\mu_c+q_c\cos\theta+\|q_c\|_2
-       \frac{s v_c}{\|v_c\|_2}\sin\theta,\quad s\in\{-1,+1\}.
+V=B-BQ^T G_Q^{-1}Q.
 \]
 
-Zero or non-finite tangent norms fail closed. A common nonnegative `theta` is
+Both \(G_Q\) and \(G_V=VV^T\) must be positive definite. With lower Cholesky
+factors \(G_Q=L_Q L_Q^T\) and \(G_V=L_V L_V^T\), define
+\(D=L_Q L_V^{-1}V\). Then \(DQ^T=0\) and \(DD^T=QQ^T\), so the full-Gram
+fixed-moment geodesic is
+
+\[
+Y=\mu+Q\cos\theta+sD\sin\theta,\quad s\in\{-1,+1\}.
+\]
+
+This preserves every channel mean and the complete channel covariance matrix,
+not only its diagonal variances, while retaining
+\(\|Y-Q\|_F=2\|Q\|_F\sin(\theta/2)\). Singular or non-finite channel/tangent
+Gram matrices fail closed. A common nonnegative `theta` is
 found deterministically so the mapped update ratio is nominally `0.02`. For
 deterministic, no-churn `EulerDiscreteScheduler`, production reconstructs the
 native epsilon corresponding to `y` and calls `scheduler.step` exactly once;
@@ -80,7 +97,11 @@ u_t=(1-\sigma_{t+1}/\sigma_t)(y_t-\hat x_{0,t}),\qquad
 \|u_t\|_2/(\|\bar x_{t-1}-x_t\|_2+10^{-12})=0.02.
 \]
 
-The measured ratio has a hard `0.05` cap after scheduler mapping. A cap hit,
+After the one scheduler call, the implementation analytically reconstructs the
+native no-op `prev_sample`, including Euler's output-dtype cast, and measures
+the actual intervention as `guided_prev_sample - native_prev_sample`. This
+post-mapping ratio must remain within `5e-4` of `0.02` and has a hard `0.05`
+cap. A cap hit,
 moment drift above 1%, native-round-trip mismatch, or any non-finite value is a
 record failure. Other schedulers are unsupported, not silently approximated.
 
@@ -107,13 +128,23 @@ actions solve the same `0.02` scheduler-coordinate target from only `x0` and
 the nominal Euler update, so geodesic displacement is direction-norm matched
 analytically. The negative endpoint direction is the registered tangent-
 antithetic pair. The edge RNG, field resolution, keys, and matching tolerances
-are hashed before generation.
+are hashed before generation. Because every signed pair starts from the same
+prompt, seed, and initial latent, its `+/-` trajectories must report an identical
+step-0 basis hash for each `P/R` orbit. Later basis hashes may diverge only after
+the signed interventions separate their trajectories.
 
 The random affinity is exactly \(a^{r,o}_{ij}=\epsilon_a+U_{ij}\). Its counter
 is a JSON object whose `schema` field is `ao-random-edge-counter-v1`, followed
 by `experiment_id`, `split_role`, `prompt_row_id`, integer `seed`, integer
 `step_index`, `orbit_name`, and sorted integer node ids `edge_low,edge_high`.
-All string values are restricted to `[A-Za-z0-9._:-]+`. Serialize with Python
+All string values are restricted to `[A-Za-z0-9._:-]+`. To preserve the same
+D4 symmetry as the structural operator, an actual undirected edge first maps to
+its canonical D4 representative: apply all eight rotations/reflections of the
+16x16 node grid, sort the two node ids within each image, and take the
+lexicographically smallest pair. The counter's `edge_low,edge_high` are this
+canonical pair. D4-related actual edges intentionally reuse one counter and
+weight; actual undirected edges themselves must remain unique within an orbit.
+Serialize with Python
 `json.dumps(counter, ensure_ascii=True, sort_keys=True, separators=(",", ":"))`
 and encode as UTF-8 with no BOM or trailing newline. One complete byte-string is:
 
@@ -123,10 +154,17 @@ and encode as UTF-8 with no BOM or trailing newline. One complete byte-string is
 
 SHA-256 of those bytes supplies `k` from its first three bytes interpreted as
 an unsigned big-endian integer, and \(U=k/2^{24}\in[0,1-2^{-24}]\). Both
-directions of one undirected edge reuse the same draw; `+/-` actions reuse the
-same graph. No process RNG or floating-point hash conversion is permitted.
-Repeated `k` or `U` values are valid; uniqueness is required only for counter
-tuples and the registered prompt/seed namespaces.
+directions of one undirected edge, all D4 images of that edge, and `+/-` actions
+reuse the same draw. No process RNG or floating-point hash conversion is
+permitted. Repeated `k` or `U` values for distinct canonical counters are valid;
+uniqueness is required for actual edge tuples and registered prompt/seed
+namespaces, while canonical-counter reuse must be explained exactly by D4.
+For each `(prompt, seed, step, orbit)`, sort the unique canonical pairs, prefix
+each exact counter byte-string by its unsigned four-byte big-endian length, and
+SHA-256 the concatenation. The resulting `random_counter_set_sha256` is
+independent of action id and sign. The auditor requires the `R+` and `R-`
+trajectories for an orbit to report the same value at every step even though
+their transported bases diverge after their latent trajectories separate.
 
 Two nested controls test whether any gain is specific to the hooked feature
 relations. They are not independently searched action banks. The **uniform**
@@ -308,26 +346,54 @@ firewall if used, chosen counts, and hashes form
 ## One-Shot Artifacts and Sequential Gates
 
 All writers use locks, atomic creation, and refusal when an output exists.
-`adaptive_oracle_prompt_manifest_v1.json`, `power_analysis.json`, a non-
-executable registration YAML, implementation/environment manifests, and an
-independent review authorization are committed first. The executable binds
-their SHA-256 values and the reviewed commit. Every run binds config, prompt,
-action, code, environment, model, scheduler, decision-ledger, PNG, sidecar, and
-strict-scorer hashes.
+`adaptive_oracle_prompt_manifest_v1.json`, a non-executable engineering
+registration YAML, implementation/environment manifests, and an independent
+engineering review authorization are committed before GPU smoke. The
+executable binds their SHA-256 values and the reviewed commit. `power_analysis`
+and selector/freezer artifacts are separate formal-search prerequisites and are
+not inputs to the no-scoring engineering gate. Every later formal run binds
+config, prompt, action, code, environment, model, scheduler, decision-ledger,
+PNG, sidecar, and strict-scorer hashes.
+
+The executable authorization has one canonical repository path. Its exact
+bytes must equal the tracked blob at the authorization-carrying `HEAD`, whose
+commit is recorded in the attempt, run config, and success receipt; the source
+`reviewed_commit` must be its ancestor, and every frozen implementation/input
+must still equal its blob at that reviewed commit. This two-commit binding
+avoids an impossible self-reference in which an authorization file would need
+to contain the hash of the commit that contains it. The textual `reviewer`
+identity is an organizational attestation, not a cryptographic signature;
+stronger identity assurance requires a separately specified signed-attestation
+scheme.
 
 1. **CPU gate:** synthetic affine-cosine constants, zero-feature and zero-`z`
    fail-closed, uniform/predicted-clean/random row sums, orbit/D4/no-wrap,
    both-input-detach, antithetic norm parity,
    tangent/geodesic moments, bitwise no-op, native Euler round trip,
-   trajectory-isolation, counter-tuple and namespace collision audit (not
-   uniqueness of truncated random values), and power analysis must produce one
-   warning-free `cpu_audit.json`.
+   trajectory-isolation, actual-edge/canonical-D4-counter and namespace
+   collision audit (not uniqueness of truncated random values), and a real
+   50-step `EulerDiscreteScheduler` round trip must produce one warning-free
+   `cpu_audit.json`. Reconstructed-clean relative L2 error is capped at `1e-2`
+   after native model-output quantization, while expected-previous-sample
+   relative L2 error is capped at `1e-3`; max absolute error is diagnostic.
 2. **Engineering gate:** only after independent authorization, run the 11 fresh
    challenge smoke prompts x one retired-on-use seed x 13 primary actions plus
    one pre-outcome, counter-cycled active `U/X` pair per prompt at 1024, Euler,
    50 steps. The cycle covers all signed orbits. Scoring is forbidden. Require
    165 PNG/sidecar pairs, distinct active outputs, complete ledgers, bounds, and
-   a warning-free one-shot `engineering_audit.json`.
+   a warning-free one-shot `engineering_audit.json`. This is runtime stress
+   coverage only: images are never inspected or scored, prompt categories are
+   not samples for an efficacy claim, and a pass authorizes only construction
+   of the separately powered formal-search registration.
+
+   For every task, the pipeline records the timesteps, sigmas, construction and
+   post-`set_timesteps` init-noise sigma from its actual scheduler invocation,
+   the hash of the prepared initial latent, and direct hashes immediately before
+   and after every scheduler step. Callback hashes are only a cross-check and
+   cannot supply or shift the pre-step ledger. Python warnings, process-local
+   logging records, and stderr are captured in canonical runtime evidence;
+   counts and hashes are independently recomputed by the engineering auditor,
+   and any warning evidence fails the warning-free gate.
 3. **Formal search gate:** run the powered 13-action primary matrix, strict
    offline scoring, and result-blind `search_primary_audit.json`. The masked
    freezer first seals every OOF choice from fold-permitted inputs. Only then
@@ -363,18 +429,37 @@ predeclared eligibility rule. No lag, orbit, feature hook, ratio, cap, envelope,
 metric, margin, seed, or exclusion may be changed after outcomes; a changed
 hypothesis starts a new namespace and registration.
 
-## Missing Implementation Checklist
+## Implementation and Authorization Checklist
 
-- Exact conditional `up_blocks.0` hook, 16x16 reducer, orbit/transport operator,
-  uniform/predicted-clean/random controls, moment geodesic, and native-Euler
-  integration with diagnostics.
-- Trajectory-isolated 13-action generation, result-blind selected-control
-  freezer, and hash-chained choices blind to held outcomes and sealed before
-  `U/X` generation.
-- Fresh prompt/seed builder, historical collision scanner, and power simulator.
-- OOF ridge/oracle/equal-budget controls and the genuine 2x2 interaction.
-- Provenance-locked OCR, counting, spatial, spectral, equivariance, diversity,
-  compute scorers, independent auditor/evaluator, freezes, and authorizer.
-- Clean reviewed commit, environment lock, source hashes, and independent
-  authorization. Until all exist and the CPU gate passes, status remains
-  `blocked_registration_only`: no GPU and no RL.
+Implemented and still subject to the one-shot CPU audit are the exact
+conditional `up_blocks.0` hook, 16x16 local operator, D4-canonical random-edge,
+uniform and predicted-clean controls, fixed-ratio moment geodesic, real Euler
+round-trip diagnostics, fresh engineering prompt/seed collision scanner,
+15-action generator, sidecar contract, warning capture, strict PNG auditor,
+and non-executable registration. Model loading is rooted only through a held
+directory descriptor exposed as `/proc/self/fd/<n>`; recursive pre/post tree
+signatures bind file bytes and file/directory identity metadata, so replacement
+or mutation fails the attempt. This is fail-closed detection, not a claim of
+noninterference against another same-UID process. The warning-as-error CPU suite
+currently passes `237/237`; the remaining legacy suite passes `333/333`.
+Prompt assets replay byte-for-byte from the pinned PartiPrompts
+source using the committed exclusion inventory without reading `outputs/`.
+That inventory freezes sorted, unique per-file prompt, source-row, and seed
+projections for the historical metadata corpus and separately inventories
+forbidden score/quality paths. An unmasked physical `cuda:1` environment-only
+probe matches the pinned GPU/runtime lock. These are implementation checks, not
+generation or efficacy evidence.
+
+GPU smoke remains blocked until a clean reviewed implementation commit,
+warning-free one-shot `cpu_audit.json`, and later independent executable
+authorization all exist and agree by hash. The executable must use physical
+GPU 1-4 with `CUDA_VISIBLE_DEVICES` unset, recheck authorized bytes across
+runtime import and generation, and record the physical GPU identity.
+
+The result-blind selected-control freezer, power simulator, OOF ridge/oracle and
+equal-budget controls, 2x2 interaction, provenance-locked quality/structural
+scorers, and formal auditors/evaluators are required before formal search, not
+before engineering smoke. They remain blockers for any efficacy experiment,
+distillation, or RL. Until the engineering blockers above close, status remains
+`blocked_registration_only`: no GPU. RL remains unauthorized at every gate in
+this document.

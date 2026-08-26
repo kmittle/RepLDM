@@ -28,5 +28,5 @@ The claim is rejected if PLADIS or GAG wins, if a spatially permuted equal-compu
 
 The original S5 YAML action IDs containing `official` are immutable historical
 identifiers. Their actual implementations and corrected claim boundaries are
-recorded in `BASELINE_PROVENANCE.md`; they must not be cited as official code
+recorded in `../audits/BASELINE_PROVENANCE.md`; they must not be cited as official code
 reproductions.
