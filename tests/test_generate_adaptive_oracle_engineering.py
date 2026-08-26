@@ -812,6 +812,26 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), payload)
             self.assertEqual(identity, generation._object_identity(target.stat()))
 
+    def test_link_eexist_is_reconciled_when_nfs_already_committed_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            payload = b"committed-before-eexist\n"
+            real_link = generation._link_descriptor
+
+            def link_then_report_eexist(descriptor, directory_descriptor, name):
+                real_link(descriptor, directory_descriptor, name)
+                raise FileExistsError(errno.EEXIST, "simulated replayed link")
+
+            with mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=link_then_report_eexist,
+            ):
+                identity = generation.atomic_create_bytes(target, payload)
+
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(identity, generation._object_identity(target.stat()))
+
     def test_temporary_name_replacement_before_link_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "receipt.json"
@@ -944,6 +964,54 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             self.assertTrue(failed)
             self.assertFalse(target.exists())
 
+    def test_final_link_and_temporary_cleanup_are_fsynced_independently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_link = generation._link_descriptor
+            real_fsync = generation.os.fsync
+            real_remove = generation._remove_matching_entry
+            linked = False
+            post_link_directory_fsyncs = 0
+
+            def publish(descriptor, directory_descriptor, name):
+                nonlocal linked
+                real_link(descriptor, directory_descriptor, name)
+                linked = True
+
+            def count_fsync(descriptor):
+                nonlocal post_link_directory_fsyncs
+                if linked and os.path.isdir(f"/proc/self/fd/{descriptor}"):
+                    post_link_directory_fsyncs += 1
+                return real_fsync(descriptor)
+
+            def remove_without_implicit_fsync(directory_descriptor, name, identity):
+                if name.endswith(".tmp"):
+                    os.unlink(name, dir_fd=directory_descriptor)
+                    return
+                return real_remove(directory_descriptor, name, identity)
+
+            with (
+                mock.patch.object(
+                    generation,
+                    "_link_descriptor",
+                    side_effect=publish,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "fsync",
+                    side_effect=count_fsync,
+                ),
+                mock.patch.object(
+                    generation,
+                    "_remove_matching_entry",
+                    side_effect=remove_without_implicit_fsync,
+                ),
+            ):
+                generation.atomic_create_bytes(target, b"durable-name\n")
+
+            self.assertGreaterEqual(post_link_directory_fsyncs, 2)
+            self.assertEqual(target.read_bytes(), b"durable-name\n")
+
     def test_matching_rollback_never_deletes_a_racing_foreign_inode(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -1025,10 +1093,66 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                     "fixture claim",
                 )
                 self.assertEqual(os.listdir(claimed), [])
-                self.assertFalse((parent / ".claimed.claim").exists())
+                self.assertTrue((parent / ".claimed.claim").is_file())
             finally:
                 if claimed >= 0:
                     os.close(claimed)
+                os.close(descriptor)
+
+    def test_fallback_exclusive_mkdir_preserves_a_competing_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            real_mkdir = generation.os.mkdir
+            competed = False
+
+            def compete_before_final_mkdir(path, *args, **kwargs):
+                nonlocal competed
+                if path == "claimed" and not competed:
+                    competed = True
+                    real_mkdir(path, *args, **kwargs)
+                    foreign_descriptor = os.open(
+                        path,
+                        generation._directory_flags(),
+                        dir_fd=kwargs.get("dir_fd"),
+                    )
+                    try:
+                        child = os.open(
+                            "foreign.txt",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=foreign_descriptor,
+                        )
+                        os.close(child)
+                    finally:
+                        os.close(foreign_descriptor)
+                return real_mkdir(path, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_rename_directory_noreplace",
+                        side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+                    ),
+                    mock.patch.object(
+                        generation.os,
+                        "mkdir",
+                        side_effect=compete_before_final_mkdir,
+                    ),
+                    self.assertRaises(FileExistsError),
+                ):
+                    generation._claim_pinned_directory_at(
+                        descriptor,
+                        "claimed",
+                        "fixture claim",
+                    )
+                self.assertTrue(competed)
+                self.assertEqual(
+                    {path.name for path in (parent / "claimed").iterdir()},
+                    {"foreign.txt"},
+                )
+            finally:
                 os.close(descriptor)
 
     def test_missing_libc_renameat2_is_reported_as_unsupported(self):

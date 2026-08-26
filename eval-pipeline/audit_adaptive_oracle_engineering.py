@@ -1287,7 +1287,9 @@ def _publish_audit_json(
     tree: _PinnedRunTree,
     name: str,
     value: Mapping[str, Any],
-) -> None:
+    *,
+    ownership: Optional[list[tuple[int, int]]] = None,
+) -> tuple[int, int]:
     payload = contract.canonical_json_bytes(value) + b"\n"
     tree.verify()
     if generation._entry_exists(tree.run_descriptor, name):
@@ -1297,6 +1299,8 @@ def _publish_audit_json(
         value,
         directory_descriptor=tree.run_descriptor,
     )
+    if ownership is not None:
+        ownership.append(identity)
     tree.add_published_entry(name, identity)
     observed = _read_regular_bytes(
         tree.run / name,
@@ -1307,6 +1311,7 @@ def _publish_audit_json(
     if observed != payload:
         raise RuntimeError(f"published audit receipt bytes differ: {name}")
     tree.verify()
+    return identity
 
 
 def _publish_audit_failure(
@@ -1369,8 +1374,14 @@ def _preflight_audit(
         ).hexdigest(),
         auditor_sha256=auditor_sha256,
     )
+    attempt_ownership: list[tuple[int, int]] = []
     try:
-        _publish_audit_json(tree, AUDIT_ATTEMPT_NAME, attempt)
+        _publish_audit_json(
+            tree,
+            AUDIT_ATTEMPT_NAME,
+            attempt,
+            ownership=attempt_ownership,
+        )
         generation_attempt = _json_record_from_raw(
             generation_attempt_raw,
             "generation attempt",
@@ -1382,9 +1393,8 @@ def _preflight_audit(
         )
     except BaseException as exc:
         try:
-            attempt_exists = generation._entry_exists(
-                tree.run_descriptor,
-                AUDIT_ATTEMPT_NAME,
+            observed_attempt = generation._entry_metadata(
+                tree.run_descriptor, AUDIT_ATTEMPT_NAME
             )
         except BaseException as existence_error:
             generation._add_exception_note(
@@ -1392,8 +1402,15 @@ def _preflight_audit(
                 "audit-attempt reconciliation failed: "
                 f"{type(existence_error).__name__}: {existence_error}",
             )
-            attempt_exists = False
-        if attempt_exists:
+            observed_attempt = None
+        attempt_owned = (
+            len(attempt_ownership) == 1
+            and observed_attempt is not None
+            and stat.S_ISREG(observed_attempt.st_mode)
+            and generation._object_identity(observed_attempt)
+            == attempt_ownership[0]
+        )
+        if attempt_owned:
             try:
                 _publish_audit_failure(tree, _failure_payload(attempt, exc))
             except BaseException as receipt_error:

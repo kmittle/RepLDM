@@ -1473,8 +1473,9 @@ def _claim_pinned_directory_with_marker(
     *,
     staging_name: str,
     staging_descriptor: int,
-) -> None:
-    marker_name = f".{name}.claim"
+    marker_directory_descriptor: int,
+    marker_name: str,
+) -> int:
     staging_identity = _object_identity(os.fstat(staging_descriptor))
     marker_payload = (
         f"repldm-directory-claim-v1:{name}:"
@@ -1483,11 +1484,11 @@ def _claim_pinned_directory_with_marker(
     marker_identity = atomic_create_bytes(
         Path(marker_name),
         marker_payload,
-        directory_descriptor=parent_descriptor,
+        directory_descriptor=marker_directory_descriptor,
     )
     marker = os.stat(
         marker_name,
-        dir_fd=parent_descriptor,
+        dir_fd=marker_directory_descriptor,
         follow_symlinks=False,
     )
     if (
@@ -1498,41 +1499,46 @@ def _claim_pinned_directory_with_marker(
     if _entry_exists(parent_descriptor, name):
         raise FileExistsError(f"{label} already exists")
 
-    try:
-        os.rename(
-            staging_name,
-            name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-    except OSError as rename_error:
-        reconciled = _entry_metadata(parent_descriptor, name)
-        if (
-            reconciled is None
-            or not stat.S_ISDIR(reconciled.st_mode)
-            or _object_identity(reconciled) != staging_identity
-        ):
-            raise rename_error
-    _verify_directory_entry(
-        parent_descriptor,
-        name,
-        staging_descriptor,
-        f"{label} marker-claimed directory",
+    staging = os.stat(
+        staging_name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
     )
-    if _entry_metadata(parent_descriptor, staging_name) is not None:
-        raise RuntimeError(f"{label} marker claim left its staging name")
+    if (
+        not stat.S_ISDIR(staging.st_mode)
+        or _object_identity(staging) != staging_identity
+        or os.listdir(staging_descriptor)
+    ):
+        raise RuntimeError(f"{label} staging directory changed before fallback")
+    os.rmdir(staging_name, dir_fd=parent_descriptor)
     os.fsync(parent_descriptor)
-    _remove_matching_entry(
-        parent_descriptor,
-        marker_name,
-        marker_identity,
-    )
+    os.mkdir(name, mode=0o750, dir_fd=parent_descriptor)
+    descriptor = -1
+    try:
+        descriptor = _open_pinned_directory_at(
+            parent_descriptor,
+            name,
+            f"{label} exclusive-mkdir directory",
+        )
+        if os.listdir(descriptor):
+            raise RuntimeError(f"{label} is not empty immediately after claim")
+        _verify_directory_entry(parent_descriptor, name, descriptor, label)
+        os.fsync(parent_descriptor)
+        result = descriptor
+        descriptor = -1
+        return result
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _claim_pinned_directory_at(
     parent_descriptor: int,
     name: str,
     label: str,
+    *,
+    fallback_marker_descriptor: Optional[int] = None,
+    fallback_marker_name: Optional[str] = None,
 ) -> int:
     if not name or Path(name).name != name:
         raise ValueError(f"{label} name must be one safe basename")
@@ -1561,13 +1567,25 @@ def _claim_pinned_directory_at(
             }
             if exc.errno not in unsupported:
                 raise
-            _claim_pinned_directory_with_marker(
+            replacement_descriptor = _claim_pinned_directory_with_marker(
                 parent_descriptor,
                 name,
                 label,
                 staging_name=staging_name,
                 staging_descriptor=descriptor,
+                marker_directory_descriptor=(
+                    parent_descriptor
+                    if fallback_marker_descriptor is None
+                    else fallback_marker_descriptor
+                ),
+                marker_name=(
+                    f".{name}.claim"
+                    if fallback_marker_name is None
+                    else fallback_marker_name
+                ),
             )
+            os.close(descriptor)
+            descriptor = replacement_descriptor
         claimed = True
         return_descriptor = descriptor
         descriptor = -1
@@ -1880,8 +1898,6 @@ def _atomic_create_at(
             _link_descriptor(descriptor, directory_descriptor, name)
             published_identity = temporary_identity
         except OSError as link_error:
-            if link_error.errno == errno.EEXIST:
-                raise
             published_identity = temporary_identity
             try:
                 reconciled = os.stat(
@@ -1916,12 +1932,14 @@ def _atomic_create_at(
                 preserve_temporary = True
             raise RuntimeError("atomic output differs from the held source inode")
         published_identity = temporary_identity
+        os.fsync(directory_descriptor)
         _remove_matching_entry(
             directory_descriptor,
             temporary_name,
             temporary_identity,
         )
         temporary_removed = True
+        os.fsync(directory_descriptor)
         durable = os.stat(
             name,
             dir_fd=directory_descriptor,
@@ -2078,6 +2096,8 @@ def _initialize_attempt_directory(
     attempt: Mapping[str, Any],
     *,
     output_descriptor: int,
+    fallback_marker_descriptor: int,
+    fallback_marker_name: str,
     publications: _PublishedArtifacts,
 ) -> tuple[Path, int]:
     marker = output_dir / "attempt.json"
@@ -2093,6 +2113,8 @@ def _initialize_attempt_directory(
         output_descriptor,
         records.name,
         "engineering records directory",
+        fallback_marker_descriptor=fallback_marker_descriptor,
+        fallback_marker_name=fallback_marker_name,
     )
     try:
         os.fsync(output_descriptor)
@@ -3291,6 +3313,8 @@ def _run_authorized_engineering_generation(
             output,
             _attempt_record(validated),
             output_descriptor=output_descriptor,
+            fallback_marker_descriptor=output_parent_descriptor,
+            fallback_marker_name=f".{output.name}.records.claim",
             publications=publications,
         )
         runtime_capture = _RuntimeEvidenceCapture()

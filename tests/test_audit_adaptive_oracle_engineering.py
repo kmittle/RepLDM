@@ -843,6 +843,45 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
             (self.fixture.run / audit.AUDIT_SUCCESS_NAME).read_bytes(), success_before
         )
 
+    def test_concurrent_audit_loser_does_not_publish_failure_for_winner(self):
+        real_atomic = audit.atomic_create_json
+        winner_bytes = None
+
+        def publish_winner_before_loser(path, value, *, directory_descriptor=None):
+            nonlocal winner_bytes
+            if Path(path).name == audit.AUDIT_ATTEMPT_NAME and winner_bytes is None:
+                real_atomic(
+                    path,
+                    value,
+                    directory_descriptor=directory_descriptor,
+                )
+                winner_bytes = Path(path).read_bytes()
+            return real_atomic(
+                path,
+                value,
+                directory_descriptor=directory_descriptor,
+            )
+
+        with (
+            mock.patch.object(
+                audit,
+                "atomic_create_json",
+                side_effect=publish_winner_before_loser,
+            ),
+            mock.patch.object(audit, "_publish_audit_failure") as publish_failure,
+            self.assertRaises(FileExistsError),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertIsNotNone(winner_bytes)
+        self.assertEqual(
+            (self.fixture.run / audit.AUDIT_ATTEMPT_NAME).read_bytes(),
+            winner_bytes,
+        )
+        publish_failure.assert_not_called()
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+
     def test_malformed_generation_receipt_is_consumed_after_audit_attempt(self):
         (self.fixture.run / "success.json").write_bytes(b"not-json\n")
 
@@ -876,12 +915,12 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         real_publish = audit._publish_audit_json
         replaced = False
 
-        def replace_before_success(tree, name, value):
+        def replace_before_success(tree, name, value, **kwargs):
             nonlocal replaced
             if name == audit.AUDIT_SUCCESS_NAME and not replaced:
                 replaced = True
                 os.replace(replacement, target)
-            return real_publish(tree, name, value)
+            return real_publish(tree, name, value, **kwargs)
 
         with (
             mock.patch.object(
