@@ -427,7 +427,13 @@ _FORBIDDEN_STATE_KEY_FRAGMENTS = (
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _COUNTER_STRING_PATTERN = re.compile(r"[A-Za-z0-9._:-]+")
 _STDERR_WARNING_TOKEN = re.compile(
-    r"\b[A-Za-z0-9_]*warnings?\b", re.IGNORECASE
+    r"(?:"
+    r"\b[A-Za-z0-9_]*warnings?\b"
+    r"|\bwarn\b"
+    r"|\bW[0-9]{3,8}\b"
+    r"|\[\s*W(?:ARN(?:ING)?)?(?=[0-9\s:\]])"
+    r")",
+    re.IGNORECASE,
 )
 
 

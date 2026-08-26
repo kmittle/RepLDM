@@ -1032,7 +1032,7 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
     def test_raw_stderr_warning_category_is_recomputed(self):
         evidence_path = self.fixture.run / "runtime_evidence.json"
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-        stderr_text = "worker.py:1: UserWarning: raw subprocess warning\n"
+        stderr_text = "[W0827 12:34:56 file.cc:1] raw subprocess warning\n"
         stderr_bytes = stderr_text.encode("utf-8")
         evidence["stderr"] = stderr_text
         evidence["stderr_byte_count"] = len(stderr_bytes)

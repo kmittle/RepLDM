@@ -464,15 +464,24 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             b"worker.py:1: UserWarning: user detail\n"
             b"FutureWarning: future detail\n"
             b"RuntimeWarning: runtime detail\n"
+            b"WARN: native fallback\n"
+            b"[W0827 12:34:56 file.cc:1] native fallback\n"
         )
         with capture:
             os.write(2, raw)
 
         record = capture.record()
-        self.assertEqual(record["warnings"]["stderr_warning_line_count"], 3)
-        self.assertEqual(record["warnings"]["count"], 3)
+        self.assertEqual(record["warnings"]["stderr_warning_line_count"], 5)
+        self.assertEqual(record["warnings"]["count"], 5)
         with self.assertRaisesRegex(RuntimeError, "runtime warnings"):
             generation._require_warning_free_runtime_evidence(record)
+
+        self.assertEqual(
+            generation.contract.stderr_warning_line_count(
+                "worker finished\nreward model loaded\n"
+            ),
+            0,
+        )
 
     def test_non_utf8_fd2_evidence_is_losslessly_hashed(self):
         capture = generation._RuntimeEvidenceCapture()
