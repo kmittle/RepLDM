@@ -1,7 +1,7 @@
 schema: structural_control_analysis_amendment_v1
-status: blocked_pending_independent_review
-reviewer: null
-reviewed_commit: null
+status: authorized_pre_score
+reviewer: codex-result-blind-structural-amendment-reviewer-20260826
+reviewed_commit: 8c82c40fcfb54982ef748cc14ab15491a1843e85
 base_commit: e0b323fab88c0cc9e24256d7bf7d466a049d2675
 result_access_before_authorization: false
 scoring_started_before_authorization: false
