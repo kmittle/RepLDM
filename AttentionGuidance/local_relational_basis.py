@@ -1,9 +1,9 @@
-"""Local, feature-conditioned relational bases on a fixed latent grid.
+"""Local relational controls on a fixed predicted-clean latent grid.
 
 This module is intentionally separate from the registered six-basis renderer
-contract.  It constructs three local graph residuals from a caller-supplied
-non-attention feature map and does not install hooks, run a denoiser, or make
-quality decisions.
+contract.  It constructs three local graph residuals using uniform,
+predicted-clean, or caller-supplied non-attention affinities and does not
+install hooks, run a denoiser, or make quality decisions.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from numbers import Integral, Real
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -26,6 +26,11 @@ LOCAL_RELATIONAL_OFFSET_ORBITS = (
 LOCAL_RELATIONAL_ORBIT_NAMES = tuple(
     name for name, _offsets in LOCAL_RELATIONAL_OFFSET_ORBITS
 )
+LOCAL_RELATIONAL_AFFINITY_SOURCES = (
+    "feature",
+    "uniform_local",
+    "predicted_clean",
+)
 
 
 @dataclass(frozen=True)
@@ -33,8 +38,10 @@ class LocalRelationalBasisDiagnostics:
     """Mechanism-level statistics for one local-basis construction."""
 
     orbit_names: Tuple[str, ...]
+    affinity_source: str
     grid_size: int
     feature_norm_epsilon: float
+    predicted_clean_norm_epsilon: float
     affinity_floor: float
     undirected_edge_counts: Tuple[int, ...]
     edge_weight_min: Tensor
@@ -53,8 +60,10 @@ class LocalRelationalBasisDiagnostics:
 
         return {
             "orbit_names": list(self.orbit_names),
+            "affinity_source": self.affinity_source,
             "grid_size": self.grid_size,
             "feature_norm_epsilon": self.feature_norm_epsilon,
+            "predicted_clean_norm_epsilon": self.predicted_clean_norm_epsilon,
             "affinity_floor": self.affinity_floor,
             "undirected_edge_counts": list(self.undirected_edge_counts),
             "edge_weight_min": encode(self.edge_weight_min),
@@ -68,19 +77,19 @@ class LocalRelationalBasisDiagnostics:
 
 
 class LocalRelationalBasisProvider:
-    """Construct three D4-equivariant local graph bases.
+    """Construct three D4-equivariant local graph controls.
 
-    Both inputs are area-pooled to ``grid_size`` square cells.  For every
-    undirected edge ``(p, q)`` in an offset orbit, the symmetric affinity is
+    Clean latents and optional non-attention features are area-pooled to
+    ``grid_size`` square cells.  Feature and predicted-clean controls use the
+    symmetric affinity
 
-    ``a[p, q] = affinity_floor + (1 + cos(feature[p], feature[q])) / 2``.
+    ``a[p, q] = affinity_floor + (1 + clip(cos(control[p], control[q]))) / 2``.
 
-    The affine map has no temperature or other quality-tuned parameter.  Each
-    row is normalized over in-bounds neighbours.  The returned basis is the
-    equivalent difference form
-    ``sum_q W[p, q] * (x0[q] - x0[p])``, which is exactly ``W x0 - x0`` but
-    preserves an exact zero for a spatially constant clean latent.  Features
-    and clean latents are detached internally so no backbone graph is retained.
+    Uniform-local controls instead assign exactly one to every legal edge.
+    Each row is normalized over in-bounds neighbours.  All modes then use the
+    same difference-form transport ``sum_q W[p, q] * (z[q] - z[p])``, exactly
+    ``W z - z``, with no boundary padding or wrap.  Inputs and outputs are
+    detached so the provider never retains a backbone graph.
     """
 
     def __init__(
@@ -88,6 +97,7 @@ class LocalRelationalBasisProvider:
         *,
         grid_size: int = 16,
         feature_norm_epsilon: float = 1e-6,
+        predicted_clean_norm_epsilon: float = 1e-6,
         affinity_floor: float = 1e-6,
     ) -> None:
         if (
@@ -99,6 +109,9 @@ class LocalRelationalBasisProvider:
         self.grid_size = int(grid_size)
         self.feature_norm_epsilon = self._validate_epsilon(
             feature_norm_epsilon, "feature_norm_epsilon"
+        )
+        self.predicted_clean_norm_epsilon = self._validate_epsilon(
+            predicted_clean_norm_epsilon, "predicted_clean_norm_epsilon"
         )
         self.affinity_floor = self._validate_epsilon(
             affinity_floor, "affinity_floor"
@@ -115,29 +128,30 @@ class LocalRelationalBasisProvider:
             raise ValueError(f"{name} must be representable as a positive float32 value")
         return result
 
+    def _validate_tensor(self, value: Tensor, name: str) -> None:
+        if not isinstance(value, Tensor) or value.ndim != 4:
+            raise ValueError(
+                f"{name} must have shape (batch, channels, height, width)"
+            )
+        if not torch.is_floating_point(value):
+            raise ValueError(f"{name} must have a real floating-point dtype")
+        if value.shape[0] <= 0 or value.shape[1] <= 0:
+            raise ValueError(f"{name} must have positive batch and channel sizes")
+        if min(value.shape[-2:]) < self.grid_size:
+            raise ValueError(f"{name} spatial dimensions must be at least grid_size")
+        if not torch.isfinite(value.detach()).all():
+            raise ValueError(f"{name} contains non-finite values")
+
+    def _validate_pred_original_sample(self, pred_original_sample: Tensor) -> None:
+        self._validate_tensor(pred_original_sample, "pred_original_sample")
+        if pred_original_sample.shape[1] != 4:
+            raise ValueError("pred_original_sample must have exactly four channels")
+
     def _validate_inputs(
         self, pred_original_sample: Tensor, feature: Tensor
     ) -> None:
-        for value, name in (
-            (pred_original_sample, "pred_original_sample"),
-            (feature, "feature"),
-        ):
-            if not isinstance(value, Tensor) or value.ndim != 4:
-                raise ValueError(
-                    f"{name} must have shape (batch, channels, height, width)"
-                )
-            if not torch.is_floating_point(value):
-                raise ValueError(f"{name} must have a real floating-point dtype")
-            if value.shape[0] <= 0 or value.shape[1] <= 0:
-                raise ValueError(f"{name} must have positive batch and channel sizes")
-            if min(value.shape[-2:]) < self.grid_size:
-                raise ValueError(
-                    f"{name} spatial dimensions must be at least grid_size"
-                )
-            if not torch.isfinite(value.detach()).all():
-                raise ValueError(f"{name} contains non-finite values")
-        if pred_original_sample.shape[1] != 4:
-            raise ValueError("pred_original_sample must have exactly four channels")
+        self._validate_pred_original_sample(pred_original_sample)
+        self._validate_tensor(feature, "feature")
         if pred_original_sample.shape[0] != feature.shape[0]:
             raise ValueError("feature batch must match pred_original_sample batch")
         if pred_original_sample.device != feature.device:
@@ -168,10 +182,25 @@ class LocalRelationalBasisProvider:
     def _orbit_basis(
         self,
         x0_tokens: Tensor,
-        feature_tokens: Tensor,
+        control_tokens: Optional[Tensor],
         offsets: Tuple[Tuple[int, int], ...],
+        affinity_source: str = "feature",
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, int]:
+        if affinity_source not in LOCAL_RELATIONAL_AFFINITY_SOURCES:
+            raise ValueError(f"unsupported affinity_source {affinity_source!r}")
+        if affinity_source == "uniform_local":
+            if control_tokens is not None:
+                raise ValueError("uniform_local affinity does not accept control tokens")
+        elif control_tokens is None or control_tokens.ndim != 3:
+            raise ValueError(
+                f"{affinity_source} affinity requires rank-three control tokens"
+            )
         batch, token_count, _channels = x0_tokens.shape
+        if control_tokens is not None and control_tokens.shape[:2] != (
+            batch,
+            token_count,
+        ):
+            raise ValueError("control tokens must match x0 batch and token dimensions")
         numerator = x0_tokens.new_zeros(x0_tokens.shape)
         row_affinity_sum = x0_tokens.new_zeros((batch, token_count))
         weights = []
@@ -182,11 +211,14 @@ class LocalRelationalBasisProvider:
             source, target = self._edge_indices(
                 self.grid_size, dy, dx, x0_tokens.device
             )
-            cosine = (
-                feature_tokens.index_select(1, source)
-                * feature_tokens.index_select(1, target)
-            ).sum(dim=-1).clamp(-1.0, 1.0)
-            weight = self.affinity_floor + 0.5 * (1.0 + cosine)
+            if affinity_source == "uniform_local":
+                weight = x0_tokens.new_ones((batch, source.numel()))
+            else:
+                cosine = (
+                    control_tokens.index_select(1, source)
+                    * control_tokens.index_select(1, target)
+                ).sum(dim=-1).clamp(-1.0, 1.0)
+                weight = self.affinity_floor + 0.5 * (1.0 + cosine)
             delta = (
                 x0_tokens.index_select(1, target)
                 - x0_tokens.index_select(1, source)
@@ -229,33 +261,57 @@ class LocalRelationalBasisProvider:
             edge_count,
         )
 
-    def __call__(
-        self, pred_original_sample: Tensor, feature: Tensor
+    def _build(
+        self,
+        pred_original_sample: Tensor,
+        *,
+        affinity_source: str,
+        feature: Optional[Tensor] = None,
     ) -> Tuple[Tensor, LocalRelationalBasisDiagnostics]:
-        """Return bases ``[B, 3, 4, H, W]`` and detached diagnostics."""
-        self._validate_inputs(pred_original_sample, feature)
+        if affinity_source == "feature":
+            self._validate_inputs(pred_original_sample, feature)
+        else:
+            self._validate_pred_original_sample(pred_original_sample)
+            if feature is not None:
+                raise ValueError(f"{affinity_source} affinity does not accept a feature")
         target_size = tuple(pred_original_sample.shape[-2:])
         grid_shape = (self.grid_size, self.grid_size)
 
         x0_grid = F.adaptive_avg_pool2d(
             pred_original_sample.detach().float(), grid_shape
         )
-        feature_grid = F.adaptive_avg_pool2d(feature.detach().float(), grid_shape)
         if not torch.isfinite(x0_grid.detach()).all():
             raise ValueError("pred_original_sample is not finite after float32 pooling")
-        if not torch.isfinite(feature_grid).all():
-            raise ValueError("feature is not finite after float32 pooling")
-        feature_norm = torch.linalg.vector_norm(
-            feature_grid, dim=1, keepdim=True
-        )
-        if not torch.isfinite(feature_norm).all():
-            raise ValueError("feature channel norms are not finite in float32")
-        if torch.any(feature_norm <= self.feature_norm_epsilon):
-            raise RuntimeError("feature channel norm is below the registered threshold")
-        feature_unit = feature_grid / feature_norm
 
         x0_tokens = x0_grid.flatten(2).transpose(1, 2)
-        feature_tokens = feature_unit.flatten(2).transpose(1, 2)
+        control_tokens = None
+        if affinity_source == "feature":
+            feature_grid = F.adaptive_avg_pool2d(
+                feature.detach().float(), grid_shape
+            )
+            if not torch.isfinite(feature_grid).all():
+                raise ValueError("feature is not finite after float32 pooling")
+            control_grid = feature_grid
+            norm_epsilon = self.feature_norm_epsilon
+            norm_name = "feature"
+        elif affinity_source == "predicted_clean":
+            control_grid = x0_grid
+            norm_epsilon = self.predicted_clean_norm_epsilon
+            norm_name = "predicted clean"
+        elif affinity_source != "uniform_local":
+            raise ValueError(f"unsupported affinity_source {affinity_source!r}")
+        if affinity_source != "uniform_local":
+            control_norm = torch.linalg.vector_norm(
+                control_grid, dim=1, keepdim=True
+            )
+            if not torch.isfinite(control_norm).all():
+                raise ValueError(f"{norm_name} channel norms are not finite in float32")
+            if torch.any(control_norm <= norm_epsilon):
+                raise RuntimeError(
+                    f"{norm_name} channel norm is below the registered threshold"
+                )
+            control_unit = control_grid / control_norm
+            control_tokens = control_unit.flatten(2).transpose(1, 2)
         coarse_bases = []
         edge_weight_min = []
         edge_weight_max = []
@@ -265,8 +321,13 @@ class LocalRelationalBasisProvider:
         row_probability_sum_max = []
         edge_counts = []
         for _name, offsets in LOCAL_RELATIONAL_OFFSET_ORBITS:
-            residual, weights, affinity_sums, probability_sums, edge_count = self._orbit_basis(
-                x0_tokens, feature_tokens, offsets
+            residual, weights, affinity_sums, probability_sums, edge_count = (
+                self._orbit_basis(
+                    x0_tokens,
+                    control_tokens,
+                    offsets,
+                    affinity_source=affinity_source,
+                )
             )
             coarse_bases.append(
                 residual.transpose(1, 2).reshape(
@@ -291,15 +352,17 @@ class LocalRelationalBasisProvider:
             ).reshape(pred_original_sample.shape[0], 3, 4, *target_size)
         if not torch.isfinite(bases.detach()).all():
             raise RuntimeError("local relational basis contains non-finite values")
-        bases = bases.to(dtype=pred_original_sample.dtype)
+        bases = bases.to(dtype=pred_original_sample.dtype).detach()
         if not torch.isfinite(bases.detach()).all():
             raise RuntimeError(
                 "local relational basis is not finite after conversion to x0 dtype"
             )
         diagnostics = LocalRelationalBasisDiagnostics(
             orbit_names=LOCAL_RELATIONAL_ORBIT_NAMES,
+            affinity_source=affinity_source,
             grid_size=self.grid_size,
             feature_norm_epsilon=self.feature_norm_epsilon,
+            predicted_clean_norm_epsilon=self.predicted_clean_norm_epsilon,
             affinity_floor=self.affinity_floor,
             undirected_edge_counts=tuple(edge_counts),
             edge_weight_min=torch.stack(edge_weight_min, dim=1).detach(),
@@ -316,8 +379,31 @@ class LocalRelationalBasisProvider:
         )
         return bases, diagnostics
 
+    def __call__(
+        self, pred_original_sample: Tensor, feature: Tensor
+    ) -> Tuple[Tensor, LocalRelationalBasisDiagnostics]:
+        """Build the backward-compatible non-attention feature control."""
+        return self._build(
+            pred_original_sample,
+            affinity_source="feature",
+            feature=feature,
+        )
+
+    def uniform_local(
+        self, pred_original_sample: Tensor
+    ) -> Tuple[Tensor, LocalRelationalBasisDiagnostics]:
+        """Build a control with affinity exactly one on every legal edge."""
+        return self._build(pred_original_sample, affinity_source="uniform_local")
+
+    def predicted_clean(
+        self, pred_original_sample: Tensor
+    ) -> Tuple[Tensor, LocalRelationalBasisDiagnostics]:
+        """Build affinities and transported values from pooled predicted clean latents."""
+        return self._build(pred_original_sample, affinity_source="predicted_clean")
+
 
 __all__ = [
+    "LOCAL_RELATIONAL_AFFINITY_SOURCES",
     "LOCAL_RELATIONAL_OFFSET_ORBITS",
     "LOCAL_RELATIONAL_ORBIT_NAMES",
     "LocalRelationalBasisDiagnostics",
