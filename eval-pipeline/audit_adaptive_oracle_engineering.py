@@ -165,7 +165,7 @@ class _PinnedArtifacts:
     """Hold every validated file descriptor through receipt publication."""
 
     def __init__(self) -> None:
-        self._rows: list[tuple[int, int, str, tuple[int, ...], str]] = []
+        self._rows: list[tuple[int, int, str, tuple[int, ...], str, str]] = []
 
     def add(
         self,
@@ -174,19 +174,37 @@ class _PinnedArtifacts:
         name: str,
         metadata: os.stat_result,
         label: str,
+        expected_sha256: str,
     ) -> None:
-        self._rows.append(
-            (
-                os.dup(descriptor),
-                directory_descriptor,
-                name,
-                _stable_file_metadata(metadata),
-                label,
+        held_descriptor = os.dup(descriptor)
+        try:
+            held_metadata = os.fstat(held_descriptor)
+            if _stable_file_metadata(held_metadata) != _stable_file_metadata(metadata):
+                raise ValueError(f"{label} changed while it was pinned")
+            self._rows.append(
+                (
+                    held_descriptor,
+                    directory_descriptor,
+                    name,
+                    _stable_file_metadata(held_metadata),
+                    expected_sha256,
+                    label,
+                )
             )
-        )
+            held_descriptor = -1
+        finally:
+            if held_descriptor >= 0:
+                os.close(held_descriptor)
 
     def verify(self) -> None:
-        for descriptor, directory_descriptor, name, expected, label in self._rows:
+        for (
+            descriptor,
+            directory_descriptor,
+            name,
+            expected,
+            expected_sha256,
+            label,
+        ) in self._rows:
             opened = os.fstat(descriptor)
             current = os.stat(
                 name,
@@ -198,13 +216,14 @@ class _PinnedArtifacts:
                 or not stat.S_ISREG(current.st_mode)
                 or _stable_file_metadata(opened) != expected
                 or _stable_file_metadata(current) != expected
+                or generation._sha256_descriptor(descriptor) != expected_sha256
             ):
                 raise ValueError(f"{label} changed before audit publication")
 
     def close(self) -> list[BaseException]:
         errors = []
         while self._rows:
-            descriptor, _, _, _, _ = self._rows.pop()
+            descriptor, _, _, _, _, _ = self._rows.pop()
             try:
                 os.close(descriptor)
             except BaseException as exc:
@@ -248,7 +267,17 @@ def _consume_regular_file(
         ):
             raise ValueError(f"{label} must be a regular non-symlink file")
 
+        expected_sha256 = (
+            generation._sha256_descriptor(descriptor)
+            if pins is not None
+            else None
+        )
         result = consumer(descriptor)
+        if (
+            expected_sha256 is not None
+            and generation._sha256_descriptor(descriptor) != expected_sha256
+        ):
+            raise ValueError(f"{label} changed while it was consumed")
 
         after = os.fstat(descriptor)
         path_after = os.stat(
@@ -272,6 +301,7 @@ def _consume_regular_file(
                 path.name,
                 after,
                 label,
+                expected_sha256,
             )
         return result
     except OSError as exc:
@@ -1324,17 +1354,29 @@ def _publish_audit_success(
     *,
     ownership: list[tuple[int, int]],
 ) -> tuple[int, int]:
+    payload = contract.canonical_json_bytes(value) + b"\n"
     tree.verify()
     for name in (AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME):
         if generation._entry_exists(tree.run_descriptor, name):
             raise FileExistsError(f"audit terminal receipt already exists: {name}")
-    return atomic_create_json(
+    identity = atomic_create_json(
         tree.run / AUDIT_SUCCESS_NAME,
         value,
         directory_descriptor=tree.run_descriptor,
         staging_directory_descriptor=tree.run_parent_descriptor,
         ownership_candidates=ownership,
     )
+    tree.add_published_entry(AUDIT_SUCCESS_NAME, identity)
+    observed = _read_regular_bytes(
+        tree.run / AUDIT_SUCCESS_NAME,
+        "published audit success receipt",
+        directory_descriptor=tree.run_descriptor,
+        pins=tree.pins,
+    )
+    if observed != payload:
+        raise RuntimeError("published audit success receipt bytes differ")
+    tree.verify()
+    return identity
 
 
 def _publish_audit_failure(

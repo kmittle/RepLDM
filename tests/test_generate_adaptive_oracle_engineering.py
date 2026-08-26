@@ -832,6 +832,36 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             self.assertEqual(target.read_bytes(), payload)
             self.assertEqual(identity, generation._object_identity(target.stat()))
 
+    def test_post_link_cancellation_rolls_back_the_owned_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            candidates = []
+            real_link = generation._link_descriptor
+
+            def link_then_cancel(descriptor, directory_descriptor, name):
+                real_link(descriptor, directory_descriptor, name)
+                raise KeyboardInterrupt("simulated cancellation after link")
+
+            with (
+                mock.patch.object(
+                    generation,
+                    "_link_descriptor",
+                    side_effect=link_then_cancel,
+                ),
+                self.assertRaisesRegex(KeyboardInterrupt, "after link"),
+            ):
+                generation.atomic_create_bytes(
+                    target,
+                    b"cancelled\n",
+                    ownership_candidates=candidates,
+                )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertFalse(target.exists())
+            self.assertFalse(
+                any(path.name.endswith(".tmp") for path in target.parent.iterdir())
+            )
+
     def test_uncertain_temporary_create_never_adopts_a_foreign_inode(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -924,6 +954,85 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             staging_entries = list(staging_directory.iterdir())
             self.assertEqual(len(staging_entries), 1)
             self.assertTrue(staging_entries[0].name.endswith(".tmp"))
+
+    def test_target_replacement_during_staging_cleanup_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target_directory = parent / "target"
+            staging_directory = parent / "staging"
+            target_directory.mkdir()
+            staging_directory.mkdir()
+            target = target_directory / "receipt.json"
+            target_descriptor = generation._open_pinned_directory(
+                target_directory, "fixture target"
+            )
+            staging_descriptor = generation._open_pinned_directory(
+                staging_directory, "fixture staging"
+            )
+            real_remove = generation._remove_matching_entry
+            replaced = False
+
+            def replace_target_after_cleanup(directory_descriptor, name, identity):
+                nonlocal replaced
+                result = real_remove(directory_descriptor, name, identity)
+                if (
+                    not replaced
+                    and directory_descriptor == staging_descriptor
+                    and name.endswith(".tmp")
+                ):
+                    replaced = True
+                    target.unlink()
+                    target.write_bytes(b"foreign\n")
+                return result
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_remove_matching_entry",
+                        side_effect=replace_target_after_cleanup,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "staging cleanup"),
+                ):
+                    generation.atomic_create_bytes(
+                        target,
+                        b"trusted\n",
+                        directory_descriptor=target_descriptor,
+                        staging_directory_descriptor=staging_descriptor,
+                    )
+            finally:
+                os.close(staging_descriptor)
+                os.close(target_descriptor)
+
+            self.assertTrue(replaced)
+            self.assertEqual(target.read_bytes(), b"foreign\n")
+
+    def test_published_artifact_detects_same_size_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target = parent / "record.bin"
+            target.write_bytes(b"AAAA")
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            publications = generation._PublishedArtifacts()
+            try:
+                publications.add_exact(
+                    descriptor,
+                    target.name,
+                    generation._object_identity(target.stat()),
+                    b"AAAA",
+                    "fixture record",
+                )
+                before = target.stat()
+                target.write_bytes(b"BBBB")
+                os.utime(
+                    target,
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+                with self.assertRaisesRegex(RuntimeError, "changed before terminal"):
+                    publications.verify()
+            finally:
+                publications.close()
+                os.close(descriptor)
 
     def test_committed_output_is_not_masked_by_source_close_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1386,6 +1495,53 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             finally:
                 if claimed >= 0:
                     os.close(claimed)
+                os.close(descriptor)
+
+    def test_fallback_marker_cancellation_preserves_claim_for_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            real_atomic = generation.atomic_create_bytes
+            candidates = []
+            cancelled = False
+
+            def publish_marker_then_cancel(path, payload, **kwargs):
+                nonlocal cancelled
+                identity = real_atomic(path, payload, **kwargs)
+                if Path(path).name == ".claimed.claim" and not cancelled:
+                    cancelled = True
+                    raise KeyboardInterrupt("simulated cancellation after marker")
+                return identity
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_rename_directory_noreplace",
+                        side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+                    ),
+                    mock.patch.object(
+                        generation,
+                        "atomic_create_bytes",
+                        side_effect=publish_marker_then_cancel,
+                    ),
+                    self.assertRaisesRegex(KeyboardInterrupt, "after marker"),
+                ):
+                    generation._claim_pinned_directory_at(
+                        descriptor,
+                        "claimed",
+                        "fixture claim",
+                        ownership_candidates=candidates,
+                    )
+
+                self.assertTrue(cancelled)
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(
+                    candidates[0],
+                    generation._object_identity((parent / "claimed").stat()),
+                )
+                self.assertTrue((parent / ".claimed.claim").is_file())
+            finally:
                 os.close(descriptor)
 
     def test_missing_libc_renameat2_is_reported_as_unsupported(self):
@@ -2192,6 +2348,31 @@ class AuthorizedGenerationTest(unittest.TestCase):
             self._run([], after_atomic_json_hook=report_after_success)
 
         self.assertTrue(reported)
+        self.assertFalse((self.output / "success.json").exists())
+        self.assertTrue((self.output / "failure.json").is_file())
+
+    def test_post_success_link_same_inode_record_rewrite_rolls_back_success(self):
+        first_task = self.design["tasks"][0]["task_id"]
+        target = self.output / "records" / f"{first_task}.json"
+        mutated = False
+
+        def rewrite_record_after_success(path, _value, _directory_descriptor, _identity):
+            nonlocal mutated
+            if Path(path).name != "success.json" or mutated:
+                return
+            mutated = True
+            before = target.stat()
+            payload = target.read_bytes()
+            replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
+            os.chmod(target, 0o640)
+            target.write_bytes(replacement)
+            os.chmod(target, before.st_mode & 0o777)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with self.assertRaisesRegex(RuntimeError, "changed before terminal"):
+            self._run([], after_atomic_json_hook=rewrite_record_after_success)
+
+        self.assertTrue(mutated)
         self.assertFalse((self.output / "success.json").exists())
         self.assertTrue((self.output / "failure.json").is_file())
 

@@ -729,6 +729,30 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         ):
             self.fixture.run_audit(sidecar_validator=replace_after_config_read)
 
+    def test_pinned_file_detects_same_size_rewrite_with_restored_mtime(self):
+        target = self.fixture.run / "config.json"
+        pins = audit._PinnedArtifacts()
+        directory_descriptor = generation._open_pinned_directory(
+            self.fixture.run, "fixture run"
+        )
+        try:
+            audit._read_regular_bytes(
+                target,
+                "fixture config",
+                directory_descriptor=directory_descriptor,
+                pins=pins,
+            )
+            before = target.stat()
+            payload = target.read_bytes()
+            replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
+            target.write_bytes(replacement)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with self.assertRaisesRegex(ValueError, "changed before audit publication"):
+                pins.verify()
+        finally:
+            pins.close()
+            os.close(directory_descriptor)
+
     def test_run_directory_replacement_is_rejected(self):
         displaced = self.fixture.repo / "displaced-run"
         replaced = False
@@ -1031,6 +1055,37 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
             self.fixture.run_production_audit()
 
         self.assertTrue(reported)
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+
+    def test_post_success_link_evidence_rewrite_rolls_back_audit_success(self):
+        target = self.fixture.run / "config.json"
+        real_link = generation._link_descriptor
+        mutated = False
+
+        def link_then_rewrite_evidence(descriptor, directory_descriptor, name):
+            nonlocal mutated
+            real_link(descriptor, directory_descriptor, name)
+            if name != audit.AUDIT_SUCCESS_NAME or mutated:
+                return
+            mutated = True
+            before = target.stat()
+            payload = target.read_bytes()
+            replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
+            target.write_bytes(replacement)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with (
+            mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=link_then_rewrite_evidence,
+            ),
+            self.assertRaisesRegex(ValueError, "changed before audit publication"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(mutated)
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
 
