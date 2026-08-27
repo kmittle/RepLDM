@@ -744,7 +744,9 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
             return result
 
         with self.assertRaisesRegex(
-            ValueError, "sidecar .* changed before audit publication"
+            ValueError,
+            "(?:sidecar .* changed before audit publication|"
+            "engineering records directory inventory changed)",
         ):
             self.fixture.run_audit(block_validator=replace_after_all_sidecars)
 
@@ -762,7 +764,9 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
             return self.fixture.sidecar_summary(record, task)
 
         with self.assertRaisesRegex(
-            ValueError, "run config changed before audit publication"
+            ValueError,
+            "(?:run config changed before audit publication|"
+            "engineering run directory inventory changed)",
         ):
             self.fixture.run_audit(sidecar_validator=replace_after_config_read)
 
@@ -788,6 +792,43 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
                 pins.verify()
         finally:
             pins.close()
+            os.close(directory_descriptor)
+
+    def test_pinned_artifact_row_owns_descriptor_after_append_cancellation(self):
+        class AppendThenCancel(list):
+            def append(self, value):
+                super().append(value)
+                raise KeyboardInterrupt("simulated pinned row cancellation")
+
+        target = self.fixture.run / "config.json"
+        pins = audit._PinnedArtifacts()
+        pins._rows = AppendThenCancel()
+        directory_descriptor = generation._open_pinned_directory(
+            self.fixture.run,
+            "fixture run",
+        )
+        source_descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            metadata = audit._stable_file_metadata(os.fstat(source_descriptor))
+            with self.assertRaisesRegex(KeyboardInterrupt, "pinned row"):
+                pins.add(
+                    source_descriptor,
+                    directory_descriptor,
+                    target.name,
+                    metadata,
+                    "fixture config",
+                    digest(target.read_bytes()),
+                )
+            self.assertEqual(len(pins._rows), 1)
+            held_descriptor = pins._rows[0][0]
+            os.fstat(held_descriptor)
+            pins.close()
+            with self.assertRaises(OSError) as closed:
+                os.fstat(held_descriptor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+        finally:
+            pins.close()
+            os.close(source_descriptor)
             os.close(directory_descriptor)
 
     def test_run_directory_replacement_is_rejected(self):
@@ -969,6 +1010,33 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
 
+    def test_audit_attempt_cleanup_cancellation_does_not_publish_failure(self):
+        real_remove = generation._remove_matching_entry
+        cancelled = False
+
+        def remove_then_cancel(directory_descriptor, name, identity):
+            nonlocal cancelled
+            result = real_remove(directory_descriptor, name, identity)
+            if name.startswith(f".{audit.AUDIT_ATTEMPT_NAME}.") and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated audit-attempt cleanup cancellation")
+            return result
+
+        with (
+            mock.patch.object(
+                generation,
+                "_remove_matching_entry",
+                side_effect=remove_then_cancel,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "audit-attempt cleanup"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(cancelled)
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+
     def test_fd_headroom_failure_precedes_the_one_shot_audit_attempt(self):
         with (
             mock.patch.object(
@@ -1014,6 +1082,68 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
             any("cleanup close failure" in note for note in raised.exception.__notes__)
         )
 
+    def test_run_tree_external_guard_owns_descriptors_after_return_cancellation(self):
+        class AppendThenCancel(list):
+            def append(self, value):
+                super().append(value)
+                raise KeyboardInterrupt("simulated run-tree return cancellation")
+
+        guard = AppendThenCancel()
+        with self.assertRaisesRegex(KeyboardInterrupt, "run-tree return"):
+            audit._pin_run_tree(
+                self.fixture.repo,
+                Path(generation.OUTPUT_DIR),
+                tree_guard=guard,
+            )
+
+        self.assertEqual(len(guard), 1)
+        tree = guard[0]
+        descriptors = [
+            tree.root_descriptor,
+            *(child for _, _, child, _ in tree.directory_links),
+            tree.run_descriptor,
+            tree.records_descriptor,
+        ]
+        for descriptor in descriptors:
+            if descriptor is not None:
+                os.fstat(descriptor)
+        tree.close()
+
+    def test_audit_run_tree_helper_return_cancellation_closes_all_descriptors(self):
+        real_resolve = audit._resolve_run_dir
+        captured = []
+
+        def resolve_then_cancel(*args, **kwargs):
+            result = real_resolve(*args, **kwargs)
+            captured.append(result[1])
+            raise KeyboardInterrupt("simulated resolved-tree return cancellation")
+
+        with (
+            mock.patch.object(
+                audit,
+                "_resolve_run_dir",
+                side_effect=resolve_then_cancel,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "resolved-tree return"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertEqual(len(captured), 1)
+        tree = captured[0]
+        descriptors = [
+            tree.root_descriptor,
+            *(child for _, _, child, _ in tree.directory_links),
+            tree.run_descriptor,
+            tree.records_descriptor,
+        ]
+        for descriptor in descriptors:
+            if descriptor is None:
+                continue
+            with self.assertRaises(OSError) as closed:
+                os.fstat(descriptor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertFalse((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).exists())
+
     def test_production_rechecks_pins_after_core_before_success_publication(self):
         task_id = self.fixture.tasks[0]["task_id"]
         target = self.fixture.run / "records" / f"{task_id}.json"
@@ -1035,7 +1165,11 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
                 "_publish_audit_success",
                 side_effect=replace_before_success,
             ),
-            self.assertRaisesRegex(ValueError, "changed before audit publication"),
+            self.assertRaisesRegex(
+                ValueError,
+                "(?:changed before audit publication|"
+                "engineering records directory inventory changed)",
+            ),
         ):
             self.fixture.run_production_audit()
 
@@ -1135,16 +1269,360 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
                     "simulated cancellation after audit success link"
                 )
 
-        with mock.patch.object(
-            generation,
-            "_link_descriptor",
-            side_effect=commit_success_then_cancel,
+        with (
+            mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=commit_success_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "after audit success link",
+            ),
         ):
-            result = self.fixture.run_production_audit()
+            self.fixture.run_production_audit()
 
         self.assertTrue(cancelled)
-        self.assertEqual(result["status"], "passed_generation_integrity_only_unscored")
         self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_audit_success_fsync_error_is_reported_without_opposite_terminal(self):
+        real_fsync = generation.os.fsync
+        failed = False
+
+        def fail_committed_success_fsync(descriptor):
+            nonlocal failed
+            if (
+                not failed
+                and (self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists()
+                and os.path.isdir(f"/proc/self/fd/{descriptor}")
+            ):
+                failed = True
+                raise OSError(errno.EIO, "simulated audit terminal fsync failure")
+            return real_fsync(descriptor)
+
+        with (
+            mock.patch.object(
+                generation.os,
+                "fsync",
+                side_effect=fail_committed_success_fsync,
+            ),
+            self.assertRaisesRegex(OSError, "audit terminal fsync failure"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(failed)
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+        staging_intents = list(
+            self.fixture.run.parent.glob(f".{audit.AUDIT_SUCCESS_NAME}.*.tmp")
+        )
+        self.assertEqual(len(staging_intents), 1)
+        self.assertTrue(
+            os.path.samefile(
+                staging_intents[0],
+                self.fixture.run / audit.AUDIT_SUCCESS_NAME,
+            )
+        )
+
+    def test_post_commit_audit_snapshot_error_ignores_stale_terminal_listing(self):
+        real_snapshot = generation._stable_regular_snapshot
+        real_names = audit._directory_names
+        snapshot_failed = False
+        stale_listing_calls = 0
+
+        def fail_committed_success_snapshot(
+            descriptor, directory_descriptor, name, label
+        ):
+            nonlocal snapshot_failed
+            if name == audit.AUDIT_SUCCESS_NAME and not snapshot_failed:
+                snapshot_failed = True
+                raise RuntimeError("simulated audit post-commit snapshot failure")
+            return real_snapshot(descriptor, directory_descriptor, name, label)
+
+        def hide_committed_success(descriptor, label):
+            nonlocal stale_listing_calls
+            if (self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists():
+                stale_listing_calls += 1
+                return real_names(descriptor, label).difference(
+                    {audit.AUDIT_SUCCESS_NAME, audit.AUDIT_FAILURE_NAME}
+                )
+            return real_names(descriptor, label)
+
+        with (
+            mock.patch.object(
+                generation,
+                "_stable_regular_snapshot",
+                side_effect=fail_committed_success_snapshot,
+            ),
+            mock.patch.object(
+                audit,
+                "_directory_names",
+                side_effect=hide_committed_success,
+            ),
+            self.assertRaisesRegex(RuntimeError, "post-commit snapshot failure"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(snapshot_failed)
+        self.assertEqual(stale_listing_calls, 0)
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_positive_audit_link_then_helper_cancellation_cannot_publish_failure(self):
+        real_reconcile = generation._link_with_positive_reconciliation
+        cancelled = False
+
+        def cancel_after_positive_reconciliation(
+            descriptor, directory_descriptor, name, identity
+        ):
+            nonlocal cancelled
+            result = real_reconcile(
+                descriptor,
+                directory_descriptor,
+                name,
+                identity,
+            )
+            if name == audit.AUDIT_SUCCESS_NAME and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt(
+                    "simulated cancellation after positive audit reconciliation"
+                )
+            return result
+
+        with (
+            mock.patch.object(
+                generation,
+                "_link_with_positive_reconciliation",
+                side_effect=cancel_after_positive_reconciliation,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "positive audit"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(cancelled)
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_audit_cancellation_before_success_does_not_publish_failure(self):
+        with (
+            mock.patch.object(
+                audit,
+                "_audit_validated_run",
+                side_effect=KeyboardInterrupt(
+                    "simulated cancellation before audit success"
+                ),
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "before audit success"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(
+            (self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file()
+        )
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_audit_success_prepare_return_cancellation_discards_private_output(self):
+        real_prepare = generation._prepare_terminal_json
+        captured = []
+
+        def prepare_then_cancel(path, *args, **kwargs):
+            prepared = real_prepare(path, *args, **kwargs)
+            if Path(path).name == audit.AUDIT_SUCCESS_NAME:
+                captured.append((prepared, prepared.descriptor))
+                raise KeyboardInterrupt(
+                    "simulated audit success prepare return cancellation"
+                )
+            return prepared
+
+        with (
+            mock.patch.object(
+                generation,
+                "_prepare_terminal_json",
+                side_effect=prepare_then_cancel,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "prepare return"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertEqual(len(captured), 1)
+        prepared, descriptor = captured[0]
+        self.assertEqual(prepared.descriptor, -1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_audit_success_discard_cancellation_blocks_failure_terminal(self):
+        real_prepare = generation._prepare_terminal_json
+        real_verify = audit._PinnedRunTree.verify
+        real_remove = generation._remove_matching_entry
+        captured = []
+        cleanup_cancelled = False
+
+        def capture_prepare(path, *args, **kwargs):
+            prepared = real_prepare(path, *args, **kwargs)
+            if Path(path).name == audit.AUDIT_SUCCESS_NAME:
+                captured.append((prepared, prepared.descriptor))
+            return prepared
+
+        def fail_verify_after_prepare(tree):
+            if captured:
+                raise RuntimeError("simulated audit success pre-commit error")
+            return real_verify(tree)
+
+        def remove_then_cancel(directory_descriptor, name, identity):
+            nonlocal cleanup_cancelled
+            result = real_remove(directory_descriptor, name, identity)
+            if (
+                name.startswith(f".{audit.AUDIT_SUCCESS_NAME}.")
+                and not cleanup_cancelled
+            ):
+                cleanup_cancelled = True
+                raise KeyboardInterrupt("simulated audit success discard cancellation")
+            return result
+
+        with (
+            mock.patch.object(
+                generation,
+                "_prepare_terminal_json",
+                side_effect=capture_prepare,
+            ),
+            mock.patch.object(
+                audit._PinnedRunTree,
+                "verify",
+                side_effect=fail_verify_after_prepare,
+                autospec=True,
+            ),
+            mock.patch.object(
+                generation,
+                "_remove_matching_entry",
+                side_effect=remove_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "audit success pre-commit error",
+            ) as raised,
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(cleanup_cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertEqual(len(captured), 1)
+        prepared, descriptor = captured[0]
+        self.assertEqual(prepared.descriptor, -1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_commit_start_cancellation_discards_audit_success_prepare(self):
+        real_mark = generation._mark_prepared_terminal_commit_started
+        captured = []
+
+        def mark_then_cancel(prepared):
+            captured.append((prepared, prepared.descriptor))
+            real_mark(prepared)
+            raise KeyboardInterrupt("simulated audit commit-start cancellation")
+
+        with (
+            mock.patch.object(
+                generation,
+                "_mark_prepared_terminal_commit_started",
+                side_effect=mark_then_cancel,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "commit-start"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertEqual(len(captured), 1)
+        prepared, descriptor = captured[0]
+        self.assertFalse(prepared.commit_started)
+        self.assertEqual(prepared.descriptor, -1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_committed_state_cancellation_closes_audit_success_prepare(self):
+        real_mark = generation._mark_prepared_terminal_committed
+        captured = []
+
+        def mark_then_cancel(prepared):
+            captured.append((prepared, prepared.descriptor))
+            real_mark(prepared)
+            raise KeyboardInterrupt("simulated audit committed-state cancellation")
+
+        with (
+            mock.patch.object(
+                generation,
+                "_mark_prepared_terminal_committed",
+                side_effect=mark_then_cancel,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "committed-state"),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertEqual(len(captured), 1)
+        prepared, descriptor = captured[0]
+        self.assertTrue(prepared.committed)
+        self.assertTrue(prepared.indeterminate)
+        self.assertEqual(prepared.descriptor, -1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_audit_failure_prepare_return_cancellation_is_structured(self):
+        real_prepare = generation._prepare_terminal_json
+        captured = []
+
+        def prepare_then_cancel(path, *args, **kwargs):
+            prepared = real_prepare(path, *args, **kwargs)
+            if Path(path).name == audit.AUDIT_FAILURE_NAME:
+                captured.append((prepared, prepared.descriptor))
+                raise KeyboardInterrupt(
+                    "simulated audit failure prepare return cancellation"
+                )
+            return prepared
+
+        with (
+            mock.patch.object(
+                audit,
+                "_audit_validated_run",
+                side_effect=RuntimeError("simulated audit core failure"),
+            ),
+            mock.patch.object(
+                generation,
+                "_prepare_terminal_json",
+                side_effect=prepare_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "failure receipt creation also failed",
+            ) as raised,
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertEqual(len(captured), 1)
+        prepared, descriptor = captured[0]
+        self.assertEqual(prepared.descriptor, -1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertTrue((self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
 
     def test_pre_success_same_inode_evidence_rewrite_blocks_audit_success(self):
@@ -1514,7 +1992,9 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
                 side_effect=replace_after_inspection,
             ),
             self.assertRaisesRegex(
-                ValueError, "PNG record changed before audit publication"
+                ValueError,
+                "(?:PNG record changed before audit publication|"
+                "engineering records directory inventory changed)",
             ),
         ):
             self.fixture.run_audit()

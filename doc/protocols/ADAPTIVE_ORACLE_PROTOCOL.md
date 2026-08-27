@@ -440,8 +440,14 @@ and non-executable registration. Model loading is rooted only through a held
 directory descriptor exposed as `/proc/self/fd/<n>`; recursive pre/post tree
 signatures bind file bytes and file/directory identity metadata, so replacement
 or mutation fails the attempt. This is fail-closed detection, not a claim of
-noninterference against another same-UID process. The warning-as-error CPU suite
-currently passes `240/240`; the remaining legacy suite passes `333/333`.
+noninterference against another same-UID process. The one-shot exclusive output
+directory claim is the cooperating-writer lock; after that claim, the gate
+assumes one writer on one mounted client for the duration of the run. NFS name
+and attribute caches do not provide cross-client snapshot isolation; any
+multi-client deployment needs a separately reviewed server-visible lock or
+freeze protocol. Both the warning-as-error CPU suite and the complete legacy
+regression suite must pass; exact counts belong in the reviewed validation
+transcript rather than this protocol.
 Prompt assets replay byte-for-byte from the pinned PartiPrompts
 source using the committed exclusion inventory without reading `outputs/`.
 That inventory freezes sorted, unique per-file prompt, source-row, and seed

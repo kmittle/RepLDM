@@ -265,6 +265,7 @@ class _RuntimeEvidenceCapture:
         self._stderr_saved_fd: Optional[int] = None
         self._stderr_stop = threading.Event()
         self._stderr_stream: Optional[io.TextIOWrapper] = None
+        self._stderr_stream_fd: Optional[int] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_context: Optional[Any] = None
         self._log_handler = _EvidenceLogHandler()
@@ -310,13 +311,22 @@ class _RuntimeEvidenceCapture:
                 pass
 
     def _start_stderr_capture(self) -> None:
-        saved_fd = os.dup(2)
+        saved_fd = -1
+        saved_fd_guard: list[int] = []
+        stream_fd_guard: list[int] = []
         read_fd: Optional[int] = None
         write_fd: Optional[int] = None
         try:
+            saved_fd = _duplicate_descriptor(
+                2,
+                descriptor_guard=saved_fd_guard,
+            )
+            if saved_fd_guard != [saved_fd]:
+                raise RuntimeError("saved stderr descriptor handoff changed")
             read_fd, write_fd = os.pipe()
             os.set_blocking(read_fd, False)
             self._stderr_saved_fd = saved_fd
+            saved_fd_guard.clear()
             self._stderr_read_fd = read_fd
             self._stderr_thread = threading.Thread(
                 target=self._drain_stderr,
@@ -325,45 +335,131 @@ class _RuntimeEvidenceCapture:
             )
             self._stderr_thread.start()
             os.dup2(write_fd, 2, inheritable=True)
-            os.close(write_fd)
-            write_fd = None
+            try:
+                os.close(write_fd)
+            finally:
+                write_fd = None
+            stream_descriptor = _duplicate_descriptor(
+                2,
+                descriptor_guard=stream_fd_guard,
+            )
+            if stream_fd_guard != [stream_descriptor]:
+                raise RuntimeError("stderr stream descriptor handoff changed")
             self._stderr_stream = os.fdopen(
-                os.dup(2),
+                stream_descriptor,
                 "w",
                 encoding="utf-8",
                 errors="backslashreplace",
                 buffering=1,
-                closefd=True,
+                closefd=False,
             )
+            self._stderr_stream_fd = stream_descriptor
+            stream_fd_guard.clear()
             self._stderr_context = redirect_stderr(self._stderr_stream)
             self._stderr_context.__enter__()
-        except BaseException:
-            if self._stderr_saved_fd is not None:
+        except BaseException as exc:
+            error_traceback = exc.__traceback__
+            cleanup_errors: list[BaseException] = []
+
+            context = self._stderr_context
+            self._stderr_context = None
+            if context is not None:
                 try:
-                    os.dup2(self._stderr_saved_fd, 2, inheritable=True)
-                finally:
-                    os.close(self._stderr_saved_fd)
-                    self._stderr_saved_fd = None
-            else:
-                os.close(saved_fd)
+                    context.__exit__(None, None, None)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
+            saved_descriptor = self._stderr_saved_fd
+            self._stderr_saved_fd = None
+            if saved_descriptor is not None:
+                try:
+                    os.dup2(saved_descriptor, 2, inheritable=True)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            saved_candidates = [
+                *saved_fd_guard,
+                *(
+                    [saved_descriptor]
+                    if saved_descriptor is not None
+                    else []
+                ),
+            ]
+            saved_fd_guard.clear()
+            for guarded_descriptor in dict.fromkeys(saved_candidates):
+                try:
+                    os.close(guarded_descriptor)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
             if write_fd is not None:
-                os.close(write_fd)
-            if self._stderr_stream is not None:
-                self._stderr_stream.close()
-                self._stderr_stream = None
+                writer_to_close = write_fd
+                write_fd = None
+                try:
+                    os.close(writer_to_close)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
+            stream = self._stderr_stream
+            self._stderr_stream = None
+            if stream is not None:
+                try:
+                    stream.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
+            stream_descriptor = self._stderr_stream_fd
+            self._stderr_stream_fd = None
+            stream_candidates = [
+                *stream_fd_guard,
+                *(
+                    [stream_descriptor]
+                    if stream_descriptor is not None
+                    else []
+                ),
+            ]
+            stream_fd_guard.clear()
+            for guarded_descriptor in dict.fromkeys(stream_candidates):
+                try:
+                    os.close(guarded_descriptor)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+
             self._stderr_stop.set()
             thread = self._stderr_thread
+            self._stderr_thread = None
             if thread is not None:
-                thread.join()
-                self._stderr_thread = None
-            elif read_fd is not None:
-                os.close(read_fd)
+                try:
+                    thread.join()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                    try:
+                        thread.join()
+                    except BaseException as retry_error:
+                        cleanup_errors.append(retry_error)
+            else:
+                read_descriptor = self._stderr_read_fd
+                if read_descriptor is None:
+                    read_descriptor = read_fd
+                if read_descriptor is not None:
+                    try:
+                        os.close(read_descriptor)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
             self._stderr_read_fd = None
-            raise
+
+            for cleanup_error in cleanup_errors:
+                _attach_secondary_exception(exc, cleanup_error)
+                _add_exception_note(
+                    exc,
+                    "stderr capture startup cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
+            raise exc.with_traceback(error_traceback)
 
     def _stop_stderr_capture(self) -> None:
         context = self._stderr_context
         stream = self._stderr_stream
+        stream_fd = self._stderr_stream_fd
         saved_fd = self._stderr_saved_fd
         thread = self._stderr_thread
         errors: list[BaseException] = []
@@ -397,6 +493,11 @@ class _RuntimeEvidenceCapture:
                 stream.close()
         except BaseException as exc:
             errors.append(exc)
+        try:
+            if stream_fd is not None:
+                os.close(stream_fd)
+        except BaseException as exc:
+            errors.append(exc)
         self._stderr_stop.set()
         if thread is not None:
             thread.join()
@@ -404,11 +505,14 @@ class _RuntimeEvidenceCapture:
             errors.append(self._stderr_reader_error)
         self._stderr_context = None
         self._stderr_stream = None
+        self._stderr_stream_fd = None
         self._stderr_saved_fd = None
         self._stderr_read_fd = None
         self._stderr_thread = None
         if errors:
-            raise RuntimeError("OS stderr evidence capture failed") from errors[0]
+            error = RuntimeError("OS stderr evidence capture failed")
+            error.secondary_exceptions = tuple(errors)
+            raise error from errors[0]
 
     def __enter__(self) -> "_RuntimeEvidenceCapture":
         if self._entered:
@@ -447,9 +551,9 @@ class _RuntimeEvidenceCapture:
         finally:
             self._entered = False
         if cleanup_errors:
-            raise RuntimeError("runtime evidence capture finalization failed") from (
-                cleanup_errors[0]
-            )
+            error = RuntimeError("runtime evidence capture finalization failed")
+            error.secondary_exceptions = tuple(cleanup_errors)
+            raise error from cleanup_errors[0]
         return False
 
     def record(self) -> dict[str, Any]:
@@ -1212,8 +1316,81 @@ def _add_exception_note(error: BaseException, note: str) -> None:
         pass
 
 
+def _attach_secondary_exception(
+    error: BaseException,
+    secondary: BaseException,
+) -> None:
+    """Retain machine-readable exception provenance for cancellation checks."""
+
+    try:
+        existing = list(getattr(error, "secondary_exceptions", ()))
+        existing.append(secondary)
+        error.secondary_exceptions = tuple(existing)
+    except BaseException:
+        pass
+
+
+def _remember_deferred_exception(
+    deferred: Optional[tuple[BaseException, Any]],
+    error: BaseException,
+) -> tuple[BaseException, Any]:
+    """Keep every deferred exception while preferring a non-OS primary."""
+
+    if deferred is None:
+        return error, error.__traceback__
+    primary, _ = deferred
+    if isinstance(primary, OSError) and not isinstance(error, OSError):
+        _attach_secondary_exception(error, primary)
+        return error, error.__traceback__
+    _attach_secondary_exception(primary, error)
+    return deferred
+
+
 class AtomicPublicationIndeterminate(RuntimeError):
     """Raised when a no-replace publication has no trustworthy final state."""
+
+
+class DirectoryClaimIndeterminate(RuntimeError):
+    """Raised when a directory claim may have changed the namespace."""
+
+
+class DirectoryClaimCommittedUnopened(DirectoryClaimIndeterminate):
+    """Raised when a claim syscall succeeded but the target cannot be reopened."""
+
+
+def _exception_contains_cancellation(error: BaseException) -> bool:
+    """Recognize cancellation even when a reconciliation error wraps it."""
+
+    pending: list[Any] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if isinstance(current, (list, tuple)):
+            pending.extend(current)
+            continue
+        if not isinstance(current, BaseException):
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if not isinstance(current, Exception):
+            return True
+        pending.extend(
+            value
+            for value in (
+                current.__cause__,
+                current.__context__,
+                getattr(current, "deferred_error", None),
+                getattr(current, "first_error", None),
+                getattr(current, "marker_error", None),
+                getattr(current, "recovery_error", None),
+                getattr(current, "reconciliation_error", None),
+                getattr(current, "secondary_exceptions", None),
+            )
+            if value is not None
+        )
+    return False
 
 
 def _close_descriptors_after_error(
@@ -1230,6 +1407,7 @@ def _close_descriptors_after_error(
         try:
             os.close(descriptor)
         except BaseException as close_error:
+            _attach_secondary_exception(error, close_error)
             _add_exception_note(
                 error,
                 "descriptor cleanup also failed: "
@@ -1278,7 +1456,14 @@ def _entry_metadata(
         return None
 
 
-def _open_pinned_directory(path: Path, label: str) -> int:
+def _open_pinned_directory(
+    path: Path,
+    label: str,
+    *,
+    descriptor_guard: Optional[list[int]] = None,
+) -> int:
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError(f"{label} descriptor guard must start empty")
     descriptor = -1
     try:
         descriptor = os.open(path, _directory_flags())
@@ -1290,20 +1475,36 @@ def _open_pinned_directory(path: Path, label: str) -> int:
             or _object_identity(opened) != _object_identity(current)
         ):
             raise ValueError(f"{label} must be a stable non-symlink directory")
-        return descriptor
+        if descriptor_guard is not None:
+            descriptor_guard.append(descriptor)
+        result = descriptor
+        descriptor = -1
+        return result
     except OSError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise ValueError(f"{label} must be a stable non-symlink directory") from exc
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
+        error = ValueError(f"{label} must be a stable non-symlink directory")
+        cleanup_descriptor = (
+            -1 if descriptor_guard == [descriptor] else descriptor
+        )
+        _close_descriptors_after_error([cleanup_descriptor], error)
+        raise error from exc
+    except BaseException as exc:
+        error_traceback = exc.__traceback__
+        cleanup_descriptor = (
+            -1 if descriptor_guard == [descriptor] else descriptor
+        )
+        _close_descriptors_after_error([cleanup_descriptor], exc)
+        raise exc.with_traceback(error_traceback)
 
 
 def _open_pinned_directory_at(
-    parent_descriptor: int, name: str, label: str
+    parent_descriptor: int,
+    name: str,
+    label: str,
+    *,
+    descriptor_guard: Optional[list[int]] = None,
 ) -> int:
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError(f"{label} descriptor guard must start empty")
     descriptor = -1
     try:
         entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -1315,15 +1516,25 @@ def _open_pinned_directory_at(
             or _object_identity(entry) != _object_identity(opened)
         ):
             raise ValueError(f"{label} must be a stable non-symlink directory")
-        return descriptor
+        if descriptor_guard is not None:
+            descriptor_guard.append(descriptor)
+        result = descriptor
+        descriptor = -1
+        return result
     except OSError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise ValueError(f"{label} must be a stable non-symlink directory") from exc
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
+        error = ValueError(f"{label} must be a stable non-symlink directory")
+        cleanup_descriptor = (
+            -1 if descriptor_guard == [descriptor] else descriptor
+        )
+        _close_descriptors_after_error([cleanup_descriptor], error)
+        raise error from exc
+    except BaseException as exc:
+        error_traceback = exc.__traceback__
+        cleanup_descriptor = (
+            -1 if descriptor_guard == [descriptor] else descriptor
+        )
+        _close_descriptors_after_error([cleanup_descriptor], exc)
+        raise exc.with_traceback(error_traceback)
 
 
 def _verify_pinned_directory_path(
@@ -1361,27 +1572,68 @@ def _open_pinned_directory_chain(
     root: Path,
     relative: Sequence[str],
     label: str,
+    *,
+    descriptor_guard: Optional[list[int]] = None,
 ) -> tuple[int, list[tuple[int, str, int, str]], int]:
-    root_descriptor = _open_pinned_directory(root, f"{label} root")
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError(f"{label} descriptor guard must start empty")
+    held_guard: list[int] = []
+    child_guard: list[int] = []
+    root_descriptor = -1
     links: list[tuple[int, str, int, str]] = []
-    current = root_descriptor
+    current = -1
+    returning = False
     try:
+        root_descriptor = _open_pinned_directory(
+            root,
+            f"{label} root",
+            descriptor_guard=held_guard,
+        )
+        if held_guard != [root_descriptor]:
+            raise RuntimeError(f"{label} root descriptor handoff changed")
+        current = root_descriptor
         for index, name in enumerate(relative):
             child_label = f"{label} component {index}"
-            child = _open_pinned_directory_at(current, name, child_label)
+            child = _open_pinned_directory_at(
+                current,
+                name,
+                child_label,
+                descriptor_guard=child_guard,
+            )
+            if child_guard != [child]:
+                raise RuntimeError(f"{child_label} descriptor handoff changed")
             links.append((current, name, child, child_label))
+            held_guard.extend(child_guard)
+            child_guard.clear()
             current = child
-        return root_descriptor, links, current
+        if descriptor_guard is not None:
+            descriptor_guard.extend(held_guard)
+        result = (root_descriptor, links, current)
+        held_guard.clear()
+        returning = True
+        return result
     except BaseException as exc:
         error_traceback = exc.__traceback__
+        externally_owned = set(descriptor_guard or ())
+        close_candidates = [
+            *reversed(child_guard),
+            *(descriptor for _, _, descriptor, _ in reversed(links)),
+            *reversed(held_guard),
+            root_descriptor,
+        ]
         _close_descriptors_after_error(
             [
-                *(descriptor for _, _, descriptor, _ in reversed(links)),
-                root_descriptor,
+                descriptor
+                for descriptor in close_candidates
+                if descriptor not in externally_owned
             ],
             exc,
         )
         raise exc.with_traceback(error_traceback)
+    finally:
+        if not returning:
+            held_guard.clear()
+            child_guard.clear()
 
 
 def _verify_directory_chain(
@@ -1393,6 +1645,67 @@ def _verify_directory_chain(
     _verify_pinned_directory_path(root, root_descriptor, f"{label} root")
     for parent, name, child, child_label in links:
         _verify_directory_entry(parent, name, child, child_label)
+
+
+def _observe_expected_directory_claim(
+    parent_descriptor: int,
+    name: str,
+    expected_identity: tuple[int, int],
+    label: str,
+    *,
+    namespace_committed: bool,
+    deferred_error: Optional[tuple[BaseException, Any]] = None,
+) -> Optional[tuple[BaseException, Any]]:
+    """Wait only for positive namespace evidence after a claim attempt."""
+
+    last_error: Optional[BaseException] = None
+    for attempt in range(_PUBLICATION_RECONCILIATION_ATTEMPTS):
+        try:
+            observed = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            last_error = exc
+        except BaseException as exc:
+            last_error = exc
+            if not isinstance(exc, OSError):
+                deferred_error = _remember_deferred_exception(
+                    deferred_error,
+                    exc,
+                )
+        else:
+            if (
+                stat.S_ISDIR(observed.st_mode)
+                and _object_identity(observed) == expected_identity
+            ):
+                return deferred_error
+            raise RuntimeError(f"{label} path identity changed")
+        try:
+            time.sleep(0.01 * (attempt + 1))
+        except BaseException as exc:
+            last_error = exc
+            if not isinstance(exc, OSError):
+                deferred_error = _remember_deferred_exception(
+                    deferred_error,
+                    exc,
+                )
+
+    error_type = (
+        DirectoryClaimCommittedUnopened
+        if namespace_committed
+        else DirectoryClaimIndeterminate
+    )
+    error = error_type(f"{label} outcome remained indeterminate for {name}")
+    error.target_name = name
+    error.expected_identity = expected_identity
+    error.namespace_committed = namespace_committed
+    if deferred_error is not None:
+        error.deferred_error = deferred_error[0]
+    if last_error is not None:
+        raise error from last_error
+    raise error
 
 
 def _rename_directory_noreplace(
@@ -1416,62 +1729,336 @@ def _rename_directory_noreplace(
     )
     renameat2.restype = ctypes.c_int
     source_identity = _object_identity(os.fstat(source_descriptor))
-    ctypes.set_errno(0)
-    result = renameat2(
-        source_parent_descriptor,
-        ctypes.c_char_p(os.fsencode(source_name)),
-        target_parent_descriptor,
-        ctypes.c_char_p(os.fsencode(target_name)),
-        _RENAME_NOREPLACE,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        rename_error = OSError(
-            error_number,
-            os.strerror(error_number),
-            target_name,
-        )
-        try:
-            reconciled = os.stat(
-                target_name,
-                dir_fd=target_parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            raise rename_error
-        except OSError as reconcile_error:
-            raise RuntimeError(
-                "directory claim outcome could not be reconciled"
-            ) from reconcile_error
-        if (
-            not stat.S_ISDIR(reconciled.st_mode)
-            or _object_identity(reconciled) != source_identity
-        ):
-            raise rename_error
-    _verify_directory_entry(
-        target_parent_descriptor,
-        target_name,
-        source_descriptor,
-        "claimed directory",
-    )
+    rename_error: Optional[BaseException] = None
+    rename_succeeded = False
     try:
-        os.stat(
-            source_name,
-            dir_fd=source_parent_descriptor,
-            follow_symlinks=False,
+        ctypes.set_errno(0)
+        result = renameat2(
+            source_parent_descriptor,
+            ctypes.c_char_p(os.fsencode(source_name)),
+            target_parent_descriptor,
+            ctypes.c_char_p(os.fsencode(target_name)),
+            _RENAME_NOREPLACE,
         )
-    except FileNotFoundError:
+        if result == 0:
+            rename_succeeded = True
+        else:
+            error_number = ctypes.get_errno()
+            rename_error = OSError(
+                error_number,
+                os.strerror(error_number),
+                target_name,
+            )
+    except BaseException as exc:
+        rename_error = exc
+
+    deferred_error = (
+        None
+        if rename_error is None or isinstance(rename_error, OSError)
+        else (rename_error, rename_error.__traceback__)
+    )
+    if rename_succeeded:
+        deferred_error = _observe_expected_directory_claim(
+            target_parent_descriptor,
+            target_name,
+            source_identity,
+            "claimed directory",
+            namespace_committed=True,
+            deferred_error=deferred_error,
+        )
+        if deferred_error is not None:
+            error, error_traceback = deferred_error
+            raise error.with_traceback(error_traceback)
         return
-    raise RuntimeError("directory claim left both staging and final names")
+
+    if isinstance(rename_error, OSError):
+        if rename_error.errno == errno.EEXIST:
+            raise rename_error
+        unsupported = {
+            errno.EINVAL,
+            errno.ENOSYS,
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if rename_error.errno in unsupported:
+            observed = _entry_metadata(target_parent_descriptor, target_name)
+            if (
+                observed is not None
+                and stat.S_ISDIR(observed.st_mode)
+                and _object_identity(observed) == source_identity
+            ):
+                return
+            raise rename_error
+        if rename_error.errno not in {
+            errno.EINTR,
+            errno.EIO,
+            getattr(errno, "ESTALE", errno.EIO),
+            getattr(errno, "ETIMEDOUT", errno.EIO),
+        }:
+            raise rename_error
+
+    try:
+        deferred_error = _observe_expected_directory_claim(
+            target_parent_descriptor,
+            target_name,
+            source_identity,
+            "claimed directory",
+            namespace_committed=False,
+            deferred_error=deferred_error,
+        )
+    except RuntimeError as exc:
+        if isinstance(exc, DirectoryClaimIndeterminate):
+            if rename_error is not None:
+                exc.rename_error = rename_error
+            raise
+        if rename_error is not None:
+            raise rename_error
+        raise
+    if deferred_error is not None:
+        error, error_traceback = deferred_error
+        raise error.with_traceback(error_traceback)
 
 
 def _create_unique_pinned_directory_at(
     parent_descriptor: int,
     name: str,
     label: str,
+    *,
+    descriptor_guard: Optional[list[int]] = None,
 ) -> int:
-    os.mkdir(name, mode=0o750, dir_fd=parent_descriptor)
-    return _open_pinned_directory_at(parent_descriptor, name, label)
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError(f"{label} descriptor guard must start empty")
+    opened_guard: list[int] = []
+    descriptor = -1
+    returning = False
+    try:
+        os.mkdir(name, mode=0o750, dir_fd=parent_descriptor)
+        descriptor = _open_pinned_directory_at(
+            parent_descriptor,
+            name,
+            label,
+            descriptor_guard=opened_guard,
+        )
+        if opened_guard != [descriptor]:
+            raise RuntimeError(f"{label} open descriptor handoff changed")
+        if descriptor_guard is not None:
+            descriptor_guard.append(descriptor)
+        opened_guard.clear()
+        result = descriptor
+        descriptor = -1
+        returning = True
+        return result
+    finally:
+        held = [*opened_guard, descriptor]
+        closed: set[int] = set()
+        for close_descriptor in held:
+            if close_descriptor < 0 or close_descriptor in closed:
+                continue
+            closed.add(close_descriptor)
+            externally_owned = descriptor_guard == [close_descriptor]
+            if not returning and not externally_owned:
+                try:
+                    opened = os.fstat(close_descriptor)
+                    current = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        stat.S_ISDIR(opened.st_mode)
+                        and stat.S_ISDIR(current.st_mode)
+                        and _object_identity(opened) == _object_identity(current)
+                        and not os.listdir(close_descriptor)
+                    ):
+                        os.rmdir(name, dir_fd=parent_descriptor)
+                        os.fsync(parent_descriptor)
+                except OSError:
+                    pass
+            if externally_owned:
+                continue
+            try:
+                os.close(close_descriptor)
+            except OSError:
+                pass
+
+
+def _open_claimed_directory_with_positive_reconciliation(
+    parent_descriptor: int,
+    name: str,
+    label: str,
+    *,
+    namespace_committed: bool,
+    expected_identity: Optional[tuple[int, int]] = None,
+    require_empty: bool = False,
+    marker_binding: Optional[tuple[int, str, tuple[int, int]]] = None,
+    ownership_candidates: Optional[list[tuple[int, int]]] = None,
+    descriptor_guard: Optional[list[int]] = None,
+) -> tuple[int, Optional[tuple[BaseException, Any]]]:
+    """Reopen a possibly committed claim without performing another mutation."""
+
+    deferred_error: Optional[tuple[BaseException, Any]] = None
+    last_error: Optional[BaseException] = None
+    for attempt in range(_PUBLICATION_RECONCILIATION_ATTEMPTS):
+        descriptor = -1
+        try:
+            descriptor = _open_pinned_directory_at(parent_descriptor, name, label)
+            identity = _object_identity(os.fstat(descriptor))
+            if expected_identity is not None and identity != expected_identity:
+                raise RuntimeError(f"{label} path identity changed")
+            if require_empty and os.listdir(descriptor):
+                raise FileExistsError(f"{label} is not empty after claim")
+            if marker_binding is not None:
+                marker_descriptor, marker_name, marker_identity = marker_binding
+                marker = os.stat(
+                    marker_name,
+                    dir_fd=marker_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(marker.st_mode)
+                    or _object_identity(marker) != marker_identity
+                ):
+                    raise RuntimeError(f"{label} claim marker changed")
+            if descriptor_guard is not None:
+                if descriptor_guard:
+                    raise RuntimeError(f"{label} descriptor guard changed")
+                descriptor_guard.append(descriptor)
+            if ownership_candidates is not None:
+                if ownership_candidates == [identity]:
+                    pass
+                elif ownership_candidates:
+                    raise RuntimeError(f"{label} ownership candidate changed")
+                else:
+                    ownership_candidates.append(identity)
+            result = descriptor
+            descriptor = -1
+            return result, deferred_error
+        except FileExistsError:
+            raise
+        except ValueError as exc:
+            last_error = exc
+            if not isinstance(exc.__cause__, OSError):
+                error_traceback = exc.__traceback__
+                _close_descriptors_after_error([descriptor], exc)
+                raise exc.with_traceback(error_traceback)
+        except OSError as exc:
+            last_error = exc
+        except RuntimeError:
+            raise
+        except BaseException as exc:
+            if descriptor < 0 and descriptor_guard:
+                guarded_descriptor = descriptor_guard.pop()
+                try:
+                    os.close(guarded_descriptor)
+                except BaseException as close_error:
+                    _add_exception_note(
+                        exc,
+                        f"{label} guarded descriptor close also failed: "
+                        f"{type(close_error).__name__}: {close_error}",
+                    )
+            last_error = exc
+            deferred_error = _remember_deferred_exception(
+                deferred_error,
+                exc,
+            )
+        finally:
+            if descriptor >= 0:
+                if descriptor_guard == [descriptor]:
+                    descriptor_guard.clear()
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:
+                    if deferred_error is None:
+                        deferred_error = (close_error, close_error.__traceback__)
+        try:
+            time.sleep(0.01 * (attempt + 1))
+        except BaseException as exc:
+            last_error = exc
+            if not isinstance(exc, OSError):
+                deferred_error = _remember_deferred_exception(
+                    deferred_error,
+                    exc,
+                )
+
+    error_type = (
+        DirectoryClaimCommittedUnopened
+        if namespace_committed
+        else DirectoryClaimIndeterminate
+    )
+    error = error_type(f"{label} could not be positively reopened")
+    error.target_name = name
+    error.namespace_committed = namespace_committed
+    if expected_identity is not None:
+        error.expected_identity = expected_identity
+    if deferred_error is not None:
+        error.deferred_error = deferred_error[0]
+    if last_error is not None:
+        raise error from last_error
+    raise error
+
+
+def _publish_directory_claim_marker(
+    *,
+    name: str,
+    label: str,
+    staging_identity: tuple[int, int],
+    marker_directory_descriptor: int,
+    marker_name: str,
+    intent_guard: list[Optional[tuple[int, int]]],
+) -> tuple[tuple[int, int], Optional[tuple[BaseException, Any]]]:
+    """Durably publish one intent before either directory-claim syscall."""
+
+    marker_payload = (
+        f"repldm-directory-claim-v1:{name}:"
+        f"{staging_identity[0]}:{staging_identity[1]}:{uuid.uuid4().hex}\n"
+    ).encode("ascii")
+    if intent_guard != [None]:
+        raise RuntimeError(f"{label} claim marker intent guard changed")
+    marker_candidates: list[tuple[int, int]] = []
+    deferred_marker_error: Optional[tuple[BaseException, Any]] = None
+    try:
+        marker_identity = atomic_create_bytes(
+            Path(marker_name),
+            marker_payload,
+            directory_descriptor=marker_directory_descriptor,
+            ownership_candidates=marker_candidates,
+        )
+    except FileExistsError:
+        intent_guard.clear()
+        raise
+    except BaseException as marker_error:
+        try:
+            observed_marker = _entry_metadata(
+                marker_directory_descriptor,
+                marker_name,
+            )
+        except BaseException as observation_error:
+            error = DirectoryClaimIndeterminate(
+                f"{label} claim marker observation was interrupted"
+            )
+            error.target_name = name
+            error.marker_name = marker_name
+            error.staging_identity = staging_identity
+            error.marker_error = marker_error
+            error.deferred_error = observation_error
+            raise error from observation_error
+        if (
+            len(marker_candidates) != 1
+            or observed_marker is None
+            or not stat.S_ISREG(observed_marker.st_mode)
+            or _object_identity(observed_marker) != marker_candidates[0]
+        ):
+            error = DirectoryClaimIndeterminate(
+                f"{label} claim marker publication is indeterminate"
+            )
+            error.target_name = name
+            error.marker_name = marker_name
+            error.staging_identity = staging_identity
+            raise error from marker_error
+        marker_identity = marker_candidates[0]
+        if not isinstance(marker_error, OSError):
+            deferred_marker_error = (marker_error, marker_error.__traceback__)
+    intent_guard[0] = marker_identity
+    return marker_identity, deferred_marker_error
 
 
 def _claim_pinned_directory_with_marker(
@@ -1484,87 +2071,85 @@ def _claim_pinned_directory_with_marker(
     staging_parent_descriptor: int,
     marker_directory_descriptor: int,
     marker_name: str,
+    marker_identity: tuple[int, int],
     ownership_candidates: Optional[list[tuple[int, int]]],
+    descriptor_guard: list[int],
 ) -> int:
+    """Fallback claim using only a positively successful mkdir as ownership."""
+
     staging_identity = _object_identity(os.fstat(staging_descriptor))
-    marker_payload = (
-        f"repldm-directory-claim-v1:{name}:"
-        f"{staging_identity[0]}:{staging_identity[1]}:{uuid.uuid4().hex}\n"
-    ).encode("ascii")
-    marker_candidates: list[tuple[int, int]] = []
-    deferred_marker_error: Optional[tuple[BaseException, Any]] = None
-    try:
-        marker_identity = atomic_create_bytes(
-            Path(marker_name),
-            marker_payload,
-            directory_descriptor=marker_directory_descriptor,
-            ownership_candidates=marker_candidates,
-        )
-    except BaseException as marker_error:
-        observed_marker = _entry_metadata(
-            marker_directory_descriptor,
-            marker_name,
-        )
-        if (
-            len(marker_candidates) != 1
-            or observed_marker is None
-            or not stat.S_ISREG(observed_marker.st_mode)
-            or _object_identity(observed_marker) != marker_candidates[0]
-        ):
-            raise
-        marker_identity = marker_candidates[0]
-        if not isinstance(marker_error, OSError):
-            deferred_marker_error = (marker_error, marker_error.__traceback__)
-    if _entry_exists(parent_descriptor, name):
-        raise FileExistsError(f"{label} already exists")
-    create_error: Optional[tuple[BaseException, Any]] = None
-    deferred_create_error: Optional[tuple[BaseException, Any]] = None
-    try:
-        os.mkdir(name, mode=0o750, dir_fd=parent_descriptor)
-    except BaseException as exc:
-        if isinstance(exc, OSError):
-            uncertain = {
+    last_create_error: Optional[BaseException] = None
+    mkdir_succeeded = False
+    for attempt in range(_PUBLICATION_RECONCILIATION_ATTEMPTS):
+        try:
+            os.mkdir(name, mode=0o750, dir_fd=parent_descriptor)
+        except FileExistsError as exc:
+            raise FileExistsError(f"{label} already exists") from exc
+        except OSError as exc:
+            if exc.errno not in {
                 errno.EINTR,
                 errno.EIO,
                 getattr(errno, "ESTALE", errno.EIO),
                 getattr(errno, "ETIMEDOUT", errno.EIO),
-            }
-            if exc.errno not in uncertain:
+            }:
                 raise
+            last_create_error = exc
+        except BaseException as exc:
+            error = DirectoryClaimIndeterminate(
+                f"{label} mkdir was interrupted with an unknown outcome"
+            )
+            error.target_name = name
+            error.marker_name = marker_name
+            error.staging_identity = staging_identity
+            error.deferred_error = exc
+            raise error from exc
         else:
-            deferred_create_error = (exc, exc.__traceback__)
-        create_error = (exc, exc.__traceback__)
-    # The permanent marker serializes every supported launcher. The protocol
-    # separately excludes interference by an arbitrary same-UID process.
+            mkdir_succeeded = True
+            break
+        try:
+            time.sleep(0.01 * (attempt + 1))
+        except BaseException as exc:
+            error = DirectoryClaimIndeterminate(
+                f"{label} mkdir reconciliation was interrupted"
+            )
+            error.target_name = name
+            error.marker_name = marker_name
+            error.staging_identity = staging_identity
+            error.deferred_error = exc
+            raise error from exc
+    if not mkdir_succeeded:
+        error = DirectoryClaimIndeterminate(
+            f"{label} mkdir outcome remained indeterminate"
+        )
+        error.target_name = name
+        error.marker_name = marker_name
+        error.staging_identity = staging_identity
+        if last_create_error is not None:
+            raise error from last_create_error
+        raise error
+
     descriptor = -1
     try:
-        try:
-            descriptor = _open_pinned_directory_at(
+        descriptor, reopen_error = (
+            _open_claimed_directory_with_positive_reconciliation(
                 parent_descriptor,
                 name,
                 f"{label} exclusive-mkdir directory",
+                namespace_committed=True,
+                require_empty=True,
+                marker_binding=(
+                    marker_directory_descriptor,
+                    marker_name,
+                    marker_identity,
+                ),
+                ownership_candidates=ownership_candidates,
+                descriptor_guard=descriptor_guard,
             )
-        except BaseException:
-            if create_error is not None:
-                error, error_traceback = create_error
-                raise error.with_traceback(error_traceback)
-            raise
-        identity = _object_identity(os.fstat(descriptor))
-        if ownership_candidates is not None:
-            ownership_candidates.append(identity)
-        if os.listdir(descriptor):
-            raise RuntimeError(f"{label} is not empty immediately after claim")
-        _verify_directory_entry(parent_descriptor, name, descriptor, label)
-        durable_marker = os.stat(
-            marker_name,
-            dir_fd=marker_directory_descriptor,
-            follow_symlinks=False,
         )
-        if (
-            not stat.S_ISREG(durable_marker.st_mode)
-            or _object_identity(durable_marker) != marker_identity
-        ):
-            raise RuntimeError(f"{label} claim marker changed after directory claim")
+        _verify_directory_entry(parent_descriptor, name, descriptor, label)
+        if reopen_error is not None:
+            reopen_exception, reopen_traceback = reopen_error
+            raise reopen_exception.with_traceback(reopen_traceback)
         try:
             staging = os.stat(
                 staging_name,
@@ -1580,17 +2165,13 @@ def _claim_pinned_directory_with_marker(
                 os.fsync(staging_parent_descriptor)
         except OSError:
             pass
-        if deferred_marker_error is not None:
-            marker_error, marker_traceback = deferred_marker_error
-            raise marker_error.with_traceback(marker_traceback)
-        if deferred_create_error is not None:
-            create_exception, create_traceback = deferred_create_error
-            raise create_exception.with_traceback(create_traceback)
         result = descriptor
         descriptor = -1
         return result
     finally:
         if descriptor >= 0:
+            if descriptor_guard == [descriptor]:
+                descriptor_guard.clear()
             try:
                 os.close(descriptor)
             except OSError:
@@ -1606,27 +2187,68 @@ def _claim_pinned_directory_at(
     fallback_marker_descriptor: Optional[int] = None,
     fallback_marker_name: Optional[str] = None,
     ownership_candidates: Optional[list[tuple[int, int]]] = None,
+    descriptor_guard: Optional[list[int]] = None,
 ) -> int:
     if not name or Path(name).name != name:
         raise ValueError(f"{label} name must be one safe basename")
     if ownership_candidates is not None and ownership_candidates:
         raise ValueError(f"{label} ownership candidate list must start empty")
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError(f"{label} descriptor guard must start empty")
     staging_parent = (
         parent_descriptor
         if staging_parent_descriptor is None
         else staging_parent_descriptor
     )
     staging_name = f".{name}.{uuid.uuid4().hex}.claim"
-    descriptor = _create_unique_pinned_directory_at(
-        staging_parent,
-        staging_name,
-        f"{label} staging directory",
-    )
+    descriptor = -1
     claimed = False
+    preserve_staging = False
+    intent_durable = False
+    fallback_descriptor_guard: list[int] = []
+    marker_intent_guard: list[Optional[tuple[int, int]]] = []
+    staging_descriptor_guard: list[int] = []
+    previous_descriptor = -1
+    staging_identity: Optional[tuple[int, int]] = None
     try:
+        descriptor = _create_unique_pinned_directory_at(
+            staging_parent,
+            staging_name,
+            f"{label} staging directory",
+            descriptor_guard=staging_descriptor_guard,
+        )
+        if staging_descriptor_guard != [descriptor]:
+            raise RuntimeError(f"{label} staging descriptor handoff changed")
+        staging_descriptor_guard.clear()
         if os.listdir(descriptor):
             raise RuntimeError(f"{label} staging directory is not empty")
         staging_identity = _object_identity(os.fstat(descriptor))
+        marker_directory = (
+            parent_descriptor
+            if fallback_marker_descriptor is None
+            else fallback_marker_descriptor
+        )
+        marker_name = (
+            f".{name}.claim"
+            if fallback_marker_name is None
+            else fallback_marker_name
+        )
+        marker_intent_guard.append(None)
+        marker_identity, deferred_marker_error = _publish_directory_claim_marker(
+            name=name,
+            label=label,
+            staging_identity=staging_identity,
+            marker_directory_descriptor=marker_directory,
+            marker_name=marker_name,
+            intent_guard=marker_intent_guard,
+        )
+        if marker_intent_guard != [marker_identity]:
+            raise RuntimeError(f"{label} claim marker intent handoff changed")
+        intent_durable = True
+        marker_intent_guard.clear()
+        if deferred_marker_error is not None:
+            marker_error, marker_traceback = deferred_marker_error
+            raise marker_error.with_traceback(marker_traceback)
         if ownership_candidates is not None:
             ownership_candidates.append(staging_identity)
         try:
@@ -1637,6 +2259,12 @@ def _claim_pinned_directory_at(
                 name,
                 descriptor,
             )
+        except FileExistsError:
+            if ownership_candidates is not None:
+                if ownership_candidates != [staging_identity]:
+                    raise RuntimeError(f"{label} ownership candidate changed")
+                ownership_candidates.clear()
+            raise
         except OSError as exc:
             unsupported = {
                 errno.EINVAL,
@@ -1656,32 +2284,57 @@ def _claim_pinned_directory_at(
                 staging_name=staging_name,
                 staging_descriptor=descriptor,
                 staging_parent_descriptor=staging_parent,
-                marker_directory_descriptor=(
-                    parent_descriptor
-                    if fallback_marker_descriptor is None
-                    else fallback_marker_descriptor
-                ),
-                marker_name=(
-                    f".{name}.claim"
-                    if fallback_marker_name is None
-                    else fallback_marker_name
-                ),
+                marker_directory_descriptor=marker_directory,
+                marker_name=marker_name,
+                marker_identity=marker_identity,
                 ownership_candidates=ownership_candidates,
+                descriptor_guard=fallback_descriptor_guard,
             )
+            if fallback_descriptor_guard != [replacement_descriptor]:
+                raise RuntimeError(f"{label} descriptor handoff changed")
             previous_descriptor = descriptor
             descriptor = replacement_descriptor
-            try:
-                os.close(previous_descriptor)
-            except OSError:
-                pass
+            fallback_descriptor_guard.clear()
         claimed = True
+        if descriptor_guard is not None:
+            if descriptor_guard:
+                raise RuntimeError(f"{label} descriptor guard changed")
+            descriptor_guard.append(descriptor)
         return_descriptor = descriptor
         descriptor = -1
         return return_descriptor
+    except (AtomicPublicationIndeterminate, DirectoryClaimIndeterminate):
+        preserve_staging = True
+        raise
+    except BaseException:
+        if intent_durable or marker_intent_guard:
+            preserve_staging = True
+        raise
     finally:
-        if descriptor >= 0:
-            if not claimed:
+        descriptors_to_close = [
+            *staging_descriptor_guard,
+            *fallback_descriptor_guard,
+            descriptor,
+            previous_descriptor,
+        ]
+        closed_descriptors: set[int] = set()
+        for close_descriptor in descriptors_to_close:
+            if close_descriptor < 0 or close_descriptor in closed_descriptors:
+                continue
+            closed_descriptors.add(close_descriptor)
+            if descriptor_guard == [close_descriptor]:
+                continue
+            if (
+                not claimed
+                and not preserve_staging
+            ):
                 try:
+                    close_identity = _object_identity(os.fstat(close_descriptor))
+                    expected_staging_identity = (
+                        close_identity
+                        if staging_identity is None
+                        else staging_identity
+                    )
                     staging = os.stat(
                         staging_name,
                         dir_fd=staging_parent,
@@ -1690,16 +2343,18 @@ def _claim_pinned_directory_at(
                     if (
                         stat.S_ISDIR(staging.st_mode)
                         and _object_identity(staging)
-                        == _object_identity(os.fstat(descriptor))
-                        and not os.listdir(descriptor)
+                        == close_identity
+                        == expected_staging_identity
+                        and not os.listdir(close_descriptor)
                     ):
                         os.rmdir(staging_name, dir_fd=staging_parent)
                 except OSError:
                     pass
             try:
-                os.close(descriptor)
+                os.close(close_descriptor)
             except OSError:
                 pass
+        fallback_descriptor_guard.clear()
 
 
 def _entry_exists(directory_descriptor: int, name: str) -> bool:
@@ -1755,15 +2410,14 @@ def _link_with_positive_reconciliation(
 
     first_error: Optional[tuple[BaseException, Any]] = None
     last_error: Optional[BaseException] = None
+    mutation_permitted = True
 
     def remember(error: BaseException) -> None:
-        nonlocal first_error, last_error
-        if first_error is None or (
-            isinstance(first_error[0], OSError)
-            and not isinstance(error, OSError)
-        ):
-            first_error = (error, error.__traceback__)
+        nonlocal first_error, last_error, mutation_permitted
+        first_error = _remember_deferred_exception(first_error, error)
         last_error = error
+        if not isinstance(error, OSError):
+            mutation_permitted = False
 
     def back_off(attempt: int) -> None:
         try:
@@ -1772,11 +2426,12 @@ def _link_with_positive_reconciliation(
             remember(delay_error)
 
     for attempt in range(_PUBLICATION_RECONCILIATION_ATTEMPTS):
-        try:
-            _link_descriptor(descriptor, directory_descriptor, name)
-            return first_error
-        except BaseException as link_error:
-            remember(link_error)
+        if mutation_permitted:
+            try:
+                _link_descriptor(descriptor, directory_descriptor, name)
+                return first_error
+            except BaseException as link_error:
+                remember(link_error)
         try:
             observed = os.stat(
                 name,
@@ -1840,6 +2495,9 @@ def _sha256_descriptor(descriptor: int) -> str:
 
 
 def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
+    # Removing the external staging hardlink changes ctime/nlink. NFS may expose
+    # those attributes at different times through descriptor and path caches.
+    # Exact bytes and their digest are bracketed and verified separately.
     return (
         value.st_dev,
         value.st_ino,
@@ -1848,8 +2506,6 @@ def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
         value.st_gid,
         value.st_size,
         value.st_mtime_ns,
-        value.st_ctime_ns,
-        value.st_nlink,
     )
 
 
@@ -1870,7 +2526,14 @@ def _stable_regular_snapshot(
                 dir_fd=directory_descriptor,
                 follow_symlinks=False,
             )
-            raw = _pread_descriptor_bytes(descriptor)
+            raw_before = _pread_descriptor_bytes(descriptor)
+            opened_middle = os.fstat(descriptor)
+            path_middle = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            raw_after = _pread_descriptor_bytes(descriptor)
             opened_after = os.fstat(descriptor)
             path_after = os.stat(
                 name,
@@ -1883,6 +2546,8 @@ def _stable_regular_snapshot(
         metadata = (
             _stable_file_metadata(opened_before),
             _stable_file_metadata(path_before),
+            _stable_file_metadata(opened_middle),
+            _stable_file_metadata(path_middle),
             _stable_file_metadata(opened_after),
             _stable_file_metadata(path_after),
         )
@@ -1890,13 +2555,16 @@ def _stable_regular_snapshot(
             all(stat.S_ISREG(value.st_mode) for value in (
                 opened_before,
                 path_before,
+                opened_middle,
+                path_middle,
                 opened_after,
                 path_after,
             ))
             and len(set(metadata)) == 1
-            and opened_after.st_size == len(raw)
+            and raw_before == raw_after
+            and opened_after.st_size == len(raw_after)
         ):
-            return raw, metadata[0]
+            return raw_after, metadata[0]
         last_error = RuntimeError(f"{label} changed during descriptor snapshot")
     if last_error is not None:
         raise RuntimeError(f"{label} did not provide a stable descriptor snapshot") from last_error
@@ -1946,8 +2614,18 @@ class _PublishedArtifacts:
             | getattr(os, "O_NONBLOCK", 0)
         )
         descriptor = -1
+        descriptor_guard: list[int] = []
         try:
-            descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+            descriptor = _open_unique_regular_at(
+                directory_descriptor,
+                name,
+                flags,
+                0o640,
+                descriptor_guard=descriptor_guard,
+            )
+            if descriptor_guard != [descriptor]:
+                raise RuntimeError(f"{label} descriptor handoff changed")
+            descriptor_guard.clear()
             raw, metadata = _stable_regular_snapshot(
                 descriptor,
                 directory_descriptor,
@@ -1972,15 +2650,25 @@ class _PublishedArtifacts:
             descriptor = -1
         except BaseException as exc:
             error_traceback = exc.__traceback__
+            if descriptor < 0 and descriptor_guard:
+                descriptor = descriptor_guard[0]
+            if (
+                descriptor >= 0
+                and self._rows
+                and self._rows[-1][0] == descriptor
+            ):
+                descriptor = -1
             if descriptor >= 0:
                 try:
                     os.close(descriptor)
                 except BaseException as close_error:
+                    _attach_secondary_exception(exc, close_error)
                     _add_exception_note(
                         exc,
                         f"{label} descriptor close also failed: "
                         f"{type(close_error).__name__}: {close_error}",
                     )
+            descriptor_guard.clear()
             raise exc.with_traceback(error_traceback)
 
     def verify(self) -> None:
@@ -2013,16 +2701,25 @@ class _PublishedArtifacts:
             directory_descriptor,
             name,
             expected,
-            _,
+            expected_sha256,
             label,
         ) in reversed(self._rows):
-            _verify_regular_metadata(
-                descriptor,
-                directory_descriptor,
-                name,
-                expected,
-                label,
-            )
+            try:
+                raw, observed = _stable_regular_snapshot(
+                    descriptor,
+                    directory_descriptor,
+                    name,
+                    label,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{label} changed before terminal verification"
+                ) from exc
+            if (
+                observed != expected
+                or hashlib.sha256(raw).hexdigest() != expected_sha256
+            ):
+                raise RuntimeError(f"{label} changed before terminal verification")
 
     def close(self) -> list[BaseException]:
         errors = []
@@ -2040,8 +2737,28 @@ def _open_unique_regular_at(
     name: str,
     flags: int,
     mode: int,
+    *,
+    descriptor_guard: Optional[list[int]] = None,
 ) -> int:
-    return os.open(name, flags, mode, dir_fd=directory_descriptor)
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError("regular-file descriptor guard must start empty")
+    descriptor = os.open(name, flags, mode, dir_fd=directory_descriptor)
+    if descriptor_guard is not None:
+        descriptor_guard.append(descriptor)
+    return descriptor
+
+
+def _duplicate_descriptor(
+    descriptor: int,
+    *,
+    descriptor_guard: Optional[list[int]] = None,
+) -> int:
+    if descriptor_guard is not None and descriptor_guard:
+        raise ValueError("duplicate descriptor guard must start empty")
+    duplicate = os.dup(descriptor)
+    if descriptor_guard is not None:
+        descriptor_guard.append(duplicate)
+    return duplicate
 
 
 def _remove_matching_entry(
@@ -2135,12 +2852,8 @@ def _atomic_create_at(
         | os.O_NOFOLLOW
         | os.O_CLOEXEC
     )
-    descriptor = _open_unique_regular_at(
-        staging_descriptor,
-        temporary_name,
-        flags,
-        0o640,
-    )
+    descriptor = -1
+    descriptor_guard: list[int] = []
     temporary_identity: Optional[tuple[int, int]] = None
     temporary_removed = False
     preserve_temporary = False
@@ -2148,6 +2861,16 @@ def _atomic_create_at(
     published_identity: Optional[tuple[int, int]] = None
     primary_error: Optional[tuple[BaseException, Any]] = None
     try:
+        descriptor = _open_unique_regular_at(
+            staging_descriptor,
+            temporary_name,
+            flags,
+            0o640,
+            descriptor_guard=descriptor_guard,
+        )
+        if descriptor_guard != [descriptor]:
+            raise RuntimeError("atomic temporary descriptor handoff changed")
+        descriptor_guard.clear()
         temporary_metadata = os.fstat(descriptor)
         if not stat.S_ISREG(temporary_metadata.st_mode):
             raise RuntimeError("atomic temporary inode is not a regular file")
@@ -2203,6 +2926,19 @@ def _atomic_create_at(
     except BaseException as exc:
         primary_error = (exc, exc.__traceback__)
 
+    if descriptor < 0 and descriptor_guard:
+        descriptor = descriptor_guard[0]
+    if temporary_identity is None and descriptor >= 0:
+        try:
+            opened_after_error = os.fstat(descriptor)
+            if stat.S_ISREG(opened_after_error.st_mode):
+                temporary_identity = _object_identity(opened_after_error)
+        except BaseException as identity_error:
+            if primary_error is None:
+                primary_error = (identity_error, identity_error.__traceback__)
+            else:
+                _attach_secondary_exception(primary_error[0], identity_error)
+
     cleanup_errors: list[BaseException] = []
     if primary_error is not None and published_identity is not None:
         try:
@@ -2257,14 +2993,17 @@ def _atomic_create_at(
                 cleanup_errors.append(rollback_error)
                 preserve_temporary = True
             result = None
-    try:
-        os.close(descriptor)
-    except BaseException as close_error:
-        cleanup_errors.append(close_error)
+    if descriptor >= 0:
+        try:
+            os.close(descriptor)
+        except BaseException as close_error:
+            cleanup_errors.append(close_error)
+    descriptor_guard.clear()
 
     if primary_error is not None:
         error, error_traceback = primary_error
         for cleanup_error in cleanup_errors:
+            _attach_secondary_exception(error, cleanup_error)
             _add_exception_note(
                 error,
                 "atomic temporary cleanup also failed: "
@@ -2274,6 +3013,19 @@ def _atomic_create_at(
     if cleanup_errors and result is None:
         error = cleanup_errors[0]
         for secondary in cleanup_errors[1:]:
+            _attach_secondary_exception(error, secondary)
+            _add_exception_note(
+                error,
+                "additional atomic cleanup failure: "
+                f"{type(secondary).__name__}: {secondary}",
+            )
+        raise error
+    if cleanup_errors and any(
+        _exception_contains_cancellation(error) for error in cleanup_errors
+    ):
+        error = cleanup_errors[0]
+        for secondary in cleanup_errors[1:]:
+            _attach_secondary_exception(error, secondary)
             _add_exception_note(
                 error,
                 "additional atomic cleanup failure: "
@@ -2294,7 +3046,9 @@ class _PreparedAtomicOutput:
         "temporary_name",
         "identity",
         "payload",
+        "commit_started",
         "committed",
+        "durable",
         "indeterminate",
         "diagnostics",
     )
@@ -2317,9 +3071,21 @@ class _PreparedAtomicOutput:
         self.temporary_name = temporary_name
         self.identity = identity
         self.payload = payload
+        self.commit_started = False
         self.committed = False
+        self.durable = False
         self.indeterminate = False
         self.diagnostics: list[BaseException] = []
+
+
+def _close_prepared_descriptor_once(prepared: _PreparedAtomicOutput) -> None:
+    """Invalidate ownership before one close attempt to prevent stale-fd retries."""
+
+    descriptor = prepared.descriptor
+    if descriptor < 0:
+        return
+    prepared.descriptor = -1
+    os.close(descriptor)
 
 
 def _prepare_atomic_output_at(
@@ -2329,6 +3095,7 @@ def _prepare_atomic_output_at(
     *,
     staging_directory_descriptor: int,
     ownership_candidates: Optional[list[tuple[int, int]]] = None,
+    prepared_guard: Optional[list[_PreparedAtomicOutput]] = None,
 ) -> _PreparedAtomicOutput:
     """Create and validate a private inode without exposing its final name."""
 
@@ -2344,10 +3111,14 @@ def _prepare_atomic_output_at(
         raise ValueError("atomic output and staging directories must share a filesystem")
     if ownership_candidates is not None and ownership_candidates:
         raise ValueError("atomic ownership candidate list must start empty")
+    if prepared_guard is not None and prepared_guard:
+        raise ValueError("prepared output guard must start empty")
 
     temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
     descriptor = -1
+    descriptor_guard: list[int] = []
     identity: Optional[tuple[int, int]] = None
+    prepared: Optional[_PreparedAtomicOutput] = None
     try:
         descriptor = _open_unique_regular_at(
             staging_directory_descriptor,
@@ -2358,7 +3129,11 @@ def _prepare_atomic_output_at(
             | os.O_NOFOLLOW
             | os.O_CLOEXEC,
             0o640,
+            descriptor_guard=descriptor_guard,
         )
+        if descriptor_guard != [descriptor]:
+            raise RuntimeError("prepared temporary descriptor handoff changed")
+        descriptor_guard.clear()
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise RuntimeError("atomic temporary inode is not a regular file")
@@ -2385,10 +3160,28 @@ def _prepare_atomic_output_at(
             identity=identity,
             payload=payload,
         )
+        if prepared_guard is not None:
+            prepared_guard.append(prepared)
         descriptor = -1
         return prepared
     except BaseException as exc:
         error_traceback = exc.__traceback__
+        externally_owned = (
+            prepared is not None
+            and prepared_guard is not None
+            and prepared_guard == [prepared]
+        )
+        if descriptor < 0 and descriptor_guard:
+            descriptor = descriptor_guard[0]
+        if identity is None and descriptor >= 0:
+            try:
+                opened_after_error = os.fstat(descriptor)
+                if stat.S_ISREG(opened_after_error.st_mode):
+                    identity = _object_identity(opened_after_error)
+            except BaseException as identity_error:
+                _attach_secondary_exception(exc, identity_error)
+        if externally_owned:
+            descriptor = -1
         if descriptor >= 0 and identity is not None:
             try:
                 _remove_matching_entry(
@@ -2397,6 +3190,7 @@ def _prepare_atomic_output_at(
                     identity,
                 )
             except BaseException as cleanup_error:
+                _attach_secondary_exception(exc, cleanup_error)
                 _add_exception_note(
                     exc,
                     "prepared atomic output cleanup also failed: "
@@ -2406,11 +3200,13 @@ def _prepare_atomic_output_at(
             try:
                 os.close(descriptor)
             except BaseException as close_error:
+                _attach_secondary_exception(exc, close_error)
                 _add_exception_note(
                     exc,
                     "prepared atomic output close also failed: "
                     f"{type(close_error).__name__}: {close_error}",
                 )
+        descriptor_guard.clear()
         raise exc.with_traceback(error_traceback)
 
 
@@ -2418,7 +3214,7 @@ def _discard_prepared_atomic_output(
     prepared: _PreparedAtomicOutput,
     error: Optional[BaseException] = None,
 ) -> None:
-    if prepared.committed or prepared.indeterminate:
+    if prepared.commit_started or prepared.committed or prepared.indeterminate:
         return
     cleanup_errors: list[BaseException] = []
     try:
@@ -2431,12 +3227,12 @@ def _discard_prepared_atomic_output(
         cleanup_errors.append(cleanup_error)
     if prepared.descriptor >= 0:
         try:
-            os.close(prepared.descriptor)
+            _close_prepared_descriptor_once(prepared)
         except BaseException as close_error:
             cleanup_errors.append(close_error)
-        prepared.descriptor = -1
     if error is not None:
         for cleanup_error in cleanup_errors:
+            _attach_secondary_exception(error, cleanup_error)
             _add_exception_note(
                 error,
                 "prepared terminal cleanup also failed: "
@@ -2444,32 +3240,54 @@ def _discard_prepared_atomic_output(
             )
         return
     if cleanup_errors:
-        raise cleanup_errors[0]
+        primary = cleanup_errors[0]
+        for secondary in cleanup_errors[1:]:
+            _attach_secondary_exception(primary, secondary)
+        raise primary
 
 
-def _commit_prepared_terminal(
+def _mark_prepared_terminal_commit_started(
+    prepared: _PreparedAtomicOutput,
+) -> None:
+    prepared.commit_started = True
+
+
+def _mark_prepared_terminal_committed(
+    prepared: _PreparedAtomicOutput,
+) -> None:
+    prepared.committed = True
+
+
+def _commit_prepared_terminal_impl(
     prepared: _PreparedAtomicOutput,
 ) -> tuple[int, int]:
     """Expose a terminal name once; a positively observed commit always wins."""
 
-    if prepared.committed or prepared.indeterminate or prepared.descriptor < 0:
+    if prepared.commit_started or prepared.descriptor < 0:
         raise RuntimeError("prepared terminal is not in the commit-ready state")
+    link_invoked = False
     try:
+        _mark_prepared_terminal_commit_started(prepared)
+        link_invoked = True
         deferred_link_error = _link_with_positive_reconciliation(
             prepared.descriptor,
             prepared.target_directory_descriptor,
             prepared.target_name,
             prepared.identity,
         )
-    except AtomicPublicationIndeterminate:
-        prepared.indeterminate = True
-        try:
-            os.close(prepared.descriptor)
-        except BaseException as close_error:
-            prepared.diagnostics.append(close_error)
-        prepared.descriptor = -1
+        _mark_prepared_terminal_committed(prepared)
+    except BaseException as exc:
+        if not link_invoked:
+            prepared.commit_started = False
+            _discard_prepared_atomic_output(prepared, exc)
+        else:
+            prepared.indeterminate = True
+            try:
+                _close_prepared_descriptor_once(prepared)
+            except BaseException as close_error:
+                prepared.diagnostics.append(close_error)
+                _attach_secondary_exception(exc, close_error)
         raise
-    prepared.committed = True
     if deferred_link_error is not None:
         prepared.diagnostics.append(deferred_link_error[0])
     terminal_error: Optional[BaseException] = None
@@ -2489,33 +3307,89 @@ def _commit_prepared_terminal(
             )
     except BaseException as integrity_error:
         terminal_error = integrity_error
+    durability_error: Optional[tuple[BaseException, Any]] = None
     try:
         os.fsync(prepared.target_directory_descriptor)
     except BaseException as sync_error:
         prepared.diagnostics.append(sync_error)
-    try:
-        _remove_matching_entry(
-            prepared.staging_directory_descriptor,
-            prepared.temporary_name,
-            prepared.identity,
-        )
-    except BaseException as cleanup_error:
-        prepared.diagnostics.append(cleanup_error)
+        durability_error = (sync_error, sync_error.__traceback__)
+    else:
+        prepared.durable = True
+    if terminal_error is None and prepared.durable:
+        try:
+            _remove_matching_entry(
+                prepared.staging_directory_descriptor,
+                prepared.temporary_name,
+                prepared.identity,
+            )
+        except BaseException as cleanup_error:
+            prepared.diagnostics.append(cleanup_error)
     if prepared.descriptor >= 0:
         try:
-            os.close(prepared.descriptor)
+            _close_prepared_descriptor_once(prepared)
         except BaseException as close_error:
             prepared.diagnostics.append(close_error)
-        prepared.descriptor = -1
-    if terminal_error is not None:
-        for diagnostic in prepared.diagnostics:
+    if terminal_error is not None or durability_error is not None:
+        error = terminal_error
+        error_traceback = (
+            None if terminal_error is None else terminal_error.__traceback__
+        )
+        if error is None:
+            error, error_traceback = durability_error
             _add_exception_note(
-                terminal_error,
+                error,
+                "terminal receipt was committed but directory durability is unknown; "
+                "opposite-terminal publication is forbidden",
+            )
+        for diagnostic in prepared.diagnostics:
+            if diagnostic is error:
+                continue
+            _attach_secondary_exception(error, diagnostic)
+            _add_exception_note(
+                error,
                 "terminal commit diagnostic: "
                 f"{type(diagnostic).__name__}: {diagnostic}",
             )
-        raise terminal_error
+        raise error.with_traceback(error_traceback)
+    cancellation_diagnostics = [
+        diagnostic
+        for diagnostic in prepared.diagnostics
+        if _exception_contains_cancellation(diagnostic)
+    ]
+    if cancellation_diagnostics:
+        error = cancellation_diagnostics[0]
+        for diagnostic in prepared.diagnostics:
+            if diagnostic is error:
+                continue
+            _attach_secondary_exception(error, diagnostic)
+        raise error
     return prepared.identity
+
+
+def _commit_prepared_terminal(
+    prepared: _PreparedAtomicOutput,
+) -> tuple[int, int]:
+    """Commit a terminal while retaining descriptor ownership at every boundary."""
+
+    active_error: Optional[BaseException] = None
+    try:
+        return _commit_prepared_terminal_impl(prepared)
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        if prepared.descriptor >= 0:
+            try:
+                _close_prepared_descriptor_once(prepared)
+            except BaseException as close_error:
+                if active_error is None:
+                    raise
+                _attach_secondary_exception(active_error, close_error)
+                _add_exception_note(
+                    active_error,
+                    "terminal descriptor finalization also failed: "
+                    f"{type(close_error).__name__}: {close_error}",
+                )
 
 
 def _prepare_terminal_json(
@@ -2525,6 +3399,7 @@ def _prepare_terminal_json(
     directory_descriptor: int,
     staging_directory_descriptor: int,
     ownership_candidates: Optional[list[tuple[int, int]]] = None,
+    prepared_guard: Optional[list[_PreparedAtomicOutput]] = None,
 ) -> _PreparedAtomicOutput:
     return _prepare_atomic_output_at(
         directory_descriptor,
@@ -2532,6 +3407,7 @@ def _prepare_terminal_json(
         contract.canonical_json_bytes(value) + b"\n",
         staging_directory_descriptor=staging_directory_descriptor,
         ownership_candidates=ownership_candidates,
+        prepared_guard=prepared_guard,
     )
 
 
@@ -2645,17 +3521,23 @@ def _publish_terminal_json(
     staging_directory_descriptor: int,
     ownership_candidates: Optional[list[tuple[int, int]]] = None,
 ) -> tuple[int, int]:
-    prepared = _prepare_terminal_json(
-        path,
-        value,
-        directory_descriptor=directory_descriptor,
-        staging_directory_descriptor=staging_directory_descriptor,
-        ownership_candidates=ownership_candidates,
-    )
+    prepared_guard: list[_PreparedAtomicOutput] = []
+    prepared: Optional[_PreparedAtomicOutput] = None
     try:
+        prepared = _prepare_terminal_json(
+            path,
+            value,
+            directory_descriptor=directory_descriptor,
+            staging_directory_descriptor=staging_directory_descriptor,
+            ownership_candidates=ownership_candidates,
+            prepared_guard=prepared_guard,
+        )
+        if prepared_guard != [prepared]:
+            raise RuntimeError("terminal prepared-output handoff changed")
         return _commit_prepared_terminal(prepared)
     except BaseException as exc:
-        _discard_prepared_atomic_output(prepared, exc)
+        for guarded in prepared_guard:
+            _discard_prepared_atomic_output(guarded, exc)
         raise
 
 
@@ -2667,6 +3549,7 @@ def _initialize_attempt_directory(
     fallback_marker_descriptor: int,
     fallback_marker_name: str,
     publications: _PublishedArtifacts,
+    descriptor_guard: list[int],
 ) -> tuple[Path, int]:
     marker = output_dir / "attempt.json"
     _publish_pinned_json(
@@ -2686,13 +3569,10 @@ def _initialize_attempt_directory(
         staging_parent_descriptor=fallback_marker_descriptor,
         fallback_marker_descriptor=fallback_marker_descriptor,
         fallback_marker_name=fallback_marker_name,
+        descriptor_guard=descriptor_guard,
     )
-    try:
-        os.fsync(output_descriptor)
-        return records, records_descriptor
-    except BaseException:
-        os.close(records_descriptor)
-        raise
+    os.fsync(output_descriptor)
+    return records, records_descriptor
 
 
 def _verified_module_execution(
@@ -3852,7 +4732,13 @@ def _run_authorized_engineering_generation(
     model_stage_cleanup_error: Optional[BaseException] = None
     model_stage_cleanup_attempted = False
     output_ownership_candidates: list[tuple[int, int]] = []
+    output_parent_chain_descriptor_guard: list[int] = []
+    output_claim_descriptor_guard: list[int] = []
+    output_recovery_descriptor_guard: list[int] = []
+    records_claim_descriptor_guard: list[int] = []
     success_ownership_candidates: list[tuple[int, int]] = []
+    success_prepared_guard: list[_PreparedAtomicOutput] = []
+    prepared_success: Optional[_PreparedAtomicOutput] = None
     generation_attempt = _attempt_record(validated)
     try:
         (
@@ -3863,7 +4749,17 @@ def _run_authorized_engineering_generation(
             repo_root,
             Path(OUTPUT_DIR).parts[:-1],
             "authorized output parent",
+            descriptor_guard=output_parent_chain_descriptor_guard,
         )
+        expected_parent_descriptors = [
+            root_descriptor,
+            *(descriptor for _, _, descriptor, _ in output_parent_links),
+        ]
+        if output_parent_chain_descriptor_guard != expected_parent_descriptors:
+            raise RuntimeError(
+                "authorized output parent descriptor handoff changed"
+            )
+        output_parent_chain_descriptor_guard.clear()
         _verify_directory_chain(
             repo_root,
             root_descriptor,
@@ -3876,27 +4772,60 @@ def _run_authorized_engineering_generation(
                 output.name,
                 "adaptive-oracle engineering output",
                 ownership_candidates=output_ownership_candidates,
+                descriptor_guard=output_claim_descriptor_guard,
             )
+            if output_claim_descriptor_guard != [output_descriptor]:
+                raise RuntimeError(
+                    "adaptive-oracle engineering output claim descriptor "
+                    "handoff changed"
+                )
+            output_claim_descriptor_guard.clear()
         except FileExistsError as exc:
             raise FileExistsError(
                 "adaptive-oracle engineering output already exists; "
                 "resume/retry is forbidden"
             ) from exc
         except BaseException as claim_exc:
+            if _exception_contains_cancellation(claim_exc):
+                raise
             try:
                 if len(output_ownership_candidates) == 1:
-                    recovered = _open_pinned_directory_at(
-                        output_parent_descriptor,
-                        output.name,
-                        "reconciled adaptive-oracle engineering output",
+                    recovered, recovery_error = (
+                        _open_claimed_directory_with_positive_reconciliation(
+                            output_parent_descriptor,
+                            output.name,
+                            "reconciled adaptive-oracle engineering output",
+                            namespace_committed=isinstance(
+                                claim_exc, DirectoryClaimCommittedUnopened
+                            ),
+                            expected_identity=output_ownership_candidates[0],
+                            descriptor_guard=output_recovery_descriptor_guard,
+                        )
                     )
+                    if output_recovery_descriptor_guard != [recovered]:
+                        raise RuntimeError(
+                            "adaptive-oracle engineering output recovery "
+                            "descriptor handoff changed"
+                        )
                     recovered_identity = _object_identity(os.fstat(recovered))
-                    if recovered_identity == output_ownership_candidates[0]:
-                        output_descriptor = recovered
-                        owned_output = True
-                    else:
-                        os.close(recovered)
+                    if recovered_identity != output_ownership_candidates[0]:
+                        raise RuntimeError(
+                            "adaptive-oracle engineering output recovery "
+                            "identity changed"
+                        )
+                    output_descriptor = recovered
+                    owned_output = True
+                    output_recovery_descriptor_guard.clear()
+                    if recovery_error is not None:
+                        claim_exc.recovery_error = recovery_error[0]
+                        _add_exception_note(
+                            claim_exc,
+                            "output claim recovery deferred: "
+                            f"{type(recovery_error[0]).__name__}: "
+                            f"{recovery_error[0]}",
+                        )
             except BaseException as reconcile_exc:
+                claim_exc.reconciliation_error = reconcile_exc
                 _add_exception_note(
                     claim_exc,
                     "output claim reconciliation also failed: "
@@ -3911,7 +4840,13 @@ def _run_authorized_engineering_generation(
             fallback_marker_descriptor=output_parent_descriptor,
             fallback_marker_name=f".{output.name}.records.claim",
             publications=publications,
+            descriptor_guard=records_claim_descriptor_guard,
         )
+        if records_claim_descriptor_guard != [records_descriptor]:
+            raise RuntimeError(
+                "engineering records claim descriptor handoff changed"
+            )
+        records_claim_descriptor_guard.clear()
         runtime_capture = _RuntimeEvidenceCapture()
         runtime_capture.__enter__()
         runtime = _load_verified_runtime_components(validated)
@@ -4185,7 +5120,10 @@ def _run_authorized_engineering_generation(
             directory_descriptor=output_descriptor,
             staging_directory_descriptor=output_parent_descriptor,
             ownership_candidates=success_ownership_candidates,
+            prepared_guard=success_prepared_guard,
         )
+        if success_prepared_guard != [prepared_success]:
+            raise RuntimeError("generation success prepared-output handoff changed")
         try:
             _verify_directory_chain(
                 repo_root,
@@ -4229,6 +5167,9 @@ def _run_authorized_engineering_generation(
             raise
         return success
     except BaseException as exc:
+        for guarded_prepared in success_prepared_guard:
+            _discard_prepared_atomic_output(guarded_prepared, exc)
+        cancellation_seen = _exception_contains_cancellation(exc)
         original_exc_info = (type(exc), exc, exc.__traceback__)
         secondary_errors: list[tuple[str, BaseException]] = []
         runtime_cleanup_error: Optional[BaseException] = None
@@ -4237,12 +5178,16 @@ def _run_authorized_engineering_generation(
                 runtime_capture.__exit__(*original_exc_info)
                 runtime_evidence = runtime_capture.record()
             except BaseException as capture_exc:
+                cancellation_seen = (
+                    cancellation_seen
+                    or _exception_contains_cancellation(capture_exc)
+                )
                 secondary_errors.append(
                     ("runtime evidence finalization also failed", capture_exc)
                 )
             finally:
                 runtime_capture = None
-        if owned_output and output_descriptor >= 0:
+        if not cancellation_seen and owned_output and output_descriptor >= 0:
             try:
                 if not _entry_exists(output_descriptor, "attempt.json"):
                     _publish_pinned_json(
@@ -4255,6 +5200,10 @@ def _run_authorized_engineering_generation(
                     )
                     os.fsync(output_parent_descriptor)
             except BaseException as attempt_exc:
+                cancellation_seen = (
+                    cancellation_seen
+                    or _exception_contains_cancellation(attempt_exc)
+                )
                 secondary_errors.append(
                     ("attempt receipt creation also failed", attempt_exc)
                 )
@@ -4264,6 +5213,10 @@ def _run_authorized_engineering_generation(
             try:
                 _cleanup_runtime_resources(runtime)
             except BaseException as cleanup_exc:
+                cancellation_seen = (
+                    cancellation_seen
+                    or _exception_contains_cancellation(cleanup_exc)
+                )
                 runtime_cleanup_error = cleanup_exc
                 secondary_errors.append(
                     ("runtime cleanup also failed", cleanup_exc)
@@ -4276,12 +5229,16 @@ def _run_authorized_engineering_generation(
                     model_stage
                 )
             except BaseException as cleanup_exc:
+                cancellation_seen = (
+                    cancellation_seen
+                    or _exception_contains_cancellation(cleanup_exc)
+                )
                 model_stage_cleanup_error = cleanup_exc
         if model_stage_cleanup_error is not None:
             secondary_errors.append(
                 ("model-stage cleanup also failed", model_stage_cleanup_error)
             )
-        if model_stage is not None and owned_output:
+        if not cancellation_seen and model_stage is not None and owned_output:
             model_stage_evidence_path = output / "model_stage_evidence.json"
             try:
                 if output_descriptor >= 0 and not _entry_exists(
@@ -4328,54 +5285,70 @@ def _run_authorized_engineering_generation(
                     )
                     publications.verify()
             except BaseException as evidence_exc:
+                cancellation_seen = (
+                    cancellation_seen
+                    or _exception_contains_cancellation(evidence_exc)
+                )
                 secondary_errors.append(
                     ("model-stage evidence creation also failed", evidence_exc)
                 )
 
-        if owned_output and output_descriptor >= 0:
+        if not cancellation_seen and owned_output and output_descriptor >= 0:
             failure_path = output / "failure.json"
-            try:
-                failure_exists = _entry_exists(output_descriptor, failure_path.name)
-                success_exists = _entry_exists(output_descriptor, "success.json")
-                if success_exists:
-                    raise RuntimeError(
-                        "generation success was already committed before failure finalization"
-                    )
-                if isinstance(exc, AtomicPublicationIndeterminate):
-                    raise RuntimeError(
-                        "generation terminal publication is indeterminate; "
-                        "opposite terminal publication is forbidden"
-                    ) from exc
-                if not failure_exists:
-                    _verify_directory_chain(
-                        repo_root,
-                        root_descriptor,
-                        output_parent_links,
-                        "authorized output parent",
-                    )
-                    _verify_directory_entry(
-                        output_parent_descriptor,
-                        output.name,
-                        output_descriptor,
-                        "adaptive-oracle engineering output",
-                    )
-                    _publish_terminal_json(
-                        failure_path,
-                        _failure_record(
-                            validated,
-                            exc,
-                            completed,
-                            runtime_evidence,
-                            model_stage,
-                            model_stage_verifications,
-                        ),
-                        directory_descriptor=output_descriptor,
-                        staging_directory_descriptor=output_parent_descriptor,
-                    )
-            except BaseException as receipt_exc:
-                secondary_errors.append(
-                    ("failure receipt creation also failed", receipt_exc)
+            terminal_commit_started = (
+                prepared_success is not None and prepared_success.commit_started
+            )
+            if terminal_commit_started:
+                _add_exception_note(
+                    exc,
+                    "generation success terminal commit had already started; "
+                    "opposite-terminal publication was skipped",
                 )
+            else:
+                try:
+                    failure_exists = _entry_exists(
+                        output_descriptor, failure_path.name
+                    )
+                    success_exists = _entry_exists(output_descriptor, "success.json")
+                    if success_exists:
+                        raise RuntimeError(
+                            "generation success was already committed before "
+                            "failure finalization"
+                        )
+                    if not failure_exists:
+                        _verify_directory_chain(
+                            repo_root,
+                            root_descriptor,
+                            output_parent_links,
+                            "authorized output parent",
+                        )
+                        _verify_directory_entry(
+                            output_parent_descriptor,
+                            output.name,
+                            output_descriptor,
+                            "adaptive-oracle engineering output",
+                        )
+                        _publish_terminal_json(
+                            failure_path,
+                            _failure_record(
+                                validated,
+                                exc,
+                                completed,
+                                runtime_evidence,
+                                model_stage,
+                                model_stage_verifications,
+                            ),
+                            directory_descriptor=output_descriptor,
+                            staging_directory_descriptor=output_parent_descriptor,
+                        )
+                except BaseException as receipt_exc:
+                    cancellation_seen = (
+                        cancellation_seen
+                        or _exception_contains_cancellation(receipt_exc)
+                    )
+                    secondary_errors.append(
+                        ("failure receipt creation also failed", receipt_exc)
+                    )
 
         if secondary_errors:
             detail = "; ".join(label for label, _ in secondary_errors)
@@ -4394,6 +5367,10 @@ def _run_authorized_engineering_generation(
     finally:
         publications.close()
         descriptors = [
+            *records_claim_descriptor_guard,
+            *output_recovery_descriptor_guard,
+            *output_claim_descriptor_guard,
+            *output_parent_chain_descriptor_guard,
             records_descriptor,
             output_descriptor,
             *(descriptor for _, _, descriptor, _ in reversed(output_parent_links)),

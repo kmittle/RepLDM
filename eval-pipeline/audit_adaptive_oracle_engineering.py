@@ -148,6 +148,8 @@ class _AuditSession:
 
 
 def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
+    # The generator removes an external staging hardlink after publication.
+    # NFS may refresh ctime/nlink differently for descriptor and path lookups.
     return (
         value.st_dev,
         value.st_ino,
@@ -156,8 +158,6 @@ def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
         value.st_gid,
         value.st_size,
         value.st_mtime_ns,
-        value.st_ctime_ns,
-        value.st_nlink,
     )
 
 
@@ -176,8 +176,16 @@ class _PinnedArtifacts:
         label: str,
         expected_sha256: str,
     ) -> None:
-        held_descriptor = os.dup(descriptor)
+        held_descriptor = -1
+        descriptor_guard: list[int] = []
         try:
+            held_descriptor = generation._duplicate_descriptor(
+                descriptor,
+                descriptor_guard=descriptor_guard,
+            )
+            if descriptor_guard != [held_descriptor]:
+                raise RuntimeError(f"{label} held-descriptor handoff changed")
+            descriptor_guard.clear()
             held_metadata = os.fstat(held_descriptor)
             current = os.stat(
                 name,
@@ -202,15 +210,25 @@ class _PinnedArtifacts:
             held_descriptor = -1
         except BaseException as exc:
             error_traceback = exc.__traceback__
+            if held_descriptor < 0 and descriptor_guard:
+                held_descriptor = descriptor_guard[0]
+            if (
+                held_descriptor >= 0
+                and self._rows
+                and self._rows[-1][0] == held_descriptor
+            ):
+                held_descriptor = -1
             if held_descriptor >= 0:
                 try:
                     os.close(held_descriptor)
                 except BaseException as close_error:
+                    generation._attach_secondary_exception(exc, close_error)
                     generation._add_exception_note(
                         exc,
                         f"{label} held-descriptor close also failed: "
                         f"{type(close_error).__name__}: {close_error}",
                     )
+            descriptor_guard.clear()
             raise exc.with_traceback(error_traceback)
 
     def verify(self) -> None:
@@ -240,21 +258,25 @@ class _PinnedArtifacts:
             directory_descriptor,
             name,
             expected,
-            _,
+            expected_sha256,
             label,
         ) in reversed(self._rows):
             try:
-                generation._verify_regular_metadata(
+                raw, observed = generation._stable_regular_snapshot(
                     descriptor,
                     directory_descriptor,
                     name,
-                    expected,
                     label,
                 )
             except RuntimeError as exc:
                 raise ValueError(
                     f"{label} changed before audit publication"
                 ) from exc
+            if (
+                observed != expected
+                or hashlib.sha256(raw).hexdigest() != expected_sha256
+            ):
+                raise ValueError(f"{label} changed before audit publication")
 
     def close(self) -> list[BaseException]:
         errors = []
@@ -360,6 +382,7 @@ def _consume_regular_file(
             except BaseException as close_error:
                 if primary_error is None:
                     raise
+                generation._attach_secondary_exception(primary_error, close_error)
                 generation._add_exception_note(
                     primary_error,
                     f"{label} descriptor close also failed: "
@@ -1207,22 +1230,44 @@ class _PinnedRunTree:
 def _pin_run_tree(
     root: Path,
     relative: Path,
+    *,
+    tree_guard: Optional[list[_PinnedRunTree]] = None,
 ) -> _PinnedRunTree:
+    if tree_guard is not None and tree_guard:
+        raise ValueError("engineering run-tree guard must start empty")
     root = Path(os.path.abspath(root))
-    root_descriptor = generation._open_pinned_directory(
-        root, "engineering repository root"
-    )
+    root_descriptor = -1
+    root_guard: list[int] = []
+    child_guard: list[int] = []
+    run_guard: list[int] = []
+    records_guard: list[int] = []
     directory_links: list[tuple[int, str, int, str]] = []
-    current_descriptor = root_descriptor
+    current_descriptor = -1
     run_descriptor = -1
     records_descriptor: Optional[int] = None
+    tree: Optional[_PinnedRunTree] = None
     try:
+        root_descriptor = generation._open_pinned_directory(
+            root,
+            "engineering repository root",
+            descriptor_guard=root_guard,
+        )
+        if root_guard != [root_descriptor]:
+            raise RuntimeError("engineering root descriptor handoff changed")
+        root_guard.clear()
+        current_descriptor = root_descriptor
         for index, part in enumerate(relative.parts[:-1]):
             child = generation._open_pinned_directory_at(
                 current_descriptor,
                 part,
                 f"engineering run parent component {index}",
+                descriptor_guard=child_guard,
             )
+            if child_guard != [child]:
+                raise RuntimeError(
+                    f"engineering run parent component {index} descriptor "
+                    "handoff changed"
+                )
             directory_links.append(
                 (
                     current_descriptor,
@@ -1231,18 +1276,27 @@ def _pin_run_tree(
                     f"engineering run parent component {index}",
                 )
             )
+            child_guard.clear()
             current_descriptor = child
         run_descriptor = generation._open_pinned_directory_at(
             current_descriptor,
             relative.name,
             "engineering run directory",
+            descriptor_guard=run_guard,
         )
+        if run_guard != [run_descriptor]:
+            raise RuntimeError("engineering run descriptor handoff changed")
+        run_guard.clear()
         try:
             records_descriptor = generation._open_pinned_directory_at(
                 run_descriptor,
                 "records",
                 "engineering records directory",
+                descriptor_guard=records_guard,
             )
+            if records_guard != [records_descriptor]:
+                raise RuntimeError("engineering records descriptor handoff changed")
+            records_guard.clear()
         except ValueError:
             try:
                 os.stat("records", dir_fd=run_descriptor, follow_symlinks=False)
@@ -1250,7 +1304,7 @@ def _pin_run_tree(
                 records_descriptor = None
             else:
                 raise
-        return _PinnedRunTree(
+        tree = _PinnedRunTree(
             root=root,
             run=root.joinpath(*relative.parts),
             root_descriptor=root_descriptor,
@@ -1259,33 +1313,52 @@ def _pin_run_tree(
             run_descriptor=run_descriptor,
             records_descriptor=records_descriptor,
         )
+        if tree_guard is not None:
+            tree_guard.append(tree)
+        return tree
     except BaseException as exc:
         error_traceback = exc.__traceback__
-        generation._close_descriptors_after_error(
-            [
-                *(
-                    [records_descriptor]
-                    if records_descriptor is not None
-                    else []
-                ),
-                run_descriptor,
-                *(descriptor for _, _, descriptor, _ in reversed(directory_links)),
-                root_descriptor,
-            ],
-            exc,
-        )
+        externally_owned = tree is not None and tree_guard == [tree]
+        if not externally_owned:
+            generation._close_descriptors_after_error(
+                [
+                    *records_guard,
+                    *run_guard,
+                    *child_guard,
+                    *root_guard,
+                    *(
+                        [records_descriptor]
+                        if records_descriptor is not None
+                        else []
+                    ),
+                    run_descriptor,
+                    *(
+                        descriptor
+                        for _, _, descriptor, _ in reversed(directory_links)
+                    ),
+                    root_descriptor,
+                ],
+                exc,
+            )
         raise exc.with_traceback(error_traceback)
 
 
 def _resolve_run_dir(
-    run_dir: str | os.PathLike[str], repo_root: str | os.PathLike[str]
+    run_dir: str | os.PathLike[str],
+    repo_root: str | os.PathLike[str],
+    *,
+    tree_guard: Optional[list[_PinnedRunTree]] = None,
 ) -> tuple[Path, _PinnedRunTree]:
     root = Path(repo_root).resolve(strict=True)
     expected = root.joinpath(*Path(generation.OUTPUT_DIR).parts)
     supplied = Path(os.path.abspath(run_dir))
     if supplied != expected:
         raise ValueError(f"engineering auditor requires the exact run {expected}")
-    return root, _pin_run_tree(root, Path(generation.OUTPUT_DIR))
+    return root, _pin_run_tree(
+        root,
+        Path(generation.OUTPUT_DIR),
+        tree_guard=tree_guard,
+    )
 
 
 def _terminal_state(tree: _PinnedRunTree) -> str:
@@ -1404,22 +1477,30 @@ def _publish_audit_success(
     value: Mapping[str, Any],
     *,
     ownership: list[tuple[int, int]],
+    prepared_outputs: list[generation._PreparedAtomicOutput],
 ) -> tuple[int, int]:
-    prepared = generation._prepare_terminal_json(
-        tree.run / AUDIT_SUCCESS_NAME,
-        value,
-        directory_descriptor=tree.run_descriptor,
-        staging_directory_descriptor=tree.run_parent_descriptor,
-        ownership_candidates=ownership,
-    )
+    if prepared_outputs:
+        raise ValueError("audit success prepared-output guard must start empty")
+    prepared: Optional[generation._PreparedAtomicOutput] = None
     try:
+        prepared = generation._prepare_terminal_json(
+            tree.run / AUDIT_SUCCESS_NAME,
+            value,
+            directory_descriptor=tree.run_descriptor,
+            staging_directory_descriptor=tree.run_parent_descriptor,
+            ownership_candidates=ownership,
+            prepared_guard=prepared_outputs,
+        )
+        if prepared_outputs != [prepared]:
+            raise RuntimeError("audit success prepared-output handoff changed")
         tree.verify()
         for name in (AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME):
             if generation._entry_exists(tree.run_descriptor, name):
                 raise FileExistsError(f"audit terminal receipt already exists: {name}")
         return generation._commit_prepared_terminal(prepared)
     except BaseException as exc:
-        generation._discard_prepared_atomic_output(prepared, exc)
+        for guarded in prepared_outputs:
+            generation._discard_prepared_atomic_output(guarded, exc)
         raise
 
 
@@ -1434,19 +1515,25 @@ def _publish_audit_failure(
         return
     if generation._entry_exists(tree.run_descriptor, AUDIT_SUCCESS_NAME):
         raise RuntimeError("audit success is already committed")
-    prepared = generation._prepare_terminal_json(
-        tree.run / AUDIT_FAILURE_NAME,
-        value,
-        directory_descriptor=tree.run_descriptor,
-        staging_directory_descriptor=tree.run_parent_descriptor,
-    )
+    prepared_guard: list[generation._PreparedAtomicOutput] = []
+    prepared: Optional[generation._PreparedAtomicOutput] = None
     try:
+        prepared = generation._prepare_terminal_json(
+            tree.run / AUDIT_FAILURE_NAME,
+            value,
+            directory_descriptor=tree.run_descriptor,
+            staging_directory_descriptor=tree.run_parent_descriptor,
+            prepared_guard=prepared_guard,
+        )
+        if prepared_guard != [prepared]:
+            raise RuntimeError("audit failure prepared-output handoff changed")
         tree.verify_directories()
         if generation._entry_exists(tree.run_descriptor, AUDIT_SUCCESS_NAME):
             raise RuntimeError("audit success appeared before failure commit")
         generation._commit_prepared_terminal(prepared)
     except BaseException as exc:
-        generation._discard_prepared_atomic_output(prepared, exc)
+        for guarded in prepared_guard:
+            generation._discard_prepared_atomic_output(guarded, exc)
         raise
 
 
@@ -1502,11 +1589,17 @@ def _preflight_audit(
             f"generation {terminal} receipt",
         )
     except BaseException as exc:
+        cancellation_seen = generation._exception_contains_cancellation(exc)
         try:
             observed_attempt = generation._entry_metadata(
                 tree.run_descriptor, AUDIT_ATTEMPT_NAME
             )
         except BaseException as existence_error:
+            generation._attach_secondary_exception(exc, existence_error)
+            cancellation_seen = (
+                cancellation_seen
+                or generation._exception_contains_cancellation(existence_error)
+            )
             generation._add_exception_note(
                 exc,
                 "audit-attempt reconciliation failed: "
@@ -1520,10 +1613,11 @@ def _preflight_audit(
             and generation._object_identity(observed_attempt)
             == attempt_ownership[0]
         )
-        if attempt_owned:
+        if attempt_owned and not cancellation_seen:
             try:
                 _publish_audit_failure(tree, _failure_payload(attempt, exc))
             except BaseException as receipt_error:
+                generation._attach_secondary_exception(exc, receipt_error)
                 generation._add_exception_note(
                     exc,
                     "audit preflight failure receipt also failed: "
@@ -2394,11 +2488,17 @@ def _audit_launcher_validated_run(
     if not isinstance(validated, Mapping):
         raise ValueError("launcher validator did not return a mapping")
     _validate_auditor_launcher_execution(validated)
-    _root, tree = _resolve_run_dir(
-        str(validated.get("output_dir", "")),
-        str(validated.get("repo_root", "")),
-    )
+    tree_guard: list[_PinnedRunTree] = []
+    tree: Optional[_PinnedRunTree] = None
     try:
+        _root, tree = _resolve_run_dir(
+            str(validated.get("output_dir", "")),
+            str(validated.get("repo_root", "")),
+            tree_guard=tree_guard,
+        )
+        if tree_guard != [tree]:
+            raise RuntimeError("engineering audit run-tree handoff changed")
+        tree_guard.clear()
         generation._require_fd_headroom(
             generation._AUDIT_PINNED_FILE_COUNT
             + generation._FD_SAFETY_RESERVE,
@@ -2427,6 +2527,7 @@ def _audit_launcher_validated_run(
         if session.audit_attempt is None:
             raise RuntimeError("audit preflight omitted its one-shot attempt")
         success_ownership: list[tuple[int, int]] = []
+        success_prepared: list[generation._PreparedAtomicOutput] = []
         try:
             result = _audit_validated_run(
                 tree,
@@ -2444,35 +2545,55 @@ def _audit_launcher_validated_run(
                 tree,
                 result,
                 ownership=success_ownership,
+                prepared_outputs=success_prepared,
             )
             return result
         except BaseException as exc:
-            try:
-                final_names = _directory_names(
-                    tree.run_descriptor, "engineering run directory"
-                ).intersection({AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME})
-            except BaseException:
-                final_names = frozenset({"untrusted-directory-state"})
-            if (
-                not final_names
-                and not isinstance(
-                    exc,
-                    generation.AtomicPublicationIndeterminate,
+            terminal_commit_started = any(
+                prepared.commit_started for prepared in success_prepared
+            )
+            cancellation_seen = generation._exception_contains_cancellation(exc)
+            if terminal_commit_started or cancellation_seen:
+                reason = (
+                    "success terminal commit had already started"
+                    if terminal_commit_started
+                    else "cancellation was observed"
                 )
-            ):
+                generation._add_exception_note(
+                    exc,
+                    f"audit {reason}; "
+                    "opposite-terminal publication was skipped",
+                )
+            else:
                 try:
-                    _publish_audit_failure(
-                        tree,
-                        _failure_payload(session.audit_attempt, exc),
-                    )
-                except BaseException as receipt_exc:
-                    raise RuntimeError(
-                        "engineering audit failed and failure receipt creation also "
-                        f"failed: {type(receipt_exc).__name__}: {receipt_exc}"
-                    ) from exc
+                    final_names = _directory_names(
+                        tree.run_descriptor, "engineering run directory"
+                    ).intersection({AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME})
+                except BaseException:
+                    final_names = frozenset({"untrusted-directory-state"})
+                if not final_names:
+                    try:
+                        _publish_audit_failure(
+                            tree,
+                            _failure_payload(session.audit_attempt, exc),
+                        )
+                    except BaseException as receipt_exc:
+                        finalization_error = RuntimeError(
+                            "engineering audit failed and failure receipt creation also "
+                            f"failed: {type(receipt_exc).__name__}: {receipt_exc}"
+                        )
+                        finalization_error.original_error = exc
+                        generation._attach_secondary_exception(
+                            finalization_error,
+                            receipt_exc,
+                        )
+                        raise finalization_error from exc
             raise
     finally:
-        tree.close()
+        for guarded_tree in tree_guard:
+            guarded_tree.close()
+        if tree is not None and all(tree is not guarded for guarded in tree_guard):
+            tree.close()
 
 
 def _audit_validated_run(
@@ -2495,13 +2616,22 @@ def _audit_validated_run(
     """Audit an authorized run without creating or replacing any receipt."""
 
     own_tree = not isinstance(run, _PinnedRunTree)
-    if own_tree:
-        _root, tree = _resolve_run_dir(
-            str(run), str(validated.get("repo_root", ""))
-        )
-    else:
-        tree = run
+    tree_guard: list[_PinnedRunTree] = []
+    tree: Optional[_PinnedRunTree] = None
     try:
+        if own_tree:
+            _root, tree = _resolve_run_dir(
+                str(run),
+                str(validated.get("repo_root", "")),
+                tree_guard=tree_guard,
+            )
+            if tree_guard != [tree]:
+                raise RuntimeError("direct audit run-tree handoff changed")
+            tree_guard.clear()
+        else:
+            tree = run
+        if tree is None:
+            raise RuntimeError("engineering audit run tree was not opened")
         if tree.run_inventory is None:
             tree.snapshot_inventories()
         active_session = session or _read_generation_session(
@@ -2543,7 +2673,13 @@ def _audit_validated_run(
         tree.verify()
         return result
     finally:
-        if own_tree:
+        for guarded_tree in tree_guard:
+            guarded_tree.close()
+        if (
+            own_tree
+            and tree is not None
+            and all(tree is not guarded for guarded in tree_guard)
+        ):
             tree.close()
 
 
