@@ -1466,75 +1466,124 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
 
     def test_success_pin_close_cancellation_is_propagated(self):
         real_close = audit._PinnedArtifacts.close
+        real_os_close = audit.os.close
+        pinned_descriptors = []
+        target_descriptor = -1
         cancelled = False
 
-        def close_then_cancel(pins):
+        def close_with_inventory(pins):
+            nonlocal target_descriptor
+            pinned_descriptors.extend(row[0] for row in pins._rows)
+            target_descriptor = pins._rows[-1][0]
+            return real_close(pins)
+
+        def cancel_before_close(descriptor):
             nonlocal cancelled
-            errors = real_close(pins)
-            if not cancelled:
+            if descriptor == target_descriptor and not cancelled:
                 cancelled = True
-                errors.append(
-                    KeyboardInterrupt("simulated audit success pin close cancellation")
+                raise KeyboardInterrupt(
+                    "simulated audit success pin pre-close cancellation"
                 )
-            return errors
+            return real_os_close(descriptor)
 
-        with (
-            mock.patch.object(
-                audit._PinnedArtifacts,
-                "close",
-                autospec=True,
-                side_effect=close_then_cancel,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "audit run-tree finalization",
-            ) as raised,
-        ):
-            self.fixture.run_production_audit()
+        try:
+            with (
+                mock.patch.object(
+                    audit._PinnedArtifacts,
+                    "close",
+                    autospec=True,
+                    side_effect=close_with_inventory,
+                ),
+                mock.patch.object(
+                    audit.os,
+                    "close",
+                    side_effect=cancel_before_close,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "audit run-tree finalization",
+                ) as raised,
+            ):
+                self.fixture.run_production_audit()
 
-        self.assertTrue(cancelled)
-        self.assertTrue(
-            generation._exception_contains_cancellation(raised.exception)
-        )
-        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
-        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+            self.assertTrue(cancelled)
+            self.assertGreater(len(pinned_descriptors), 1)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            os.fstat(target_descriptor)
+            for descriptor in pinned_descriptors:
+                if descriptor == target_descriptor:
+                    continue
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(descriptor)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+            self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+        finally:
+            if target_descriptor >= 0:
+                real_os_close(target_descriptor)
 
     def test_failure_pin_close_cancellation_attaches_to_primary(self):
         real_close = audit._PinnedArtifacts.close
+        real_os_close = audit.os.close
+        target_descriptor = -1
+        sentinel_descriptor = -1
+        sentinel_descriptors = []
         cancelled = False
 
-        def close_then_cancel(pins):
-            nonlocal cancelled
-            errors = real_close(pins)
-            if not cancelled:
+        def close_with_inventory(pins):
+            nonlocal target_descriptor
+            target_descriptor = pins._rows[-1][0]
+            return real_close(pins)
+
+        def close_reuse_then_cancel(descriptor):
+            nonlocal cancelled, sentinel_descriptor
+            if descriptor == target_descriptor and not cancelled:
                 cancelled = True
-                errors.append(
-                    KeyboardInterrupt("simulated audit failure pin close cancellation")
+                real_os_close(descriptor)
+                while descriptor not in sentinel_descriptors:
+                    sentinel_descriptors.append(os.open("/dev/null", os.O_RDONLY))
+                sentinel_descriptor = descriptor
+                raise KeyboardInterrupt(
+                    "simulated audit failure pin post-close cancellation"
                 )
-            return errors
+            return real_os_close(descriptor)
 
-        with (
-            mock.patch.object(
-                audit,
-                "_audit_validated_run",
-                side_effect=RuntimeError("simulated audit core failure"),
-            ),
-            mock.patch.object(
-                audit._PinnedArtifacts,
-                "close",
-                autospec=True,
-                side_effect=close_then_cancel,
-            ),
-            self.assertRaisesRegex(RuntimeError, "audit core failure") as raised,
-        ):
-            self.fixture.run_production_audit()
+        try:
+            with (
+                mock.patch.object(
+                    audit,
+                    "_audit_validated_run",
+                    side_effect=RuntimeError("simulated audit core failure"),
+                ),
+                mock.patch.object(
+                    audit._PinnedArtifacts,
+                    "close",
+                    autospec=True,
+                    side_effect=close_with_inventory,
+                ),
+                mock.patch.object(
+                    audit.os,
+                    "close",
+                    side_effect=close_reuse_then_cancel,
+                ),
+                self.assertRaisesRegex(RuntimeError, "audit core failure") as raised,
+            ):
+                self.fixture.run_production_audit()
 
-        self.assertTrue(cancelled)
-        self.assertTrue(
-            generation._exception_contains_cancellation(raised.exception)
-        )
-        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
-        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+            self.assertTrue(cancelled)
+            self.assertGreaterEqual(target_descriptor, 0)
+            self.assertEqual(sentinel_descriptor, target_descriptor)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            os.fstat(sentinel_descriptor)
+            self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+            self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+        finally:
+            for descriptor in sentinel_descriptors:
+                real_os_close(descriptor)
 
     def test_audit_success_prepare_return_cancellation_discards_private_output(self):
         real_prepare = generation._prepare_terminal_json

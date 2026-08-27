@@ -255,6 +255,27 @@ class _EvidenceLogHandler(logging.Handler):
         )
 
 
+class _StderrReaderHandoff:
+    """Resolve pipe ownership without inferring whether Thread.start returned."""
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.reader_owns_descriptor: Optional[bool] = None
+
+    def release(self, reader_owns_descriptor: bool) -> tuple[bool, list[BaseException]]:
+        if self.reader_owns_descriptor is None:
+            self.reader_owns_descriptor = reader_owns_descriptor
+        errors: list[BaseException] = []
+        for _ in range(2):
+            try:
+                self.ready.set()
+            except BaseException as exc:
+                errors.append(exc)
+            if self.ready.is_set():
+                break
+        return bool(self.reader_owns_descriptor), errors
+
+
 class _RuntimeEvidenceCapture:
     """Capture process-local warning, logging, and stderr evidence."""
 
@@ -267,14 +288,37 @@ class _RuntimeEvidenceCapture:
         self._stderr_stream: Optional[io.TextIOWrapper] = None
         self._stderr_stream_fd: Optional[int] = None
         self._stderr_thread: Optional[threading.Thread] = None
-        self._stderr_thread_started = False
+        self._stderr_handoff: Optional[_StderrReaderHandoff] = None
         self._stderr_context: Optional[Any] = None
         self._log_handler = _EvidenceLogHandler()
-        self._warning_context = warnings.catch_warnings(record=True)
+        self._warning_context: Optional[Any] = None
+        self._warning_restore_state: Optional[tuple[Any, Any, Any]] = None
         self._root_logger = logging.getLogger()
-        self._previous_root_level = self._root_logger.level
+        self._previous_root_level: Optional[int] = None
         self._observed_warnings: list[Any] = []
         self._entered = False
+        self._cleanup_pending = False
+        self._used = False
+
+    def _record_stderr_reader_error(self, error: BaseException) -> None:
+        if self._stderr_reader_error is None:
+            self._stderr_reader_error = error
+        else:
+            _attach_secondary_exception(self._stderr_reader_error, error)
+
+    def _run_stderr_reader(
+        self,
+        descriptor: int,
+        handoff: _StderrReaderHandoff,
+    ) -> None:
+        while handoff.reader_owns_descriptor is None:
+            try:
+                handoff.ready.wait(0.05)
+            except BaseException as exc:
+                self._record_stderr_reader_error(exc)
+        if not handoff.reader_owns_descriptor:
+            return
+        self._drain_stderr(descriptor)
 
     def _drain_stderr(self, descriptor: int) -> None:
         eof_deadline: Optional[float] = None
@@ -301,24 +345,107 @@ class _RuntimeEvidenceCapture:
                     break
                 self._stderr_chunks.append(chunk)
         except BaseException as exc:
-            self._stderr_reader_error = exc
+            self._record_stderr_reader_error(exc)
         finally:
             try:
                 os.close(descriptor)
             except BaseException as close_error:
-                if self._stderr_reader_error is None:
-                    self._stderr_reader_error = close_error
-                else:
-                    _attach_secondary_exception(
-                        self._stderr_reader_error,
-                        close_error,
-                    )
+                self._record_stderr_reader_error(close_error)
+
+    @staticmethod
+    def _same_descriptor_target(left: int, right: int) -> bool:
+        return os.path.samestat(os.fstat(left), os.fstat(right))
+
+    def _restore_stderr_descriptor(
+        self,
+        saved_descriptor: int,
+    ) -> tuple[bool, list[BaseException]]:
+        errors: list[BaseException] = []
+        for _ in range(3):
+            try:
+                os.dup2(saved_descriptor, 2, inheritable=True)
+            except BaseException as exc:
+                errors.append(exc)
+            try:
+                if self._same_descriptor_target(saved_descriptor, 2):
+                    return True, errors
+            except BaseException as exc:
+                errors.append(exc)
+        errors.append(RuntimeError("OS stderr descriptor could not be restored and verified"))
+        return False, errors
+
+    def _logger_state_is_restored(self) -> bool:
+        target_level = self._previous_root_level
+        return target_level is None or (
+            self._log_handler not in self._root_logger.handlers
+            and self._root_logger.level == target_level
+        )
+
+    def _restore_logger_state(self) -> tuple[list[BaseException], bool]:
+        errors: list[BaseException] = []
+        target_level = self._previous_root_level
+        if target_level is None:
+            return errors, True
+        for _ in range(3):
+            if self._log_handler in self._root_logger.handlers:
+                try:
+                    self._root_logger.removeHandler(self._log_handler)
+                except BaseException as exc:
+                    errors.append(exc)
+            if self._root_logger.level != target_level:
+                try:
+                    self._root_logger.setLevel(target_level)
+                except BaseException as exc:
+                    errors.append(exc)
+            if self._logger_state_is_restored():
+                self._previous_root_level = None
+                return errors, True
+        errors.append(RuntimeError("root logger state could not be restored and verified"))
+        return errors, False
+
+    def _warning_state_is_restored(self) -> bool:
+        state = self._warning_restore_state
+        return state is None or (
+            warnings.filters is state[0]
+            and warnings.showwarning is state[1]
+            and warnings._showwarnmsg_impl is state[2]
+        )
+
+    def _restore_warning_state(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        traceback_value: Any,
+    ) -> tuple[list[BaseException], bool]:
+        errors: list[BaseException] = []
+        state = self._warning_restore_state
+        if state is None:
+            return errors, True
+        restoration_completed = False
+        for _ in range(3):
+            try:
+                warnings.filters = state[0]
+                warnings.showwarning = state[1]
+                warnings._showwarnmsg_impl = state[2]
+                warnings._filters_mutated()
+            except BaseException as restore_error:
+                errors.append(restore_error)
+            else:
+                restoration_completed = True
+            if restoration_completed and self._warning_state_is_restored():
+                break
+        restored = restoration_completed and self._warning_state_is_restored()
+        if restored:
+            self._warning_restore_state = None
+            self._warning_context = None
+        else:
+            errors.append(RuntimeError("warnings state could not be restored and verified"))
+        return errors, restored
 
     def _start_stderr_capture(self) -> None:
         saved_fd = -1
         saved_fd_guard: list[int] = []
         stream_fd_guard: list[int] = []
-        read_fd: Optional[int] = None
         write_fd: Optional[int] = None
         try:
             saved_fd = _duplicate_descriptor(
@@ -327,19 +454,27 @@ class _RuntimeEvidenceCapture:
             )
             if saved_fd_guard != [saved_fd]:
                 raise RuntimeError("saved stderr descriptor handoff changed")
-            read_fd, write_fd = os.pipe()
-            os.set_blocking(read_fd, False)
             self._stderr_saved_fd = saved_fd
             saved_fd_guard.clear()
+            read_fd, write_fd = os.pipe()
             self._stderr_read_fd = read_fd
+            os.set_blocking(read_fd, False)
+            handoff = _StderrReaderHandoff()
+            self._stderr_handoff = handoff
             self._stderr_thread = threading.Thread(
-                target=self._drain_stderr,
-                args=(read_fd,),
+                target=self._run_stderr_reader,
+                args=(read_fd, handoff),
                 name="adaptive-oracle-stderr-capture",
                 daemon=False,
             )
             self._stderr_thread.start()
-            self._stderr_thread_started = True
+            reader_owns, handoff_errors = handoff.release(True)
+            if not reader_owns:
+                raise RuntimeError("stderr reader descriptor handoff was rejected")
+            if handoff_errors:
+                handoff_error = RuntimeError("stderr reader handoff was interrupted")
+                handoff_error.secondary_exceptions = tuple(handoff_errors)
+                raise handoff_error from handoff_errors[0]
             os.dup2(write_fd, 2, inheritable=True)
             try:
                 os.close(write_fd)
@@ -366,41 +501,6 @@ class _RuntimeEvidenceCapture:
         except BaseException as exc:
             error_traceback = exc.__traceback__
             cleanup_errors: list[BaseException] = []
-
-            context = self._stderr_context
-            self._stderr_context = None
-            if context is not None:
-                try:
-                    context.__exit__(None, None, None)
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
-
-            saved_descriptor = self._stderr_saved_fd
-            self._stderr_saved_fd = None
-            if saved_descriptor is not None:
-                try:
-                    os.dup2(saved_descriptor, 2, inheritable=True)
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
-                    try:
-                        os.close(2)
-                    except BaseException as close_error:
-                        cleanup_errors.append(close_error)
-            saved_candidates = [
-                *saved_fd_guard,
-                *(
-                    [saved_descriptor]
-                    if saved_descriptor is not None
-                    else []
-                ),
-            ]
-            saved_fd_guard.clear()
-            for guarded_descriptor in dict.fromkeys(saved_candidates):
-                try:
-                    os.close(guarded_descriptor)
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
-
             if write_fd is not None:
                 writer_to_close = write_fd
                 write_fd = None
@@ -408,62 +508,19 @@ class _RuntimeEvidenceCapture:
                     os.close(writer_to_close)
                 except BaseException as cleanup_error:
                     cleanup_errors.append(cleanup_error)
-
-            stream = self._stderr_stream
-            self._stderr_stream = None
-            if stream is not None:
-                try:
-                    stream.close()
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
-
-            stream_descriptor = self._stderr_stream_fd
-            self._stderr_stream_fd = None
-            stream_candidates = [
-                *stream_fd_guard,
-                *(
-                    [stream_descriptor]
-                    if stream_descriptor is not None
-                    else []
-                ),
-            ]
-            stream_fd_guard.clear()
-            for guarded_descriptor in dict.fromkeys(stream_candidates):
+            for guarded_descriptor in dict.fromkeys(
+                [*stream_fd_guard, *saved_fd_guard]
+            ):
                 try:
                     os.close(guarded_descriptor)
                 except BaseException as cleanup_error:
                     cleanup_errors.append(cleanup_error)
-
-            self._stderr_stop.set()
-            thread = self._stderr_thread
-            self._stderr_thread = None
-            thread_started = self._stderr_thread_started or (
-                thread is not None and thread.ident is not None
-            )
-            self._stderr_thread_started = False
-            read_descriptor = self._stderr_read_fd
-            self._stderr_read_fd = None
-            if thread is not None and thread_started:
-                try:
-                    thread.join()
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
-                    try:
-                        thread.join()
-                    except BaseException as retry_error:
-                        cleanup_errors.append(retry_error)
-            else:
-                if read_descriptor is None:
-                    read_descriptor = read_fd
-                if read_descriptor is not None:
-                    try:
-                        os.close(read_descriptor)
-                    except BaseException as cleanup_error:
-                        cleanup_errors.append(cleanup_error)
-            reader_error = self._stderr_reader_error
-            self._stderr_reader_error = None
-            if reader_error is not None:
-                cleanup_errors.append(reader_error)
+            stream_fd_guard.clear()
+            saved_fd_guard.clear()
+            try:
+                self._stop_stderr_capture()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
             for cleanup_error in cleanup_errors:
                 _attach_secondary_exception(exc, cleanup_error)
                 _add_exception_note(
@@ -480,16 +537,14 @@ class _RuntimeEvidenceCapture:
         saved_fd = self._stderr_saved_fd
         read_fd = self._stderr_read_fd
         thread = self._stderr_thread
-        thread_started = self._stderr_thread_started or (
-            thread is not None and thread.ident is not None
-        )
+        handoff = self._stderr_handoff
         self._stderr_context = None
         self._stderr_stream = None
         self._stderr_stream_fd = None
         self._stderr_saved_fd = None
         self._stderr_read_fd = None
         self._stderr_thread = None
-        self._stderr_thread_started = False
+        self._stderr_handoff = None
         errors: list[BaseException] = []
         try:
             if stream is not None:
@@ -501,21 +556,17 @@ class _RuntimeEvidenceCapture:
                 context.__exit__(None, None, None)
         except BaseException as exc:
             errors.append(exc)
-        try:
-            if saved_fd is not None:
-                os.dup2(saved_fd, 2, inheritable=True)
-        except BaseException as exc:
-            errors.append(exc)
-            try:
-                os.close(2)
-            except BaseException as close_error:
-                errors.append(close_error)
-        finally:
-            if saved_fd is not None:
+        stderr_restored = True
+        if saved_fd is not None:
+            stderr_restored, restore_errors = self._restore_stderr_descriptor(saved_fd)
+            errors.extend(restore_errors)
+            if stderr_restored:
                 try:
                     os.close(saved_fd)
                 except BaseException as exc:
                     errors.append(exc)
+            else:
+                self._stderr_saved_fd = saved_fd
         try:
             if stream is not None:
                 stream.close()
@@ -527,7 +578,14 @@ class _RuntimeEvidenceCapture:
         except BaseException as exc:
             errors.append(exc)
         self._stderr_stop.set()
-        if thread is not None and thread_started:
+        reader_owns = False
+        if handoff is not None:
+            reader_owns, handoff_errors = handoff.release(False)
+            errors.extend(handoff_errors)
+        elif thread is not None:
+            reader_owns = True
+            errors.append(RuntimeError("stderr reader ownership handoff was lost"))
+        if reader_owns and thread is not None:
             try:
                 thread.join()
             except BaseException as exc:
@@ -536,6 +594,8 @@ class _RuntimeEvidenceCapture:
                     thread.join()
                 except BaseException as retry_error:
                     errors.append(retry_error)
+        elif reader_owns:
+            errors.append(RuntimeError("stderr reader owned a descriptor without a thread"))
         elif read_fd is not None:
             try:
                 os.close(read_fd)
@@ -545,20 +605,44 @@ class _RuntimeEvidenceCapture:
         self._stderr_reader_error = None
         if reader_error is not None:
             errors.append(reader_error)
+        if not stderr_restored and self._stderr_saved_fd is None:
+            errors.append(RuntimeError("stderr restoration ownership was lost"))
         if errors:
             error = RuntimeError("OS stderr evidence capture failed")
             error.secondary_exceptions = tuple(errors)
             raise error from errors[0]
 
+    def _stderr_resources_released(self) -> bool:
+        return all(
+            value is None
+            for value in (
+                self._stderr_context,
+                self._stderr_stream,
+                self._stderr_stream_fd,
+                self._stderr_saved_fd,
+                self._stderr_read_fd,
+                self._stderr_thread,
+                self._stderr_handoff,
+                self._stderr_reader_error,
+            )
+        )
+
     def __enter__(self) -> "_RuntimeEvidenceCapture":
-        if self._entered:
+        if self._used or self._entered or self._cleanup_pending:
             raise RuntimeError("runtime evidence capture may be entered only once")
-        warning_entered = False
+        self._used = True
+        self._cleanup_pending = True
+        self._warning_restore_state = (
+            warnings.filters,
+            warnings.showwarning,
+            warnings._showwarnmsg_impl,
+        )
+        self._warning_context = warnings.catch_warnings(record=True)
         try:
             self._observed_warnings = self._warning_context.__enter__()
-            warning_entered = True
             warnings.simplefilter("always")
             self._start_stderr_capture()
+            self._previous_root_level = self._root_logger.level
             self._root_logger.setLevel(logging.NOTSET)
             self._root_logger.addHandler(self._log_handler)
             self._entered = True
@@ -566,14 +650,8 @@ class _RuntimeEvidenceCapture:
         except BaseException as exc:
             error_traceback = exc.__traceback__
             cleanup_errors: list[BaseException] = []
-            try:
-                self._root_logger.removeHandler(self._log_handler)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-            try:
-                self._root_logger.setLevel(self._previous_root_level)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+            logger_errors, logger_restored = self._restore_logger_state()
+            cleanup_errors.extend(logger_errors)
             if any(
                 value is not None
                 for value in (
@@ -583,21 +661,23 @@ class _RuntimeEvidenceCapture:
                     self._stderr_saved_fd,
                     self._stderr_read_fd,
                     self._stderr_thread,
+                    self._stderr_handoff,
                 )
             ):
                 try:
                     self._stop_stderr_capture()
                 except BaseException as cleanup_error:
                     cleanup_errors.append(cleanup_error)
-            if warning_entered:
-                try:
-                    self._warning_context.__exit__(
-                        type(exc),
-                        exc,
-                        error_traceback,
-                    )
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
+            warning_errors, warnings_restored = self._restore_warning_state(
+                type(exc),
+                exc,
+                error_traceback,
+            )
+            cleanup_errors.extend(warning_errors)
+            stderr_released = self._stderr_resources_released()
+            self._cleanup_pending = not (
+                logger_restored and warnings_restored and stderr_released
+            )
             self._entered = False
             for cleanup_error in cleanup_errors:
                 _attach_secondary_exception(exc, cleanup_error)
@@ -609,26 +689,31 @@ class _RuntimeEvidenceCapture:
             raise exc.with_traceback(error_traceback)
 
     def __exit__(self, exc_type, exc, traceback_value) -> bool:
-        if not self._entered:
+        if not self._entered and not self._cleanup_pending:
             return False
-        self._entered = False
         cleanup_errors: list[BaseException] = []
-        try:
-            self._root_logger.removeHandler(self._log_handler)
-        except BaseException as cleanup_exc:
-            cleanup_errors.append(cleanup_exc)
-        try:
-            self._root_logger.setLevel(self._previous_root_level)
-        except BaseException as cleanup_exc:
-            cleanup_errors.append(cleanup_exc)
-        try:
-            self._stop_stderr_capture()
-        except BaseException as cleanup_exc:
-            cleanup_errors.append(cleanup_exc)
-        try:
-            self._warning_context.__exit__(exc_type, exc, traceback_value)
-        except BaseException as cleanup_exc:
-            cleanup_errors.append(cleanup_exc)
+        logger_errors, logger_restored = self._restore_logger_state()
+        cleanup_errors.extend(logger_errors)
+        if not self._stderr_resources_released():
+            try:
+                self._stop_stderr_capture()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+        warning_errors, warnings_restored = self._restore_warning_state(
+            exc_type,
+            exc,
+            traceback_value,
+        )
+        cleanup_errors.extend(warning_errors)
+        stderr_released = self._stderr_resources_released()
+        restored = logger_restored and warnings_restored and stderr_released
+        self._cleanup_pending = not restored
+        if restored:
+            self._entered = False
+        elif not cleanup_errors:
+            cleanup_errors.append(
+                RuntimeError("runtime evidence capture ownership was not restored")
+            )
         if cleanup_errors:
             error = RuntimeError("runtime evidence capture finalization failed")
             error.secondary_exceptions = tuple(cleanup_errors)
@@ -638,7 +723,7 @@ class _RuntimeEvidenceCapture:
         return False
 
     def record(self) -> dict[str, Any]:
-        if self._entered:
+        if self._entered or self._cleanup_pending:
             raise RuntimeError("runtime evidence cannot be read while capture is active")
         warning_rows = [
             {

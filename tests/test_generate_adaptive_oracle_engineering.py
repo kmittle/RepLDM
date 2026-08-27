@@ -638,7 +638,80 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertIsNone(capture._stderr_saved_fd)
         self.assertIsNone(capture._stderr_read_fd)
         self.assertIsNone(capture._stderr_thread)
-        self.assertFalse(capture._stderr_thread_started)
+        self.assertIsNone(capture._stderr_handoff)
+
+    def test_ambiguous_thread_start_never_transfers_the_read_descriptor(self):
+        capture = generation._RuntimeEvidenceCapture()
+        before_fd2 = self._fd_identity(2)
+        filters_before = warnings.filters
+        real_pipe = generation.os.pipe
+        real_start = generation.threading.Thread.start
+        release_delayed_reader = generation.threading.Event()
+        pipe_descriptors = []
+        delayed_workers = []
+
+        def record_pipe():
+            descriptors = real_pipe()
+            pipe_descriptors.extend(descriptors)
+            return descriptors
+
+        def launch_without_publishing_start(thread):
+            target = thread._target
+            args = thread._args
+            kwargs = thread._kwargs
+
+            def delayed_target():
+                release_delayed_reader.wait()
+                target(*args, **kwargs)
+
+            worker = generation.threading.Thread(
+                target=delayed_target,
+                name="delayed-stderr-reader-fixture",
+                daemon=False,
+            )
+            real_start(worker)
+            delayed_workers.append(worker)
+            raise KeyboardInterrupt("simulated ambiguous thread start")
+
+        sentinels = []
+        try:
+            with (
+                mock.patch.object(generation.os, "pipe", side_effect=record_pipe),
+                mock.patch.object(
+                    generation.threading.Thread,
+                    "start",
+                    autospec=True,
+                    side_effect=launch_without_publishing_start,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "ambiguous thread start",
+                ) as raised,
+            ):
+                capture.__enter__()
+
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertEqual(len(pipe_descriptors), 2)
+            read_descriptor = pipe_descriptors[0]
+            while read_descriptor not in sentinels:
+                sentinels.append(os.open("/dev/null", os.O_RDONLY))
+            release_delayed_reader.set()
+            for worker in delayed_workers:
+                worker.join()
+            os.fstat(read_descriptor)
+            self.assertEqual(self._fd_identity(2), before_fd2)
+            self.assertIs(warnings.filters, filters_before)
+            self.assertIsNone(capture._stderr_read_fd)
+            self.assertIsNone(capture._stderr_thread)
+            self.assertIsNone(capture._stderr_handoff)
+        finally:
+            release_delayed_reader.set()
+            for worker in delayed_workers:
+                worker.join()
+            for descriptor in sentinels:
+                os.close(descriptor)
 
     def test_enter_rollback_survives_join_cancellation_and_restores_globals(self):
         capture = generation._RuntimeEvidenceCapture()
@@ -689,7 +762,7 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertIsNone(capture._stderr_saved_fd)
         self.assertIsNone(capture._stderr_stream_fd)
         self.assertIsNone(capture._stderr_thread)
-        self.assertFalse(capture._stderr_thread_started)
+        self.assertIsNone(capture._stderr_handoff)
 
     def test_stop_join_cancellation_invalidates_state_before_fd_reuse(self):
         capture = generation._RuntimeEvidenceCapture()
@@ -729,7 +802,7 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertIsNone(capture._stderr_stream_fd)
         self.assertIsNone(capture._stderr_read_fd)
         self.assertIsNone(capture._stderr_thread)
-        self.assertFalse(capture._stderr_thread_started)
+        self.assertIsNone(capture._stderr_handoff)
 
         sentinel = os.open("/dev/null", os.O_RDONLY)
         try:
@@ -738,6 +811,232 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             os.fstat(sentinel)
         finally:
             os.close(sentinel)
+
+    def test_stderr_restore_post_dup2_cancellation_keeps_fd2_restored(self):
+        capture = generation._RuntimeEvidenceCapture()
+        before_fd2 = self._fd_identity(2)
+        capture.__enter__()
+        saved_descriptor = capture._stderr_saved_fd
+        self.assertIsNotNone(saved_descriptor)
+        real_dup2 = generation.os.dup2
+        cancelled = False
+
+        def restore_then_cancel(source, destination, *args, **kwargs):
+            nonlocal cancelled
+            result = real_dup2(source, destination, *args, **kwargs)
+            if source == saved_descriptor and destination == 2 and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated post-dup2 restore cancellation")
+            return result
+
+        with (
+            mock.patch.object(
+                generation.os,
+                "dup2",
+                side_effect=restore_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertEqual(self._fd_identity(2), before_fd2)
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
+
+    def test_stderr_restore_exhaustion_retains_saved_fd_for_explicit_retry(self):
+        capture = generation._RuntimeEvidenceCapture()
+        before_fd2 = self._fd_identity(2)
+        capture.__enter__()
+
+        with (
+            mock.patch.object(
+                generation.os,
+                "dup2",
+                side_effect=KeyboardInterrupt(
+                    "simulated persistent stderr restore cancellation"
+                ),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertTrue(capture._entered)
+        self.assertTrue(capture._cleanup_pending)
+        self.assertIsNotNone(capture._stderr_saved_fd)
+        os.fstat(capture._stderr_saved_fd)
+
+        capture.__exit__(None, None, None)
+        self.assertEqual(self._fd_identity(2), before_fd2)
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
+        self.assertIsNone(capture._stderr_saved_fd)
+
+    def test_logger_handler_restore_retries_pre_remove_cancellation(self):
+        capture = generation._RuntimeEvidenceCapture()
+        root_logger = logging.getLogger()
+        before_level = root_logger.level
+        capture.__enter__()
+        real_remove = root_logger.removeHandler
+        cancelled = False
+
+        def cancel_then_remove(handler):
+            nonlocal cancelled
+            if handler is capture._log_handler and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated pre-remove cancellation")
+            return real_remove(handler)
+
+        with (
+            mock.patch.object(
+                root_logger,
+                "removeHandler",
+                side_effect=cancel_then_remove,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertNotIn(capture._log_handler, root_logger.handlers)
+        self.assertEqual(root_logger.level, before_level)
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
+
+    def test_logger_level_restore_retries_pre_setlevel_cancellation(self):
+        capture = generation._RuntimeEvidenceCapture()
+        root_logger = logging.getLogger()
+        before_level = root_logger.level
+        capture.__enter__()
+        real_set_level = root_logger.setLevel
+        cancelled = False
+
+        def cancel_then_set(level):
+            nonlocal cancelled
+            if level == before_level and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated pre-setLevel cancellation")
+            return real_set_level(level)
+
+        with (
+            mock.patch.object(
+                root_logger,
+                "setLevel",
+                side_effect=cancel_then_set,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertNotIn(capture._log_handler, root_logger.handlers)
+        self.assertEqual(root_logger.level, before_level)
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
+
+    def test_warning_restore_retries_pre_exit_cancellation(self):
+        capture = generation._RuntimeEvidenceCapture()
+        filters_before = warnings.filters
+        showwarning_before = warnings.showwarning
+        showwarnmsg_before = warnings._showwarnmsg_impl
+        capture.__enter__()
+        real_filters_mutated = warnings._filters_mutated
+        cancelled = False
+
+        def cancel_then_mutate():
+            nonlocal cancelled
+            if not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated pre-warning-exit cancellation")
+            return real_filters_mutated()
+
+        with (
+            mock.patch.object(
+                warnings,
+                "_filters_mutated",
+                side_effect=cancel_then_mutate,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertIs(warnings.filters, filters_before)
+        self.assertIs(warnings.showwarning, showwarning_before)
+        self.assertIs(warnings._showwarnmsg_impl, showwarnmsg_before)
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
+
+    def test_warning_enter_post_mutation_cancellation_restores_globals(self):
+        capture = generation._RuntimeEvidenceCapture()
+        filters_before = warnings.filters
+        showwarning_before = warnings.showwarning
+        showwarnmsg_before = warnings._showwarnmsg_impl
+        context_type = type(warnings.catch_warnings())
+        real_enter = context_type.__enter__
+        cancelled = False
+
+        def enter_then_cancel(context):
+            nonlocal cancelled
+            result = real_enter(context)
+            if context is capture._warning_context and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated post-warning-enter cancellation")
+            return result
+
+        with (
+            mock.patch.object(
+                context_type,
+                "__enter__",
+                autospec=True,
+                side_effect=enter_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "post-warning-enter cancellation",
+            ) as raised,
+        ):
+            capture.__enter__()
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertIs(warnings.filters, filters_before)
+        self.assertIs(warnings.showwarning, showwarning_before)
+        self.assertIs(warnings._showwarnmsg_impl, showwarnmsg_before)
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
 
     def test_raw_stderr_warning_categories_are_counted(self):
         capture = generation._RuntimeEvidenceCapture()
@@ -4975,73 +5274,125 @@ class AuthorizedGenerationTest(unittest.TestCase):
 
     def test_success_publication_close_cancellation_is_propagated(self):
         real_close = generation._PublishedArtifacts.close
+        real_os_close = generation.os.close
+        pinned_descriptors = []
+        target_descriptor = -1
         cancelled = False
 
-        def close_then_cancel(publications):
+        def close_with_inventory(publications):
+            nonlocal target_descriptor
+            pinned_descriptors.extend(row[0] for row in publications._rows)
+            target_descriptor = publications._rows[-1][0]
+            return real_close(publications)
+
+        def cancel_before_close(descriptor):
             nonlocal cancelled
-            errors = real_close(publications)
-            if not cancelled:
+            if descriptor == target_descriptor and not cancelled:
                 cancelled = True
-                errors.append(
-                    KeyboardInterrupt("simulated success publication close cancellation")
+                raise KeyboardInterrupt(
+                    "simulated success publication pre-close cancellation"
                 )
-            return errors
+            return real_os_close(descriptor)
 
-        with (
-            mock.patch.object(
-                generation._PublishedArtifacts,
-                "close",
-                autospec=True,
-                side_effect=close_then_cancel,
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "generation descriptor finalization",
-            ) as raised,
-        ):
-            self._run([])
+        try:
+            with (
+                mock.patch.object(
+                    generation._PublishedArtifacts,
+                    "close",
+                    autospec=True,
+                    side_effect=close_with_inventory,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "close",
+                    side_effect=cancel_before_close,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "generation descriptor finalization",
+                ) as raised,
+            ):
+                self._run([])
 
-        self.assertTrue(cancelled)
-        self.assertTrue(
-            generation._exception_contains_cancellation(raised.exception)
-        )
-        self.assertTrue((self.output / "success.json").is_file())
-        self.assertFalse((self.output / "failure.json").exists())
+            self.assertTrue(cancelled)
+            self.assertGreater(len(pinned_descriptors), 1)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            os.fstat(target_descriptor)
+            for descriptor in pinned_descriptors:
+                if descriptor == target_descriptor:
+                    continue
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(descriptor)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertTrue((self.output / "success.json").is_file())
+            self.assertFalse((self.output / "failure.json").exists())
+        finally:
+            if target_descriptor >= 0:
+                real_os_close(target_descriptor)
 
     def test_failure_publication_close_cancellation_attaches_to_primary(self):
         real_close = generation._PublishedArtifacts.close
+        real_os_close = generation.os.close
+        target_descriptor = -1
+        sentinel_descriptor = -1
+        sentinel_descriptors = []
         cancelled = False
 
-        def close_then_cancel(publications):
-            nonlocal cancelled
-            errors = real_close(publications)
-            if not cancelled:
+        def close_with_inventory(publications):
+            nonlocal target_descriptor
+            target_descriptor = publications._rows[-1][0]
+            return real_close(publications)
+
+        def close_reuse_then_cancel(descriptor):
+            nonlocal cancelled, sentinel_descriptor
+            if descriptor == target_descriptor and not cancelled:
                 cancelled = True
-                errors.append(
-                    KeyboardInterrupt("simulated failure publication close cancellation")
+                real_os_close(descriptor)
+                while descriptor not in sentinel_descriptors:
+                    sentinel_descriptors.append(os.open("/dev/null", os.O_RDONLY))
+                sentinel_descriptor = descriptor
+                raise KeyboardInterrupt(
+                    "simulated failure publication post-close cancellation"
                 )
-            return errors
+            return real_os_close(descriptor)
 
-        with (
-            mock.patch.object(
-                generation._PublishedArtifacts,
-                "close",
-                autospec=True,
-                side_effect=close_then_cancel,
-            ),
-            self.assertRaisesRegex(RuntimeError, "generation core failure") as raised,
-        ):
-            self._run(
-                [],
-                task_error=RuntimeError("simulated generation core failure"),
+        try:
+            with (
+                mock.patch.object(
+                    generation._PublishedArtifacts,
+                    "close",
+                    autospec=True,
+                    side_effect=close_with_inventory,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "close",
+                    side_effect=close_reuse_then_cancel,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "generation core failure",
+                ) as raised,
+            ):
+                self._run(
+                    [],
+                    task_error=RuntimeError("simulated generation core failure"),
+                )
+
+            self.assertTrue(cancelled)
+            self.assertGreaterEqual(target_descriptor, 0)
+            self.assertEqual(sentinel_descriptor, target_descriptor)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
             )
-
-        self.assertTrue(cancelled)
-        self.assertTrue(
-            generation._exception_contains_cancellation(raised.exception)
-        )
-        self.assertFalse((self.output / "success.json").exists())
-        self.assertTrue((self.output / "failure.json").is_file())
+            os.fstat(sentinel_descriptor)
+            self.assertFalse((self.output / "success.json").exists())
+            self.assertTrue((self.output / "failure.json").is_file())
+        finally:
+            for descriptor in sentinel_descriptors:
+                real_os_close(descriptor)
 
     def test_pre_success_same_inode_record_rewrite_blocks_success(self):
         first_task = self.design["tasks"][0]["task_id"]
