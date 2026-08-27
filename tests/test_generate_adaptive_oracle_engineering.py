@@ -460,6 +460,121 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertIsNone(capture._stderr_thread)
         self.assertEqual(capture.record()["warnings"]["count"], 1)
 
+    def test_duplicate_post_return_cancellation_reconciles_hidden_fd(self):
+        real_dup = generation.os.dup
+        created = []
+
+        def dup_then_cancel(descriptor):
+            duplicate = real_dup(descriptor)
+            created.append(duplicate)
+            raise KeyboardInterrupt("simulated post-dup cancellation")
+
+        with (
+            mock.patch.object(generation.os, "dup", side_effect=dup_then_cancel),
+            self.assertRaisesRegex(KeyboardInterrupt, "post-dup cancellation"),
+        ):
+            generation._duplicate_descriptor(2)
+
+        self.assertEqual(len(created), 1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(created[0])
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_anchor_post_return_cancellation_reconciles_hidden_fd(self):
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        capture = generation._RuntimeEvidenceCapture()
+        real_dup = generation.os.dup
+        created = []
+
+        def dup_then_cancel(source):
+            duplicate = real_dup(source)
+            created.append(duplicate)
+            raise KeyboardInterrupt("simulated post-anchor-dup cancellation")
+
+        try:
+            with (
+                mock.patch.object(generation.os, "dup", side_effect=dup_then_cancel),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "post-anchor-dup cancellation"
+                ),
+            ):
+                capture._bind_stderr_descriptor(
+                    "_stderr_saved_fd",
+                    "_stderr_saved_fd_identity",
+                    descriptor,
+                )
+            self.assertEqual(len(created), 1)
+            with self.assertRaises(OSError) as closed:
+                os.fstat(created[0])
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            self.assertEqual(capture._stderr_saved_fd, descriptor)
+            self.assertEqual(capture._stderr_fd_anchors, {})
+        finally:
+            if capture._stderr_saved_fd == descriptor:
+                os.close(descriptor)
+            elif descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_anchor_pre_close_cancellation_retains_retry_ownership(self):
+        capture = generation._RuntimeEvidenceCapture()
+        capture.__enter__()
+        descriptor = capture._stderr_stream_fd
+        anchor = capture._stderr_fd_anchors[descriptor]
+        real_close = generation.os.close
+        cancelled = False
+
+        def cancel_anchor_close(candidate):
+            nonlocal cancelled
+            if candidate == anchor and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated anchor pre-close cancellation")
+            return real_close(candidate)
+
+        try:
+            with (
+                mock.patch.object(
+                    generation.os, "close", side_effect=cancel_anchor_close
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "runtime evidence capture finalization failed"
+                ),
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertTrue(cancelled)
+            self.assertTrue(capture._cleanup_pending)
+            self.assertEqual(capture._stderr_stream_fd, descriptor)
+            self.assertEqual(capture._stderr_fd_anchors.get(descriptor), anchor)
+
+            capture.__exit__(None, None, None)
+            self.assertFalse(capture._cleanup_pending)
+            with self.assertRaises(OSError) as closed:
+                os.fstat(anchor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+        finally:
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
+    def test_unknown_guarded_fd_is_never_closed_after_number_reuse(self):
+        capture = generation._RuntimeEvidenceCapture()
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        capture._stderr_guarded_fds[descriptor] = None
+        os.close(descriptor)
+        foreign = os.open("/dev/null", os.O_RDONLY)
+        self.assertEqual(foreign, descriptor)
+        try:
+            errors = capture._close_guarded_stderr_descriptors()
+            self.assertTrue(
+                any("identity is unavailable" in str(error) for error in errors)
+            )
+            os.fstat(foreign)
+            self.assertIn(descriptor, capture._stderr_guarded_fds)
+        finally:
+            os.close(foreign)
+
     def test_stderr_writer_close_error_does_not_close_a_reused_descriptor(self):
         capture = generation._RuntimeEvidenceCapture()
         real_pipe = generation.os.pipe

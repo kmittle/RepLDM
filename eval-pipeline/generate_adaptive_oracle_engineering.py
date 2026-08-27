@@ -324,6 +324,7 @@ class _RuntimeEvidenceCapture:
         # descriptor number -> private duplicate sharing its OFD.  The anchor
         # makes ownership robust against same-target fd-number reuse.
         self._stderr_fd_anchors: dict[int, int] = {}
+        self._stderr_fd_anchor_identities: dict[int, tuple[Any, ...]] = {}
         self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_handoff: Optional[_StderrReaderHandoff] = None
         self._stderr_context: Optional[Any] = None
@@ -426,7 +427,7 @@ class _RuntimeEvidenceCapture:
                     int(right),
                 )
             )
-        except BaseException:
+        except BaseException as exc:
             return None
         if result < 0:
             return None
@@ -447,18 +448,44 @@ class _RuntimeEvidenceCapture:
         identity = self._stderr_descriptor_identity(descriptor)
         setattr(self, identity_attribute, identity)
         anchor = -1
+        anchor_guard: list[int] = []
         try:
-            anchor = os.dup(descriptor)
+            anchor = _duplicate_descriptor(
+                descriptor,
+                descriptor_guard=anchor_guard,
+            )
+            if anchor_guard != [anchor]:
+                raise RuntimeError("stderr descriptor anchor handoff changed")
             self._stderr_fd_anchors[descriptor] = anchor
-        except BaseException:
-            # A cancellation between dup(2) and map registration must not
-            # strand the new descriptor.  Keep cleanup best-effort while
-            # preserving the original exception.
-            if anchor >= 0 and descriptor not in self._stderr_fd_anchors:
-                try:
-                    os.close(anchor)
-                except BaseException:
-                    pass
+            self._stderr_fd_anchor_identities[descriptor] = identity
+            anchor_guard.clear()
+        except BaseException as exc:
+            # Transfer any duplicate that could not be closed to the
+            # ownership map.  The startup rollback will retry it; silently
+            # dropping the guard would turn a post-return cancellation into a
+            # descriptor leak.
+            for guarded in tuple(anchor_guard):
+                if descriptor not in self._stderr_fd_anchors:
+                    self._stderr_fd_anchors[descriptor] = guarded
+                    self._stderr_fd_anchor_identities[descriptor] = identity
+                elif self._stderr_fd_anchors[descriptor] != guarded:
+                    try:
+                        os.close(guarded)
+                    except BaseException:
+                        pass
+            anchor_guard.clear()
+            if descriptor in self._stderr_fd_anchors:
+                anchor_errors, anchor_released = self._close_stderr_anchor(descriptor)
+                for cleanup_error in anchor_errors:
+                    _attach_secondary_exception(exc, cleanup_error)
+                    _add_exception_note(
+                        exc,
+                        "stderr anchor rollback also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}",
+                    )
+                if anchor_released:
+                    self._stderr_fd_anchors.pop(descriptor, None)
+                    self._stderr_fd_anchor_identities.pop(descriptor, None)
             raise
 
     def _stderr_descriptor_binding(
@@ -492,12 +519,12 @@ class _RuntimeEvidenceCapture:
     ) -> tuple[
         list[BaseException],
         bool,
-        Optional[tuple[int, int, int, int]],
+        Optional[tuple[Any, ...]],
     ]:
         errors: list[BaseException] = []
         if expected_identity is None:
             try:
-                expected_identity = self._stderr_descriptor_identity(descriptor)
+                self._stderr_descriptor_identity(descriptor)
             except OSError as exc:
                 if exc.errno == errno.EBADF:
                     return errors, True, None
@@ -506,6 +533,12 @@ class _RuntimeEvidenceCapture:
             except BaseException as exc:
                 errors.append(exc)
                 return errors, False, None
+            errors.append(
+                RuntimeError(
+                    "stderr descriptor ownership identity is unavailable; refusing to close"
+                )
+            )
+            return errors, False, None
         else:
             binding, binding_errors = self._stderr_descriptor_binding(
                 descriptor,
@@ -552,19 +585,79 @@ class _RuntimeEvidenceCapture:
             getattr(self, identity_attribute),
         )
         if released:
-            setattr(self, descriptor_attribute, None)
-            setattr(self, identity_attribute, None)
-            anchor = self._stderr_fd_anchors.get(descriptor)
-            if anchor is not None:
-                try:
-                    os.close(anchor)
-                except BaseException as exc:
-                    errors.append(exc)
-                else:
-                    self._stderr_fd_anchors.pop(descriptor, None)
+            anchor_errors, anchor_released = self._close_stderr_anchor(descriptor)
+            errors.extend(anchor_errors)
+            # Keep the descriptor number and identity until its private anchor
+            # is also released.  This preserves enough ownership state for a
+            # later retry when anchor close is cancelled after the descriptor
+            # itself has already been closed.
+            if anchor_released:
+                setattr(self, descriptor_attribute, None)
+                setattr(self, identity_attribute, None)
+                return errors, True
+            return errors, False
         else:
             setattr(self, identity_attribute, retained_identity)
         return errors, released
+
+    def _close_stderr_anchor(
+        self,
+        descriptor: int,
+    ) -> tuple[list[BaseException], bool]:
+        """Close a descriptor's private OFD anchor while retaining ownership."""
+
+        anchor = self._stderr_fd_anchors.get(descriptor)
+        if anchor is None:
+            self._stderr_fd_anchor_identities.pop(descriptor, None)
+            return [], True
+        errors: list[BaseException] = []
+        try:
+            os.close(anchor)
+        except BaseException as exc:
+            errors.append(exc)
+
+        # Reconcile both pre-close cancellation and close-after-reuse.  When
+        # the original descriptor is still available, KCMP_FILE distinguishes
+        # an owned anchor from a foreign descriptor with the same stat target.
+        try:
+            observed = self._stderr_descriptor_identity(anchor)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                self._stderr_fd_anchors.pop(descriptor, None)
+                self._stderr_fd_anchor_identities.pop(descriptor, None)
+                return errors, True
+            errors.append(exc)
+            return errors, False
+        except BaseException as exc:
+            errors.append(exc)
+            return errors, False
+
+        expected = self._stderr_fd_anchor_identities.get(descriptor)
+        if expected is not None and observed != expected:
+            errors.append(
+                RuntimeError(
+                    "stderr anchor descriptor number was reused before ownership release"
+                )
+            )
+            self._stderr_fd_anchors.pop(descriptor, None)
+            self._stderr_fd_anchor_identities.pop(descriptor, None)
+            return errors, True
+
+        try:
+            same_ofd = self._stderr_ofd_same(descriptor, anchor)
+        except BaseException as exc:
+            errors.append(exc)
+            same_ofd = None
+        if same_ofd is False:
+            errors.append(
+                RuntimeError(
+                    "stderr anchor open-file description was reused before ownership release"
+                )
+            )
+            self._stderr_fd_anchors.pop(descriptor, None)
+            self._stderr_fd_anchor_identities.pop(descriptor, None)
+            return errors, True
+        return errors, False
 
     def _close_guarded_stderr_descriptors(self) -> list[BaseException]:
         errors: list[BaseException] = []
@@ -577,15 +670,12 @@ class _RuntimeEvidenceCapture:
             )
             errors.extend(close_errors)
             if released:
-                self._stderr_guarded_fds.pop(descriptor, None)
-                anchor = self._stderr_fd_anchors.get(descriptor)
-                if anchor is not None:
-                    try:
-                        os.close(anchor)
-                    except BaseException as exc:
-                        errors.append(exc)
-                    else:
-                        self._stderr_fd_anchors.pop(descriptor, None)
+                anchor_errors, anchor_released = self._close_stderr_anchor(descriptor)
+                errors.extend(anchor_errors)
+                if anchor_released:
+                    self._stderr_guarded_fds.pop(descriptor, None)
+                else:
+                    self._stderr_guarded_fds[descriptor] = expected_identity
             else:
                 self._stderr_guarded_fds[descriptor] = retained_identity
         return errors
@@ -1081,6 +1171,7 @@ class _RuntimeEvidenceCapture:
                 self._stderr_write_fd_identity,
                 self._stderr_saved_fd_identity,
                 self._stderr_fd_anchors or None,
+                self._stderr_fd_anchor_identities or None,
             )
         ) and not (
             self._stderr_fd_restore_pending
@@ -1125,6 +1216,7 @@ class _RuntimeEvidenceCapture:
                     self._stderr_handoff,
                     self._stderr_guarded_fds or None,
                     self._stderr_fd_anchors or None,
+                    self._stderr_fd_anchor_identities or None,
                 )
             ):
                 try:
@@ -3434,6 +3526,97 @@ def _open_unique_regular_at(
     return descriptor
 
 
+def _descriptor_numbers() -> set[int]:
+    """Return a best-effort snapshot of this process's open descriptors."""
+
+    try:
+        entries = os.listdir("/proc/self/fd")
+    except BaseException:
+        return set()
+    numbers: set[int] = set()
+    for entry in entries:
+        try:
+            number = int(entry)
+        except (TypeError, ValueError):
+            continue
+        if number < 0:
+            continue
+        try:
+            os.fstat(number)
+        except OSError:
+            # /proc/self/fd includes the descriptor used by listdir itself;
+            # it may already be closed by the time the entry is parsed.
+            continue
+        except BaseException:
+            continue
+        numbers.add(number)
+    return numbers
+
+
+def _new_duplicate_descriptors(
+    source: int,
+    before: set[int],
+) -> list[int]:
+    """Find duplicates created before an interrupted ``os.dup`` returned."""
+
+    candidates: list[int] = []
+    try:
+        source_identity = os.fstat(source)
+    except BaseException:
+        return candidates
+    for candidate in sorted(_descriptor_numbers() - before - {source}):
+        try:
+            same_ofd = _RuntimeEvidenceCapture._stderr_ofd_same(source, candidate)
+        except BaseException:
+            same_ofd = None
+        if same_ofd is True:
+            candidates.append(candidate)
+            continue
+        if same_ofd is False:
+            continue
+        # Non-Linux fallback.  Restrict the search to descriptors that
+        # appeared after the snapshot so a pre-existing foreign fd cannot be
+        # adopted through this path.
+        try:
+            if os.path.samestat(source_identity, os.fstat(candidate)):
+                candidates.append(candidate)
+        except BaseException:
+            continue
+    return candidates
+
+
+def _close_reconciled_descriptors(
+    descriptors: Sequence[int],
+) -> tuple[list[BaseException], list[int]]:
+    """Close recovered descriptors and report any that remain owned."""
+
+    errors: list[BaseException] = []
+    survivors: list[int] = []
+    for descriptor in dict.fromkeys(descriptors):
+        released = False
+        for _ in range(3):
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    os.fstat(descriptor)
+                except OSError as state_error:
+                    if state_error.errno == errno.EBADF:
+                        released = True
+                        break
+                except BaseException as state_error:
+                    errors.append(state_error)
+                else:
+                    continue
+            else:
+                released = True
+                break
+        if not released:
+            survivors.append(descriptor)
+    return errors, survivors
+
+
 def _duplicate_descriptor(
     descriptor: int,
     *,
@@ -3441,9 +3624,70 @@ def _duplicate_descriptor(
 ) -> int:
     if descriptor_guard is not None and descriptor_guard:
         raise ValueError("duplicate descriptor guard must start empty")
-    duplicate = os.dup(descriptor)
+    before = _descriptor_numbers()
+    try:
+        duplicate = os.dup(descriptor)
+    except BaseException as exc:
+        recovered = _new_duplicate_descriptors(descriptor, before)
+        # os.dup returns the lowest available descriptor.  If another actor
+        # created an additional same-OFD duplicate before cancellation was
+        # observed, claim only that first candidate; closing the rest could
+        # destroy a foreign descriptor.
+        claimed = recovered[:1]
+        ambiguous = recovered[1:]
+        if ambiguous:
+            _add_exception_note(
+                exc,
+                "ambiguous same-OFD duplicate descriptors left untouched: "
+                + ",".join(str(value) for value in ambiguous),
+            )
+        if descriptor_guard is not None:
+            for candidate in claimed:
+                try:
+                    descriptor_guard.append(candidate)
+                except BaseException as guard_error:
+                    _attach_secondary_exception(exc, guard_error)
+                    _add_exception_note(
+                        exc,
+                        "duplicate descriptor guard handoff also failed: "
+                        f"{type(guard_error).__name__}: {guard_error}",
+                    )
+                    cleanup_errors, survivors = _close_reconciled_descriptors(
+                        [candidate]
+                    )
+                    for cleanup_error in cleanup_errors:
+                        _attach_secondary_exception(exc, cleanup_error)
+                    if candidate not in descriptor_guard:
+                        descriptor_guard.extend(survivors)
+            raise
+        cleanup_errors, survivors = _close_reconciled_descriptors(recovered)
+        for cleanup_error in cleanup_errors:
+            _attach_secondary_exception(exc, cleanup_error)
+            _add_exception_note(
+                exc,
+                "recovered duplicate cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}",
+            )
+        if survivors:
+            _add_exception_note(
+                exc,
+                "recovered duplicate descriptors remained open: "
+                + ",".join(str(value) for value in survivors),
+            )
+        raise
     if descriptor_guard is not None:
-        descriptor_guard.append(duplicate)
+        try:
+            descriptor_guard.append(duplicate)
+        except BaseException as exc:
+            if duplicate not in descriptor_guard:
+                cleanup_errors, survivors = _close_reconciled_descriptors(
+                    [duplicate]
+                )
+                for cleanup_error in cleanup_errors:
+                    _attach_secondary_exception(exc, cleanup_error)
+                if survivors:
+                    descriptor_guard.extend(survivors)
+            raise
     return duplicate
 
 
