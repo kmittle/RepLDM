@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -460,7 +461,7 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertIsNone(capture._stderr_thread)
         self.assertEqual(capture.record()["warnings"]["count"], 1)
 
-    def test_duplicate_post_return_cancellation_reconciles_hidden_fd(self):
+    def test_duplicate_post_return_cancellation_does_not_close_unproven_fd(self):
         real_dup = generation.os.dup
         created = []
 
@@ -471,16 +472,169 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
 
         with (
             mock.patch.object(generation.os, "dup", side_effect=dup_then_cancel),
-            self.assertRaisesRegex(KeyboardInterrupt, "post-dup cancellation"),
+            self.assertRaisesRegex(
+                KeyboardInterrupt, "post-dup cancellation"
+            ) as raised,
         ):
-            generation._duplicate_descriptor(2)
+            generation._duplicate_descriptor(2, descriptor_guard=[])
 
         self.assertEqual(len(created), 1)
-        with self.assertRaises(OSError) as closed:
-            os.fstat(created[0])
-        self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertEqual(raised.exception.survivor_descriptors, tuple(created))
+        # The allocated fd is explicitly returned as survivor ownership;
+        # closing a guessed number is never required.
+        os.fstat(created[0])
+        os.close(created[0])
 
-    def test_anchor_post_return_cancellation_reconciles_hidden_fd(self):
+    def test_open_guard_append_failure_retains_returned_descriptor(self):
+        class RaisingGuard(list):
+            def append(self, _value):
+                raise KeyboardInterrupt("simulated open guard append")
+
+        guard = RaisingGuard()
+        with self.assertRaisesRegex(
+            KeyboardInterrupt, "open guard append"
+        ) as raised:
+            generation._open_with_reconciliation(
+                "/dev/null",
+                os.O_RDONLY,
+                0,
+                directory_descriptor=None,
+                descriptor_guard=guard,
+                expected_mode=stat.S_IFCHR,
+            )
+
+        survivors = tuple(raised.exception.survivor_descriptors)
+        self.assertEqual(len(survivors), 1)
+        try:
+            os.fstat(survivors[0])
+        finally:
+            os.close(survivors[0])
+
+    def test_pipe_guard_extend_failure_retains_both_endpoints(self):
+        class RaisingGuard(list):
+            def extend(self, _values):
+                raise KeyboardInterrupt("simulated pipe guard extend")
+
+        guard = RaisingGuard()
+        with self.assertRaisesRegex(
+            KeyboardInterrupt, "pipe guard extend"
+        ) as raised:
+            generation._pipe_with_reconciliation(descriptor_guard=guard)
+
+        survivors = tuple(raised.exception.survivor_descriptors)
+        self.assertEqual(len(survivors), 2)
+        try:
+            for descriptor in survivors:
+                os.fstat(descriptor)
+        finally:
+            for descriptor in survivors:
+                os.close(descriptor)
+
+    def test_duplicate_guard_append_failure_retains_returned_descriptor(self):
+        class RaisingGuard(list):
+            def append(self, _value):
+                raise KeyboardInterrupt("simulated duplicate guard append")
+
+        source = os.open("/dev/null", os.O_RDONLY)
+        guard = RaisingGuard()
+        survivors = ()
+        try:
+            with self.assertRaisesRegex(
+                KeyboardInterrupt, "duplicate guard append"
+            ) as raised:
+                generation._duplicate_descriptor(
+                    source,
+                    descriptor_guard=guard,
+                )
+
+            survivors = tuple(raised.exception.survivor_descriptors)
+            self.assertEqual(len(survivors), 1)
+            os.fstat(survivors[0])
+        finally:
+            for descriptor in survivors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            os.close(source)
+
+    def test_managed_descriptor_second_witness_cancellation_merges_survivors(self):
+        source = os.open("/dev/null", os.O_RDONLY)
+        real_dup = generation.os.dup
+        created = []
+
+        def dup_then_cancel_on_second(descriptor):
+            duplicate = real_dup(descriptor)
+            created.append(duplicate)
+            if len(created) == 2:
+                raise KeyboardInterrupt("simulated managed second witness")
+            return duplicate
+
+        try:
+            with (
+                mock.patch.object(
+                    generation.os,
+                    "dup",
+                    side_effect=dup_then_cancel_on_second,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "managed second witness"
+                ) as raised,
+            ):
+                generation._ManagedDescriptor(source, mode="rb")
+
+            self.assertEqual(
+                set(raised.exception.survivor_descriptors), set(created)
+            )
+            for descriptor in created:
+                os.fstat(descriptor)
+        finally:
+            for descriptor in created:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            os.close(source)
+
+    def test_descriptor_witness_second_dup_cancellation_merges_survivors(self):
+        source = os.open("/dev/null", os.O_RDONLY)
+        real_dup = generation.os.dup
+        created = []
+
+        def dup_then_cancel_on_second(descriptor):
+            duplicate = real_dup(descriptor)
+            created.append(duplicate)
+            if len(created) == 2:
+                raise KeyboardInterrupt("simulated descriptor second witness")
+            return duplicate
+
+        try:
+            with (
+                mock.patch.object(
+                    generation.os,
+                    "dup",
+                    side_effect=dup_then_cancel_on_second,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "descriptor second witness"
+                ) as raised,
+            ):
+                generation._DescriptorWitness(source)
+
+            self.assertEqual(
+                set(raised.exception.survivor_descriptors), set(created)
+            )
+            for descriptor in created:
+                os.fstat(descriptor)
+        finally:
+            for descriptor in created:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            os.close(source)
+
+    def test_anchor_post_return_cancellation_does_not_close_unproven_fd(self):
         descriptor = os.open("/dev/null", os.O_RDONLY)
         capture = generation._RuntimeEvidenceCapture()
         real_dup = generation.os.dup
@@ -504,9 +658,8 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
                     descriptor,
                 )
             self.assertEqual(len(created), 1)
-            with self.assertRaises(OSError) as closed:
-                os.fstat(created[0])
-            self.assertEqual(closed.exception.errno, errno.EBADF)
+            os.fstat(created[0])
+            os.close(created[0])
             self.assertEqual(capture._stderr_saved_fd, descriptor)
             self.assertEqual(capture._stderr_fd_anchors, {})
         finally:
@@ -518,17 +671,203 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
                 except OSError:
                     pass
 
+    def test_anchor_rollback_merges_nested_and_cleanup_survivors(self):
+        source = os.open("/dev/null", os.O_RDONLY)
+        capture = generation._RuntimeEvidenceCapture()
+        real_dup = os.dup
+        created = []
+
+        def duplicate_then_fail(descriptor, *, descriptor_guard):
+            duplicate = real_dup(descriptor)
+            created.append(duplicate)
+            if len(created) == 2:
+                error = KeyboardInterrupt("simulated second anchor cancellation")
+                error.survivor_descriptors = (duplicate,)
+                raise error
+            descriptor_guard.append(duplicate)
+            return duplicate
+
+        def retain_first_anchor(descriptor):
+            return [OSError(errno.EIO, "simulated anchor cleanup failure")], [descriptor]
+
+        try:
+            with (
+                mock.patch.object(
+                    generation,
+                    "_duplicate_descriptor",
+                    side_effect=duplicate_then_fail,
+                ),
+                mock.patch.object(
+                    generation,
+                    "_close_raw_descriptor_with_reconciliation",
+                    side_effect=retain_first_anchor,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "second anchor cancellation"
+                ) as raised,
+            ):
+                capture._bind_stderr_descriptor(
+                    "_stderr_saved_fd",
+                    "_stderr_saved_fd_identity",
+                    source,
+                )
+
+            survivors = tuple(raised.exception.survivor_descriptors)
+            self.assertEqual(set(survivors), set(created))
+            for descriptor in survivors:
+                os.fstat(descriptor)
+        finally:
+            for descriptor in set(created + [source]):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_anchor_wrapper_constructor_failure_retains_wrapper_and_nested_survivors(self):
+        source = os.open("/dev/null", os.O_RDONLY)
+        capture = generation._RuntimeEvidenceCapture()
+        real_managed = generation._ManagedDescriptor
+        real_close = real_managed.close
+        wrappers = []
+        anchors = []
+        nested_survivors = []
+        constructor_calls = 0
+
+        def construct(descriptor, **kwargs):
+            nonlocal constructor_calls
+            constructor_calls += 1
+            anchors.append(descriptor)
+            if constructor_calls == 2:
+                survivor = os.open("/dev/zero", os.O_RDONLY)
+                nested_survivors.append(survivor)
+                error = KeyboardInterrupt("simulated anchor wrapper constructor failure")
+                error.survivor_descriptors = (survivor,)
+                raise error
+            wrapper = real_managed(descriptor, **kwargs)
+            wrappers.append(wrapper)
+            return wrapper
+
+        def fail_first_wrapper_close(wrapper):
+            if wrapper is wrappers[0]:
+                raise OSError(errno.EIO, "simulated wrapper close failure")
+            return real_close(wrapper)
+
+        try:
+            with (
+                mock.patch.object(
+                    generation,
+                    "_ManagedDescriptor",
+                    side_effect=construct,
+                ),
+                mock.patch.object(
+                    real_managed,
+                    "close",
+                    autospec=True,
+                    side_effect=fail_first_wrapper_close,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "wrapper constructor failure"
+                ) as raised,
+            ):
+                capture._bind_stderr_descriptor(
+                    "_stderr_saved_fd",
+                    "_stderr_saved_fd_identity",
+                    source,
+                )
+
+            survivors = tuple(raised.exception.survivor_descriptors)
+            self.assertIn(anchors[0], survivors)
+            self.assertIn(nested_survivors[0], survivors)
+            for descriptor in survivors:
+                os.fstat(descriptor)
+        finally:
+            for wrapper in wrappers:
+                try:
+                    real_close(wrapper)
+                except BaseException:
+                    pass
+            for descriptor in set(anchors + nested_survivors + [source]):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_closed_anchor_marker_is_retained_for_partial_retry_then_cleared(self):
+        source = os.open("/dev/null", os.O_RDONLY)
+        capture = generation._RuntimeEvidenceCapture()
+        real_managed = generation._ManagedDescriptor
+        first_fd = os.dup(source)
+        second_fd = os.dup(source)
+        first = real_managed(first_fd, mode="rb", retain_witness=False)
+        second = real_managed(second_fd, mode="rb", retain_witness=False)
+        first_descriptor = first.fileno()
+        replacement = -1
+        identity = capture._stderr_descriptor_identity(source)
+        capture._stderr_fd_anchors[source] = (first, second, identity)
+        real_close = real_managed.close
+        failed = False
+
+        def fail_second_once(wrapper):
+            nonlocal failed
+            if wrapper is second and not failed:
+                failed = True
+                raise KeyboardInterrupt("simulated partial anchor close")
+            return real_close(wrapper)
+
+        try:
+            os.close(first_descriptor)
+            replacement = os.open("/dev/zero", os.O_RDONLY)
+            self.assertEqual(replacement, first_descriptor)
+            with mock.patch.object(
+                real_managed,
+                "close",
+                autospec=True,
+                side_effect=fail_second_once,
+            ):
+                errors, released = capture._close_stderr_anchor(source)
+            self.assertFalse(released)
+            self.assertTrue(failed)
+            self.assertIn(id(first), capture._stderr_closed_anchor_ids)
+            self.assertFalse(
+                any("closed outside the managed cleanup path" in str(error) for error in errors)
+            )
+
+            errors, released = capture._close_stderr_anchor(source)
+            self.assertTrue(released)
+            self.assertNotIn(source, capture._stderr_fd_anchors)
+            self.assertEqual(capture._stderr_closed_anchor_ids, set())
+            self.assertFalse(
+                any("closed outside the managed cleanup path" in str(error) for error in errors)
+            )
+        finally:
+            if replacement >= 0:
+                try:
+                    os.close(replacement)
+                except OSError:
+                    pass
+            try:
+                real_close(second)
+            except BaseException:
+                pass
+            try:
+                os.close(source)
+            except OSError:
+                pass
+
     def test_anchor_pre_close_cancellation_retains_retry_ownership(self):
         capture = generation._RuntimeEvidenceCapture()
         capture.__enter__()
         descriptor = capture._stderr_stream_fd
-        anchor = capture._stderr_fd_anchors[descriptor]
-        real_close = generation.os.close
+        anchor_file, witness_file, anchor_identity = capture._stderr_fd_anchors[
+            descriptor
+        ]
+        anchor = anchor_file.fileno()
+        real_close = generation._ManagedDescriptor.close
         cancelled = False
 
         def cancel_anchor_close(candidate):
             nonlocal cancelled
-            if candidate == anchor and not cancelled:
+            if candidate is anchor_file and not cancelled:
                 cancelled = True
                 raise KeyboardInterrupt("simulated anchor pre-close cancellation")
             return real_close(candidate)
@@ -536,7 +875,10 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         try:
             with (
                 mock.patch.object(
-                    generation.os, "close", side_effect=cancel_anchor_close
+                    generation._ManagedDescriptor,
+                    "close",
+                    autospec=True,
+                    side_effect=cancel_anchor_close,
                 ),
                 self.assertRaisesRegex(
                     RuntimeError, "runtime evidence capture finalization failed"
@@ -547,7 +889,10 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             self.assertTrue(cancelled)
             self.assertTrue(capture._cleanup_pending)
             self.assertEqual(capture._stderr_stream_fd, descriptor)
-            self.assertEqual(capture._stderr_fd_anchors.get(descriptor), anchor)
+            self.assertEqual(
+                capture._stderr_fd_anchors.get(descriptor),
+                (anchor_file, witness_file, anchor_identity),
+            )
 
             capture.__exit__(None, None, None)
             self.assertFalse(capture._cleanup_pending)
@@ -2023,6 +2368,82 @@ class PipelineStagingTest(unittest.TestCase):
 
 
 class DescriptorBoundPublicationTest(unittest.TestCase):
+    def test_raw_descriptor_close_exhaustion_publishes_live_survivor(self):
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        real_close = generation.os.close
+        calls = 0
+
+        def fail_before_close(candidate):
+            nonlocal calls
+            self.assertEqual(candidate, descriptor)
+            calls += 1
+            raise OSError(errno.EIO, "simulated persistent close failure")
+
+        try:
+            with mock.patch.object(
+                generation.os, "close", side_effect=fail_before_close
+            ):
+                errors, survivors = generation._close_raw_descriptor_with_reconciliation(
+                    descriptor
+                )
+            self.assertEqual(calls, 3)
+            self.assertTrue(errors)
+            self.assertIn(descriptor, survivors)
+            os.fstat(descriptor)
+        finally:
+            real_close(descriptor)
+
+    def test_atomic_parent_close_failure_publishes_survivor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_open = generation._open_pinned_directory
+            real_close = generation.os.close
+            parent_descriptor = -1
+            failed = False
+            close_attempts = 0
+
+            def open_parent(*args, **kwargs):
+                nonlocal parent_descriptor
+                parent_descriptor = real_open(*args, **kwargs)
+                return parent_descriptor
+
+            def fail_parent_close(candidate):
+                nonlocal failed, close_attempts
+                if candidate == parent_descriptor:
+                    close_attempts += 1
+                    failed = True
+                    raise OSError(errno.EIO, "simulated parent close failure")
+                return real_close(candidate)
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_open_pinned_directory",
+                        side_effect=open_parent,
+                    ),
+                    mock.patch.object(
+                        generation.os,
+                        "close",
+                        side_effect=fail_parent_close,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "simulated parent close failure"
+                    ) as raised:
+                        generation.atomic_create_bytes(target, b"payload\n")
+                self.assertTrue(failed)
+                self.assertEqual(close_attempts, 3)
+                self.assertTrue(target.is_file())
+                self.assertIn(parent_descriptor, generation._exception_survivor_descriptors(raised.exception))
+                os.fstat(parent_descriptor)
+            finally:
+                if parent_descriptor >= 0:
+                    try:
+                        real_close(parent_descriptor)
+                    except OSError:
+                        pass
+
     def test_fd_headroom_rejects_low_limit_before_publication(self):
         with (
             mock.patch.object(
@@ -2145,6 +2566,71 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             with self.assertRaises(OSError) as raised:
                 os.fstat(opened[0])
             self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_pinned_directory_wrapper_preserves_open_survivor_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            survivor = os.open("/dev/zero", os.O_RDONLY)
+            original = OSError(errno.EIO, "simulated pinned open failure")
+            original.survivor_descriptors = (survivor,)
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_open_with_reconciliation",
+                        side_effect=original,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "stable non-symlink directory"
+                    ) as raised,
+                ):
+                    generation._open_pinned_directory(path, "fixture directory")
+                self.assertEqual(
+                    tuple(raised.exception.survivor_descriptors),
+                    (survivor,),
+                )
+                os.fstat(survivor)
+            finally:
+                try:
+                    os.close(survivor)
+                except OSError:
+                    pass
+
+    def test_pinned_directory_at_wrapper_preserves_open_survivor_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "child").mkdir()
+            parent = os.open(root, generation._directory_flags())
+            survivor = os.open("/dev/zero", os.O_RDONLY)
+            original = OSError(errno.EIO, "simulated pinned-at open failure")
+            original.survivor_descriptors = (survivor,)
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_open_with_reconciliation",
+                        side_effect=original,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "stable non-symlink directory"
+                    ) as raised,
+                ):
+                    generation._open_pinned_directory_at(
+                        parent,
+                        "child",
+                        "fixture child",
+                    )
+                self.assertEqual(
+                    tuple(raised.exception.survivor_descriptors),
+                    (survivor,),
+                )
+                os.fstat(survivor)
+            finally:
+                try:
+                    os.close(survivor)
+                except OSError:
+                    pass
+                os.close(parent)
 
     def test_directory_chain_external_guard_owns_every_returned_descriptor(self):
         class InterruptingGuard(list):
@@ -2611,25 +3097,27 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                 staging_directory_descriptor=staging_fd,
             )
             prepared_descriptor = prepared.descriptor
-            real_close = generation.os.close
+            real_close = generation._ManagedDescriptor.close
             sentinel_descriptor = -1
             cancelled = False
 
-            def close_then_reuse(descriptor):
+            def close_then_reuse(descriptor_file):
                 nonlocal sentinel_descriptor, cancelled
+                descriptor = descriptor_file.fileno()
                 if descriptor == prepared_descriptor and not cancelled:
                     cancelled = True
-                    real_close(descriptor)
+                    real_close(descriptor_file)
                     sentinel_descriptor = os.open("/dev/null", os.O_RDONLY)
                     self.assertEqual(sentinel_descriptor, descriptor)
                     raise KeyboardInterrupt("simulated prepared close cancellation")
-                return real_close(descriptor)
+                return real_close(descriptor_file)
 
             try:
                 with (
                     mock.patch.object(
-                        generation.os,
+                        generation._ManagedDescriptor,
                         "close",
+                        autospec=True,
                         side_effect=close_then_reuse,
                     ),
                     self.assertRaisesRegex(KeyboardInterrupt, "prepared close"),
@@ -2967,9 +3455,11 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                         "fixture record",
                     )
                 self.assertEqual(len(publications._rows), 1)
-                held_descriptor = publications._rows[0][0]
+                held_file = publications._rows[0][0]
+                held_descriptor = held_file.fileno()
                 os.fstat(held_descriptor)
                 publications.close()
+                self.assertTrue(held_file.closed)
                 with self.assertRaises(OSError) as closed:
                     os.fstat(held_descriptor)
                 self.assertEqual(closed.exception.errno, errno.EBADF)
@@ -3145,7 +3635,7 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
                         payload,
                         f"fixture {path.name}",
                     )
-                second_descriptor = publications._rows[1][0]
+                second_descriptor = publications._rows[1][0].fileno()
                 first_before = first.stat()
 
                 def mutate_first_while_hashing_second(descriptor, count, offset):
@@ -3179,22 +3669,24 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
     def test_committed_output_is_not_masked_by_source_close_error(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "receipt.json"
-            real_close = generation.os.close
+            real_close = generation._ManagedDescriptor.close
             failed = False
 
-            def close_then_report_error(descriptor):
+            def close_then_report_error(descriptor_file):
                 nonlocal failed
+                descriptor = descriptor_file.fileno()
                 if target.exists() and not failed and not os.path.isdir(
                     f"/proc/self/fd/{descriptor}"
                 ):
                     failed = True
-                    real_close(descriptor)
+                    real_close(descriptor_file)
                     raise OSError(errno.EIO, "simulated source close error")
-                return real_close(descriptor)
+                return real_close(descriptor_file)
 
             with mock.patch.object(
-                generation.os,
+                generation._ManagedDescriptor,
                 "close",
+                autospec=True,
                 side_effect=close_then_report_error,
             ):
                 identity = generation.atomic_create_bytes(target, b"committed\n")
@@ -6277,25 +6769,27 @@ class AuthorizedGenerationTest(unittest.TestCase):
 
     def test_success_publication_close_cancellation_is_propagated(self):
         real_close = generation._PublishedArtifacts.close
-        real_os_close = generation.os.close
+        real_descriptor_close = generation._ManagedDescriptor.close
         pinned_descriptors = []
         target_descriptor = -1
+        target_file = None
         cancelled = False
 
         def close_with_inventory(publications):
-            nonlocal target_descriptor
-            pinned_descriptors.extend(row[0] for row in publications._rows)
-            target_descriptor = publications._rows[-1][0]
+            nonlocal target_descriptor, target_file
+            pinned_descriptors.extend(row[0].fileno() for row in publications._rows)
+            target_file = publications._rows[-1][0]
+            target_descriptor = target_file.fileno()
             return real_close(publications)
 
-        def cancel_before_close(descriptor):
+        def cancel_before_close(descriptor_file):
             nonlocal cancelled
-            if descriptor == target_descriptor and not cancelled:
+            if descriptor_file is target_file and not cancelled:
                 cancelled = True
                 raise KeyboardInterrupt(
                     "simulated success publication pre-close cancellation"
                 )
-            return real_os_close(descriptor)
+            return real_descriptor_close(descriptor_file)
 
         try:
             with (
@@ -6306,8 +6800,9 @@ class AuthorizedGenerationTest(unittest.TestCase):
                     side_effect=close_with_inventory,
                 ),
                 mock.patch.object(
-                    generation.os,
+                    generation._ManagedDescriptor,
                     "close",
+                    autospec=True,
                     side_effect=cancel_before_close,
                 ),
                 self.assertRaisesRegex(
@@ -6333,33 +6828,39 @@ class AuthorizedGenerationTest(unittest.TestCase):
             self.assertFalse((self.output / "failure.json").exists())
         finally:
             if target_descriptor >= 0:
-                real_os_close(target_descriptor)
+                try:
+                    os.close(target_descriptor)
+                except OSError:
+                    pass
 
     def test_failure_publication_close_cancellation_attaches_to_primary(self):
         real_close = generation._PublishedArtifacts.close
-        real_os_close = generation.os.close
+        real_descriptor_close = generation._ManagedDescriptor.close
         target_descriptor = -1
+        target_file = None
         sentinel_descriptor = -1
         sentinel_descriptors = []
         cancelled = False
 
         def close_with_inventory(publications):
-            nonlocal target_descriptor
-            target_descriptor = publications._rows[-1][0]
+            nonlocal target_descriptor, target_file
+            target_file = publications._rows[-1][0]
+            target_descriptor = target_file.fileno()
             return real_close(publications)
 
-        def close_reuse_then_cancel(descriptor):
+        def close_reuse_then_cancel(descriptor_file):
             nonlocal cancelled, sentinel_descriptor
-            if descriptor == target_descriptor and not cancelled:
+            descriptor = descriptor_file.fileno()
+            if descriptor_file is target_file and not cancelled:
                 cancelled = True
-                real_os_close(descriptor)
+                real_descriptor_close(descriptor_file)
                 while descriptor not in sentinel_descriptors:
                     sentinel_descriptors.append(os.open("/dev/null", os.O_RDONLY))
                 sentinel_descriptor = descriptor
                 raise KeyboardInterrupt(
                     "simulated failure publication post-close cancellation"
                 )
-            return real_os_close(descriptor)
+            return real_descriptor_close(descriptor_file)
 
         try:
             with (
@@ -6370,8 +6871,9 @@ class AuthorizedGenerationTest(unittest.TestCase):
                     side_effect=close_with_inventory,
                 ),
                 mock.patch.object(
-                    generation.os,
+                    generation._ManagedDescriptor,
                     "close",
+                    autospec=True,
                     side_effect=close_reuse_then_cancel,
                 ),
                 self.assertRaisesRegex(
@@ -6395,7 +6897,10 @@ class AuthorizedGenerationTest(unittest.TestCase):
             self.assertTrue((self.output / "failure.json").is_file())
         finally:
             for descriptor in sentinel_descriptors:
-                real_os_close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def test_pre_success_same_inode_record_rewrite_blocks_success(self):
         first_task = self.design["tasks"][0]["task_id"]
