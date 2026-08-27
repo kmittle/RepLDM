@@ -217,6 +217,8 @@ _EVIDENCE_SCOPE = {
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _CUDA_DEVICE = re.compile(r"cuda:(0|[1-9][0-9]*)")
+_PYTHON_SYS_MODULE = sys
+_RUNTIME_CAPTURE_FINALIZATION_ATTEMPTS = 3
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -404,6 +406,36 @@ class _RuntimeEvidenceCapture:
             errors.append(RuntimeError("Python stderr target could not be restored and verified"))
         return errors, restored
 
+    def _restore_python_stderr_direct(self) -> tuple[list[BaseException], bool]:
+        """Restore the real sys module when ordinary assignment stays interrupted."""
+
+        errors: list[BaseException] = []
+        if not self._stderr_python_restore_pending:
+            return errors, True
+        target = self._stderr_previous_target
+        namespace = vars(_PYTHON_SYS_MODULE)
+        restored = False
+        for _ in range(3):
+            try:
+                namespace["stderr"] = target
+            except BaseException as exc:
+                errors.append(exc)
+            try:
+                restored = namespace.get("stderr") is target
+            except BaseException as exc:
+                errors.append(exc)
+            if restored:
+                break
+        if restored:
+            self._stderr_python_restore_pending = False
+            self._stderr_previous_target = None
+            self._stderr_context = None
+        else:
+            errors.append(
+                RuntimeError("direct Python stderr restore could not be verified")
+            )
+        return errors, restored
+
     def _logger_state_is_restored(self) -> bool:
         target_level = self._previous_root_level
         return target_level is None or (
@@ -495,7 +527,7 @@ class _RuntimeEvidenceCapture:
                 target=self._run_stderr_reader,
                 args=(read_fd, handoff),
                 name="adaptive-oracle-stderr-capture",
-                daemon=False,
+                daemon=True,
             )
             self._stderr_thread.start()
             reader_owns, handoff_errors = handoff.release(True)
@@ -573,6 +605,11 @@ class _RuntimeEvidenceCapture:
             self._restore_python_stderr()
         )
         errors.extend(python_restore_errors)
+        if not python_stderr_restored:
+            direct_restore_errors, python_stderr_restored = (
+                self._restore_python_stderr_direct()
+            )
+            errors.extend(direct_restore_errors)
         stderr_restored = True
         saved_fd = self._stderr_saved_fd
         if saved_fd is not None:
@@ -817,6 +854,37 @@ class _RuntimeEvidenceCapture:
                 "stderr_warning_line_count": stderr_warning_line_count,
             },
         }
+
+
+def _finalize_runtime_capture(
+    capture: _RuntimeEvidenceCapture,
+    exc_info: tuple[Optional[type[BaseException]], Optional[BaseException], Any],
+    *,
+    read_record: bool,
+) -> tuple[Optional[dict[str, Any]], list[BaseException], bool]:
+    errors: list[BaseException] = []
+    for _ in range(_RUNTIME_CAPTURE_FINALIZATION_ATTEMPTS):
+        try:
+            capture.__exit__(*exc_info)
+        except BaseException as exc:
+            errors.append(exc)
+        released = not capture._entered and not capture._cleanup_pending
+        if not released:
+            continue
+        evidence: Optional[dict[str, Any]] = None
+        if read_record:
+            try:
+                evidence = capture.record()
+            except BaseException as exc:
+                errors.append(exc)
+        return evidence, errors, True
+
+    pending_error = RuntimeError(
+        "runtime evidence capture cleanup remained pending after retries"
+    )
+    pending_error.runtime_capture = capture
+    pending_error.secondary_exceptions = tuple(errors)
+    return None, [pending_error], False
 
 
 def _require_warning_free_runtime_evidence(evidence: Mapping[str, Any]) -> None:
@@ -5422,10 +5490,18 @@ def _run_authorized_engineering_generation(
         secondary_errors: list[tuple[str, BaseException]] = []
         runtime_cleanup_error: Optional[BaseException] = None
         if runtime_capture is not None:
-            try:
-                runtime_capture.__exit__(*original_exc_info)
-                runtime_evidence = runtime_capture.record()
-            except BaseException as capture_exc:
+            (
+                captured_evidence,
+                capture_errors,
+                capture_released,
+            ) = _finalize_runtime_capture(
+                runtime_capture,
+                original_exc_info,
+                read_record=True,
+            )
+            if captured_evidence is not None:
+                runtime_evidence = captured_evidence
+            for capture_exc in capture_errors:
                 cancellation_seen = (
                     cancellation_seen
                     or _exception_contains_cancellation(capture_exc)
@@ -5433,8 +5509,10 @@ def _run_authorized_engineering_generation(
                 secondary_errors.append(
                     ("runtime evidence finalization also failed", capture_exc)
                 )
-            finally:
+            if capture_released:
                 runtime_capture = None
+            else:
+                cancellation_seen = True
         if not cancellation_seen and owned_output and output_descriptor >= 0:
             try:
                 if not _entry_exists(output_descriptor, "attempt.json"):
@@ -5615,6 +5693,19 @@ def _run_authorized_engineering_generation(
     finally:
         active_error = sys.exc_info()[1]
         cleanup_errors: list[BaseException] = []
+        if runtime_capture is not None:
+            _, capture_errors, capture_released = _finalize_runtime_capture(
+                runtime_capture,
+                (
+                    type(active_error) if active_error is not None else None,
+                    active_error,
+                    active_error.__traceback__ if active_error is not None else None,
+                ),
+                read_record=False,
+            )
+            cleanup_errors.extend(capture_errors)
+            if capture_released:
+                runtime_capture = None
         try:
             cleanup_errors.extend(publications.close())
         except BaseException as cleanup_error:

@@ -899,6 +899,14 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         try:
             with (
                 mock.patch.object(generation, "sys", proxy),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr_direct",
+                    return_value=(
+                        [KeyboardInterrupt("simulated direct restore cancellation")],
+                        False,
+                    ),
+                ),
                 self.assertRaisesRegex(
                     RuntimeError,
                     "runtime evidence capture finalization failed",
@@ -925,6 +933,58 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             self.assertFalse(capture._entered)
             self.assertFalse(capture._cleanup_pending)
             self.assertFalse(capture._stderr_python_restore_pending)
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
+    def test_direct_python_stderr_fallback_releases_after_normal_exhaustion(self):
+        class InterruptingSys:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+                self.restore_attempts = 0
+
+            @property
+            def stderr(self):
+                return self._wrapped.stderr
+
+            @stderr.setter
+            def stderr(self, _value):
+                self.restore_attempts += 1
+                raise KeyboardInterrupt("simulated persistent ordinary restore failure")
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        capture.__enter__()
+        captured_stream = capture._stderr_stream
+        thread = capture._stderr_thread
+        proxy = InterruptingSys(generation.sys)
+        try:
+            with (
+                mock.patch.object(generation, "sys", proxy),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence capture finalization failed",
+                ) as raised,
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertEqual(proxy.restore_attempts, 3)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertTrue(captured_stream.closed)
+            self.assertTrue(thread.daemon)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_thread)
+            capture.record()
         finally:
             if sys.stderr is not original_stderr:
                 sys.stderr = original_stderr
@@ -4701,6 +4761,279 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertIn("model_cleanup", events)
         self.assertFalse((self.output / "success.json").exists())
         self.assertFalse((self.output / "failure.json").exists())
+
+    def test_core_failure_with_persistent_normal_restore_releases_wrapper_capture(self):
+        events = []
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        restore_error = KeyboardInterrupt(
+            "simulated persistent wrapper stderr restoration cancellation"
+        )
+        try:
+            with (
+                mock.patch.object(
+                    generation,
+                    "_RuntimeEvidenceCapture",
+                    return_value=capture,
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr",
+                    return_value=([restore_error], False),
+                ) as restore,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence finalization also failed",
+                ) as raised,
+            ):
+                self._run(
+                    events,
+                    task_error=RuntimeError("simulated generation core failure"),
+                )
+
+            restore.assert_called_once_with()
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_stream)
+            self.assertIsNone(capture._stderr_thread)
+            self.assertFalse((self.output / "success.json").exists())
+            self.assertFalse((self.output / "failure.json").exists())
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
+    def test_success_cleanup_retries_pending_wrapper_capture_before_release(self):
+        events = []
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        real_restore = capture._restore_python_stderr
+        real_direct_restore = capture._restore_python_stderr_direct
+        restore_calls = 0
+        direct_restore_calls = 0
+
+        def fail_twice_then_restore():
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls <= 2:
+                return (
+                    [KeyboardInterrupt("simulated repeated wrapper restore cancellation")],
+                    False,
+                )
+            return real_restore()
+
+        def fail_twice_then_direct_restore():
+            nonlocal direct_restore_calls
+            direct_restore_calls += 1
+            if direct_restore_calls <= 2:
+                return (
+                    [KeyboardInterrupt("simulated repeated direct restore cancellation")],
+                    False,
+                )
+            return real_direct_restore()
+
+        try:
+            with (
+                mock.patch.object(
+                    generation,
+                    "_RuntimeEvidenceCapture",
+                    return_value=capture,
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr",
+                    side_effect=fail_twice_then_restore,
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr_direct",
+                    side_effect=fail_twice_then_direct_restore,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence finalization also failed",
+                ) as raised,
+            ):
+                self._run(events)
+
+            self.assertEqual(restore_calls, 3)
+            self.assertEqual(direct_restore_calls, 2)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_stream)
+            self.assertIsNone(capture._stderr_thread)
+            self.assertFalse((self.output / "success.json").exists())
+            self.assertFalse((self.output / "failure.json").exists())
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
+    def test_persistent_wrapper_cleanup_failure_hands_off_daemon_capture(self):
+        events = []
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        captured_stream = None
+        try:
+            with (
+                mock.patch.object(
+                    generation,
+                    "_RuntimeEvidenceCapture",
+                    return_value=capture,
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr",
+                    return_value=(
+                        [KeyboardInterrupt("simulated persistent normal failure")],
+                        False,
+                    ),
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr_direct",
+                    return_value=(
+                        [KeyboardInterrupt("simulated persistent direct failure")],
+                        False,
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence finalization also failed",
+                ) as raised,
+            ):
+                self._run(
+                    events,
+                    task_error=RuntimeError("simulated generation core failure"),
+                )
+
+            pending_errors = [
+                error
+                for _label, error in raised.exception.secondary_errors
+                if hasattr(error, "runtime_capture")
+            ]
+            self.assertEqual(len(pending_errors), 1)
+            self.assertIs(pending_errors[0].runtime_capture, capture)
+            captured_stream = capture._stderr_stream
+            thread = capture._stderr_thread
+            self.assertTrue(capture._cleanup_pending)
+            self.assertIs(sys.stderr, captured_stream)
+            self.assertFalse(captured_stream.closed)
+            self.assertIsNotNone(thread)
+            self.assertTrue(thread.daemon)
+            self.assertTrue(thread.is_alive())
+            self.assertFalse((self.output / "success.json").exists())
+            self.assertFalse((self.output / "failure.json").exists())
+
+            capture.__exit__(None, None, None)
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertTrue(captured_stream.closed)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(capture._cleanup_pending)
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
+    def test_enter_rollback_retries_pending_wrapper_capture_before_release(self):
+        events = []
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        real_restore = capture._restore_python_stderr
+        real_direct_restore = capture._restore_python_stderr_direct
+        root_logger = logging.getLogger()
+        real_add_handler = root_logger.addHandler
+        restore_calls = 0
+        direct_restore_calls = 0
+
+        def add_then_fail(handler):
+            real_add_handler(handler)
+            raise RuntimeError("simulated wrapper capture enter failure")
+
+        def fail_twice_then_restore():
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls <= 2:
+                return (
+                    [KeyboardInterrupt("simulated enter rollback cancellation")],
+                    False,
+                )
+            return real_restore()
+
+        def fail_twice_then_direct_restore():
+            nonlocal direct_restore_calls
+            direct_restore_calls += 1
+            if direct_restore_calls <= 2:
+                return (
+                    [KeyboardInterrupt("simulated direct enter rollback cancellation")],
+                    False,
+                )
+            return real_direct_restore()
+
+        try:
+            with (
+                mock.patch.object(
+                    generation,
+                    "_RuntimeEvidenceCapture",
+                    return_value=capture,
+                ),
+                mock.patch.object(
+                    root_logger,
+                    "addHandler",
+                    side_effect=add_then_fail,
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr",
+                    side_effect=fail_twice_then_restore,
+                ),
+                mock.patch.object(
+                    capture,
+                    "_restore_python_stderr_direct",
+                    side_effect=fail_twice_then_direct_restore,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence finalization also failed",
+                ) as raised,
+            ):
+                self._run(events)
+
+            self.assertEqual(restore_calls, 3)
+            self.assertEqual(direct_restore_calls, 2)
+            self.assertIn(
+                "wrapper capture enter failure",
+                str(raised.exception.original_error),
+            )
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertNotIn(capture._log_handler, root_logger.handlers)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_stream)
+            self.assertIsNone(capture._stderr_thread)
+            self.assertFalse((self.output / "success.json").exists())
+            self.assertFalse((self.output / "failure.json").exists())
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._log_handler in root_logger.handlers:
+                root_logger.removeHandler(capture._log_handler)
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
 
     def test_existing_output_is_terminal_before_runtime_load(self):
         self.output.mkdir()
