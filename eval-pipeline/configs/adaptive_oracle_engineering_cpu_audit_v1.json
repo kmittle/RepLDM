@@ -81,7 +81,7 @@
   },
   "implementation": {
     "clean": true,
-    "commit": "298c8a4276aa604d5ee8bbfa4d9dd47e3609ab99",
+    "commit": "073bc48c321053481ec705eec0451fc58c7072b9",
     "source_files": [
       {
         "path": "AttentionGuidance/__init__.py",
@@ -175,8 +175,8 @@
       },
       {
         "path": "eval-pipeline/generate_adaptive_oracle_engineering.py",
-        "sha256": "a4f970df4b0aad80826d78df18779b3f9ae796170e2804d9547bc47df29d84fb",
-        "size": 237418
+        "sha256": "57471c9c2bd9acf7bcb45c41f1bf7e840f003464bc85542328d19a1eed0d6467",
+        "size": 316917
       },
       {
         "path": "eval-pipeline/adaptive_oracle_generation_environment.py",
@@ -341,8 +341,8 @@
       },
       {
         "path": "tests/test_generate_adaptive_oracle_engineering.py",
-        "sha256": "a594af81cdf3577ed492be835599721add353c9b69dd361d8825800a3face0f3",
-        "size": 256689
+        "sha256": "02de2c486f2650c17cb72a058c5b9aca702c516bde53bef7a500162436066fea",
+        "size": 280241
       },
       {
         "path": "tests/test_launch_adaptive_oracle_tool.py",
@@ -358,9 +358,9 @@
     "status": "passed_warning_free",
     "stderr_byte_count": 0,
     "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "stdout_byte_count": 76575,
-    "stdout_sha256": "2e324f81fbc8642e0ad2ed5e8885910fb969f0a9937128282a030fb204cfe676",
-    "test_count": 391,
+    "stdout_byte_count": 79945,
+    "stdout_sha256": "ff32f9e2f9431f40312f249b310dfe7c7f3448f6a041b3bf92ed205e3eb756c4",
+    "test_count": 407,
     "warning_count": 0,
     "warnings_as_errors": true
   },
