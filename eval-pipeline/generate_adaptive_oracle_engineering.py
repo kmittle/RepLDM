@@ -267,6 +267,7 @@ class _RuntimeEvidenceCapture:
         self._stderr_stream: Optional[io.TextIOWrapper] = None
         self._stderr_stream_fd: Optional[int] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_thread_started = False
         self._stderr_context: Optional[Any] = None
         self._log_handler = _EvidenceLogHandler()
         self._warning_context = warnings.catch_warnings(record=True)
@@ -275,10 +276,7 @@ class _RuntimeEvidenceCapture:
         self._observed_warnings: list[Any] = []
         self._entered = False
 
-    def _drain_stderr(self) -> None:
-        descriptor = self._stderr_read_fd
-        if descriptor is None:
-            return
+    def _drain_stderr(self, descriptor: int) -> None:
         eof_deadline: Optional[float] = None
         try:
             while True:
@@ -307,8 +305,14 @@ class _RuntimeEvidenceCapture:
         finally:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
+            except BaseException as close_error:
+                if self._stderr_reader_error is None:
+                    self._stderr_reader_error = close_error
+                else:
+                    _attach_secondary_exception(
+                        self._stderr_reader_error,
+                        close_error,
+                    )
 
     def _start_stderr_capture(self) -> None:
         saved_fd = -1
@@ -330,10 +334,12 @@ class _RuntimeEvidenceCapture:
             self._stderr_read_fd = read_fd
             self._stderr_thread = threading.Thread(
                 target=self._drain_stderr,
+                args=(read_fd,),
                 name="adaptive-oracle-stderr-capture",
                 daemon=False,
             )
             self._stderr_thread.start()
+            self._stderr_thread_started = True
             os.dup2(write_fd, 2, inheritable=True)
             try:
                 os.close(write_fd)
@@ -376,6 +382,10 @@ class _RuntimeEvidenceCapture:
                     os.dup2(saved_descriptor, 2, inheritable=True)
                 except BaseException as cleanup_error:
                     cleanup_errors.append(cleanup_error)
+                    try:
+                        os.close(2)
+                    except BaseException as close_error:
+                        cleanup_errors.append(close_error)
             saved_candidates = [
                 *saved_fd_guard,
                 *(
@@ -427,7 +437,13 @@ class _RuntimeEvidenceCapture:
             self._stderr_stop.set()
             thread = self._stderr_thread
             self._stderr_thread = None
-            if thread is not None:
+            thread_started = self._stderr_thread_started or (
+                thread is not None and thread.ident is not None
+            )
+            self._stderr_thread_started = False
+            read_descriptor = self._stderr_read_fd
+            self._stderr_read_fd = None
+            if thread is not None and thread_started:
                 try:
                     thread.join()
                 except BaseException as cleanup_error:
@@ -437,7 +453,6 @@ class _RuntimeEvidenceCapture:
                     except BaseException as retry_error:
                         cleanup_errors.append(retry_error)
             else:
-                read_descriptor = self._stderr_read_fd
                 if read_descriptor is None:
                     read_descriptor = read_fd
                 if read_descriptor is not None:
@@ -445,8 +460,10 @@ class _RuntimeEvidenceCapture:
                         os.close(read_descriptor)
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
-            self._stderr_read_fd = None
-
+            reader_error = self._stderr_reader_error
+            self._stderr_reader_error = None
+            if reader_error is not None:
+                cleanup_errors.append(reader_error)
             for cleanup_error in cleanup_errors:
                 _attach_secondary_exception(exc, cleanup_error)
                 _add_exception_note(
@@ -461,7 +478,18 @@ class _RuntimeEvidenceCapture:
         stream = self._stderr_stream
         stream_fd = self._stderr_stream_fd
         saved_fd = self._stderr_saved_fd
+        read_fd = self._stderr_read_fd
         thread = self._stderr_thread
+        thread_started = self._stderr_thread_started or (
+            thread is not None and thread.ident is not None
+        )
+        self._stderr_context = None
+        self._stderr_stream = None
+        self._stderr_stream_fd = None
+        self._stderr_saved_fd = None
+        self._stderr_read_fd = None
+        self._stderr_thread = None
+        self._stderr_thread_started = False
         errors: list[BaseException] = []
         try:
             if stream is not None:
@@ -480,8 +508,8 @@ class _RuntimeEvidenceCapture:
             errors.append(exc)
             try:
                 os.close(2)
-            except OSError:
-                pass
+            except BaseException as close_error:
+                errors.append(close_error)
         finally:
             if saved_fd is not None:
                 try:
@@ -499,16 +527,24 @@ class _RuntimeEvidenceCapture:
         except BaseException as exc:
             errors.append(exc)
         self._stderr_stop.set()
-        if thread is not None:
-            thread.join()
-        if self._stderr_reader_error is not None:
-            errors.append(self._stderr_reader_error)
-        self._stderr_context = None
-        self._stderr_stream = None
-        self._stderr_stream_fd = None
-        self._stderr_saved_fd = None
-        self._stderr_read_fd = None
-        self._stderr_thread = None
+        if thread is not None and thread_started:
+            try:
+                thread.join()
+            except BaseException as exc:
+                errors.append(exc)
+                try:
+                    thread.join()
+                except BaseException as retry_error:
+                    errors.append(retry_error)
+        elif read_fd is not None:
+            try:
+                os.close(read_fd)
+            except BaseException as exc:
+                errors.append(exc)
+        reader_error = self._stderr_reader_error
+        self._stderr_reader_error = None
+        if reader_error is not None:
+            errors.append(reader_error)
         if errors:
             error = RuntimeError("OS stderr evidence capture failed")
             error.secondary_exceptions = tuple(errors)
@@ -517,26 +553,71 @@ class _RuntimeEvidenceCapture:
     def __enter__(self) -> "_RuntimeEvidenceCapture":
         if self._entered:
             raise RuntimeError("runtime evidence capture may be entered only once")
-        self._observed_warnings = self._warning_context.__enter__()
+        warning_entered = False
         try:
+            self._observed_warnings = self._warning_context.__enter__()
+            warning_entered = True
             warnings.simplefilter("always")
             self._start_stderr_capture()
             self._root_logger.setLevel(logging.NOTSET)
             self._root_logger.addHandler(self._log_handler)
             self._entered = True
             return self
-        except BaseException:
-            if self._stderr_saved_fd is not None:
-                self._stop_stderr_capture()
-            self._warning_context.__exit__(*sys.exc_info())
-            raise
+        except BaseException as exc:
+            error_traceback = exc.__traceback__
+            cleanup_errors: list[BaseException] = []
+            try:
+                self._root_logger.removeHandler(self._log_handler)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            try:
+                self._root_logger.setLevel(self._previous_root_level)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if any(
+                value is not None
+                for value in (
+                    self._stderr_context,
+                    self._stderr_stream,
+                    self._stderr_stream_fd,
+                    self._stderr_saved_fd,
+                    self._stderr_read_fd,
+                    self._stderr_thread,
+                )
+            ):
+                try:
+                    self._stop_stderr_capture()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if warning_entered:
+                try:
+                    self._warning_context.__exit__(
+                        type(exc),
+                        exc,
+                        error_traceback,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            self._entered = False
+            for cleanup_error in cleanup_errors:
+                _attach_secondary_exception(exc, cleanup_error)
+                _add_exception_note(
+                    exc,
+                    "runtime evidence enter rollback also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
+            raise exc.with_traceback(error_traceback)
 
     def __exit__(self, exc_type, exc, traceback_value) -> bool:
         if not self._entered:
             return False
+        self._entered = False
         cleanup_errors: list[BaseException] = []
         try:
             self._root_logger.removeHandler(self._log_handler)
+        except BaseException as cleanup_exc:
+            cleanup_errors.append(cleanup_exc)
+        try:
             self._root_logger.setLevel(self._previous_root_level)
         except BaseException as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
@@ -548,11 +629,11 @@ class _RuntimeEvidenceCapture:
             self._warning_context.__exit__(exc_type, exc, traceback_value)
         except BaseException as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
-        finally:
-            self._entered = False
         if cleanup_errors:
             error = RuntimeError("runtime evidence capture finalization failed")
             error.secondary_exceptions = tuple(cleanup_errors)
+            if isinstance(exc, BaseException):
+                _attach_secondary_exception(error, exc)
             raise error from cleanup_errors[0]
         return False
 
@@ -1413,6 +1494,28 @@ def _close_descriptors_after_error(
                 "descriptor cleanup also failed: "
                 f"{type(close_error).__name__}: {close_error}",
             )
+
+
+def _propagate_cleanup_errors(
+    active_error: Optional[BaseException],
+    errors: Sequence[BaseException],
+    label: str,
+) -> None:
+    """Attach cleanup failures to a primary or raise one structured failure."""
+
+    if not errors:
+        return
+    if active_error is not None:
+        for cleanup_error in errors:
+            _attach_secondary_exception(active_error, cleanup_error)
+            _add_exception_note(
+                active_error,
+                f"{label}: {type(cleanup_error).__name__}: {cleanup_error}",
+            )
+        return
+    error = RuntimeError(label)
+    error.secondary_exceptions = tuple(errors)
+    raise error from errors[0]
 
 
 def _open_descriptor_count() -> int:
@@ -5365,7 +5468,12 @@ def _run_authorized_engineering_generation(
             raise finalization_error from exc
         raise
     finally:
-        publications.close()
+        active_error = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+        try:
+            cleanup_errors.extend(publications.close())
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
         descriptors = [
             *records_claim_descriptor_guard,
             *output_recovery_descriptor_guard,
@@ -5380,11 +5488,16 @@ def _run_authorized_engineering_generation(
         for descriptor in descriptors:
             if descriptor < 0 or descriptor in closed:
                 continue
+            closed.add(descriptor)
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
-            closed.add(descriptor)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        _propagate_cleanup_errors(
+            active_error,
+            cleanup_errors,
+            "engineering generation descriptor finalization failed",
+        )
 
 
 def _run_from_verified_launcher(

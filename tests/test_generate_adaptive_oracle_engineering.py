@@ -605,6 +605,140 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertIsNone(capture._stderr_read_fd)
         self.assertIsNone(capture._stderr_thread)
 
+    def test_thread_start_failure_closes_pipe_and_restores_enter_state(self):
+        capture = generation._RuntimeEvidenceCapture()
+        before_fd2 = self._fd_identity(2)
+        filters_before = warnings.filters
+        pipe_descriptors = []
+        real_pipe = generation.os.pipe
+
+        def record_pipe():
+            descriptors = real_pipe()
+            pipe_descriptors.extend(descriptors)
+            return descriptors
+
+        with (
+            mock.patch.object(generation.os, "pipe", side_effect=record_pipe),
+            mock.patch.object(
+                generation.threading.Thread,
+                "start",
+                side_effect=RuntimeError("simulated thread start failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "thread start failure"),
+        ):
+            capture.__enter__()
+
+        self.assertEqual(self._fd_identity(2), before_fd2)
+        self.assertIs(warnings.filters, filters_before)
+        self.assertEqual(len(pipe_descriptors), 2)
+        for descriptor in pipe_descriptors:
+            with self.assertRaises(OSError) as closed:
+                os.fstat(descriptor)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+        self.assertIsNone(capture._stderr_saved_fd)
+        self.assertIsNone(capture._stderr_read_fd)
+        self.assertIsNone(capture._stderr_thread)
+        self.assertFalse(capture._stderr_thread_started)
+
+    def test_enter_rollback_survives_join_cancellation_and_restores_globals(self):
+        capture = generation._RuntimeEvidenceCapture()
+        root_logger = logging.getLogger()
+        before_level = root_logger.level
+        before_fd2 = self._fd_identity(2)
+        filters_before = warnings.filters
+        real_add_handler = root_logger.addHandler
+        real_join = generation.threading.Thread.join
+        join_cancelled = False
+
+        def add_then_fail(handler):
+            real_add_handler(handler)
+            raise RuntimeError("simulated logger handoff failure")
+
+        def cancel_first_capture_join(thread, *args, **kwargs):
+            nonlocal join_cancelled
+            if thread.name == "adaptive-oracle-stderr-capture" and not join_cancelled:
+                join_cancelled = True
+                raise KeyboardInterrupt("simulated enter rollback join cancellation")
+            return real_join(thread, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                root_logger,
+                "addHandler",
+                side_effect=add_then_fail,
+            ),
+            mock.patch.object(
+                generation.threading.Thread,
+                "join",
+                autospec=True,
+                side_effect=cancel_first_capture_join,
+            ),
+            self.assertRaisesRegex(RuntimeError, "logger handoff failure") as raised,
+        ):
+            capture.__enter__()
+
+        self.assertTrue(join_cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertEqual(root_logger.level, before_level)
+        self.assertNotIn(capture._log_handler, root_logger.handlers)
+        self.assertEqual(self._fd_identity(2), before_fd2)
+        self.assertIs(warnings.filters, filters_before)
+        self.assertFalse(capture._entered)
+        self.assertIsNone(capture._stderr_saved_fd)
+        self.assertIsNone(capture._stderr_stream_fd)
+        self.assertIsNone(capture._stderr_thread)
+        self.assertFalse(capture._stderr_thread_started)
+
+    def test_stop_join_cancellation_invalidates_state_before_fd_reuse(self):
+        capture = generation._RuntimeEvidenceCapture()
+        capture.__enter__()
+        thread = capture._stderr_thread
+        self.assertIsNotNone(thread)
+        owned_descriptors = {
+            capture._stderr_saved_fd,
+            capture._stderr_stream_fd,
+            capture._stderr_read_fd,
+        }
+        real_join = thread.join
+        join_cancelled = False
+
+        def cancel_once(*args, **kwargs):
+            nonlocal join_cancelled
+            if not join_cancelled:
+                join_cancelled = True
+                raise KeyboardInterrupt("simulated stop join cancellation")
+            return real_join(*args, **kwargs)
+
+        with (
+            mock.patch.object(thread, "join", side_effect=cancel_once),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(join_cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertFalse(capture._entered)
+        self.assertIsNone(capture._stderr_saved_fd)
+        self.assertIsNone(capture._stderr_stream_fd)
+        self.assertIsNone(capture._stderr_read_fd)
+        self.assertIsNone(capture._stderr_thread)
+        self.assertFalse(capture._stderr_thread_started)
+
+        sentinel = os.open("/dev/null", os.O_RDONLY)
+        try:
+            self.assertIn(sentinel, owned_descriptors)
+            capture._stop_stderr_capture()
+            os.fstat(sentinel)
+        finally:
+            os.close(sentinel)
+
     def test_raw_stderr_warning_categories_are_counted(self):
         capture = generation._RuntimeEvidenceCapture()
         raw = (
@@ -4838,6 +4972,76 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertTrue(cancelled)
         self.assertTrue((self.output / "success.json").is_file())
         self.assertFalse((self.output / "failure.json").exists())
+
+    def test_success_publication_close_cancellation_is_propagated(self):
+        real_close = generation._PublishedArtifacts.close
+        cancelled = False
+
+        def close_then_cancel(publications):
+            nonlocal cancelled
+            errors = real_close(publications)
+            if not cancelled:
+                cancelled = True
+                errors.append(
+                    KeyboardInterrupt("simulated success publication close cancellation")
+                )
+            return errors
+
+        with (
+            mock.patch.object(
+                generation._PublishedArtifacts,
+                "close",
+                autospec=True,
+                side_effect=close_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "generation descriptor finalization",
+            ) as raised,
+        ):
+            self._run([])
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertTrue((self.output / "success.json").is_file())
+        self.assertFalse((self.output / "failure.json").exists())
+
+    def test_failure_publication_close_cancellation_attaches_to_primary(self):
+        real_close = generation._PublishedArtifacts.close
+        cancelled = False
+
+        def close_then_cancel(publications):
+            nonlocal cancelled
+            errors = real_close(publications)
+            if not cancelled:
+                cancelled = True
+                errors.append(
+                    KeyboardInterrupt("simulated failure publication close cancellation")
+                )
+            return errors
+
+        with (
+            mock.patch.object(
+                generation._PublishedArtifacts,
+                "close",
+                autospec=True,
+                side_effect=close_then_cancel,
+            ),
+            self.assertRaisesRegex(RuntimeError, "generation core failure") as raised,
+        ):
+            self._run(
+                [],
+                task_error=RuntimeError("simulated generation core failure"),
+            )
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertFalse((self.output / "success.json").exists())
+        self.assertTrue((self.output / "failure.json").is_file())
 
     def test_pre_success_same_inode_record_rewrite_blocks_success(self):
         first_task = self.design["tasks"][0]["task_id"]

@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import stat
 import struct
+import sys
 import traceback
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 import zlib
@@ -1131,6 +1132,7 @@ class _PinnedRunTree:
         self.run_inventory: Optional[frozenset[str]] = None
         self.records_inventory: Optional[frozenset[str]] = None
         self.published_identities: dict[str, tuple[int, int]] = {}
+        self._closed = False
 
     def snapshot_inventories(self) -> None:
         self.run_inventory = _directory_names(
@@ -1209,8 +1211,15 @@ class _PinnedRunTree:
                 raise ValueError(f"published audit receipt identity changed: {name}")
         self.pins.verify()
 
-    def close(self) -> None:
-        self.pins.close()
+    def close(self) -> list[BaseException]:
+        if self._closed:
+            return []
+        self._closed = True
+        errors: list[BaseException] = []
+        try:
+            errors.extend(self.pins.close())
+        except BaseException as exc:
+            errors.append(exc)
         descriptors = [
             self.records_descriptor,
             self.run_descriptor,
@@ -1220,11 +1229,12 @@ class _PinnedRunTree:
         closed: set[int] = set()
         for descriptor in descriptors:
             if descriptor is not None and descriptor not in closed:
+                closed.add(descriptor)
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
-                closed.add(descriptor)
+                except BaseException as exc:
+                    errors.append(exc)
+        return errors
 
 
 def _pin_run_tree(
@@ -1359,6 +1369,25 @@ def _resolve_run_dir(
         Path(generation.OUTPUT_DIR),
         tree_guard=tree_guard,
     )
+
+
+def _finalize_run_trees(
+    trees: Sequence[_PinnedRunTree],
+    active_error: Optional[BaseException],
+    label: str,
+) -> None:
+    errors: list[BaseException] = []
+    closed: set[int] = set()
+    for tree in trees:
+        identity = id(tree)
+        if identity in closed:
+            continue
+        closed.add(identity)
+        try:
+            errors.extend(tree.close())
+        except BaseException as exc:
+            errors.append(exc)
+    generation._propagate_cleanup_errors(active_error, errors, label)
 
 
 def _terminal_state(tree: _PinnedRunTree) -> str:
@@ -2569,7 +2598,17 @@ def _audit_launcher_validated_run(
                     final_names = _directory_names(
                         tree.run_descriptor, "engineering run directory"
                     ).intersection({AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME})
-                except BaseException:
+                except BaseException as listing_exc:
+                    generation._attach_secondary_exception(exc, listing_exc)
+                    generation._add_exception_note(
+                        exc,
+                        "audit terminal observation also failed: "
+                        f"{type(listing_exc).__name__}: {listing_exc}",
+                    )
+                    cancellation_seen = (
+                        cancellation_seen
+                        or generation._exception_contains_cancellation(listing_exc)
+                    )
                     final_names = frozenset({"untrusted-directory-state"})
                 if not final_names:
                     try:
@@ -2590,10 +2629,15 @@ def _audit_launcher_validated_run(
                         raise finalization_error from exc
             raise
     finally:
-        for guarded_tree in tree_guard:
-            guarded_tree.close()
+        active_error = sys.exc_info()[1]
+        trees_to_close = list(tree_guard)
         if tree is not None and all(tree is not guarded for guarded in tree_guard):
-            tree.close()
+            trees_to_close.append(tree)
+        _finalize_run_trees(
+            trees_to_close,
+            active_error,
+            "engineering audit run-tree finalization failed",
+        )
 
 
 def _audit_validated_run(
@@ -2673,14 +2717,19 @@ def _audit_validated_run(
         tree.verify()
         return result
     finally:
-        for guarded_tree in tree_guard:
-            guarded_tree.close()
+        active_error = sys.exc_info()[1]
+        trees_to_close = list(tree_guard)
         if (
             own_tree
             and tree is not None
             and all(tree is not guarded for guarded in tree_guard)
         ):
-            tree.close()
+            trees_to_close.append(tree)
+        _finalize_run_trees(
+            trees_to_close,
+            active_error,
+            "direct engineering audit run-tree finalization failed",
+        )
 
 
 def main(

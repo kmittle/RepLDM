@@ -1423,6 +1423,119 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
 
+    def test_terminal_listing_cancellation_is_retained_without_failure(self):
+        real_names = audit._directory_names
+        core_failed = False
+        listing_cancelled = False
+
+        def fail_core(*_args, **_kwargs):
+            nonlocal core_failed
+            core_failed = True
+            raise RuntimeError("simulated audit core failure")
+
+        def cancel_final_listing(descriptor, label):
+            nonlocal listing_cancelled
+            if core_failed and not listing_cancelled:
+                listing_cancelled = True
+                raise KeyboardInterrupt(
+                    "simulated audit terminal listing cancellation"
+                )
+            return real_names(descriptor, label)
+
+        with (
+            mock.patch.object(audit, "_audit_validated_run", side_effect=fail_core),
+            mock.patch.object(
+                audit,
+                "_directory_names",
+                side_effect=cancel_final_listing,
+            ),
+            self.assertRaisesRegex(RuntimeError, "audit core failure") as raised,
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(core_failed)
+        self.assertTrue(listing_cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertTrue(
+            (self.fixture.run / audit.AUDIT_ATTEMPT_NAME).is_file()
+        )
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_success_pin_close_cancellation_is_propagated(self):
+        real_close = audit._PinnedArtifacts.close
+        cancelled = False
+
+        def close_then_cancel(pins):
+            nonlocal cancelled
+            errors = real_close(pins)
+            if not cancelled:
+                cancelled = True
+                errors.append(
+                    KeyboardInterrupt("simulated audit success pin close cancellation")
+                )
+            return errors
+
+        with (
+            mock.patch.object(
+                audit._PinnedArtifacts,
+                "close",
+                autospec=True,
+                side_effect=close_then_cancel,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "audit run-tree finalization",
+            ) as raised,
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_failure_pin_close_cancellation_attaches_to_primary(self):
+        real_close = audit._PinnedArtifacts.close
+        cancelled = False
+
+        def close_then_cancel(pins):
+            nonlocal cancelled
+            errors = real_close(pins)
+            if not cancelled:
+                cancelled = True
+                errors.append(
+                    KeyboardInterrupt("simulated audit failure pin close cancellation")
+                )
+            return errors
+
+        with (
+            mock.patch.object(
+                audit,
+                "_audit_validated_run",
+                side_effect=RuntimeError("simulated audit core failure"),
+            ),
+            mock.patch.object(
+                audit._PinnedArtifacts,
+                "close",
+                autospec=True,
+                side_effect=close_then_cancel,
+            ),
+            self.assertRaisesRegex(RuntimeError, "audit core failure") as raised,
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(cancelled)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+
     def test_audit_success_prepare_return_cancellation_discards_private_output(self):
         real_prepare = generation._prepare_terminal_json
         captured = []
