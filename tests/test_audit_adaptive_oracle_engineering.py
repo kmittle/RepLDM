@@ -144,6 +144,43 @@ class StableRegularFileReadTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "changed while it was read"):
                     audit.sha256_file(source)
 
+    def test_transient_consumed_bytes_cannot_be_rebound_to_restored_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            persistent = b'{"value":0}\n'
+            transient = b'{"value":1}\n'
+            source.write_bytes(persistent)
+            before = source.stat()
+            original_read = audit.os.read
+            swapped = False
+
+            def read_transient_then_restore(descriptor, count):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    source.write_bytes(transient)
+                    chunk = original_read(descriptor, count)
+                    source.write_bytes(persistent)
+                    os.utime(
+                        source,
+                        ns=(before.st_atime_ns, before.st_mtime_ns),
+                    )
+                    return chunk
+                return original_read(descriptor, count)
+
+            with (
+                mock.patch.object(
+                    audit.os,
+                    "read",
+                    side_effect=read_transient_then_restore,
+                ),
+                self.assertRaisesRegex(ValueError, "consumed bytes were not stable"),
+            ):
+                audit._read_regular_bytes(source, "fixture input")
+
+            self.assertTrue(swapped)
+            self.assertEqual(source.read_bytes(), persistent)
+
 
 class EngineeringRunFixture:
     def __init__(self):
@@ -947,6 +984,36 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
 
+    def test_run_tree_cleanup_preserves_primary_error_and_closes_all(self):
+        missing_relative = Path("outputs/adaptive_oracle/missing-run")
+        real_close = audit.os.close
+        closed = []
+        reported = False
+
+        def close_then_report_once(descriptor):
+            nonlocal reported
+            real_close(descriptor)
+            closed.append(descriptor)
+            if not reported:
+                reported = True
+                raise OSError(errno.EIO, "simulated cleanup close failure")
+
+        with (
+            mock.patch.object(
+                audit.os,
+                "close",
+                side_effect=close_then_report_once,
+            ),
+            self.assertRaisesRegex(ValueError, "run directory") as raised,
+        ):
+            audit._pin_run_tree(self.fixture.repo, missing_relative)
+
+        self.assertTrue(reported)
+        self.assertGreaterEqual(len(closed), 3)
+        self.assertTrue(
+            any("cleanup close failure" in note for note in raised.exception.__notes__)
+        )
+
     def test_production_rechecks_pins_after_core_before_success_publication(self):
         task_id = self.fixture.tasks[0]["task_id"]
         target = self.fixture.run / "records" / f"{task_id}.json"
@@ -1011,17 +1078,17 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         )
 
     def test_audit_success_publication_error_produces_failure_only(self):
-        real_atomic = audit.atomic_create_json
+        real_prepare = generation._prepare_terminal_json
 
         def fail_before_success_commit(path, value, **kwargs):
             if Path(path).name == audit.AUDIT_SUCCESS_NAME:
                 raise OSError(errno.EIO, "simulated audit success publication error")
-            return real_atomic(path, value, **kwargs)
+            return real_prepare(path, value, **kwargs)
 
         with (
             mock.patch.object(
-                audit,
-                "atomic_create_json",
+                generation,
+                "_prepare_terminal_json",
                 side_effect=fail_before_success_commit,
             ),
             self.assertRaisesRegex(OSError, "success publication"),
@@ -1032,54 +1099,75 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
         self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
 
-    def test_ambiguous_audit_success_is_rolled_back_before_failure(self):
-        real_atomic = audit.atomic_create_json
+    def test_ambiguous_audit_success_commit_wins_without_failure(self):
+        real_link = generation._link_descriptor
         reported = False
 
-        def commit_success_then_report_error(path, value, **kwargs):
+        def commit_success_then_report_error(descriptor, directory_descriptor, name):
             nonlocal reported
-            identity = real_atomic(path, value, **kwargs)
-            if Path(path).name == audit.AUDIT_SUCCESS_NAME and not reported:
+            real_link(descriptor, directory_descriptor, name)
+            if name == audit.AUDIT_SUCCESS_NAME and not reported:
                 reported = True
                 raise OSError(errno.EIO, "simulated committed audit success error")
-            return identity
+
+        with mock.patch.object(
+            generation,
+            "_link_descriptor",
+            side_effect=commit_success_then_report_error,
+        ):
+            result = self.fixture.run_production_audit()
+
+        self.assertTrue(reported)
+        self.assertEqual(result["status"], "passed_generation_integrity_only_unscored")
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_post_link_cancellation_cannot_reverse_audit_success(self):
+        real_link = generation._link_descriptor
+        cancelled = False
+
+        def commit_success_then_cancel(descriptor, directory_descriptor, name):
+            nonlocal cancelled
+            real_link(descriptor, directory_descriptor, name)
+            if name == audit.AUDIT_SUCCESS_NAME and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt(
+                    "simulated cancellation after audit success link"
+                )
+
+        with mock.patch.object(
+            generation,
+            "_link_descriptor",
+            side_effect=commit_success_then_cancel,
+        ):
+            result = self.fixture.run_production_audit()
+
+        self.assertTrue(cancelled)
+        self.assertEqual(result["status"], "passed_generation_integrity_only_unscored")
+        self.assertTrue((self.fixture.run / audit.AUDIT_SUCCESS_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_FAILURE_NAME).exists())
+
+    def test_pre_success_same_inode_evidence_rewrite_blocks_audit_success(self):
+        target = self.fixture.run / "config.json"
+        real_publish = audit._publish_audit_success
+        mutated = False
+
+        def rewrite_evidence_then_publish(tree, value, **kwargs):
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                before = target.stat()
+                payload = target.read_bytes()
+                replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
+                target.write_bytes(replacement)
+                os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return real_publish(tree, value, **kwargs)
 
         with (
             mock.patch.object(
                 audit,
-                "atomic_create_json",
-                side_effect=commit_success_then_report_error,
-            ),
-            self.assertRaisesRegex(OSError, "committed audit success"),
-        ):
-            self.fixture.run_production_audit()
-
-        self.assertTrue(reported)
-        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
-        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
-
-    def test_post_success_link_evidence_rewrite_rolls_back_audit_success(self):
-        target = self.fixture.run / "config.json"
-        real_link = generation._link_descriptor
-        mutated = False
-
-        def link_then_rewrite_evidence(descriptor, directory_descriptor, name):
-            nonlocal mutated
-            real_link(descriptor, directory_descriptor, name)
-            if name != audit.AUDIT_SUCCESS_NAME or mutated:
-                return
-            mutated = True
-            before = target.stat()
-            payload = target.read_bytes()
-            replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
-            target.write_bytes(replacement)
-            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
-
-        with (
-            mock.patch.object(
-                generation,
-                "_link_descriptor",
-                side_effect=link_then_rewrite_evidence,
+                "_publish_audit_success",
+                side_effect=rewrite_evidence_then_publish,
             ),
             self.assertRaisesRegex(ValueError, "changed before audit publication"),
         ):
@@ -1504,6 +1592,42 @@ class AdaptiveOracleEngineeringAuditTest(unittest.TestCase):
         self.assertEqual(
             audit_failure["status"], "failed_terminal_no_resume_or_retry"
         )
+
+    def test_audit_failure_rewrite_during_commit_is_detected(self):
+        self.fixture.replace_with_failure()
+        real_link = generation._link_descriptor
+        mutated = False
+
+        def link_then_rewrite_failure(descriptor, directory_descriptor, name):
+            nonlocal mutated
+            real_link(descriptor, directory_descriptor, name)
+            if name != audit.AUDIT_FAILURE_NAME or mutated:
+                return
+            mutated = True
+            target = self.fixture.run / name
+            before = target.stat()
+            payload = target.read_bytes()
+            os.chmod(target, 0o640)
+            target.write_bytes((b"X" if payload[:1] != b"X" else b"Y") + payload[1:])
+            os.chmod(target, before.st_mode & 0o777)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with (
+            mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=link_then_rewrite_failure,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "failure receipt creation also failed",
+            ),
+        ):
+            self.fixture.run_production_audit()
+
+        self.assertTrue(mutated)
+        self.assertTrue((self.fixture.run / audit.AUDIT_FAILURE_NAME).is_file())
+        self.assertFalse((self.fixture.run / audit.AUDIT_SUCCESS_NAME).exists())
 
     def test_symlinked_record_is_rejected(self):
         task_id = self.fixture.tasks[0]["task_id"]

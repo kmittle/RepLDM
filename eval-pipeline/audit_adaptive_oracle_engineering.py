@@ -148,8 +148,6 @@ class _AuditSession:
 
 
 def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
-    # External staging cleanup can make NFS refresh nlink and ctime after the
-    # receipt is pinned. Path identity and parsed raw bytes are bound separately.
     return (
         value.st_dev,
         value.st_ino,
@@ -158,6 +156,8 @@ def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
         value.st_gid,
         value.st_size,
         value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_nlink,
     )
 
 
@@ -172,29 +172,46 @@ class _PinnedArtifacts:
         descriptor: int,
         directory_descriptor: int,
         name: str,
-        metadata: os.stat_result,
+        metadata: tuple[int, ...],
         label: str,
         expected_sha256: str,
     ) -> None:
         held_descriptor = os.dup(descriptor)
         try:
             held_metadata = os.fstat(held_descriptor)
-            if _stable_file_metadata(held_metadata) != _stable_file_metadata(metadata):
+            current = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                _stable_file_metadata(held_metadata) != metadata
+                or _stable_file_metadata(current) != metadata
+            ):
                 raise ValueError(f"{label} changed while it was pinned")
             self._rows.append(
                 (
                     held_descriptor,
                     directory_descriptor,
                     name,
-                    _stable_file_metadata(held_metadata),
+                    metadata,
                     expected_sha256,
                     label,
                 )
             )
             held_descriptor = -1
-        finally:
+        except BaseException as exc:
+            error_traceback = exc.__traceback__
             if held_descriptor >= 0:
-                os.close(held_descriptor)
+                try:
+                    os.close(held_descriptor)
+                except BaseException as close_error:
+                    generation._add_exception_note(
+                        exc,
+                        f"{label} held-descriptor close also failed: "
+                        f"{type(close_error).__name__}: {close_error}",
+                    )
+            raise exc.with_traceback(error_traceback)
 
     def verify(self) -> None:
         for (
@@ -205,20 +222,39 @@ class _PinnedArtifacts:
             expected_sha256,
             label,
         ) in self._rows:
-            opened = os.fstat(descriptor)
-            current = os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or not stat.S_ISREG(current.st_mode)
-                or _stable_file_metadata(opened) != expected
-                or _stable_file_metadata(current) != expected
-                or generation._sha256_descriptor(descriptor) != expected_sha256
-            ):
+            try:
+                raw, observed = generation._stable_regular_snapshot(
+                    descriptor,
+                    directory_descriptor,
+                    name,
+                    label,
+                )
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"{label} changed before audit publication"
+                ) from exc
+            if observed != expected or hashlib.sha256(raw).hexdigest() != expected_sha256:
                 raise ValueError(f"{label} changed before audit publication")
+        for (
+            descriptor,
+            directory_descriptor,
+            name,
+            expected,
+            _,
+            label,
+        ) in reversed(self._rows):
+            try:
+                generation._verify_regular_metadata(
+                    descriptor,
+                    directory_descriptor,
+                    name,
+                    expected,
+                    label,
+                )
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"{label} changed before audit publication"
+                ) from exc
 
     def close(self) -> list[BaseException]:
         errors = []
@@ -234,7 +270,7 @@ class _PinnedArtifacts:
 def _consume_regular_file(
     path: Path,
     label: str,
-    consumer: Callable[[int], Any],
+    consumer: Callable[[bytes], Any],
     *,
     directory_descriptor: Optional[int] = None,
     pins: Optional[_PinnedArtifacts] = None,
@@ -248,6 +284,7 @@ def _consume_regular_file(
         | os.O_CLOEXEC
         | getattr(os, "O_NONBLOCK", 0)
     )
+    primary_error: Optional[BaseException] = None
     try:
         target: str | os.PathLike[str] = (
             path.name if directory_descriptor is not None else path
@@ -267,31 +304,35 @@ def _consume_regular_file(
         ):
             raise ValueError(f"{label} must be a regular non-symlink file")
 
-        expected_sha256 = (
-            generation._sha256_descriptor(descriptor)
-            if pins is not None
-            else None
-        )
-        result = consumer(descriptor)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        consumed_sha256 = hashlib.sha256(raw).hexdigest()
+        result = consumer(raw)
+        try:
+            persisted_raw, persisted_metadata = generation._stable_regular_snapshot(
+                descriptor,
+                directory_descriptor,
+                target,
+                label,
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"{label} changed while it was read; consumed bytes were not stable"
+            ) from exc
         if (
-            expected_sha256 is not None
-            and generation._sha256_descriptor(descriptor) != expected_sha256
+            persisted_metadata != _stable_file_metadata(before)
+            or _stable_file_metadata(path_before) != _stable_file_metadata(before)
+            or persisted_raw != raw
+            or hashlib.sha256(persisted_raw).hexdigest() != consumed_sha256
         ):
-            raise ValueError(f"{label} changed while it was consumed")
-
-        after = os.fstat(descriptor)
-        path_after = os.stat(
-            target,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            _stable_file_metadata(after) != _stable_file_metadata(before)
-            or not stat.S_ISREG(path_after.st_mode)
-            or (path_after.st_dev, path_after.st_ino)
-            != (before.st_dev, before.st_ino)
-        ):
-            raise ValueError(f"{label} changed while it was read")
+            raise ValueError(
+                f"{label} changed while it was read; consumed bytes were not stable"
+            )
         if pins is not None:
             if directory_descriptor is None:
                 raise ValueError("pinned artifact reads require a pinned directory")
@@ -299,18 +340,31 @@ def _consume_regular_file(
                 descriptor,
                 directory_descriptor,
                 path.name,
-                after,
+                persisted_metadata,
                 label,
-                expected_sha256,
+                consumed_sha256,
             )
         return result
     except OSError as exc:
-        raise ValueError(
+        primary_error = ValueError(
             f"{label} must be a stable regular non-symlink file"
-        ) from exc
+        )
+        raise primary_error from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if descriptor >= 0:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except BaseException as close_error:
+                if primary_error is None:
+                    raise
+                generation._add_exception_note(
+                    primary_error,
+                    f"{label} descriptor close also failed: "
+                    f"{type(close_error).__name__}: {close_error}",
+                )
 
 
 def sha256_file(
@@ -319,13 +373,8 @@ def sha256_file(
     directory_descriptor: Optional[int] = None,
     pins: Optional[_PinnedArtifacts] = None,
 ) -> str:
-    def consume(descriptor: int) -> str:
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                return digest.hexdigest()
-            digest.update(chunk)
+    def consume(raw: bytes) -> str:
+        return hashlib.sha256(raw).hexdigest()
 
     return _consume_regular_file(
         path,
@@ -346,7 +395,7 @@ def _require_regular_file(
     _consume_regular_file(
         path,
         label,
-        lambda descriptor: None,
+        lambda raw: None,
         directory_descriptor=directory_descriptor,
         pins=pins,
     )
@@ -359,13 +408,8 @@ def _read_regular_bytes(
     directory_descriptor: Optional[int] = None,
     pins: Optional[_PinnedArtifacts] = None,
 ) -> bytes:
-    def consume(descriptor: int) -> bytes:
-        chunks = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
+    def consume(raw: bytes) -> bytes:
+        return raw
 
     return _consume_regular_file(
         path,
@@ -1215,15 +1259,22 @@ def _pin_run_tree(
             run_descriptor=run_descriptor,
             records_descriptor=records_descriptor,
         )
-    except BaseException:
-        if records_descriptor is not None:
-            os.close(records_descriptor)
-        if run_descriptor >= 0:
-            os.close(run_descriptor)
-        for _, _, descriptor, _ in reversed(directory_links):
-            os.close(descriptor)
-        os.close(root_descriptor)
-        raise
+    except BaseException as exc:
+        error_traceback = exc.__traceback__
+        generation._close_descriptors_after_error(
+            [
+                *(
+                    [records_descriptor]
+                    if records_descriptor is not None
+                    else []
+                ),
+                run_descriptor,
+                *(descriptor for _, _, descriptor, _ in reversed(directory_links)),
+                root_descriptor,
+            ],
+            exc,
+        )
+        raise exc.with_traceback(error_traceback)
 
 
 def _resolve_run_dir(
@@ -1354,29 +1405,22 @@ def _publish_audit_success(
     *,
     ownership: list[tuple[int, int]],
 ) -> tuple[int, int]:
-    payload = contract.canonical_json_bytes(value) + b"\n"
-    tree.verify()
-    for name in (AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME):
-        if generation._entry_exists(tree.run_descriptor, name):
-            raise FileExistsError(f"audit terminal receipt already exists: {name}")
-    identity = atomic_create_json(
+    prepared = generation._prepare_terminal_json(
         tree.run / AUDIT_SUCCESS_NAME,
         value,
         directory_descriptor=tree.run_descriptor,
         staging_directory_descriptor=tree.run_parent_descriptor,
         ownership_candidates=ownership,
     )
-    tree.add_published_entry(AUDIT_SUCCESS_NAME, identity)
-    observed = _read_regular_bytes(
-        tree.run / AUDIT_SUCCESS_NAME,
-        "published audit success receipt",
-        directory_descriptor=tree.run_descriptor,
-        pins=tree.pins,
-    )
-    if observed != payload:
-        raise RuntimeError("published audit success receipt bytes differ")
-    tree.verify()
-    return identity
+    try:
+        tree.verify()
+        for name in (AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME):
+            if generation._entry_exists(tree.run_descriptor, name):
+                raise FileExistsError(f"audit terminal receipt already exists: {name}")
+        return generation._commit_prepared_terminal(prepared)
+    except BaseException as exc:
+        generation._discard_prepared_atomic_output(prepared, exc)
+        raise
 
 
 def _publish_audit_failure(
@@ -1385,25 +1429,25 @@ def _publish_audit_failure(
 ) -> None:
     """Publish a non-pass terminal even when evidence verification has failed."""
 
-    payload = contract.canonical_json_bytes(value) + b"\n"
     tree.verify_directories()
     if generation._entry_exists(tree.run_descriptor, AUDIT_FAILURE_NAME):
         return
-    identity = atomic_create_json(
+    if generation._entry_exists(tree.run_descriptor, AUDIT_SUCCESS_NAME):
+        raise RuntimeError("audit success is already committed")
+    prepared = generation._prepare_terminal_json(
         tree.run / AUDIT_FAILURE_NAME,
         value,
         directory_descriptor=tree.run_descriptor,
         staging_directory_descriptor=tree.run_parent_descriptor,
     )
-    tree.add_published_entry(AUDIT_FAILURE_NAME, identity)
-    observed = _read_regular_bytes(
-        tree.run / AUDIT_FAILURE_NAME,
-        "published audit failure receipt",
-        directory_descriptor=tree.run_descriptor,
-    )
-    if observed != payload:
-        raise RuntimeError("published audit failure receipt bytes differ")
-    tree.verify_directories()
+    try:
+        tree.verify_directories()
+        if generation._entry_exists(tree.run_descriptor, AUDIT_SUCCESS_NAME):
+            raise RuntimeError("audit success appeared before failure commit")
+        generation._commit_prepared_terminal(prepared)
+    except BaseException as exc:
+        generation._discard_prepared_atomic_output(prepared, exc)
+        raise
 
 
 def _preflight_audit(
@@ -2403,26 +2447,19 @@ def _audit_launcher_validated_run(
             )
             return result
         except BaseException as exc:
-            if len(success_ownership) == 1:
-                try:
-                    generation._remove_matching_entry(
-                        tree.run_descriptor,
-                        AUDIT_SUCCESS_NAME,
-                        success_ownership[0],
-                    )
-                except BaseException as rollback_exc:
-                    generation._add_exception_note(
-                        exc,
-                        "audit success rollback also failed: "
-                        f"{type(rollback_exc).__name__}: {rollback_exc}",
-                    )
             try:
                 final_names = _directory_names(
                     tree.run_descriptor, "engineering run directory"
                 ).intersection({AUDIT_SUCCESS_NAME, AUDIT_FAILURE_NAME})
             except BaseException:
                 final_names = frozenset({"untrusted-directory-state"})
-            if not final_names:
+            if (
+                not final_names
+                and not isinstance(
+                    exc,
+                    generation.AtomicPublicationIndeterminate,
+                )
+            ):
                 try:
                     _publish_audit_failure(
                         tree,

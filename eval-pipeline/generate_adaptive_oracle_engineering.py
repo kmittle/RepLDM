@@ -62,6 +62,7 @@ LAUNCH_TRUST_ROOT = "cpython_explicit_commit_launcher_v2"
 LAUNCH_LOADER_ID = "adaptive_oracle_reviewed_git_blob_loader_v2"
 COMMIT_TOPOLOGY_SCHEMA = "adaptive_oracle_commit_topology_v1"
 _RENAME_NOREPLACE = 1
+_PUBLICATION_RECONCILIATION_ATTEMPTS = 8
 _FD_SAFETY_RESERVE = 64
 _GENERATION_PINNED_FILE_COUNT = 1 + (2 * contract.TOTAL_TASK_COUNT) + 5
 _AUDIT_PINNED_FILE_COUNT = 2 + 1 + (2 * contract.TOTAL_TASK_COUNT) + 4 + 1
@@ -1211,6 +1212,31 @@ def _add_exception_note(error: BaseException, note: str) -> None:
         pass
 
 
+class AtomicPublicationIndeterminate(RuntimeError):
+    """Raised when a no-replace publication has no trustworthy final state."""
+
+
+def _close_descriptors_after_error(
+    descriptors: Sequence[int],
+    error: BaseException,
+) -> None:
+    """Attempt every close while retaining the original exception."""
+
+    closed: set[int] = set()
+    for descriptor in descriptors:
+        if descriptor < 0 or descriptor in closed:
+            continue
+        closed.add(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException as close_error:
+            _add_exception_note(
+                error,
+                "descriptor cleanup also failed: "
+                f"{type(close_error).__name__}: {close_error}",
+            )
+
+
 def _open_descriptor_count() -> int:
     return len(os.listdir("/proc/self/fd"))
 
@@ -1346,11 +1372,16 @@ def _open_pinned_directory_chain(
             links.append((current, name, child, child_label))
             current = child
         return root_descriptor, links, current
-    except BaseException:
-        for _, _, descriptor, _ in reversed(links):
-            os.close(descriptor)
-        os.close(root_descriptor)
-        raise
+    except BaseException as exc:
+        error_traceback = exc.__traceback__
+        _close_descriptors_after_error(
+            [
+                *(descriptor for _, _, descriptor, _ in reversed(links)),
+                root_descriptor,
+            ],
+            exc,
+        )
+        raise exc.with_traceback(error_traceback)
 
 
 def _verify_directory_chain(
@@ -1486,19 +1517,23 @@ def _claim_pinned_directory_with_marker(
             deferred_marker_error = (marker_error, marker_error.__traceback__)
     if _entry_exists(parent_descriptor, name):
         raise FileExistsError(f"{label} already exists")
-    create_error: Optional[OSError] = None
+    create_error: Optional[tuple[BaseException, Any]] = None
+    deferred_create_error: Optional[tuple[BaseException, Any]] = None
     try:
         os.mkdir(name, mode=0o750, dir_fd=parent_descriptor)
-    except OSError as exc:
-        uncertain = {
-            errno.EINTR,
-            errno.EIO,
-            getattr(errno, "ESTALE", errno.EIO),
-            getattr(errno, "ETIMEDOUT", errno.EIO),
-        }
-        if exc.errno not in uncertain:
-            raise
-        create_error = exc
+    except BaseException as exc:
+        if isinstance(exc, OSError):
+            uncertain = {
+                errno.EINTR,
+                errno.EIO,
+                getattr(errno, "ESTALE", errno.EIO),
+                getattr(errno, "ETIMEDOUT", errno.EIO),
+            }
+            if exc.errno not in uncertain:
+                raise
+        else:
+            deferred_create_error = (exc, exc.__traceback__)
+        create_error = (exc, exc.__traceback__)
     # The permanent marker serializes every supported launcher. The protocol
     # separately excludes interference by an arbitrary same-UID process.
     descriptor = -1
@@ -1511,7 +1546,8 @@ def _claim_pinned_directory_with_marker(
             )
         except BaseException:
             if create_error is not None:
-                raise create_error
+                error, error_traceback = create_error
+                raise error.with_traceback(error_traceback)
             raise
         identity = _object_identity(os.fstat(descriptor))
         if ownership_candidates is not None:
@@ -1547,6 +1583,9 @@ def _claim_pinned_directory_with_marker(
         if deferred_marker_error is not None:
             marker_error, marker_traceback = deferred_marker_error
             raise marker_error.with_traceback(marker_traceback)
+        if deferred_create_error is not None:
+            create_exception, create_traceback = deferred_create_error
+            raise create_exception.with_traceback(create_traceback)
         result = descriptor
         descriptor = -1
         return result
@@ -1706,6 +1745,68 @@ def _link_descriptor(
     )
 
 
+def _link_with_positive_reconciliation(
+    descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+) -> Optional[tuple[BaseException, Any]]:
+    """Link once, retrying ambiguous negative observations until state is positive."""
+
+    first_error: Optional[tuple[BaseException, Any]] = None
+    last_error: Optional[BaseException] = None
+
+    def remember(error: BaseException) -> None:
+        nonlocal first_error, last_error
+        if first_error is None or (
+            isinstance(first_error[0], OSError)
+            and not isinstance(error, OSError)
+        ):
+            first_error = (error, error.__traceback__)
+        last_error = error
+
+    def back_off(attempt: int) -> None:
+        try:
+            time.sleep(0.01 * (attempt + 1))
+        except BaseException as delay_error:
+            remember(delay_error)
+
+    for attempt in range(_PUBLICATION_RECONCILIATION_ATTEMPTS):
+        try:
+            _link_descriptor(descriptor, directory_descriptor, name)
+            return first_error
+        except BaseException as link_error:
+            remember(link_error)
+        try:
+            observed = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            back_off(attempt)
+            continue
+        except BaseException as observe_error:
+            remember(observe_error)
+            back_off(attempt)
+            continue
+        if stat.S_ISREG(observed.st_mode) and _object_identity(observed) == identity:
+            return first_error
+        original, original_traceback = first_error
+        raise original.with_traceback(original_traceback)
+
+    unresolved = AtomicPublicationIndeterminate(
+        f"atomic publication outcome remained indeterminate for {name}"
+    )
+    unresolved.target_name = name
+    unresolved.source_identity = identity
+    if first_error is not None:
+        unresolved.first_error = first_error[0]
+    if last_error is not None:
+        raise unresolved from last_error
+    raise unresolved
+
+
 def _read_descriptor_bytes(descriptor: int) -> bytes:
     os.lseek(descriptor, 0, os.SEEK_SET)
     chunks = []
@@ -1714,6 +1815,17 @@ def _read_descriptor_bytes(descriptor: int) -> bytes:
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
+
+
+def _pread_descriptor_bytes(descriptor: int) -> bytes:
+    chunks = []
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        offset += len(chunk)
 
 
 def _sha256_descriptor(descriptor: int) -> str:
@@ -1728,9 +1840,6 @@ def _sha256_descriptor(descriptor: int) -> str:
 
 
 def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
-    # NFS may expose the pre-cleanup link count and ctime briefly after the
-    # external staging hardlink is removed. Identity and exact bytes are pinned
-    # separately, while every other mutation-relevant field remains stable.
     return (
         value.st_dev,
         value.st_ino,
@@ -1739,7 +1848,81 @@ def _stable_file_metadata(value: os.stat_result) -> tuple[int, ...]:
         value.st_gid,
         value.st_size,
         value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_nlink,
     )
+
+
+def _stable_regular_snapshot(
+    descriptor: int,
+    directory_descriptor: Optional[int],
+    name: str | os.PathLike[str],
+    label: str,
+) -> tuple[bytes, tuple[int, ...]]:
+    """Read one descriptor snapshot bracketed by inode and path metadata."""
+
+    last_error: Optional[BaseException] = None
+    for _ in range(_PUBLICATION_RECONCILIATION_ATTEMPTS):
+        try:
+            opened_before = os.fstat(descriptor)
+            path_before = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            raw = _pread_descriptor_bytes(descriptor)
+            opened_after = os.fstat(descriptor)
+            path_after = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            last_error = exc
+            continue
+        metadata = (
+            _stable_file_metadata(opened_before),
+            _stable_file_metadata(path_before),
+            _stable_file_metadata(opened_after),
+            _stable_file_metadata(path_after),
+        )
+        if (
+            all(stat.S_ISREG(value.st_mode) for value in (
+                opened_before,
+                path_before,
+                opened_after,
+                path_after,
+            ))
+            and len(set(metadata)) == 1
+            and opened_after.st_size == len(raw)
+        ):
+            return raw, metadata[0]
+        last_error = RuntimeError(f"{label} changed during descriptor snapshot")
+    if last_error is not None:
+        raise RuntimeError(f"{label} did not provide a stable descriptor snapshot") from last_error
+    raise RuntimeError(f"{label} did not provide a stable descriptor snapshot")
+
+
+def _verify_regular_metadata(
+    descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    expected: tuple[int, ...],
+    label: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    current = os.stat(
+        name,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or _stable_file_metadata(opened) != expected
+        or _stable_file_metadata(current) != expected
+    ):
+        raise RuntimeError(f"{label} changed before terminal verification")
 
 
 class _PublishedArtifacts:
@@ -1765,18 +1948,15 @@ class _PublishedArtifacts:
         descriptor = -1
         try:
             descriptor = os.open(name, flags, dir_fd=directory_descriptor)
-            opened = os.fstat(descriptor)
-            current = os.stat(
+            raw, metadata = _stable_regular_snapshot(
+                descriptor,
+                directory_descriptor,
                 name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
+                label,
             )
             if (
-                not stat.S_ISREG(opened.st_mode)
-                or not stat.S_ISREG(current.st_mode)
-                or _object_identity(opened) != identity
-                or _stable_file_metadata(opened) != _stable_file_metadata(current)
-                or _read_descriptor_bytes(descriptor) != payload
+                (metadata[0], metadata[1]) != identity
+                or raw != payload
             ):
                 raise RuntimeError(f"{label} differs after atomic publication")
             self._rows.append(
@@ -1784,15 +1964,24 @@ class _PublishedArtifacts:
                     descriptor,
                     directory_descriptor,
                     name,
-                    _stable_file_metadata(opened),
+                    metadata,
                     hashlib.sha256(payload).hexdigest(),
                     label,
                 )
             )
             descriptor = -1
-        finally:
+        except BaseException as exc:
+            error_traceback = exc.__traceback__
             if descriptor >= 0:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except BaseException as close_error:
+                    _add_exception_note(
+                        exc,
+                        f"{label} descriptor close also failed: "
+                        f"{type(close_error).__name__}: {close_error}",
+                    )
+            raise exc.with_traceback(error_traceback)
 
     def verify(self) -> None:
         for (
@@ -1803,20 +1992,37 @@ class _PublishedArtifacts:
             expected_sha256,
             label,
         ) in self._rows:
-            opened = os.fstat(descriptor)
-            current = os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
+            try:
+                raw, observed = _stable_regular_snapshot(
+                    descriptor,
+                    directory_descriptor,
+                    name,
+                    label,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"{label} changed before terminal verification"
+                ) from exc
             if (
-                not stat.S_ISREG(opened.st_mode)
-                or not stat.S_ISREG(current.st_mode)
-                or _stable_file_metadata(opened) != expected
-                or _stable_file_metadata(current) != expected
-                or _sha256_descriptor(descriptor) != expected_sha256
+                observed != expected
+                or hashlib.sha256(raw).hexdigest() != expected_sha256
             ):
                 raise RuntimeError(f"{label} changed before terminal verification")
+        for (
+            descriptor,
+            directory_descriptor,
+            name,
+            expected,
+            _,
+            label,
+        ) in reversed(self._rows):
+            _verify_regular_metadata(
+                descriptor,
+                directory_descriptor,
+                name,
+                expected,
+                label,
+            )
 
     def close(self) -> list[BaseException]:
         errors = []
@@ -1961,31 +2167,23 @@ def _atomic_create_at(
         if ownership_candidates is not None:
             ownership_candidates.append(temporary_identity)
         try:
-            _link_descriptor(descriptor, directory_descriptor, name)
+            deferred_link_error = _link_with_positive_reconciliation(
+                descriptor,
+                directory_descriptor,
+                name,
+                temporary_identity,
+            )
             published_identity = temporary_identity
-        except BaseException as link_error:
-            published_identity = temporary_identity
-            try:
-                reconciled = os.stat(
-                    name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                published_identity = None
-                raise link_error
-            except OSError as reconcile_error:
-                raise RuntimeError(
-                    "atomic publication outcome could not be reconciled"
-                ) from reconcile_error
             if (
-                not stat.S_ISREG(reconciled.st_mode)
-                or _object_identity(reconciled) != temporary_identity
+                deferred_link_error is not None
+                and not isinstance(deferred_link_error[0], OSError)
             ):
-                published_identity = None
-                raise link_error
-            if not isinstance(link_error, OSError):
-                raise
+                link_error, link_traceback = deferred_link_error
+                raise link_error.with_traceback(link_traceback)
+        except AtomicPublicationIndeterminate:
+            published_identity = None
+            preserve_temporary = True
+            raise
         published = os.stat(
             name, dir_fd=directory_descriptor, follow_symlinks=False
         )
@@ -2085,6 +2283,256 @@ def _atomic_create_at(
     if result is None:
         raise RuntimeError("atomic publication completed without an inode identity")
     return result
+
+
+class _PreparedAtomicOutput:
+    __slots__ = (
+        "descriptor",
+        "target_directory_descriptor",
+        "staging_directory_descriptor",
+        "target_name",
+        "temporary_name",
+        "identity",
+        "payload",
+        "committed",
+        "indeterminate",
+        "diagnostics",
+    )
+
+    def __init__(
+        self,
+        *,
+        descriptor: int,
+        target_directory_descriptor: int,
+        staging_directory_descriptor: int,
+        target_name: str,
+        temporary_name: str,
+        identity: tuple[int, int],
+        payload: bytes,
+    ) -> None:
+        self.descriptor = descriptor
+        self.target_directory_descriptor = target_directory_descriptor
+        self.staging_directory_descriptor = staging_directory_descriptor
+        self.target_name = target_name
+        self.temporary_name = temporary_name
+        self.identity = identity
+        self.payload = payload
+        self.committed = False
+        self.indeterminate = False
+        self.diagnostics: list[BaseException] = []
+
+
+def _prepare_atomic_output_at(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+    *,
+    staging_directory_descriptor: int,
+    ownership_candidates: Optional[list[tuple[int, int]]] = None,
+) -> _PreparedAtomicOutput:
+    """Create and validate a private inode without exposing its final name."""
+
+    if not name or Path(name).name != name:
+        raise ValueError("atomic output name must be one safe basename")
+    target_directory = os.fstat(directory_descriptor)
+    staging_directory = os.fstat(staging_directory_descriptor)
+    if not stat.S_ISDIR(target_directory.st_mode):
+        raise ValueError("atomic output parent descriptor must be a directory")
+    if not stat.S_ISDIR(staging_directory.st_mode):
+        raise ValueError("atomic staging descriptor must be a directory")
+    if target_directory.st_dev != staging_directory.st_dev:
+        raise ValueError("atomic output and staging directories must share a filesystem")
+    if ownership_candidates is not None and ownership_candidates:
+        raise ValueError("atomic ownership candidate list must start empty")
+
+    temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    descriptor = -1
+    identity: Optional[tuple[int, int]] = None
+    try:
+        descriptor = _open_unique_regular_at(
+            staging_directory_descriptor,
+            temporary_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o640,
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError("atomic temporary inode is not a regular file")
+        identity = _object_identity(opened)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("atomic output write made no progress")
+            offset += written
+        os.fchmod(descriptor, 0o440)
+        os.fsync(descriptor)
+        if _read_descriptor_bytes(descriptor) != payload:
+            raise RuntimeError("atomic output descriptor bytes differ before publication")
+        os.fsync(staging_directory_descriptor)
+        if ownership_candidates is not None:
+            ownership_candidates.append(identity)
+        prepared = _PreparedAtomicOutput(
+            descriptor=descriptor,
+            target_directory_descriptor=directory_descriptor,
+            staging_directory_descriptor=staging_directory_descriptor,
+            target_name=name,
+            temporary_name=temporary_name,
+            identity=identity,
+            payload=payload,
+        )
+        descriptor = -1
+        return prepared
+    except BaseException as exc:
+        error_traceback = exc.__traceback__
+        if descriptor >= 0 and identity is not None:
+            try:
+                _remove_matching_entry(
+                    staging_directory_descriptor,
+                    temporary_name,
+                    identity,
+                )
+            except BaseException as cleanup_error:
+                _add_exception_note(
+                    exc,
+                    "prepared atomic output cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                )
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException as close_error:
+                _add_exception_note(
+                    exc,
+                    "prepared atomic output close also failed: "
+                    f"{type(close_error).__name__}: {close_error}",
+                )
+        raise exc.with_traceback(error_traceback)
+
+
+def _discard_prepared_atomic_output(
+    prepared: _PreparedAtomicOutput,
+    error: Optional[BaseException] = None,
+) -> None:
+    if prepared.committed or prepared.indeterminate:
+        return
+    cleanup_errors: list[BaseException] = []
+    try:
+        _remove_matching_entry(
+            prepared.staging_directory_descriptor,
+            prepared.temporary_name,
+            prepared.identity,
+        )
+    except BaseException as cleanup_error:
+        cleanup_errors.append(cleanup_error)
+    if prepared.descriptor >= 0:
+        try:
+            os.close(prepared.descriptor)
+        except BaseException as close_error:
+            cleanup_errors.append(close_error)
+        prepared.descriptor = -1
+    if error is not None:
+        for cleanup_error in cleanup_errors:
+            _add_exception_note(
+                error,
+                "prepared terminal cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}",
+            )
+        return
+    if cleanup_errors:
+        raise cleanup_errors[0]
+
+
+def _commit_prepared_terminal(
+    prepared: _PreparedAtomicOutput,
+) -> tuple[int, int]:
+    """Expose a terminal name once; a positively observed commit always wins."""
+
+    if prepared.committed or prepared.indeterminate or prepared.descriptor < 0:
+        raise RuntimeError("prepared terminal is not in the commit-ready state")
+    try:
+        deferred_link_error = _link_with_positive_reconciliation(
+            prepared.descriptor,
+            prepared.target_directory_descriptor,
+            prepared.target_name,
+            prepared.identity,
+        )
+    except AtomicPublicationIndeterminate:
+        prepared.indeterminate = True
+        try:
+            os.close(prepared.descriptor)
+        except BaseException as close_error:
+            prepared.diagnostics.append(close_error)
+        prepared.descriptor = -1
+        raise
+    prepared.committed = True
+    if deferred_link_error is not None:
+        prepared.diagnostics.append(deferred_link_error[0])
+    terminal_error: Optional[BaseException] = None
+    try:
+        raw, observed = _stable_regular_snapshot(
+            prepared.descriptor,
+            prepared.target_directory_descriptor,
+            prepared.target_name,
+            f"terminal receipt {prepared.target_name}",
+        )
+        if (
+            (observed[0], observed[1]) != prepared.identity
+            or raw != prepared.payload
+        ):
+            raise RuntimeError(
+                f"terminal receipt {prepared.target_name} changed during commit"
+            )
+    except BaseException as integrity_error:
+        terminal_error = integrity_error
+    try:
+        os.fsync(prepared.target_directory_descriptor)
+    except BaseException as sync_error:
+        prepared.diagnostics.append(sync_error)
+    try:
+        _remove_matching_entry(
+            prepared.staging_directory_descriptor,
+            prepared.temporary_name,
+            prepared.identity,
+        )
+    except BaseException as cleanup_error:
+        prepared.diagnostics.append(cleanup_error)
+    if prepared.descriptor >= 0:
+        try:
+            os.close(prepared.descriptor)
+        except BaseException as close_error:
+            prepared.diagnostics.append(close_error)
+        prepared.descriptor = -1
+    if terminal_error is not None:
+        for diagnostic in prepared.diagnostics:
+            _add_exception_note(
+                terminal_error,
+                "terminal commit diagnostic: "
+                f"{type(diagnostic).__name__}: {diagnostic}",
+            )
+        raise terminal_error
+    return prepared.identity
+
+
+def _prepare_terminal_json(
+    path: Path,
+    value: Any,
+    *,
+    directory_descriptor: int,
+    staging_directory_descriptor: int,
+    ownership_candidates: Optional[list[tuple[int, int]]] = None,
+) -> _PreparedAtomicOutput:
+    return _prepare_atomic_output_at(
+        directory_descriptor,
+        path.name,
+        contract.canonical_json_bytes(value) + b"\n",
+        staging_directory_descriptor=staging_directory_descriptor,
+        ownership_candidates=ownership_candidates,
+    )
 
 
 def atomic_create_bytes(
@@ -2197,13 +2645,18 @@ def _publish_terminal_json(
     staging_directory_descriptor: int,
     ownership_candidates: Optional[list[tuple[int, int]]] = None,
 ) -> tuple[int, int]:
-    return atomic_create_json(
+    prepared = _prepare_terminal_json(
         path,
         value,
         directory_descriptor=directory_descriptor,
         staging_directory_descriptor=staging_directory_descriptor,
         ownership_candidates=ownership_candidates,
     )
+    try:
+        return _commit_prepared_terminal(prepared)
+    except BaseException as exc:
+        _discard_prepared_atomic_output(prepared, exc)
+        raise
 
 
 def _initialize_attempt_directory(
@@ -3726,93 +4179,54 @@ def _run_authorized_engineering_generation(
             publications=publications,
             label="run config",
         )
-        _verify_directory_chain(
-            repo_root,
-            root_descriptor,
-            output_parent_links,
-            "authorized output parent",
-        )
-        _verify_directory_entry(
-            output_parent_descriptor,
-            output.name,
-            output_descriptor,
-            "adaptive-oracle engineering output",
-        )
-        _verify_directory_entry(
-            output_descriptor,
-            records_dir.name,
-            records_descriptor,
-            "engineering records directory",
-        )
-        _verify_directory_inventory(
-            output_descriptor,
-            {
-                "attempt.json",
-                "config.json",
-                "manifest.json",
-                "model_stage_evidence.json",
-                "records",
-                "runtime_evidence.json",
-            },
-            "pre-success engineering output",
-        )
-        _verify_directory_inventory(
-            records_descriptor,
-            expected_record_names,
-            "engineering records",
-        )
-        publications.verify()
-        success_identity = _publish_terminal_json(
+        prepared_success = _prepare_terminal_json(
             output / "success.json",
             success,
             directory_descriptor=output_descriptor,
             staging_directory_descriptor=output_parent_descriptor,
             ownership_candidates=success_ownership_candidates,
         )
-        publications.add_exact(
-            output_descriptor,
-            "success.json",
-            success_identity,
-            contract.canonical_json_bytes(success) + b"\n",
-            "generation success receipt",
-        )
-        _verify_directory_chain(
-            repo_root,
-            root_descriptor,
-            output_parent_links,
-            "authorized output parent",
-        )
-        _verify_directory_entry(
-            output_parent_descriptor,
-            output.name,
-            output_descriptor,
-            "adaptive-oracle engineering output",
-        )
-        _verify_directory_entry(
-            output_descriptor,
-            records_dir.name,
-            records_descriptor,
-            "engineering records directory",
-        )
-        _verify_directory_inventory(
-            output_descriptor,
-            {
-                "attempt.json",
-                "config.json",
-                "manifest.json",
-                "model_stage_evidence.json",
-                "records",
-                "runtime_evidence.json",
-                "success.json",
-            },
-            "terminal engineering output",
-        )
-        _verify_directory_inventory(
-            records_descriptor,
-            expected_record_names,
-            "engineering records",
-        )
-        publications.verify()
+        try:
+            _verify_directory_chain(
+                repo_root,
+                root_descriptor,
+                output_parent_links,
+                "authorized output parent",
+            )
+            _verify_directory_entry(
+                output_parent_descriptor,
+                output.name,
+                output_descriptor,
+                "adaptive-oracle engineering output",
+            )
+            _verify_directory_entry(
+                output_descriptor,
+                records_dir.name,
+                records_descriptor,
+                "engineering records directory",
+            )
+            _verify_directory_inventory(
+                output_descriptor,
+                {
+                    "attempt.json",
+                    "config.json",
+                    "manifest.json",
+                    "model_stage_evidence.json",
+                    "records",
+                    "runtime_evidence.json",
+                },
+                "pre-success engineering output",
+            )
+            _verify_directory_inventory(
+                records_descriptor,
+                expected_record_names,
+                "engineering records",
+            )
+            publications.verify()
+            _commit_prepared_terminal(prepared_success)
+        except BaseException as exc:
+            _discard_prepared_atomic_output(prepared_success, exc)
+            raise
         return success
     except BaseException as exc:
         original_exc_info = (type(exc), exc, exc.__traceback__)
@@ -3923,17 +4337,15 @@ def _run_authorized_engineering_generation(
             try:
                 failure_exists = _entry_exists(output_descriptor, failure_path.name)
                 success_exists = _entry_exists(output_descriptor, "success.json")
-                if success_exists and len(success_ownership_candidates) == 1:
-                    _remove_matching_entry(
-                        output_descriptor,
-                        "success.json",
-                        success_ownership_candidates[0],
-                    )
-                    success_exists = _entry_exists(output_descriptor, "success.json")
                 if success_exists:
                     raise RuntimeError(
                         "generation success was already committed before failure finalization"
                     )
+                if isinstance(exc, AtomicPublicationIndeterminate):
+                    raise RuntimeError(
+                        "generation terminal publication is indeterminate; "
+                        "opposite terminal publication is forbidden"
+                    ) from exc
                 if not failure_exists:
                     _verify_directory_chain(
                         repo_root,

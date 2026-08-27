@@ -792,6 +792,42 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
         generation._add_exception_note(error, "secondary")
         self.assertEqual(error.__notes__, ["secondary"])
 
+    def test_directory_chain_cleanup_preserves_primary_error_and_closes_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "present").mkdir()
+            real_close = generation.os.close
+            closed = []
+            reported = False
+
+            def close_then_report_once(descriptor):
+                nonlocal reported
+                real_close(descriptor)
+                closed.append(descriptor)
+                if not reported:
+                    reported = True
+                    raise OSError(errno.EIO, "simulated cleanup close failure")
+
+            with (
+                mock.patch.object(
+                    generation.os,
+                    "close",
+                    side_effect=close_then_report_once,
+                ),
+                self.assertRaisesRegex(ValueError, "component 1") as raised,
+            ):
+                generation._open_pinned_directory_chain(
+                    root,
+                    ("present", "missing"),
+                    "fixture chain",
+                )
+
+            self.assertTrue(reported)
+            self.assertGreaterEqual(len(closed), 2)
+            self.assertTrue(
+                any("cleanup close failure" in note for note in raised.exception.__notes__)
+            )
+
     def test_link_error_is_reconciled_when_held_inode_was_committed(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "receipt.json"
@@ -831,6 +867,164 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), payload)
             self.assertEqual(identity, generation._object_identity(target.stat()))
+
+    def test_stale_enoent_after_ambiguous_link_retries_to_positive_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            payload = b"committed-before-stale-negative\n"
+            real_link = generation._link_descriptor
+            real_stat = generation.os.stat
+            link_calls = 0
+            stale_negative = True
+
+            def link_then_report_error(descriptor, directory_descriptor, name):
+                nonlocal link_calls
+                link_calls += 1
+                if link_calls == 1:
+                    real_link(descriptor, directory_descriptor, name)
+                    raise OSError(errno.EIO, "simulated NFS reply loss")
+                return real_link(descriptor, directory_descriptor, name)
+
+            def hide_first_target_lookup(path, *args, **kwargs):
+                nonlocal stale_negative
+                if (
+                    stale_negative
+                    and path == target.name
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    stale_negative = False
+                    raise FileNotFoundError(errno.ENOENT, "stale negative lookup")
+                return real_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    generation,
+                    "_link_descriptor",
+                    side_effect=link_then_report_error,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "stat",
+                    side_effect=hide_first_target_lookup,
+                ),
+            ):
+                identity = generation.atomic_create_bytes(target, payload)
+
+            self.assertFalse(stale_negative)
+            self.assertGreaterEqual(link_calls, 2)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(identity, generation._object_identity(target.stat()))
+
+    def test_cancellation_during_link_reconciliation_is_deferred(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "receipt.json"
+            real_link = generation._link_descriptor
+            real_stat = generation.os.stat
+            link_reported = False
+            stat_cancelled = False
+
+            def link_then_report_error(descriptor, directory_descriptor, name):
+                nonlocal link_reported
+                if not link_reported:
+                    link_reported = True
+                    real_link(descriptor, directory_descriptor, name)
+                    raise OSError(errno.EIO, "simulated NFS reply loss")
+                return real_link(descriptor, directory_descriptor, name)
+
+            def cancel_first_target_lookup(path, *args, **kwargs):
+                nonlocal stat_cancelled
+                if (
+                    not stat_cancelled
+                    and path == target.name
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    stat_cancelled = True
+                    raise KeyboardInterrupt("simulated reconciliation cancellation")
+                return real_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    generation,
+                    "_link_descriptor",
+                    side_effect=link_then_report_error,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "stat",
+                    side_effect=cancel_first_target_lookup,
+                ),
+                self.assertRaisesRegex(KeyboardInterrupt, "reconciliation"),
+            ):
+                generation.atomic_create_bytes(target, b"cancelled\n")
+
+            self.assertTrue(link_reported)
+            self.assertTrue(stat_cancelled)
+            self.assertFalse(target.exists())
+
+    def test_terminal_commit_wins_over_reconciliation_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_dir = root / "target"
+            staging_dir = root / "staging"
+            target_dir.mkdir()
+            staging_dir.mkdir()
+            target_fd = generation._open_pinned_directory(target_dir, "target")
+            staging_fd = generation._open_pinned_directory(staging_dir, "staging")
+            real_link = generation._link_descriptor
+            real_stat = generation.os.stat
+            link_reported = False
+            stat_cancelled = False
+            prepared = generation._prepare_terminal_json(
+                target_dir / "success.json",
+                {"status": "complete"},
+                directory_descriptor=target_fd,
+                staging_directory_descriptor=staging_fd,
+            )
+
+            def link_then_report_error(descriptor, directory_descriptor, name):
+                nonlocal link_reported
+                if name == "success.json" and not link_reported:
+                    link_reported = True
+                    real_link(descriptor, directory_descriptor, name)
+                    raise OSError(errno.EIO, "simulated NFS reply loss")
+                return real_link(descriptor, directory_descriptor, name)
+
+            def cancel_first_target_lookup(path, *args, **kwargs):
+                nonlocal stat_cancelled
+                if (
+                    not stat_cancelled
+                    and path == "success.json"
+                    and kwargs.get("dir_fd") == target_fd
+                ):
+                    stat_cancelled = True
+                    raise KeyboardInterrupt("simulated reconciliation cancellation")
+                return real_stat(path, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_link_descriptor",
+                        side_effect=link_then_report_error,
+                    ),
+                    mock.patch.object(
+                        generation.os,
+                        "stat",
+                        side_effect=cancel_first_target_lookup,
+                    ),
+                ):
+                    identity = generation._commit_prepared_terminal(prepared)
+
+                self.assertTrue(link_reported)
+                self.assertTrue(stat_cancelled)
+                self.assertEqual(
+                    identity,
+                    generation._object_identity((target_dir / "success.json").stat()),
+                )
+            finally:
+                os.close(staging_fd)
+                os.close(target_fd)
 
     def test_post_link_cancellation_rolls_back_the_owned_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1033,6 +1227,108 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             finally:
                 publications.close()
                 os.close(descriptor)
+
+    def test_published_artifact_detects_rewrite_during_descriptor_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            target = parent / "record.bin"
+            target.write_bytes(b"AAAA")
+            directory_descriptor = generation._open_pinned_directory(
+                parent, "fixture parent"
+            )
+            publications = generation._PublishedArtifacts()
+            real_pread = generation.os.pread
+            mutated = False
+            try:
+                publications.add_exact(
+                    directory_descriptor,
+                    target.name,
+                    generation._object_identity(target.stat()),
+                    b"AAAA",
+                    "fixture record",
+                )
+                before = target.stat()
+
+                def mutate_after_first_chunk(descriptor, count, offset):
+                    nonlocal mutated
+                    chunk = real_pread(descriptor, count, offset)
+                    if chunk and not mutated:
+                        mutated = True
+                        os.chmod(target, 0o640)
+                        target.write_bytes(b"BBBB")
+                        os.chmod(target, before.st_mode & 0o777)
+                        os.utime(
+                            target,
+                            ns=(before.st_atime_ns, before.st_mtime_ns),
+                        )
+                    return chunk
+
+                with (
+                    mock.patch.object(
+                        generation.os,
+                        "pread",
+                        side_effect=mutate_after_first_chunk,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "changed before terminal"),
+                ):
+                    publications.verify()
+                self.assertTrue(mutated)
+            finally:
+                publications.close()
+                os.close(directory_descriptor)
+
+    def test_global_snapshot_detects_earlier_file_changed_during_later_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            first = parent / "first.bin"
+            second = parent / "second.bin"
+            first.write_bytes(b"AAAA")
+            second.write_bytes(b"CCCC")
+            directory_descriptor = generation._open_pinned_directory(
+                parent, "fixture parent"
+            )
+            publications = generation._PublishedArtifacts()
+            real_pread = generation.os.pread
+            mutated = False
+            try:
+                for path, payload in ((first, b"AAAA"), (second, b"CCCC")):
+                    publications.add_exact(
+                        directory_descriptor,
+                        path.name,
+                        generation._object_identity(path.stat()),
+                        payload,
+                        f"fixture {path.name}",
+                    )
+                second_descriptor = publications._rows[1][0]
+                first_before = first.stat()
+
+                def mutate_first_while_hashing_second(descriptor, count, offset):
+                    nonlocal mutated
+                    chunk = real_pread(descriptor, count, offset)
+                    if descriptor == second_descriptor and chunk and not mutated:
+                        mutated = True
+                        os.chmod(first, 0o640)
+                        first.write_bytes(b"BBBB")
+                        os.chmod(first, first_before.st_mode & 0o777)
+                        os.utime(
+                            first,
+                            ns=(first_before.st_atime_ns, first_before.st_mtime_ns),
+                        )
+                    return chunk
+
+                with (
+                    mock.patch.object(
+                        generation.os,
+                        "pread",
+                        side_effect=mutate_first_while_hashing_second,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "changed before terminal"),
+                ):
+                    publications.verify()
+                self.assertTrue(mutated)
+            finally:
+                publications.close()
+                os.close(directory_descriptor)
 
     def test_committed_output_is_not_masked_by_source_close_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1544,6 +1840,54 @@ class DescriptorBoundPublicationTest(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
+    def test_fallback_final_mkdir_cancellation_records_owned_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            descriptor = generation._open_pinned_directory(parent, "fixture parent")
+            ownership = []
+            real_mkdir = generation.os.mkdir
+            cancelled = False
+
+            def create_final_then_cancel(name, *args, **kwargs):
+                nonlocal cancelled
+                result = real_mkdir(name, *args, **kwargs)
+                if name == "claimed" and not cancelled:
+                    cancelled = True
+                    raise KeyboardInterrupt("simulated cancellation after final mkdir")
+                return result
+
+            try:
+                with (
+                    mock.patch.object(
+                        generation,
+                        "_rename_directory_noreplace",
+                        side_effect=OSError(errno.ENOSYS, "fallback required"),
+                    ),
+                    mock.patch.object(
+                        generation.os,
+                        "mkdir",
+                        side_effect=create_final_then_cancel,
+                    ),
+                    self.assertRaisesRegex(KeyboardInterrupt, "after final mkdir"),
+                ):
+                    generation._claim_pinned_directory_at(
+                        descriptor,
+                        "claimed",
+                        "fixture claim",
+                        fallback_marker_descriptor=descriptor,
+                        fallback_marker_name=".claimed.claim",
+                        ownership_candidates=ownership,
+                    )
+                self.assertTrue(cancelled)
+                self.assertEqual(len(ownership), 1)
+                self.assertEqual(
+                    ownership[0],
+                    generation._object_identity((parent / "claimed").stat()),
+                )
+                self.assertTrue((parent / ".claimed.claim").is_file())
+            finally:
+                os.close(descriptor)
+
     def test_missing_libc_renameat2_is_reported_as_unsupported(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -1795,6 +2139,7 @@ class AuthorizedGenerationTest(unittest.TestCase):
         pipe = SimpleNamespace(unet=_FakeUNet())
         initial_verifications = [self._verification(i) for i in (1, 2, 3)]
         real_atomic_json = generation.atomic_create_json
+        real_commit_terminal = generation._commit_prepared_terminal
 
         def stage_model(*_args, **_kwargs):
             events.append("stage")
@@ -1877,6 +2222,12 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 after_atomic_json_hook(path, value, directory_descriptor, identity)
             return identity
 
+        def commit_terminal(prepared):
+            identity = real_commit_terminal(prepared)
+            if trace_atomic_json:
+                events.append(f"write:{prepared.target_name}")
+            return identity
+
         patches = (
             mock.patch.object(
                 generation, "_load_verified_runtime_components", return_value=runtime
@@ -1928,6 +2279,11 @@ class AuthorizedGenerationTest(unittest.TestCase):
             ),
             mock.patch.object(
                 generation, "atomic_create_json", side_effect=atomic_json
+            ),
+            mock.patch.object(
+                generation,
+                "_commit_prepared_terminal",
+                side_effect=commit_terminal,
             ),
         )
         return runtime, patches
@@ -2226,6 +2582,40 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertTrue((self.output / "failure.json").is_file())
         self.assertFalse((self.output / "success.json").exists())
 
+    def test_final_mkdir_cancellation_is_reconciled_to_terminal_failure(self):
+        real_mkdir = generation.os.mkdir
+        cancelled = False
+
+        def create_output_then_cancel(path, *args, **kwargs):
+            nonlocal cancelled
+            result = real_mkdir(path, *args, **kwargs)
+            if path == self.output.name and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt(
+                    "simulated cancellation after output directory mkdir"
+                )
+            return result
+
+        with (
+            mock.patch.object(
+                generation,
+                "_rename_directory_noreplace",
+                side_effect=OSError(errno.EOPNOTSUPP, "unsupported"),
+            ),
+            mock.patch.object(
+                generation.os,
+                "mkdir",
+                side_effect=create_output_then_cancel,
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "output directory mkdir"),
+        ):
+            generation._run_authorized_engineering_generation(self.validated)
+
+        self.assertTrue(cancelled)
+        self.assertTrue((self.output / "attempt.json").is_file())
+        self.assertTrue((self.output / "failure.json").is_file())
+        self.assertFalse((self.output / "success.json").exists())
+
     def test_output_directory_replacement_blocks_terminal_publication(self):
         events = []
         displaced = self.root / "displaced-engineering-run"
@@ -2300,13 +2690,20 @@ class AuthorizedGenerationTest(unittest.TestCase):
             )
 
         secondary = getattr(raised.exception, "secondary_errors", ())
+        observed_errors = [
+            getattr(raised.exception, "original_error", raised.exception),
+            *(error for _, error in secondary),
+        ]
         self.assertTrue(
-            any("changed before terminal" in str(error) for _, error in secondary)
+            any(
+                "changed" in str(error) or "descriptor snapshot" in str(error)
+                for error in observed_errors
+            )
         )
         self.assertFalse((self.output / "success.json").exists())
         self.assertTrue((self.output / "failure.json").is_file())
 
-    def test_success_fsync_error_rolls_back_before_failure_receipt(self):
+    def test_success_fsync_error_does_not_reverse_committed_terminal(self):
         real_fsync = generation.os.fsync
         failed = False
 
@@ -2321,44 +2718,72 @@ class AuthorizedGenerationTest(unittest.TestCase):
                 raise OSError(errno.EIO, "simulated terminal fsync failure")
             return real_fsync(descriptor)
 
-        with (
-            mock.patch.object(
-                generation.os,
-                "fsync",
-                side_effect=fail_success_directory_fsync,
-            ),
-            self.assertRaises(OSError),
+        with mock.patch.object(
+            generation.os,
+            "fsync",
+            side_effect=fail_success_directory_fsync,
         ):
-            self._run([])
+            result, _runtime = self._run([])
 
         self.assertTrue(failed)
-        self.assertFalse((self.output / "success.json").exists())
-        self.assertTrue((self.output / "failure.json").is_file())
+        self.assertEqual(result["status"], "complete_generation_only_unscored")
+        self.assertTrue((self.output / "success.json").is_file())
+        self.assertFalse((self.output / "failure.json").exists())
 
-    def test_ambiguous_success_is_rolled_back_before_failure_receipt(self):
+    def test_ambiguous_success_commit_wins_without_failure_receipt(self):
+        real_link = generation._link_descriptor
         reported = False
 
-        def report_after_success(path, _value, _directory_descriptor, _identity):
+        def link_success_then_report_error(descriptor, directory_descriptor, name):
             nonlocal reported
-            if Path(path).name == "success.json" and not reported:
+            real_link(descriptor, directory_descriptor, name)
+            if name == "success.json" and not reported:
                 reported = True
                 raise OSError(errno.EIO, "simulated committed success error")
 
-        with self.assertRaisesRegex(OSError, "committed success"):
-            self._run([], after_atomic_json_hook=report_after_success)
+        with mock.patch.object(
+            generation,
+            "_link_descriptor",
+            side_effect=link_success_then_report_error,
+        ):
+            result, _runtime = self._run([])
 
         self.assertTrue(reported)
-        self.assertFalse((self.output / "success.json").exists())
-        self.assertTrue((self.output / "failure.json").is_file())
+        self.assertEqual(result["status"], "complete_generation_only_unscored")
+        self.assertTrue((self.output / "success.json").is_file())
+        self.assertFalse((self.output / "failure.json").exists())
 
-    def test_post_success_link_same_inode_record_rewrite_rolls_back_success(self):
+    def test_post_link_cancellation_cannot_reverse_generation_success(self):
+        real_link = generation._link_descriptor
+        cancelled = False
+
+        def link_success_then_cancel(descriptor, directory_descriptor, name):
+            nonlocal cancelled
+            real_link(descriptor, directory_descriptor, name)
+            if name == "success.json" and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated cancellation after success link")
+
+        with mock.patch.object(
+            generation,
+            "_link_descriptor",
+            side_effect=link_success_then_cancel,
+        ):
+            result, _runtime = self._run([])
+
+        self.assertTrue(cancelled)
+        self.assertEqual(result["status"], "complete_generation_only_unscored")
+        self.assertTrue((self.output / "success.json").is_file())
+        self.assertFalse((self.output / "failure.json").exists())
+
+    def test_pre_success_same_inode_record_rewrite_blocks_success(self):
         first_task = self.design["tasks"][0]["task_id"]
         target = self.output / "records" / f"{first_task}.json"
         mutated = False
 
-        def rewrite_record_after_success(path, _value, _directory_descriptor, _identity):
+        def rewrite_record_before_success():
             nonlocal mutated
-            if Path(path).name != "success.json" or mutated:
+            if mutated:
                 return
             mutated = True
             before = target.stat()
@@ -2369,8 +2794,8 @@ class AuthorizedGenerationTest(unittest.TestCase):
             os.chmod(target, before.st_mode & 0o777)
             os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
 
-        with self.assertRaisesRegex(RuntimeError, "changed before terminal"):
-            self._run([], after_atomic_json_hook=rewrite_record_after_success)
+        with self.assertRaises(RuntimeError):
+            self._run([], after_generation_hook=rewrite_record_before_success)
 
         self.assertTrue(mutated)
         self.assertFalse((self.output / "success.json").exists())
@@ -2383,6 +2808,41 @@ class AuthorizedGenerationTest(unittest.TestCase):
         self.assertEqual(success["status"], "complete_generation_only_unscored")
         self.assertTrue((self.output / "success.json").is_file())
         self.assertFalse((self.output / "failure.json").exists())
+
+    def test_failure_receipt_rewrite_during_commit_is_detected(self):
+        real_link = generation._link_descriptor
+        mutated = False
+
+        def link_then_rewrite_failure(descriptor, directory_descriptor, name):
+            nonlocal mutated
+            real_link(descriptor, directory_descriptor, name)
+            if name != "failure.json" or mutated:
+                return
+            mutated = True
+            target = self.output / name
+            before = target.stat()
+            payload = target.read_bytes()
+            os.chmod(target, 0o640)
+            target.write_bytes((b"X" if payload[:1] != b"X" else b"Y") + payload[1:])
+            os.chmod(target, before.st_mode & 0o777)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        with (
+            mock.patch.object(
+                generation,
+                "_link_descriptor",
+                side_effect=link_then_rewrite_failure,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "failure receipt creation also failed",
+            ),
+        ):
+            self._run([], task_error=RuntimeError("fixture task failure"))
+
+        self.assertTrue(mutated)
+        self.assertTrue((self.output / "failure.json").is_file())
+        self.assertFalse((self.output / "success.json").exists())
 
     def test_runtime_warning_log_and_stderr_are_captured_on_failure(self):
         def noisy_runtime_load(_validated):
