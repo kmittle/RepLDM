@@ -388,6 +388,9 @@ class _RuntimeEvidenceCapture:
         for _ in range(3):
             try:
                 sys.stderr = target
+            except BaseException as exc:
+                errors.append(exc)
+            try:
                 restored = sys.stderr is target
             except BaseException as exc:
                 errors.append(exc)

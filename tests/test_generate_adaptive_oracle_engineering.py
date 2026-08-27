@@ -931,6 +931,56 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             if capture._cleanup_pending:
                 capture.__exit__(None, None, None)
 
+    def test_python_stderr_post_restore_cancellation_confirms_safe_state(self):
+        class PostRestoreInterruptingSys:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+                self.restore_attempts = 0
+
+            @property
+            def stderr(self):
+                return self._wrapped.stderr
+
+            @stderr.setter
+            def stderr(self, value):
+                self.restore_attempts += 1
+                self._wrapped.stderr = value
+                raise KeyboardInterrupt("simulated post-restore cancellation")
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        capture.__enter__()
+        captured_stream = capture._stderr_stream
+        proxy = PostRestoreInterruptingSys(generation.sys)
+        try:
+            with (
+                mock.patch.object(generation, "sys", proxy),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence capture finalization failed",
+                ) as raised,
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertEqual(proxy.restore_attempts, 1)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertTrue(captured_stream.closed)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertFalse(capture._stderr_python_restore_pending)
+            capture.record()
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
     def test_stderr_restore_post_dup2_cancellation_keeps_fd2_restored(self):
         capture = generation._RuntimeEvidenceCapture()
         before_fd2 = self._fd_identity(2)
