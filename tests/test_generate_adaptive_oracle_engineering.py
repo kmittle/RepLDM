@@ -508,6 +508,54 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             if reused_descriptor >= 0:
                 os.close(reused_descriptor)
 
+    def test_same_target_fd_reuse_is_rejected_when_kcmp_is_available(self):
+        if generation._LIBC is None or generation._SYS_KCMP is None:
+            self.skipTest("KCMP_FILE unavailable")
+        capture = generation._RuntimeEvidenceCapture()
+        capture.__enter__()
+        descriptor = capture._stderr_stream_fd
+        anchor = capture._stderr_fd_anchors.get(descriptor)
+        self.assertIsNotNone(descriptor)
+        self.assertIsNotNone(anchor)
+        real_close = generation.os.close
+        reused = -1
+        cancelled = False
+
+        def close_then_reuse(candidate):
+            nonlocal reused, cancelled
+            if candidate == descriptor and not cancelled:
+                cancelled = True
+                real_close(candidate)
+                # Re-open the exact same underlying target (fd number reuse is
+                # otherwise indistinguishable from ownership by stat alone).
+                reused = os.dup(2)
+                self.assertEqual(reused, descriptor)
+                raise KeyboardInterrupt("same-target fd reuse")
+            return real_close(candidate)
+
+        try:
+            with (
+                mock.patch.object(generation.os, "close", side_effect=close_then_reuse),
+                self.assertRaisesRegex(RuntimeError, "finalization failed"),
+            ):
+                capture.__exit__(None, None, None)
+            self.assertTrue(cancelled)
+            os.fstat(reused)
+            # The foreign descriptor is deliberately never adopted; cleanup
+            # may clear the ownership record after detecting the reuse.
+            self.assertIsNone(capture._stderr_stream_fd)
+            self.assertNotEqual(
+                generation._RuntimeEvidenceCapture._stderr_ofd_same(
+                    descriptor, anchor
+                ),
+                True,
+            )
+        finally:
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+            if reused >= 0:
+                real_close(reused)
+
     def test_fdopen_return_cancellation_keeps_stream_guard_single_owned(self):
         capture = generation._RuntimeEvidenceCapture()
         real_fdopen = generation.os.fdopen

@@ -12,6 +12,7 @@ import copy
 from contextlib import redirect_stderr
 import csv
 import ctypes
+import ctypes.util
 import errno
 import hashlib
 import importlib
@@ -220,6 +221,31 @@ _CUDA_DEVICE = re.compile(r"cuda:(0|[1-9][0-9]*)")
 _PYTHON_SYS_MODULE = sys
 _RUNTIME_CAPTURE_FINALIZATION_ATTEMPTS = 3
 
+# Linux exposes KCMP_FILE, which compares open-file descriptions rather than
+# merely the inode behind a descriptor.  This lets cleanup distinguish our
+# original OFD from a foreign descriptor that reused the same integer.
+_KCMP_FILE = 0
+_SYS_KCMP = (
+    312
+    if sys.platform == "linux" and ctypes.sizeof(ctypes.c_void_p) == 8
+    else None
+)
+_LIBC = None
+if _SYS_KCMP is not None:
+    try:
+        _LIBC = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        _LIBC.syscall.argtypes = (
+            ctypes.c_long,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        )
+        _LIBC.syscall.restype = ctypes.c_long
+    except (OSError, AttributeError):
+        _LIBC = None
+
 
 class _UniqueKeyLoader(yaml.SafeLoader):
     pass
@@ -285,18 +311,19 @@ class _RuntimeEvidenceCapture:
         self._stderr_chunks: list[bytes] = []
         self._stderr_reader_error: Optional[BaseException] = None
         self._stderr_read_fd: Optional[int] = None
-        self._stderr_read_fd_identity: Optional[tuple[int, int, int, int]] = None
+        self._stderr_read_fd_identity: Optional[tuple[Any, ...]] = None
         self._stderr_saved_fd: Optional[int] = None
-        self._stderr_saved_fd_identity: Optional[tuple[int, int, int, int]] = None
+        self._stderr_saved_fd_identity: Optional[tuple[Any, ...]] = None
         self._stderr_write_fd: Optional[int] = None
-        self._stderr_write_fd_identity: Optional[tuple[int, int, int, int]] = None
+        self._stderr_write_fd_identity: Optional[tuple[Any, ...]] = None
         self._stderr_stop = threading.Event()
         self._stderr_stream: Optional[io.TextIOWrapper] = None
         self._stderr_stream_fd: Optional[int] = None
-        self._stderr_stream_fd_identity: Optional[tuple[int, int, int, int]] = None
-        self._stderr_guarded_fds: dict[
-            int, Optional[tuple[int, int, int, int]]
-        ] = {}
+        self._stderr_stream_fd_identity: Optional[tuple[Any, ...]] = None
+        self._stderr_guarded_fds: dict[int, Optional[tuple[Any, ...]]] = {}
+        # descriptor number -> private duplicate sharing its OFD.  The anchor
+        # makes ownership robust against same-target fd-number reuse.
+        self._stderr_fd_anchors: dict[int, int] = {}
         self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_handoff: Optional[_StderrReaderHandoff] = None
         self._stderr_context: Optional[Any] = None
@@ -375,9 +402,35 @@ class _RuntimeEvidenceCapture:
         return os.path.samestat(os.fstat(left), os.fstat(right))
 
     @staticmethod
-    def _stderr_descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
+    def _stderr_descriptor_identity(descriptor: int) -> tuple[Any, ...]:
         value = os.fstat(descriptor)
-        return value.st_dev, value.st_ino, value.st_mode, value.st_rdev
+        stat_identity = (value.st_dev, value.st_ino, value.st_mode, value.st_rdev)
+        # A stat tuple identifies the target, not the open-file description.
+        # Keep a private duplicate as an anchor when KCMP_FILE is available.
+        # The duplicate itself is intentionally not part of the public state;
+        # callers use the token returned here only for equality checks.
+        return stat_identity
+
+    @staticmethod
+    def _stderr_ofd_same(left: int, right: int) -> Optional[bool]:
+        if _LIBC is None or _SYS_KCMP is None:
+            return None
+        try:
+            result = int(
+                _LIBC.syscall(
+                    _SYS_KCMP,
+                    os.getpid(),
+                    os.getpid(),
+                    _KCMP_FILE,
+                    int(left),
+                    int(right),
+                )
+            )
+        except BaseException:
+            return None
+        if result < 0:
+            return None
+        return result == 0
 
     def _bind_stderr_descriptor(
         self,
@@ -387,14 +440,31 @@ class _RuntimeEvidenceCapture:
     ) -> None:
         """Record descriptor ownership before any fallible follow-up operation."""
 
+        # Establish the descriptor and stat record first.  The anchor is then
+        # recorded immediately; if a later operation is cancelled, cleanup can
+        # still prove whether this exact OFD survived.
         setattr(self, descriptor_attribute, descriptor)
         identity = self._stderr_descriptor_identity(descriptor)
         setattr(self, identity_attribute, identity)
+        anchor = -1
+        try:
+            anchor = os.dup(descriptor)
+            self._stderr_fd_anchors[descriptor] = anchor
+        except BaseException:
+            # A cancellation between dup(2) and map registration must not
+            # strand the new descriptor.  Keep cleanup best-effort while
+            # preserving the original exception.
+            if anchor >= 0 and descriptor not in self._stderr_fd_anchors:
+                try:
+                    os.close(anchor)
+                except BaseException:
+                    pass
+            raise
 
     def _stderr_descriptor_binding(
         self,
         descriptor: int,
-        expected_identity: tuple[int, int, int, int],
+        expected_identity: tuple[Any, ...],
     ) -> tuple[str, list[BaseException]]:
         try:
             observed_identity = self._stderr_descriptor_identity(descriptor)
@@ -404,6 +474,13 @@ class _RuntimeEvidenceCapture:
             return "unknown", [exc]
         except BaseException as exc:
             return "unknown", [exc]
+        anchor = self._stderr_fd_anchors.get(descriptor)
+        if anchor is not None:
+            same_ofd = self._stderr_ofd_same(descriptor, anchor)
+            if same_ofd is False:
+                return "reused", []
+            if same_ofd is True:
+                return "owned", []
         if observed_identity == expected_identity:
             return "owned", []
         return "reused", []
@@ -411,7 +488,7 @@ class _RuntimeEvidenceCapture:
     def _close_stderr_descriptor_number(
         self,
         descriptor: int,
-        expected_identity: Optional[tuple[int, int, int, int]],
+        expected_identity: Optional[tuple[Any, ...]],
     ) -> tuple[
         list[BaseException],
         bool,
@@ -477,6 +554,14 @@ class _RuntimeEvidenceCapture:
         if released:
             setattr(self, descriptor_attribute, None)
             setattr(self, identity_attribute, None)
+            anchor = self._stderr_fd_anchors.get(descriptor)
+            if anchor is not None:
+                try:
+                    os.close(anchor)
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    self._stderr_fd_anchors.pop(descriptor, None)
         else:
             setattr(self, identity_attribute, retained_identity)
         return errors, released
@@ -493,6 +578,14 @@ class _RuntimeEvidenceCapture:
             errors.extend(close_errors)
             if released:
                 self._stderr_guarded_fds.pop(descriptor, None)
+                anchor = self._stderr_fd_anchors.get(descriptor)
+                if anchor is not None:
+                    try:
+                        os.close(anchor)
+                    except BaseException as exc:
+                        errors.append(exc)
+                    else:
+                        self._stderr_fd_anchors.pop(descriptor, None)
             else:
                 self._stderr_guarded_fds[descriptor] = retained_identity
         return errors
@@ -987,6 +1080,7 @@ class _RuntimeEvidenceCapture:
                 self._stderr_stream_fd_identity,
                 self._stderr_write_fd_identity,
                 self._stderr_saved_fd_identity,
+                self._stderr_fd_anchors or None,
             )
         ) and not (
             self._stderr_fd_restore_pending
@@ -1030,6 +1124,7 @@ class _RuntimeEvidenceCapture:
                     self._stderr_thread,
                     self._stderr_handoff,
                     self._stderr_guarded_fds or None,
+                    self._stderr_fd_anchors or None,
                 )
             ):
                 try:
