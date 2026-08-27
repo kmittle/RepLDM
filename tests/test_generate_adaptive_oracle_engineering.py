@@ -812,6 +812,125 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         finally:
             os.close(sentinel)
 
+    def test_two_join_cancellations_retain_thread_ownership_for_retry(self):
+        capture = generation._RuntimeEvidenceCapture()
+        capture.__enter__()
+        thread = capture._stderr_thread
+        handoff = capture._stderr_handoff
+        read_descriptor = capture._stderr_read_fd
+        self.assertIsNotNone(thread)
+        self.assertIsNotNone(handoff)
+        self.assertIsNotNone(read_descriptor)
+        held_writer = os.dup(2)
+        sentinels = []
+        join_calls = 0
+
+        def cancel_join(*_args, **_kwargs):
+            nonlocal join_calls
+            join_calls += 1
+            raise KeyboardInterrupt("simulated repeated join cancellation")
+
+        try:
+            with (
+                mock.patch.object(thread, "join", side_effect=cancel_join),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence capture finalization failed",
+                ) as raised,
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertEqual(join_calls, 2)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertTrue(capture._entered)
+            self.assertTrue(capture._cleanup_pending)
+            self.assertIs(capture._stderr_thread, thread)
+            self.assertIs(capture._stderr_handoff, handoff)
+            self.assertIsNone(capture._stderr_read_fd)
+            with self.assertRaisesRegex(RuntimeError, "cannot be read"):
+                capture.record()
+
+            os.close(held_writer)
+            held_writer = -1
+            thread.join()
+            while read_descriptor not in sentinels:
+                sentinels.append(os.open("/dev/null", os.O_RDONLY))
+            capture.__exit__(None, None, None)
+            os.fstat(read_descriptor)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_thread)
+            self.assertIsNone(capture._stderr_handoff)
+        finally:
+            if held_writer >= 0:
+                os.close(held_writer)
+            if thread is not None and thread.is_alive():
+                thread.join()
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+            for descriptor in sentinels:
+                os.close(descriptor)
+
+    def test_python_stderr_restore_failure_retains_open_retry_state(self):
+        class InterruptingSys:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+                self.restore_attempts = 0
+
+            @property
+            def stderr(self):
+                return self._wrapped.stderr
+
+            @stderr.setter
+            def stderr(self, _value):
+                self.restore_attempts += 1
+                raise KeyboardInterrupt("simulated persistent sys.stderr cancellation")
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        capture = generation._RuntimeEvidenceCapture()
+        original_stderr = sys.stderr
+        capture.__enter__()
+        captured_stream = capture._stderr_stream
+        proxy = InterruptingSys(generation.sys)
+        try:
+            with (
+                mock.patch.object(generation, "sys", proxy),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence capture finalization failed",
+                ) as raised,
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertEqual(proxy.restore_attempts, 3)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertIs(sys.stderr, captured_stream)
+            self.assertFalse(captured_stream.closed)
+            self.assertTrue(capture._entered)
+            self.assertTrue(capture._cleanup_pending)
+            self.assertTrue(capture._stderr_python_restore_pending)
+            self.assertIsNotNone(capture._stderr_context)
+            with self.assertRaisesRegex(RuntimeError, "cannot be read"):
+                capture.record()
+
+            capture.__exit__(None, None, None)
+            self.assertIs(sys.stderr, original_stderr)
+            self.assertTrue(captured_stream.closed)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertFalse(capture._stderr_python_restore_pending)
+        finally:
+            if sys.stderr is not original_stderr:
+                sys.stderr = original_stderr
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+
     def test_stderr_restore_post_dup2_cancellation_keeps_fd2_restored(self):
         capture = generation._RuntimeEvidenceCapture()
         before_fd2 = self._fd_identity(2)
@@ -4479,6 +4598,59 @@ class AuthorizedGenerationTest(unittest.TestCase):
             evidence["cleanup_failure"]["exception_message"],
             "retry cleanup failed",
         )
+
+    def test_labeled_secondary_cancellation_blocks_both_generation_terminals(self):
+        events = []
+        task_error = RuntimeError("generation failed before finalization")
+        task_error.secondary_errors = (
+            (
+                "simulated labeled cleanup",
+                KeyboardInterrupt("simulated labeled cleanup cancellation"),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "generation failed before finalization",
+        ) as raised:
+            self._run(events, task_error=task_error)
+
+        self.assertIs(raised.exception, task_error)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertIn("runtime_cleanup", events)
+        self.assertIn("model_cleanup", events)
+        self.assertFalse((self.output / "success.json").exists())
+        self.assertFalse((self.output / "failure.json").exists())
+
+    def test_model_stage_cleanup_cancellation_blocks_both_generation_terminals(self):
+        events = []
+        partial_stage = {
+            "schema": generation.model_snapshot.MODEL_STAGE_SCHEMA,
+            "status": "staging_failed_cleanup_pending",
+            "path": str(self.root / "partial-model-stage"),
+            "parent": str(self.root),
+            "root_identity": {"st_dev": 7, "st_ino": 11},
+        }
+        stage_error = generation.model_snapshot.ModelStageCreationError(
+            ValueError("copy failed"),
+            KeyboardInterrupt("simulated initial stage cleanup cancellation"),
+            partial_stage,
+        )
+
+        with self.assertRaises(
+            generation.model_snapshot.ModelStageCreationError
+        ) as raised:
+            self._run(events, stage_error=stage_error)
+
+        self.assertIs(raised.exception, stage_error)
+        self.assertTrue(
+            generation._exception_contains_cancellation(raised.exception)
+        )
+        self.assertIn("model_cleanup", events)
+        self.assertFalse((self.output / "success.json").exists())
+        self.assertFalse((self.output / "failure.json").exists())
 
     def test_existing_output_is_terminal_before_runtime_load(self):
         self.output.mkdir()

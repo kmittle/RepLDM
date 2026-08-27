@@ -290,6 +290,8 @@ class _RuntimeEvidenceCapture:
         self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_handoff: Optional[_StderrReaderHandoff] = None
         self._stderr_context: Optional[Any] = None
+        self._stderr_previous_target: Any = None
+        self._stderr_python_restore_pending = False
         self._log_handler = _EvidenceLogHandler()
         self._warning_context: Optional[Any] = None
         self._warning_restore_state: Optional[tuple[Any, Any, Any]] = None
@@ -311,13 +313,16 @@ class _RuntimeEvidenceCapture:
         descriptor: int,
         handoff: _StderrReaderHandoff,
     ) -> None:
+        bootstrap_errors: list[BaseException] = []
         while handoff.reader_owns_descriptor is None:
             try:
                 handoff.ready.wait(0.05)
             except BaseException as exc:
-                self._record_stderr_reader_error(exc)
+                bootstrap_errors.append(exc)
         if not handoff.reader_owns_descriptor:
             return
+        for error in bootstrap_errors:
+            self._record_stderr_reader_error(error)
         self._drain_stderr(descriptor)
 
     def _drain_stderr(self, descriptor: int) -> None:
@@ -373,6 +378,28 @@ class _RuntimeEvidenceCapture:
                 errors.append(exc)
         errors.append(RuntimeError("OS stderr descriptor could not be restored and verified"))
         return False, errors
+
+    def _restore_python_stderr(self) -> tuple[list[BaseException], bool]:
+        errors: list[BaseException] = []
+        if not self._stderr_python_restore_pending:
+            return errors, True
+        target = self._stderr_previous_target
+        restored = False
+        for _ in range(3):
+            try:
+                sys.stderr = target
+                restored = sys.stderr is target
+            except BaseException as exc:
+                errors.append(exc)
+            if restored:
+                break
+        if restored:
+            self._stderr_python_restore_pending = False
+            self._stderr_previous_target = None
+            self._stderr_context = None
+        else:
+            errors.append(RuntimeError("Python stderr target could not be restored and verified"))
+        return errors, restored
 
     def _logger_state_is_restored(self) -> bool:
         target_level = self._previous_root_level
@@ -496,6 +523,8 @@ class _RuntimeEvidenceCapture:
             )
             self._stderr_stream_fd = stream_descriptor
             stream_fd_guard.clear()
+            self._stderr_previous_target = sys.stderr
+            self._stderr_python_restore_pending = True
             self._stderr_context = redirect_stderr(self._stderr_stream)
             self._stderr_context.__enter__()
         except BaseException as exc:
@@ -531,80 +560,104 @@ class _RuntimeEvidenceCapture:
             raise exc.with_traceback(error_traceback)
 
     def _stop_stderr_capture(self) -> None:
-        context = self._stderr_context
-        stream = self._stderr_stream
-        stream_fd = self._stderr_stream_fd
-        saved_fd = self._stderr_saved_fd
-        read_fd = self._stderr_read_fd
-        thread = self._stderr_thread
-        handoff = self._stderr_handoff
-        self._stderr_context = None
-        self._stderr_stream = None
-        self._stderr_stream_fd = None
-        self._stderr_saved_fd = None
-        self._stderr_read_fd = None
-        self._stderr_thread = None
-        self._stderr_handoff = None
         errors: list[BaseException] = []
         try:
-            if stream is not None:
-                stream.flush()
+            if self._stderr_stream is not None:
+                self._stderr_stream.flush()
         except BaseException as exc:
             errors.append(exc)
-        try:
-            if context is not None:
-                context.__exit__(None, None, None)
-        except BaseException as exc:
-            errors.append(exc)
+        python_restore_errors, python_stderr_restored = (
+            self._restore_python_stderr()
+        )
+        errors.extend(python_restore_errors)
         stderr_restored = True
+        saved_fd = self._stderr_saved_fd
         if saved_fd is not None:
             stderr_restored, restore_errors = self._restore_stderr_descriptor(saved_fd)
             errors.extend(restore_errors)
             if stderr_restored:
+                self._stderr_saved_fd = None
                 try:
                     os.close(saved_fd)
                 except BaseException as exc:
                     errors.append(exc)
+        if python_stderr_restored:
+            stream = self._stderr_stream
+            self._stderr_stream = None
+            try:
+                if stream is not None:
+                    stream.close()
+            except BaseException as exc:
+                errors.append(exc)
+            stream_fd = self._stderr_stream_fd
+            self._stderr_stream_fd = None
+            try:
+                if stream_fd is not None:
+                    os.close(stream_fd)
+            except BaseException as exc:
+                errors.append(exc)
+            self._stderr_stop.set()
+            handoff = self._stderr_handoff
+            thread = self._stderr_thread
+            read_fd = self._stderr_read_fd
+            reader_owns = False
+            if handoff is not None:
+                reader_owns, handoff_errors = handoff.release(False)
+                errors.extend(handoff_errors)
+            elif thread is not None:
+                reader_owns = True
+                errors.append(RuntimeError("stderr reader ownership handoff was lost"))
+            if reader_owns:
+                self._stderr_read_fd = None
+                if thread is None:
+                    errors.append(
+                        RuntimeError(
+                            "stderr reader owned a descriptor without a thread"
+                        )
+                    )
+                else:
+                    join_confirmed = False
+                    for _ in range(2):
+                        try:
+                            thread.join()
+                        except BaseException as join_error:
+                            errors.append(join_error)
+                        else:
+                            join_confirmed = True
+                        if not join_confirmed:
+                            try:
+                                join_confirmed = not thread.is_alive()
+                            except BaseException as state_error:
+                                errors.append(state_error)
+                        if join_confirmed:
+                            break
+                    if join_confirmed:
+                        self._stderr_thread = None
+                        self._stderr_handoff = None
+                        reader_error = self._stderr_reader_error
+                        self._stderr_reader_error = None
+                        if reader_error is not None:
+                            errors.append(reader_error)
+                    else:
+                        errors.append(
+                            RuntimeError(
+                                "stderr reader exit was not confirmed; ownership is "
+                                "retained for retry"
+                            )
+                        )
             else:
-                self._stderr_saved_fd = saved_fd
-        try:
-            if stream is not None:
-                stream.close()
-        except BaseException as exc:
-            errors.append(exc)
-        try:
-            if stream_fd is not None:
-                os.close(stream_fd)
-        except BaseException as exc:
-            errors.append(exc)
-        self._stderr_stop.set()
-        reader_owns = False
-        if handoff is not None:
-            reader_owns, handoff_errors = handoff.release(False)
-            errors.extend(handoff_errors)
-        elif thread is not None:
-            reader_owns = True
-            errors.append(RuntimeError("stderr reader ownership handoff was lost"))
-        if reader_owns and thread is not None:
-            try:
-                thread.join()
-            except BaseException as exc:
-                errors.append(exc)
-                try:
-                    thread.join()
-                except BaseException as retry_error:
-                    errors.append(retry_error)
-        elif reader_owns:
-            errors.append(RuntimeError("stderr reader owned a descriptor without a thread"))
-        elif read_fd is not None:
-            try:
-                os.close(read_fd)
-            except BaseException as exc:
-                errors.append(exc)
-        reader_error = self._stderr_reader_error
-        self._stderr_reader_error = None
-        if reader_error is not None:
-            errors.append(reader_error)
+                self._stderr_thread = None
+                self._stderr_handoff = None
+                self._stderr_read_fd = None
+                if read_fd is not None:
+                    try:
+                        os.close(read_fd)
+                    except BaseException as exc:
+                        errors.append(exc)
+                reader_error = self._stderr_reader_error
+                self._stderr_reader_error = None
+                if reader_error is not None:
+                    errors.append(reader_error)
         if not stderr_restored and self._stderr_saved_fd is None:
             errors.append(RuntimeError("stderr restoration ownership was lost"))
         if errors:
@@ -625,7 +678,7 @@ class _RuntimeEvidenceCapture:
                 self._stderr_handoff,
                 self._stderr_reader_error,
             )
-        )
+        ) and not self._stderr_python_restore_pending
 
     def __enter__(self) -> "_RuntimeEvidenceCapture":
         if self._used or self._entered or self._cleanup_pending:
@@ -1547,11 +1600,15 @@ def _exception_contains_cancellation(error: BaseException) -> bool:
             for value in (
                 current.__cause__,
                 current.__context__,
+                getattr(current, "original_error", None),
+                getattr(current, "cleanup_error", None),
                 getattr(current, "deferred_error", None),
                 getattr(current, "first_error", None),
                 getattr(current, "marker_error", None),
+                getattr(current, "rename_error", None),
                 getattr(current, "recovery_error", None),
                 getattr(current, "reconciliation_error", None),
+                getattr(current, "secondary_errors", None),
                 getattr(current, "secondary_exceptions", None),
             )
             if value is not None
