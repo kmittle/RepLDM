@@ -285,14 +285,23 @@ class _RuntimeEvidenceCapture:
         self._stderr_chunks: list[bytes] = []
         self._stderr_reader_error: Optional[BaseException] = None
         self._stderr_read_fd: Optional[int] = None
+        self._stderr_read_fd_identity: Optional[tuple[int, int, int, int]] = None
         self._stderr_saved_fd: Optional[int] = None
+        self._stderr_saved_fd_identity: Optional[tuple[int, int, int, int]] = None
+        self._stderr_write_fd: Optional[int] = None
+        self._stderr_write_fd_identity: Optional[tuple[int, int, int, int]] = None
         self._stderr_stop = threading.Event()
         self._stderr_stream: Optional[io.TextIOWrapper] = None
         self._stderr_stream_fd: Optional[int] = None
+        self._stderr_stream_fd_identity: Optional[tuple[int, int, int, int]] = None
+        self._stderr_guarded_fds: dict[
+            int, Optional[tuple[int, int, int, int]]
+        ] = {}
         self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_handoff: Optional[_StderrReaderHandoff] = None
         self._stderr_context: Optional[Any] = None
         self._stderr_previous_target: Any = None
+        self._stderr_fd_restore_pending = False
         self._stderr_python_restore_pending = False
         self._log_handler = _EvidenceLogHandler()
         self._warning_context: Optional[Any] = None
@@ -354,14 +363,159 @@ class _RuntimeEvidenceCapture:
         except BaseException as exc:
             self._record_stderr_reader_error(exc)
         finally:
-            try:
-                os.close(descriptor)
-            except BaseException as close_error:
+            close_errors, _ = self._close_stderr_descriptor(
+                "_stderr_read_fd",
+                "_stderr_read_fd_identity",
+            )
+            for close_error in close_errors:
                 self._record_stderr_reader_error(close_error)
 
     @staticmethod
     def _same_descriptor_target(left: int, right: int) -> bool:
         return os.path.samestat(os.fstat(left), os.fstat(right))
+
+    @staticmethod
+    def _stderr_descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
+        value = os.fstat(descriptor)
+        return value.st_dev, value.st_ino, value.st_mode, value.st_rdev
+
+    def _bind_stderr_descriptor(
+        self,
+        descriptor_attribute: str,
+        identity_attribute: str,
+        descriptor: int,
+    ) -> None:
+        """Record descriptor ownership before any fallible follow-up operation."""
+
+        setattr(self, descriptor_attribute, descriptor)
+        identity = self._stderr_descriptor_identity(descriptor)
+        setattr(self, identity_attribute, identity)
+
+    def _stderr_descriptor_binding(
+        self,
+        descriptor: int,
+        expected_identity: tuple[int, int, int, int],
+    ) -> tuple[str, list[BaseException]]:
+        try:
+            observed_identity = self._stderr_descriptor_identity(descriptor)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                return "closed", []
+            return "unknown", [exc]
+        except BaseException as exc:
+            return "unknown", [exc]
+        if observed_identity == expected_identity:
+            return "owned", []
+        return "reused", []
+
+    def _close_stderr_descriptor_number(
+        self,
+        descriptor: int,
+        expected_identity: Optional[tuple[int, int, int, int]],
+    ) -> tuple[
+        list[BaseException],
+        bool,
+        Optional[tuple[int, int, int, int]],
+    ]:
+        errors: list[BaseException] = []
+        if expected_identity is None:
+            try:
+                expected_identity = self._stderr_descriptor_identity(descriptor)
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    return errors, True, None
+                errors.append(exc)
+                return errors, False, None
+            except BaseException as exc:
+                errors.append(exc)
+                return errors, False, None
+        else:
+            binding, binding_errors = self._stderr_descriptor_binding(
+                descriptor,
+                expected_identity,
+            )
+            errors.extend(binding_errors)
+            if binding in {"closed", "reused"}:
+                if binding == "reused":
+                    errors.append(
+                        RuntimeError(
+                            "stderr descriptor number was reused before ownership release"
+                        )
+                    )
+                return errors, True, None
+            if binding == "unknown":
+                return errors, False, expected_identity
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            errors.append(exc)
+            binding, binding_errors = self._stderr_descriptor_binding(
+                descriptor,
+                expected_identity,
+            )
+            errors.extend(binding_errors)
+            if binding in {"closed", "reused"}:
+                return errors, True, None
+            return errors, False, expected_identity
+        return errors, True, None
+
+    def _close_stderr_descriptor(
+        self,
+        descriptor_attribute: str,
+        identity_attribute: str,
+    ) -> tuple[list[BaseException], bool]:
+        """Close one owned fd without ever retrying a reused descriptor number."""
+
+        descriptor = getattr(self, descriptor_attribute)
+        if descriptor is None:
+            setattr(self, identity_attribute, None)
+            return [], True
+        errors, released, retained_identity = self._close_stderr_descriptor_number(
+            descriptor,
+            getattr(self, identity_attribute),
+        )
+        if released:
+            setattr(self, descriptor_attribute, None)
+            setattr(self, identity_attribute, None)
+        else:
+            setattr(self, identity_attribute, retained_identity)
+        return errors, released
+
+    def _close_guarded_stderr_descriptors(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        for descriptor, expected_identity in tuple(self._stderr_guarded_fds.items()):
+            close_errors, released, retained_identity = (
+                self._close_stderr_descriptor_number(
+                    descriptor,
+                    expected_identity,
+                )
+            )
+            errors.extend(close_errors)
+            if released:
+                self._stderr_guarded_fds.pop(descriptor, None)
+            else:
+                self._stderr_guarded_fds[descriptor] = retained_identity
+        return errors
+
+    def _close_stderr_stream(self) -> tuple[list[BaseException], bool]:
+        errors: list[BaseException] = []
+        stream = self._stderr_stream
+        if stream is None:
+            return errors, True
+        try:
+            stream.close()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            closed = bool(stream.closed)
+        except BaseException as exc:
+            errors.append(exc)
+            return errors, False
+        if closed:
+            self._stderr_stream = None
+            return errors, True
+        errors.append(RuntimeError("Python stderr capture stream remained open"))
+        return errors, False
 
     def _restore_stderr_descriptor(
         self,
@@ -508,7 +662,6 @@ class _RuntimeEvidenceCapture:
         saved_fd = -1
         saved_fd_guard: list[int] = []
         stream_fd_guard: list[int] = []
-        write_fd: Optional[int] = None
         try:
             saved_fd = _duplicate_descriptor(
                 2,
@@ -516,10 +669,25 @@ class _RuntimeEvidenceCapture:
             )
             if saved_fd_guard != [saved_fd]:
                 raise RuntimeError("saved stderr descriptor handoff changed")
-            self._stderr_saved_fd = saved_fd
+            self._bind_stderr_descriptor(
+                "_stderr_saved_fd",
+                "_stderr_saved_fd_identity",
+                saved_fd,
+            )
             saved_fd_guard.clear()
             read_fd, write_fd = os.pipe()
             self._stderr_read_fd = read_fd
+            self._stderr_write_fd = write_fd
+            self._bind_stderr_descriptor(
+                "_stderr_read_fd",
+                "_stderr_read_fd_identity",
+                read_fd,
+            )
+            self._bind_stderr_descriptor(
+                "_stderr_write_fd",
+                "_stderr_write_fd_identity",
+                write_fd,
+            )
             os.set_blocking(read_fd, False)
             handoff = _StderrReaderHandoff()
             self._stderr_handoff = handoff
@@ -537,17 +705,31 @@ class _RuntimeEvidenceCapture:
                 handoff_error = RuntimeError("stderr reader handoff was interrupted")
                 handoff_error.secondary_exceptions = tuple(handoff_errors)
                 raise handoff_error from handoff_errors[0]
+            self._stderr_fd_restore_pending = True
             os.dup2(write_fd, 2, inheritable=True)
-            try:
-                os.close(write_fd)
-            finally:
-                write_fd = None
+            writer_errors, writer_released = self._close_stderr_descriptor(
+                "_stderr_write_fd",
+                "_stderr_write_fd_identity",
+            )
+            if writer_errors:
+                writer_error = writer_errors[0]
+                for secondary in writer_errors[1:]:
+                    _attach_secondary_exception(writer_error, secondary)
+                raise writer_error
+            if not writer_released:
+                raise RuntimeError("stderr writer descriptor close was not verified")
             stream_descriptor = _duplicate_descriptor(
                 2,
                 descriptor_guard=stream_fd_guard,
             )
             if stream_fd_guard != [stream_descriptor]:
                 raise RuntimeError("stderr stream descriptor handoff changed")
+            self._bind_stderr_descriptor(
+                "_stderr_stream_fd",
+                "_stderr_stream_fd_identity",
+                stream_descriptor,
+            )
+            stream_fd_guard.clear()
             self._stderr_stream = os.fdopen(
                 stream_descriptor,
                 "w",
@@ -556,8 +738,6 @@ class _RuntimeEvidenceCapture:
                 buffering=1,
                 closefd=False,
             )
-            self._stderr_stream_fd = stream_descriptor
-            stream_fd_guard.clear()
             self._stderr_previous_target = sys.stderr
             self._stderr_python_restore_pending = True
             self._stderr_context = redirect_stderr(self._stderr_stream)
@@ -565,20 +745,48 @@ class _RuntimeEvidenceCapture:
         except BaseException as exc:
             error_traceback = exc.__traceback__
             cleanup_errors: list[BaseException] = []
-            if write_fd is not None:
-                writer_to_close = write_fd
-                write_fd = None
-                try:
-                    os.close(writer_to_close)
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
+            guarded_attributes = (
+                (
+                    stream_fd_guard,
+                    "_stderr_stream_fd",
+                    "_stderr_stream_fd_identity",
+                ),
+                (
+                    saved_fd_guard,
+                    "_stderr_saved_fd",
+                    "_stderr_saved_fd_identity",
+                ),
+            )
+            for guard, descriptor_attribute, identity_attribute in guarded_attributes:
+                owned_descriptor = getattr(self, descriptor_attribute)
+                if owned_descriptor in guard:
+                    guard.remove(owned_descriptor)
+                if owned_descriptor is None and len(guard) == 1:
+                    guarded_descriptor = guard.pop()
+                    try:
+                        self._bind_stderr_descriptor(
+                            descriptor_attribute,
+                            identity_attribute,
+                            guarded_descriptor,
+                        )
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
             for guarded_descriptor in dict.fromkeys(
                 [*stream_fd_guard, *saved_fd_guard]
             ):
                 try:
-                    os.close(guarded_descriptor)
+                    guarded_identity = self._stderr_descriptor_identity(
+                        guarded_descriptor
+                    )
+                except OSError as cleanup_error:
+                    if cleanup_error.errno != errno.EBADF:
+                        self._stderr_guarded_fds[guarded_descriptor] = None
+                        cleanup_errors.append(cleanup_error)
                 except BaseException as cleanup_error:
+                    self._stderr_guarded_fds[guarded_descriptor] = None
                     cleanup_errors.append(cleanup_error)
+                else:
+                    self._stderr_guarded_fds[guarded_descriptor] = guarded_identity
             stream_fd_guard.clear()
             saved_fd_guard.clear()
             try:
@@ -610,36 +818,88 @@ class _RuntimeEvidenceCapture:
                 self._restore_python_stderr_direct()
             )
             errors.extend(direct_restore_errors)
-        stderr_restored = True
+        stderr_restored = not self._stderr_fd_restore_pending
         saved_fd = self._stderr_saved_fd
-        if saved_fd is not None:
-            stderr_restored, restore_errors = self._restore_stderr_descriptor(saved_fd)
-            errors.extend(restore_errors)
-            if stderr_restored:
-                self._stderr_saved_fd = None
-                try:
-                    os.close(saved_fd)
-                except BaseException as exc:
-                    errors.append(exc)
-        if python_stderr_restored:
-            stream = self._stderr_stream
-            self._stderr_stream = None
-            try:
-                if stream is not None:
-                    stream.close()
-            except BaseException as exc:
-                errors.append(exc)
-            stream_fd = self._stderr_stream_fd
-            self._stderr_stream_fd = None
-            try:
-                if stream_fd is not None:
-                    os.close(stream_fd)
-            except BaseException as exc:
-                errors.append(exc)
+        saved_identity = self._stderr_saved_fd_identity
+        if self._stderr_fd_restore_pending and saved_fd is not None:
+            if saved_identity is None:
+                errors.append(RuntimeError("saved stderr descriptor identity was lost"))
+            else:
+                binding, binding_errors = self._stderr_descriptor_binding(
+                    saved_fd,
+                    saved_identity,
+                )
+                errors.extend(binding_errors)
+                if binding == "owned":
+                    stderr_restored, restore_errors = (
+                        self._restore_stderr_descriptor(saved_fd)
+                    )
+                    errors.extend(restore_errors)
+                    if stderr_restored:
+                        self._stderr_fd_restore_pending = False
+                elif binding in {"closed", "reused"}:
+                    self._stderr_saved_fd = None
+                    self._stderr_saved_fd_identity = None
+                    if binding == "reused":
+                        errors.append(
+                            RuntimeError(
+                                "saved stderr descriptor number was reused before "
+                                "ownership release"
+                            )
+                        )
+                    try:
+                        fd2_restored = (
+                            self._stderr_descriptor_identity(2) == saved_identity
+                        )
+                    except BaseException as verification_error:
+                        errors.append(verification_error)
+                        fd2_restored = False
+                    if fd2_restored:
+                        self._stderr_fd_restore_pending = False
+                        stderr_restored = True
+                    else:
+                        errors.append(
+                            RuntimeError(
+                                "saved stderr descriptor ownership was lost before "
+                                "fd 2 restoration"
+                            )
+                        )
+        saved_fd = self._stderr_saved_fd
+        if stderr_restored and saved_fd is not None:
+            close_errors, _ = self._close_stderr_descriptor(
+                "_stderr_saved_fd",
+                "_stderr_saved_fd_identity",
+            )
+            errors.extend(close_errors)
+        if stderr_restored:
+            writer_errors, _ = self._close_stderr_descriptor(
+                "_stderr_write_fd",
+                "_stderr_write_fd_identity",
+            )
+            errors.extend(writer_errors)
+            errors.extend(self._close_guarded_stderr_descriptors())
+        if python_stderr_restored and stderr_restored:
+            stream_errors, stream_closed = self._close_stderr_stream()
+            errors.extend(stream_errors)
+            if stream_closed:
+                stream_fd_errors, _ = self._close_stderr_descriptor(
+                    "_stderr_stream_fd",
+                    "_stderr_stream_fd_identity",
+                )
+                errors.extend(stream_fd_errors)
+        writers_released = all(
+            value is None
+            for value in (
+                self._stderr_stream,
+                self._stderr_stream_fd,
+                self._stderr_write_fd,
+                self._stderr_guarded_fds or None,
+            )
+        )
+        if python_stderr_restored and stderr_restored and writers_released:
             self._stderr_stop.set()
             handoff = self._stderr_handoff
             thread = self._stderr_thread
-            read_fd = self._stderr_read_fd
             reader_owns = False
             if handoff is not None:
                 reader_owns, handoff_errors = handoff.release(False)
@@ -648,7 +908,6 @@ class _RuntimeEvidenceCapture:
                 reader_owns = True
                 errors.append(RuntimeError("stderr reader ownership handoff was lost"))
             if reader_owns:
-                self._stderr_read_fd = None
                 if thread is None:
                     errors.append(
                         RuntimeError(
@@ -672,12 +931,18 @@ class _RuntimeEvidenceCapture:
                         if join_confirmed:
                             break
                     if join_confirmed:
-                        self._stderr_thread = None
-                        self._stderr_handoff = None
-                        reader_error = self._stderr_reader_error
-                        self._stderr_reader_error = None
-                        if reader_error is not None:
-                            errors.append(reader_error)
+                        read_errors, read_released = self._close_stderr_descriptor(
+                            "_stderr_read_fd",
+                            "_stderr_read_fd_identity",
+                        )
+                        errors.extend(read_errors)
+                        if read_released:
+                            self._stderr_thread = None
+                            self._stderr_handoff = None
+                            reader_error = self._stderr_reader_error
+                            self._stderr_reader_error = None
+                            if reader_error is not None:
+                                errors.append(reader_error)
                     else:
                         errors.append(
                             RuntimeError(
@@ -688,17 +953,16 @@ class _RuntimeEvidenceCapture:
             else:
                 self._stderr_thread = None
                 self._stderr_handoff = None
-                self._stderr_read_fd = None
-                if read_fd is not None:
-                    try:
-                        os.close(read_fd)
-                    except BaseException as exc:
-                        errors.append(exc)
+                read_errors, _ = self._close_stderr_descriptor(
+                    "_stderr_read_fd",
+                    "_stderr_read_fd_identity",
+                )
+                errors.extend(read_errors)
                 reader_error = self._stderr_reader_error
                 self._stderr_reader_error = None
                 if reader_error is not None:
                     errors.append(reader_error)
-        if not stderr_restored and self._stderr_saved_fd is None:
+        if self._stderr_fd_restore_pending and self._stderr_saved_fd is None:
             errors.append(RuntimeError("stderr restoration ownership was lost"))
         if errors:
             error = RuntimeError("OS stderr evidence capture failed")
@@ -712,13 +976,22 @@ class _RuntimeEvidenceCapture:
                 self._stderr_context,
                 self._stderr_stream,
                 self._stderr_stream_fd,
+                self._stderr_write_fd,
                 self._stderr_saved_fd,
                 self._stderr_read_fd,
                 self._stderr_thread,
                 self._stderr_handoff,
                 self._stderr_reader_error,
+                self._stderr_guarded_fds or None,
+                self._stderr_read_fd_identity,
+                self._stderr_stream_fd_identity,
+                self._stderr_write_fd_identity,
+                self._stderr_saved_fd_identity,
             )
-        ) and not self._stderr_python_restore_pending
+        ) and not (
+            self._stderr_fd_restore_pending
+            or self._stderr_python_restore_pending
+        )
 
     def __enter__(self) -> "_RuntimeEvidenceCapture":
         if self._used or self._entered or self._cleanup_pending:
@@ -751,10 +1024,12 @@ class _RuntimeEvidenceCapture:
                     self._stderr_context,
                     self._stderr_stream,
                     self._stderr_stream_fd,
+                    self._stderr_write_fd,
                     self._stderr_saved_fd,
                     self._stderr_read_fd,
                     self._stderr_thread,
                     self._stderr_handoff,
+                    self._stderr_guarded_fds or None,
                 )
             ):
                 try:

@@ -848,7 +848,7 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
             self.assertTrue(capture._cleanup_pending)
             self.assertIs(capture._stderr_thread, thread)
             self.assertIs(capture._stderr_handoff, handoff)
-            self.assertIsNone(capture._stderr_read_fd)
+            self.assertEqual(capture._stderr_read_fd, read_descriptor)
             with self.assertRaisesRegex(RuntimeError, "cannot be read"):
                 capture.record()
 
@@ -1112,6 +1112,291 @@ class RuntimeEvidenceCaptureTest(unittest.TestCase):
         self.assertFalse(capture._entered)
         self.assertFalse(capture._cleanup_pending)
         self.assertIsNone(capture._stderr_saved_fd)
+
+    def test_owned_stderr_fds_retain_pre_close_cancellation_for_retry(self):
+        for descriptor_attribute in (
+            "_stderr_saved_fd",
+            "_stderr_stream_fd",
+        ):
+            with self.subTest(descriptor_attribute=descriptor_attribute):
+                capture = generation._RuntimeEvidenceCapture()
+                before_fd2 = self._fd_identity(2)
+                capture.__enter__()
+                descriptor = getattr(capture, descriptor_attribute)
+                self.assertIsNotNone(descriptor)
+                real_close = generation.os.close
+                cancelled = False
+
+                def cancel_before_close(candidate):
+                    nonlocal cancelled
+                    if candidate == descriptor and not cancelled:
+                        cancelled = True
+                        raise KeyboardInterrupt(
+                            f"simulated {descriptor_attribute} pre-close cancellation"
+                        )
+                    return real_close(candidate)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            generation.os,
+                            "close",
+                            side_effect=cancel_before_close,
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "runtime evidence capture finalization failed",
+                        ) as raised,
+                    ):
+                        capture.__exit__(None, None, None)
+
+                    self.assertTrue(cancelled)
+                    self.assertTrue(
+                        generation._exception_contains_cancellation(raised.exception)
+                    )
+                    self.assertTrue(capture._entered)
+                    self.assertTrue(capture._cleanup_pending)
+                    self.assertEqual(getattr(capture, descriptor_attribute), descriptor)
+                    os.fstat(descriptor)
+
+                    capture.__exit__(None, None, None)
+                    self.assertEqual(self._fd_identity(2), before_fd2)
+                    self.assertFalse(capture._entered)
+                    self.assertFalse(capture._cleanup_pending)
+                    self.assertIsNone(getattr(capture, descriptor_attribute))
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(descriptor)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                finally:
+                    if capture._cleanup_pending:
+                        capture.__exit__(None, None, None)
+
+    def test_owned_stderr_fds_release_post_close_reused_numbers(self):
+        for descriptor_attribute in (
+            "_stderr_saved_fd",
+            "_stderr_stream_fd",
+        ):
+            with self.subTest(descriptor_attribute=descriptor_attribute):
+                capture = generation._RuntimeEvidenceCapture()
+                before_fd2 = self._fd_identity(2)
+                capture.__enter__()
+                descriptor = getattr(capture, descriptor_attribute)
+                self.assertIsNotNone(descriptor)
+                real_close = generation.os.close
+                reused_descriptors = []
+                cancelled = False
+
+                def close_reuse_then_cancel(candidate):
+                    nonlocal cancelled
+                    if candidate == descriptor and not cancelled:
+                        cancelled = True
+                        real_close(candidate)
+                        while descriptor not in reused_descriptors:
+                            reused_descriptors.append(
+                                os.open("/dev/null", os.O_RDONLY)
+                            )
+                        raise KeyboardInterrupt(
+                            f"simulated {descriptor_attribute} post-close cancellation"
+                        )
+                    return real_close(candidate)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            generation.os,
+                            "close",
+                            side_effect=close_reuse_then_cancel,
+                        ),
+                        self.assertRaisesRegex(
+                            RuntimeError,
+                            "runtime evidence capture finalization failed",
+                        ) as raised,
+                    ):
+                        capture.__exit__(None, None, None)
+
+                    self.assertTrue(cancelled)
+                    self.assertTrue(
+                        generation._exception_contains_cancellation(raised.exception)
+                    )
+                    self.assertEqual(self._fd_identity(2), before_fd2)
+                    self.assertFalse(capture._entered)
+                    self.assertFalse(capture._cleanup_pending)
+                    self.assertIsNone(getattr(capture, descriptor_attribute))
+                    os.fstat(descriptor)
+                    capture._stop_stderr_capture()
+                    os.fstat(descriptor)
+                finally:
+                    if capture._cleanup_pending:
+                        capture.__exit__(None, None, None)
+                    for reused_descriptor in reused_descriptors:
+                        real_close(reused_descriptor)
+
+    def test_stderr_reader_pre_close_cancellation_is_reconciled(self):
+        capture = generation._RuntimeEvidenceCapture()
+        capture.__enter__()
+        read_descriptor = capture._stderr_read_fd
+        self.assertIsNotNone(read_descriptor)
+        real_close = generation.os.close
+        cancelled = False
+
+        def cancel_before_reader_close(descriptor):
+            nonlocal cancelled
+            if descriptor == read_descriptor and not cancelled:
+                cancelled = True
+                raise KeyboardInterrupt("simulated reader pre-close cancellation")
+            return real_close(descriptor)
+
+        with (
+            mock.patch.object(
+                generation.os,
+                "close",
+                side_effect=cancel_before_reader_close,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ) as raised,
+        ):
+            capture.__exit__(None, None, None)
+
+        self.assertTrue(cancelled)
+        self.assertTrue(generation._exception_contains_cancellation(raised.exception))
+        self.assertFalse(capture._entered)
+        self.assertFalse(capture._cleanup_pending)
+        self.assertIsNone(capture._stderr_read_fd)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(read_descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_saved_fd_retry_never_restores_from_a_reused_descriptor(self):
+        capture = generation._RuntimeEvidenceCapture()
+        before_fd2 = self._fd_identity(2)
+        capture.__enter__()
+        saved_descriptor = capture._stderr_saved_fd
+        self.assertIsNotNone(saved_descriptor)
+        real_binding = capture._stderr_descriptor_binding
+        real_close = generation.os.close
+        saved_binding_calls = 0
+        reused_descriptors = []
+        close_cancelled = False
+
+        def interrupt_third_saved_binding(descriptor, expected_identity):
+            nonlocal saved_binding_calls
+            if descriptor == saved_descriptor:
+                saved_binding_calls += 1
+                if saved_binding_calls == 3:
+                    return (
+                        "unknown",
+                        [KeyboardInterrupt("simulated close reconciliation cancellation")],
+                    )
+            return real_binding(descriptor, expected_identity)
+
+        def close_saved_reuse_then_cancel(descriptor):
+            nonlocal close_cancelled
+            if descriptor == saved_descriptor and not close_cancelled:
+                close_cancelled = True
+                real_close(descriptor)
+                while saved_descriptor not in reused_descriptors:
+                    reused_descriptors.append(os.open("/dev/null", os.O_RDONLY))
+                raise KeyboardInterrupt("simulated saved fd post-close cancellation")
+            return real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    capture,
+                    "_stderr_descriptor_binding",
+                    side_effect=interrupt_third_saved_binding,
+                ),
+                mock.patch.object(
+                    generation.os,
+                    "close",
+                    side_effect=close_saved_reuse_then_cancel,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence capture finalization failed",
+                ) as raised,
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertTrue(close_cancelled)
+            self.assertEqual(saved_binding_calls, 3)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertFalse(capture._stderr_fd_restore_pending)
+            self.assertTrue(capture._cleanup_pending)
+            self.assertEqual(capture._stderr_saved_fd, saved_descriptor)
+            self.assertEqual(self._fd_identity(2), before_fd2)
+            os.fstat(saved_descriptor)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "runtime evidence capture finalization failed",
+            ):
+                capture.__exit__(None, None, None)
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_saved_fd)
+            self.assertEqual(self._fd_identity(2), before_fd2)
+            os.fstat(saved_descriptor)
+            capture._stop_stderr_capture()
+            os.fstat(saved_descriptor)
+        finally:
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+            for reused_descriptor in reused_descriptors:
+                real_close(reused_descriptor)
+
+    def test_stderr_reader_post_close_reuse_is_not_closed_by_joiner(self):
+        capture = generation._RuntimeEvidenceCapture()
+        capture.__enter__()
+        read_descriptor = capture._stderr_read_fd
+        self.assertIsNotNone(read_descriptor)
+        real_close = generation.os.close
+        reused_descriptors = []
+        cancelled = False
+
+        def close_reader_reuse_then_cancel(descriptor):
+            nonlocal cancelled
+            if descriptor == read_descriptor and not cancelled:
+                cancelled = True
+                real_close(descriptor)
+                while read_descriptor not in reused_descriptors:
+                    reused_descriptors.append(os.open("/dev/null", os.O_RDONLY))
+                raise KeyboardInterrupt("simulated reader post-close cancellation")
+            return real_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    generation.os,
+                    "close",
+                    side_effect=close_reader_reuse_then_cancel,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "runtime evidence capture finalization failed",
+                ) as raised,
+            ):
+                capture.__exit__(None, None, None)
+
+            self.assertTrue(cancelled)
+            self.assertTrue(
+                generation._exception_contains_cancellation(raised.exception)
+            )
+            self.assertFalse(capture._entered)
+            self.assertFalse(capture._cleanup_pending)
+            self.assertIsNone(capture._stderr_read_fd)
+            os.fstat(read_descriptor)
+            capture._stop_stderr_capture()
+            os.fstat(read_descriptor)
+        finally:
+            if capture._cleanup_pending:
+                capture.__exit__(None, None, None)
+            for reused_descriptor in reused_descriptors:
+                real_close(reused_descriptor)
 
     def test_logger_handler_restore_retries_pre_remove_cancellation(self):
         capture = generation._RuntimeEvidenceCapture()
