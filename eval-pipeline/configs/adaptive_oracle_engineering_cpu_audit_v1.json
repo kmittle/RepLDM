@@ -1,0 +1,372 @@
+{
+  "design": {
+    "contract_sha256": "7c5ab1f1314aa82a394ee51f2edc2b4556d2a89d80baaa6fd6dc2fd43cec49d4",
+    "design_sha256": "63acba7e5321b9b1681016804dc319c2ad0652e80053a23fabaa4b186eef8538",
+    "execution_contract_sha256": "dcc365105f9e3e354de24063c198e27fb9c18da9fafd6b00942c2f4e116c3812",
+    "primary_action_bank_sha256": "ce10244eec6959e9e74764cab3990da2a685d738663b55a33d5c66fdcaca80f8",
+    "prompt_count": 11,
+    "sidecar_shape_sha256": "1d9a22b2e5ad66ee87627536601793fec7db2e812d6826eaa5b93f31c81869c7",
+    "signed_orbit_cycle_sha256": "d435b6fcfe201d60893c35b44e4c5fa3aa36c5c8acca74a44a9d2746d5f49cc1",
+    "status": "passed",
+    "task_count": 165,
+    "tasks_per_prompt": 15,
+    "tasks_sha256": "8bb24f08f75258db487dc962e506a8a123dbd40392236af783b3342f5815b532"
+  },
+  "environment": {
+    "helper_schema": "repldm_generation_environment_lock_v2",
+    "lock_id": "adaptive_oracle_20260826",
+    "lock_path": "eval-pipeline/configs/generation_environment_adaptive_oracle_v2.yaml",
+    "lock_sha256": "6ebddd587d32ede30a12256f80ead1fbc392129b3b133cec4bbc917c0d1797c6",
+    "observed": {
+      "cuda_device": {
+        "binding": {
+          "name_match": true,
+          "unmasked_physical_index_match": true,
+          "uuid_match": true
+        },
+        "cuda_device_order": null,
+        "cuda_visible_devices": null,
+        "logical_index": 1,
+        "nvidia_smi": {
+          "index": 1,
+          "name": "NVIDIA GeForce RTX 3090",
+          "pci_bus_id": "00000000:1B:00.0",
+          "uuid": "GPU-1e2de078-b1e0-0b99-1154-a738e8fee015"
+        },
+        "requested": "cuda:1",
+        "torch": {
+          "index": 1,
+          "name": "NVIDIA GeForce RTX 3090",
+          "uuid": "GPU-1e2de078-b1e0-0b99-1154-a738e8fee015"
+        }
+      },
+      "determinism": {
+        "cuda_matmul_allow_tf32": false,
+        "cudnn_allow_tf32": true,
+        "cudnn_benchmark": false,
+        "cudnn_deterministic": false,
+        "deterministic_algorithms": false
+      },
+      "hardware": {
+        "compute_capability": "8.6",
+        "driver": "580.126.09",
+        "gpu": "NVIDIA GeForce RTX 3090"
+      },
+      "packages": {
+        "accelerate": "1.12.0",
+        "diffusers": "0.32.1",
+        "einops": "0.8.0",
+        "entmax": "1.3",
+        "huggingface-hub": "0.26.3",
+        "numpy": "2.0.1",
+        "pandas": "2.2.3",
+        "pillow": "11.0.0",
+        "pyyaml": "6.0.2",
+        "safetensors": "0.4.5",
+        "scipy": "1.14.1",
+        "tokenizers": "0.21.0",
+        "torch": "2.5.1",
+        "torchvision": "0.20.1",
+        "tqdm": "4.67.1",
+        "transformers": "4.47.1"
+      },
+      "platform": "linux-x86_64",
+      "runtime": {
+        "cuda": "12.1",
+        "cudnn": 90100,
+        "python": "3.11.10"
+      }
+    },
+    "status": "passed"
+  },
+  "implementation": {
+    "clean": true,
+    "commit": "b2c9855933d42c856952e930d2ef69c987d4e3d7",
+    "source_files": [
+      {
+        "path": "AttentionGuidance/__init__.py",
+        "sha256": "85a777e36a74ce23f1dfe2e0248e864a23b57b90bacb1b52e1509b6e9c2a4275",
+        "size": 4362
+      },
+      {
+        "path": "AttentionGuidance/adaptive_oracle.py",
+        "sha256": "0d557fc2a45a76dddac92845f25b33d61dde5e25e2c5bbf2e0d802d01cf79f56",
+        "size": 38704
+      },
+      {
+        "path": "AttentionGuidance/ancestral_correction.py",
+        "sha256": "9f2209dbd2a8902d1256b9d4cc49f0f3246feb05b608563cebcf3483d9d5a3d3",
+        "size": 11685
+      },
+      {
+        "path": "AttentionGuidance/attention_guidance.py",
+        "sha256": "7d415befefac640c44769ea8378568dddf3f7a81cbe94379961f4dc72ba70358",
+        "size": 30315
+      },
+      {
+        "path": "AttentionGuidance/controller.py",
+        "sha256": "d7ed5bfafc8e383a0dd1fb7ba222a3481dc5e9a23394b9fa2e8b23a7915c08a8",
+        "size": 4458
+      },
+      {
+        "path": "AttentionGuidance/freeu.py",
+        "sha256": "cac5be8e1a0a788ad8c7e43a3ca12b3d5a7a90aa2f2d62ca22fdebda13a97f46",
+        "size": 18970
+      },
+      {
+        "path": "AttentionGuidance/latent_renderer.py",
+        "sha256": "692ad0a46ad9d6fa2cd81544aedb6c98e0fe3cc26da08975623aac7bac10f1d7",
+        "size": 82056
+      },
+      {
+        "path": "AttentionGuidance/local_relational_basis.py",
+        "sha256": "20708eb6f5ab784f139e3d5a21d599834d3863aea348ec3ffd4921a226749087",
+        "size": 33528
+      },
+      {
+        "path": "AttentionGuidance/semantic_transport.py",
+        "sha256": "78b56ff791249a4ca001547c76a4add1a4589b7a01a4b5676e9b49d7ff60d852",
+        "size": 18293
+      },
+      {
+        "path": "AttentionGuidance/types.py",
+        "sha256": "c615a171dd20d524f5f40fb97b0036e5ed5d92ecb06e7b8419cd3d88572eb043",
+        "size": 778
+      },
+      {
+        "path": "InferencePipelines/__init__.py",
+        "sha256": "5ac3a9624f1e1e1ea7e3faa9c5645be0e9b72ea78309c7f8cda658094fabcb43",
+        "size": 1017
+      },
+      {
+        "path": "InferencePipelines/RepLDM/pipeline_repldm_sdxl.py",
+        "sha256": "1dbc3b62184b406befbf5ff94f00006771af87f54d703a166618a4b8418c984d",
+        "size": 120351
+      },
+      {
+        "path": "InferencePipelines/cfg_batch.py",
+        "sha256": "54869812c069c5e1ff08bceb8851fa7c0679e5d326c926946fbaaa0e61fcd9ec",
+        "size": 1835
+      },
+      {
+        "path": "eval-pipeline/adaptive_oracle_contract.py",
+        "sha256": "d482b636f11c8e870c56a852abbca9128e89840aa208caa2c070afb425032be1",
+        "size": 72440
+      },
+      {
+        "path": "eval-pipeline/adaptive_oracle_model_snapshot.py",
+        "sha256": "b093d992f03c0b81d0608984d0ca6c12a89f550942c70f4f64a95b88fea8ed3d",
+        "size": 52988
+      },
+      {
+        "path": "eval-pipeline/audit_adaptive_oracle_cpu.py",
+        "sha256": "3aa5a24b067b17a5c8fcb323caed5d409d40255da08b02286b9fc58d6544d18c",
+        "size": 63669
+      },
+      {
+        "path": "eval-pipeline/audit_adaptive_oracle_engineering.py",
+        "sha256": "067345cb1279793f5aa21ad8eaf18d60f30f66be72890a62422246743eecad54",
+        "size": 102745
+      },
+      {
+        "path": "eval-pipeline/build_adaptive_oracle_prompts.py",
+        "sha256": "0e8e54366657714dadcf5f76d4c61d655b3c58c2c5eaec65a3d53c4e2b5555c7",
+        "size": 56326
+      },
+      {
+        "path": "eval-pipeline/generate_adaptive_oracle_engineering.py",
+        "sha256": "57471c9c2bd9acf7bcb45c41f1bf7e840f003464bc85542328d19a1eed0d6467",
+        "size": 316917
+      },
+      {
+        "path": "eval-pipeline/adaptive_oracle_generation_environment.py",
+        "sha256": "a7a60dfcb7cf7266383a4f6d35f3fb153112e4a7605202d9ffa7b62473258d5d",
+        "size": 14372
+      },
+      {
+        "path": "eval-pipeline/launch_adaptive_oracle_tool.py",
+        "sha256": "6b61b1086dd472bd82fed342e2635117a8e3ba4fa37ac2fb34eced2403c713f6",
+        "size": 44101
+      }
+    ]
+  },
+  "one_shot": true,
+  "prompt_replay": {
+    "assets": [
+      {
+        "path": "eval-pipeline/prompts/adaptive_oracle_engineering.csv",
+        "sha256": "84b723ff9e2aab6a892e23bd9780a47e97c75be2d7c3fcd3f8185620564ac1d0",
+        "size": 1647
+      },
+      {
+        "path": "eval-pipeline/prompts/adaptive_oracle_exclusion_inventory_v1.json",
+        "sha256": "d7f320b1bc9e5f1ecea9c6dbb6bae8e4c1a5277485611e26e6ab8e21393bd42a",
+        "size": 9819176
+      },
+      {
+        "path": "eval-pipeline/prompts/adaptive_oracle_prompt_manifest_v1.json",
+        "sha256": "132d4b26c03c69dcbf66a51b1e9efd567beaf4a667fe76d6ddb0dc49dc14c998",
+        "size": 14753
+      }
+    ],
+    "mismatch_count": 0,
+    "source_path": "/tmp/parti/PartiPrompts.tsv",
+    "source_repository": "/tmp/parti",
+    "source_revision": "5a657978134374ce28973948331b319adef164bd",
+    "source_sha256": "fab29e41bb512a169b56acab4cf2a41dcb675e285df2efcde6640c7dd3c440eb",
+    "status": "passed_byte_exact",
+    "upstream_repository": "https://github.com/google-research/parti"
+  },
+  "registered_inputs": [
+    {
+      "path": "eval-pipeline/configs/generation_environment_adaptive_oracle_v2.yaml",
+      "sha256": "6ebddd587d32ede30a12256f80ead1fbc392129b3b133cec4bbc917c0d1797c6",
+      "size": 1290
+    },
+    {
+      "path": "eval-pipeline/prompts/adaptive_oracle_engineering.csv",
+      "sha256": "84b723ff9e2aab6a892e23bd9780a47e97c75be2d7c3fcd3f8185620564ac1d0",
+      "size": 1647
+    },
+    {
+      "path": "eval-pipeline/prompts/adaptive_oracle_exclusion_inventory_v1.json",
+      "sha256": "d7f320b1bc9e5f1ecea9c6dbb6bae8e4c1a5277485611e26e6ab8e21393bd42a",
+      "size": 9819176
+    },
+    {
+      "path": "eval-pipeline/prompts/adaptive_oracle_prompt_manifest_v1.json",
+      "sha256": "132d4b26c03c69dcbf66a51b1e9efd567beaf4a667fe76d6ddb0dc49dc14c998",
+      "size": 14753
+    },
+    {
+      "path": "eval-pipeline/configs/adaptive_oracle_engineering_registration_v1.yaml",
+      "sha256": "e37ff4652b0c1de78c99b08c5ca86facd94b0e3a24245756f18955f497c98b04",
+      "size": 3999
+    }
+  ],
+  "registration": {
+    "design_sha256": "63acba7e5321b9b1681016804dc319c2ad0652e80053a23fabaa4b186eef8538",
+    "environment_lock_sha256": "6ebddd587d32ede30a12256f80ead1fbc392129b3b133cec4bbc917c0d1797c6",
+    "exclusion_inventory_sha256": "d7f320b1bc9e5f1ecea9c6dbb6bae8e4c1a5277485611e26e6ab8e21393bd42a",
+    "schema": "adaptive_oracle_engineering_registration_v1",
+    "sha256": "e37ff4652b0c1de78c99b08c5ca86facd94b0e3a24245756f18955f497c98b04",
+    "status": "passed_exact_non_executable"
+  },
+  "schema": "adaptive_oracle_engineering_cpu_audit_v1",
+  "scope": {
+    "cpu_validation_only": true,
+    "gpu_generation": false,
+    "method_selection": false,
+    "quality_inspection": false,
+    "renderer_training": false,
+    "rl": false,
+    "scoring": false
+  },
+  "status": "passed_warning_free",
+  "tests": {
+    "allowlist": [
+      "tests.test_adaptive_oracle",
+      "tests.test_adaptive_oracle_contract",
+      "tests.test_adaptive_oracle_model_snapshot",
+      "tests.test_adaptive_oracle_prompts",
+      "tests.test_audit_adaptive_oracle_cpu",
+      "tests.test_audit_adaptive_oracle_engineering",
+      "tests.test_generate_adaptive_oracle_engineering",
+      "tests.test_launch_adaptive_oracle_tool",
+      "tests.test_local_relational_basis"
+    ],
+    "arguments": [
+      "-I",
+      "-B",
+      "-S",
+      "-W",
+      "error",
+      "-c",
+      "import pathlib\nimport sys\nimport unittest\n\nroot = pathlib.Path.cwd().resolve(strict=True)\nsys.path.extend([\n    \"/home/bycao/miniforge3/envs/diff_attn/lib/python3.11/site-packages\",\n    str(root),\n    str(root / \"eval-pipeline\"),\n])\nsuite = unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:])\nresult = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)\nraise SystemExit(0 if result.wasSuccessful() else 1)\n",
+      "tests.test_adaptive_oracle",
+      "tests.test_adaptive_oracle_contract",
+      "tests.test_adaptive_oracle_model_snapshot",
+      "tests.test_adaptive_oracle_prompts",
+      "tests.test_audit_adaptive_oracle_cpu",
+      "tests.test_audit_adaptive_oracle_engineering",
+      "tests.test_generate_adaptive_oracle_engineering",
+      "tests.test_launch_adaptive_oracle_tool",
+      "tests.test_local_relational_basis"
+    ],
+    "environment_overrides": {
+      "CUDA_VISIBLE_DEVICES": "",
+      "HF_HUB_OFFLINE": "1",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "PYTHONHASHSEED": "0",
+      "PYTHONNOUSERSITE": "1",
+      "TOKENIZERS_PARALLELISM": "false",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "interpreter": {
+      "executable": "/home/bycao/miniforge3/envs/diff_attn/bin/python3.11",
+      "implementation": "CPython",
+      "version": "3.11.10"
+    },
+    "return_code": 0,
+    "source_files": [
+      {
+        "path": "tests/test_adaptive_oracle.py",
+        "sha256": "a384cd2261f13126cd71c9739106a108594fb3ce9e74f5ca665d69db4cb70a6a",
+        "size": 46705
+      },
+      {
+        "path": "tests/test_adaptive_oracle_contract.py",
+        "sha256": "f1c797132ec7a3ab45edd1f4a72d181567c3ea57f75d1ace1760604f5605fe24",
+        "size": 38571
+      },
+      {
+        "path": "tests/test_adaptive_oracle_model_snapshot.py",
+        "sha256": "94a672bd5eec883bbf81835526d98ef638c70e1ad45b8df1bf5643b4bbdd48e2",
+        "size": 23172
+      },
+      {
+        "path": "tests/test_adaptive_oracle_prompts.py",
+        "sha256": "5367f85a635317028a0a31f8991fe63af93e4617fda5639d33b58612f1f8c689",
+        "size": 25224
+      },
+      {
+        "path": "tests/test_audit_adaptive_oracle_cpu.py",
+        "sha256": "d38513b96c52bd81080f8c9bdac1ccf9255dd8a6c23e1e284d85efc533bdf108",
+        "size": 26619
+      },
+      {
+        "path": "tests/test_audit_adaptive_oracle_engineering.py",
+        "sha256": "0f13c4d6893e28019d61e72ffbf2233a8371bec5e162f2a427008660fe493296",
+        "size": 93864
+      },
+      {
+        "path": "tests/test_generate_adaptive_oracle_engineering.py",
+        "sha256": "02de2c486f2650c17cb72a058c5b9aca702c516bde53bef7a500162436066fea",
+        "size": 280241
+      },
+      {
+        "path": "tests/test_launch_adaptive_oracle_tool.py",
+        "sha256": "eec4df2cef346eb4945a1d645b6966ffadb478c97860d0e6540ddc3e59d3eccc",
+        "size": 35229
+      },
+      {
+        "path": "tests/test_local_relational_basis.py",
+        "sha256": "bb8fc72cc815a25c23b85a85c78aa49a335b4dd527e70071c8682ff2c8b7c982",
+        "size": 41512
+      }
+    ],
+    "status": "passed_warning_free",
+    "stderr_byte_count": 0,
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stdout_byte_count": 79945,
+    "stdout_sha256": "d1e04a53a87c4dce84e3d6c0f7322753b7bfeef6b04e58fb153c44becb3d5f81",
+    "test_count": 407,
+    "warning_count": 0,
+    "warnings_as_errors": true
+  },
+  "warnings": {
+    "count": 0,
+    "same_process_count": 0,
+    "test_subprocess_count": 0
+  }
+}
