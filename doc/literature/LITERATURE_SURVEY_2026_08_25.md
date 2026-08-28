@@ -1,6 +1,6 @@
 # Literature Survey: Frozen Latent-Trajectory Extensions
 
-**Cutoff:** 2026-08-26. This is a research memo, not evidence that any
+**Cutoff:** 2026-08-28. This is a research memo, not evidence that any
 reported result transfers to RepLDM. Links use moving arXiv records; pin the
 reviewed version and refresh version, withdrawal, and venue status before
 submission, especially for the July-August 2026 entries.
@@ -115,6 +115,59 @@ Euler; an exact coordinate derivation and anchored native-prediction baseline
 would be required. Neither paper permits reward learning to rescue a relational
 family that failed its preregistered fixed-action gate.
 
+## 2026-08-27 Update: Dense Rewards, Distillation, and Evaluation
+
+Five releases further narrow the claims available to a learned renderer. None
+has been reproduced here, and their repositories and checkpoints have not yet
+passed a source audit.
+
+[Latent Reward Registers](https://arxiv.org/abs/2608.03929v3) runs trainable,
+position-free register tokens through an independent read-only side stream that
+reuses frozen DiT features without writing to the native image/text stream. It
+predicts terminal preference from noisy intermediate states, then uses either
+reward-gradient on-policy distillation or magnitude-matched inference guidance.
+The reported SD3 configuration has 147.6M trainable reward-path parameters; its
+complete 42-step RGS pipeline runs at `1.80x` the CFG latency. It is therefore a
+`CX` dense-reward upper bound rather than a matched sub-1M SDXL control. It
+occupies latent reward readout, dense intermediate rewards, and frozen-generator
+reward gradients as standalone claims.
+
+[Self-OPD](https://arxiv.org/abs/2608.26872v1) removes the external teacher from
+on-policy distillation. At a sampled flow timestep it makes `K` stochastic SDE
+branches, rolls every branch and a deterministic self-reference to completion,
+turns terminal rewards into normalized advantages, and fits a transformer LoRA
+against the generator's velocity prediction with a signed pull-push objective.
+This is not directly interchangeable
+with SDXL epsilon prediction or a small side renderer, but it occupies
+teacher-free branch search followed by stepwise distillation. A future renderer
+study must charge every reward query and rollout, and compare fixed-teacher,
+OPSD-style bounded-target, Self-OPD-style branch, and anchored native-prediction
+distillation before claiming that RL is necessary.
+
+Evaluation work also changes the evidence standard.
+[QC-T2I-Bench](https://arxiv.org/abs/2608.24112v1) keeps atomic questions and
+their Davidsonian-scene-graph dependencies instead of collapsing them directly
+to prompt scores. Its hierarchy-constrained aggregation masks descendants when
+a prerequisite object is absent and resamples conceptual prompt clusters.
+[RubricRM](https://arxiv.org/abs/2608.26956v1) takes a prompt and two candidate
+images, then jointly generates a candidate-conditioned rubric and pairwise score
+in one forward; it is trained with SFT and GRPO. These methods motivate
+dependency-aware diagnostics and richer human rubrics, but neither is a frozen
+objective metric. A stricter local RepLDM protocol may generate prompt-only
+rubrics before images or action identities are exposed, but that is an
+anti-leakage adaptation, not RubricRM's mechanism. Such rubrics cannot define
+and test the same reward. Confirmatory endpoints should retain deterministic
+OCR/count/spatial measurements plus action-blind human judgments, while
+reporting root existence, conditional relation success, and exact joint success
+separately.
+
+[HPSv3++](https://arxiv.org/abs/2606.14657v1) explicitly models reward shifts
+across generator capability and RL iterations. Its reported gains have not been
+verified here, but the problem it identifies means HPSv2 alone is an inadequate
+2026 reward witness. Keep HPSv2 for historical continuity, and add HPSv3++ only
+after source, checkpoint, preprocessing, and action-blind reliability audits;
+neither checkpoint may serve as both a training reward and confirmatory metric.
+
 ## Narrow Hypothesis and Falsification
 
 The best-supported candidate hypothesis is a zero-initialized, sub-1M
@@ -128,7 +181,9 @@ uniform local graph and a predicted-clean latent-affinity graph. It is not
 established novelty in advance of those tests and a matched
 SteeringDiffusion-style adapter.
 
-Before learning, freeze a prompt-disjoint action and require TOPIQ-NR delta
+For the currently registered fixed local-relational oracle, freeze a prompt-
+disjoint action before reward distillation or policy learning and require
+TOPIQ-NR delta
 `>= +0.005`, a crossed prompt/seed interval above zero, Holm-adjusted prompt
 significance, HPSv2/CLIP non-inferiority, structural/detail evidence, and
 clipping, saturation, diversity, moment, and off-target guards. Include no-op,
@@ -144,7 +199,11 @@ anchor and independent native-resolution, patch, and human witnesses. Failure
 closes the currently registered positive `+0.02` fixed-action family and bars
 RL from rescuing that family on the same evidence. It does not falsify every
 signed, scheduled, or learned renderer; any distinct family requires an
-independent rationale, new preregistration, and untouched prompt splits.
+independent rationale, new preregistration, and untouched prompt splits. A
+distinct renderer may run clean-image, reward-free supervised denoising only
+after its own CPU audit and executable authorization; that feasibility stage
+does not waive a prompt-disjoint generation and replay gate before reward
+distillation or RL.
 
 The `+0.005` and non-inferiority margins are preregistered decision thresholds,
 not perceptual calibrations. Calibrate them against repeated human judgments
