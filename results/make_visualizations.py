@@ -64,6 +64,76 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_json(path: Path) -> dict:
+    path = register(path)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_run_provenance(run_dir: Path) -> tuple[dict, pd.DataFrame]:
+    config = load_json(run_dir / "config.json")
+    configured_path = Path(config["prompts_csv"])
+    if "eval-pipeline" in configured_path.parts:
+        start = configured_path.parts.index("eval-pipeline")
+        prompts_path = ROOT.joinpath(*configured_path.parts[start:])
+    else:
+        prompts_path = configured_path if configured_path.is_absolute() else ROOT / configured_path
+    prompts_path = register(prompts_path)
+    expected_hash = config.get("prompts_sha256")
+    if expected_hash is not None and sha256(prompts_path) != expected_hash:
+        raise ValueError(f"Prompt CSV hash mismatch: {prompts_path}")
+    prompts = pd.read_csv(prompts_path)
+    required = {"index", "TEXT"}
+    if not required.issubset(prompts.columns):
+        raise ValueError(f"Prompt CSV lacks {sorted(required)}: {prompts_path}")
+    return config, prompts
+
+
+def validated_generated_image(
+    run_dir: Path,
+    config: dict,
+    prompts: pd.DataFrame,
+    prompt_index: int,
+    seed: int,
+    action_id: str,
+) -> Path:
+    image_path = run_dir / "images" / f"p{prompt_index}_seed{seed}_a{action_id}.png"
+    image_path = register(image_path)
+    metadata = load_json(image_path.with_suffix(".json"))
+
+    prompt_rows = prompts[prompts["index"] == prompt_index]
+    if len(prompt_rows) != 1:
+        raise ValueError(f"Expected one registered prompt {prompt_index} in {config['prompts_csv']}")
+    expected_prompt = str(prompt_rows.iloc[0]["TEXT"])
+    configured_actions = {item["id"] for item in config["actions"]}
+    if action_id not in configured_actions or seed not in config["seeds"]:
+        raise ValueError(f"Image setting is absent from run config: {image_path}")
+
+    resolution = int(config["resolution"])
+    expected = {
+        "id": image_path.stem,
+        "prompt_index": prompt_index,
+        "prompt": expected_prompt,
+        "seed": seed,
+        "action_id": action_id,
+        "image_path": f"images/{image_path.name}",
+        "height": resolution,
+        "width": resolution,
+        "model_name": config["model_name"],
+        "git_commit": config["git_commit"],
+    }
+    mismatches = {
+        key: (metadata.get(key), value)
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"Image sidecar mismatch for {image_path}: {mismatches}")
+    with Image.open(image_path) as image:
+        if image.size != (resolution, resolution):
+            raise ValueError(f"Image dimensions disagree with sidecar: {image_path}")
+    return image_path
+
+
 def configure_plot_style() -> None:
     missing = [str(path) for path in (FONT_REGULAR, FONT_BOLD) if not path.is_file()]
     if missing:
@@ -372,18 +442,31 @@ def make_grid(
 
 
 def make_guidance_examples() -> None:
-    spectral = ROOT / "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images"
-    moment = ROOT / "outputs/exp_moment_tangent/development_12prompt_3seed_v1/images"
-    cone = ROOT / "outputs/exp_trajectory_cone/development_12prompt_3seed_v1/images"
+    spectral = ROOT / "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1"
+    moment = ROOT / "outputs/exp_moment_tangent/development_12prompt_3seed_v1"
+    cone = ROOT / "outputs/exp_trajectory_cone/development_12prompt_3seed_v1"
+    spectral_config, spectral_prompts = load_run_provenance(spectral)
+    moment_config, moment_prompts = load_run_provenance(moment)
+    cone_config, cone_prompts = load_run_provenance(cone)
     paths = []
     for prompt in (0, 2):
         paths.append(
             [
-                spectral / f"p{prompt}_seed0_ano_ag.png",
-                spectral / f"p{prompt}_seed0_ascalar_0.004.png",
-                spectral / f"p{prompt}_seed0_amid_only_0.004.png",
-                moment / f"p{prompt}_seed0_amoment_tangent_0.002.png",
-                cone / f"p{prompt}_seed0_atrajectory_cone_0.002.png",
+                validated_generated_image(
+                    spectral, spectral_config, spectral_prompts, prompt, 0, "no_ag"
+                ),
+                validated_generated_image(
+                    spectral, spectral_config, spectral_prompts, prompt, 0, "scalar_0.004"
+                ),
+                validated_generated_image(
+                    spectral, spectral_config, spectral_prompts, prompt, 0, "mid_only_0.004"
+                ),
+                validated_generated_image(
+                    moment, moment_config, moment_prompts, prompt, 0, "moment_tangent_0.002"
+                ),
+                validated_generated_image(
+                    cone, cone_config, cone_prompts, prompt, 0, "trajectory_cone_0.002"
+                ),
             ]
         )
     make_grid(
@@ -396,7 +479,8 @@ def make_guidance_examples() -> None:
 
 
 def make_stage2_examples() -> None:
-    base = ROOT / "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images"
+    run = ROOT / "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1"
+    config, prompts = load_run_provenance(run)
     actions = [
         ("no-AG", "no_ag"),
         ("会议设置", "conference_expert"),
@@ -405,7 +489,10 @@ def make_stage2_examples() -> None:
         ("删除反向分量", "trajectory_cone_0.002"),
     ]
     paths = [
-        [base / f"p{prompt}_seed0_a{action}.png" for _, action in actions]
+        [
+            validated_generated_image(run, config, prompts, prompt, 0, action)
+            for _, action in actions
+        ]
         for prompt in (0, 2)
     ]
     make_grid(
@@ -427,9 +514,13 @@ def difference_image(reference: Image.Image, other: Image.Image, factor: float =
 
 
 def make_renderer_wiring() -> None:
-    base = register(ROOT / "outputs/latent_renderer/wiring_smoke_50_fee18b3/no_renderer.png")
-    zero = register(ROOT / "outputs/latent_renderer/wiring_smoke_50_fee18b3/zero_renderer.png")
-    probe = register(ROOT / "outputs/latent_renderer/wiring_smoke_50_fee18b3/probe_renderer.png")
+    run = ROOT / "outputs/latent_renderer/wiring_smoke_50_fee18b3"
+    report = load_json(run / "report.json")
+    if report.get("schema") != "latent_renderer_wiring_smoke_v1" or report.get("seed") != 123:
+        raise ValueError("Unexpected LR-0 wiring report provenance")
+    base = register(run / "no_renderer.png")
+    zero = register(run / "zero_renderer.png")
+    probe = register(run / "probe_renderer.png")
     with Image.open(base) as base_image, Image.open(zero) as zero_image, Image.open(probe) as probe_image:
         base_rgb = base_image.convert("RGB")
         zero_rgb = zero_image.convert("RGB")
@@ -440,6 +531,17 @@ def make_renderer_wiring() -> None:
         probe_array = np.asarray(probe_rgb, dtype=np.int16) - np.asarray(base_rgb, dtype=np.int16)
         zero_max = int(np.abs(zero_array).max())
         probe_mean = float(np.abs(probe_array).mean())
+        pixel_hashes = {
+            "no_renderer": hashlib.sha256(base_rgb.tobytes()).hexdigest(),
+            "zero_renderer": hashlib.sha256(zero_rgb.tobytes()).hexdigest(),
+            "probe_renderer": hashlib.sha256(probe_rgb.tobytes()).hexdigest(),
+        }
+        if pixel_hashes != report.get("hashes"):
+            raise ValueError("LR-0 image pixels disagree with the wiring report")
+        if zero_max != 0 or not report.get("zero_matches_no_renderer"):
+            raise ValueError("LR-0 zero-renderer identity check failed")
+        if probe_mean == 0 or not report.get("probe_differs_from_no_renderer"):
+            raise ValueError("LR-0 nonzero probe did not change the image")
 
         temp_zero = FIGURES / ".renderer_zero_diff.png"
         temp_probe = FIGURES / ".renderer_probe_diff.png"
@@ -551,14 +653,21 @@ def make_freeu_tradeoff() -> None:
 
 
 def make_freeu_examples() -> None:
-    base = ROOT / "outputs/freeu_moment_followup_v1/images"
+    run = ROOT / "outputs/freeu_moment_followup_v1"
+    config, prompts = load_run_provenance(run)
+    first_indices = [int(value) for value in prompts["index"].head(3)]
+    if first_indices != [0, 1, 2]:
+        raise ValueError(f"Unexpected first three registered prompts: {first_indices}")
     actions = [
         ("no FreeU", "no_freeu"),
         ("普通 FreeU", "freeu_backbone_only"),
         ("保持 feature moment", "mp_backbone_only"),
     ]
     paths = [
-        [base / f"p{prompt}_seed7_a{action}.png" for _, action in actions]
+        [
+            validated_generated_image(run, config, prompts, prompt, 7, action)
+            for _, action in actions
+        ]
         for prompt in (0, 1, 2)
     ]
     make_grid(

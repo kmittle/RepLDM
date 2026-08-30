@@ -102,7 +102,7 @@ tangent 系列接近 0。
 
 **观察：** 工程 smoke 证明 Stage-2 noise 可复现，2048px VAE 路径无设备错误；pilot 共 12 x 3 x 5 = 180 张最终图。
 
-**结果：** `conference_settings`、raw、tangent、cone 的 TOPIQ 差值分别为 `-0.020052`、`-0.005907`、
+**结果：** 会议版设置、raw、tangent、cone 的 TOPIQ 差值分别为 `-0.020052`、`-0.005907`、
 `-0.002836`、`-0.002091`。cone 只是少伤害一些，仍低于 `no_ag`，CLIP 保护条件也失败。
 
 **结论：** 高分辨率没有救回 Attention Guidance，S4 关闭。
@@ -179,7 +179,7 @@ backbone 设置提高了 TOPIQ，但 clipping 和 saturation 都越线；保持 
 
 ![FreeU 与保持 feature moment 的固定生成样本](figures/07_freeu_examples.jpg)
 
-**图 7：FreeU 的前三个登记 prompt，固定 seed 7。** 普通 FreeU 更明显地改变亮度、颜色和对比度；
+**图 7：FreeU prompt CSV 中前三个登记 prompt，固定 seed 7。** 普通 FreeU 更明显地改变亮度、颜色和对比度；
 保持 feature moment 后图像重新接近 no-FreeU。这些样本用于说明统计中看到的趋势，不是人工挑选的赢家。
 
 ## 13. S7：ancestral correction development
