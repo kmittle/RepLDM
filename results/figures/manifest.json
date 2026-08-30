@@ -1,0 +1,146 @@
+{
+  "schema": "repldm_result_visualizations_v1",
+  "generator": "results/make_visualizations.py",
+  "generator_sha256": "73ee3a6705ebf59e555be9f38e83b6efde3ffb355be55b76bc21e18181d47e9c",
+  "embedded_data": {
+    "01_evidence_scale.png": [
+      {
+        "label": "S7 scheduler correction",
+        "samples_per_setting": 22,
+        "basis": "11 prompts x 2 seeds"
+      },
+      {
+        "label": "S0-S5 early pilots",
+        "samples_per_setting": 36,
+        "basis": "12 prompts x 3 seeds"
+      },
+      {
+        "label": "S6 FreeU",
+        "samples_per_setting": 48,
+        "basis": "24 prompts x 2 seeds"
+      },
+      {
+        "label": "Native headroom screen",
+        "samples_per_setting": 99,
+        "basis": "33 prompts x 3 seeds"
+      },
+      {
+        "label": "Structural controls",
+        "samples_per_setting": 99,
+        "basis": "33 prompts x 3 seeds"
+      },
+      {
+        "label": "LR-1 fixed renderer",
+        "samples_per_setting": 144,
+        "basis": "48 prompts x 3 seeds"
+      },
+      {
+        "label": "Formal 1024px target",
+        "samples_per_setting": 3000,
+        "basis": "1,000 prompts x 3 seeds"
+      },
+      {
+        "label": "Formal 2048px target",
+        "samples_per_setting": 6000,
+        "basis": "2,000 prompts x 3 seeds"
+      }
+    ]
+  },
+  "rendering_dependencies": {
+    "fonts": {
+      "NotoSansCJK-Regular.ttc": {
+        "path": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "sha256": "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
+      },
+      "NotoSansCJK-Bold.ttc": {
+        "path": "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "sha256": "faa5f3656a78b2e2d450d27fe8382c778bc2b6bb5ea29c986664a6a435056ceb"
+      }
+    }
+  },
+  "inputs": {
+    "outputs/exp_moment_tangent/development_12prompt_3seed_v1/action_comparisons.csv": "068ae7759142c9771dce7d31dd05ccb7362075fbe18f2abc4ea8000fc6b8192b",
+    "outputs/exp_moment_tangent/development_12prompt_3seed_v1/images/p0_seed0_amoment_tangent_0.002.png": "39275e7e5b3bc20eff725c609807eb604c1af61c157c2b45571442b12f66d2a9",
+    "outputs/exp_moment_tangent/development_12prompt_3seed_v1/images/p2_seed0_amoment_tangent_0.002.png": "7f619f1b047a3795e126dd98fa677bbd889b863d46891aa954cf14e4d3b4554b",
+    "outputs/exp_s5/development_12prompt_3seed_v2/action_comparisons.csv": "9e81042c31705a044d6f1f0fb8f91e0af212672bf248a8ead27c011b12fd4c96",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/action_comparisons.csv": "eea3639c9db22e9de29efcb2c1509c2b9b72b912cf0b886bf1320d3e3a143ad3",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images/p0_seed0_amid_only_0.004.png": "72d81f1cc47c902762ce049a304b8793bb9df7ed9e80a66f76669293d4a16641",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images/p0_seed0_ano_ag.png": "d282fa5a15dce6c9f1d932c07b91686f3dc1aa0d5381880e792f2c176db0cad7",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images/p0_seed0_ascalar_0.004.png": "c1e8377de13b2ab78a49915a4ab2cb631df9dd3f81c20479ebbb0214151d0d46",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images/p2_seed0_amid_only_0.004.png": "0171689d53abb93465b404fd0aa188f0d6a52e27605c1f72900eb830c938ce07",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images/p2_seed0_ano_ag.png": "739afc692a0611c100859b97b7db60a3cd471c5ec2fad0f9f3359557539eed68",
+    "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/images/p2_seed0_ascalar_0.004.png": "71c42eb07f40ea85dab88051e99febfaf7c2e1923b1548723680ad3efc48504e",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/action_comparisons.csv": "caf7fef94890895e68f0290ac9fd838b32c95dce39a22de0c5483cb1309342d1",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p0_seed0_aconference_expert.png": "a513da6662bf6ff2f43223273f9f945a1790f68e3d3975eaa823b01fbe8efddf",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p0_seed0_amoment_tangent_0.002.png": "8414846021ad1fa077a3618793cb3e4731920cca9adb1380a0d94f148fad1125",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p0_seed0_ano_ag.png": "3187f72cdbea4b42ade7ad724edf69cb74f39655670e6e87ca4c2528a0930a55",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p0_seed0_araw_0.001.png": "95be0396f77d0a0425526c71194fedc7398d5f541ffcc683f7ac641f29a0d8fa",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p0_seed0_atrajectory_cone_0.002.png": "d1626d0fbdb665214e76b5c79f1cb2259f8f4e1de49769ca093e3cefff952d45",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p2_seed0_aconference_expert.png": "289119d9c39f6546e3c0936383b28b4b5b9b70d4e539e424226be5ebf51056a2",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p2_seed0_amoment_tangent_0.002.png": "b612ff649a7143570a3468b6be4f9c17e26eb7666109acee0bd61b34f99eaf50",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p2_seed0_ano_ag.png": "bb4ac9937be0190cfe79903e6d45ceeb20f59b9cf145954375af935a3157bb49",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p2_seed0_araw_0.001.png": "c047bc5a407489f963100dfe8e954ae4e580c40dbbe1e8cd135ef0e9232402c8",
+    "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/images/p2_seed0_atrajectory_cone_0.002.png": "53d8a76a56c16a1eb74f897999f1904dd6fbcd9ad1e155d5fc1435f17ac1d1ce",
+    "outputs/exp_trajectory_cone/development_12prompt_3seed_v1/action_comparisons.csv": "678b4199f93f22e851038c7a05bd05c1d1742aef4907e11f8c6370920fab0653",
+    "outputs/exp_trajectory_cone/development_12prompt_3seed_v1/images/p0_seed0_atrajectory_cone_0.002.png": "e475b17ade6d7a79bfcd8c2a950a093e6eb8dd61c5ed140d45decd0b338fbe0e",
+    "outputs/exp_trajectory_cone/development_12prompt_3seed_v1/images/p2_seed0_atrajectory_cone_0.002.png": "2fb577bd3c5ecfc176a2ad2bbd95713281b8441c9a758643aa26b0783f2cc5ad",
+    "outputs/freeu_moment_followup_v1/images/p0_seed7_afreeu_backbone_only.png": "018167ac02d34a8b66fd6a6b53dc26de65c680f7cdfa9cf3d8700f99c53fc56a",
+    "outputs/freeu_moment_followup_v1/images/p0_seed7_amp_backbone_only.png": "4e96843ff6f39a0e10a048fe2a9af1ef15a2da5cc8c972b41eaf672e9f8b3334",
+    "outputs/freeu_moment_followup_v1/images/p0_seed7_ano_freeu.png": "9367af71a58425f15eb4ce4defdbad8df994c6d1107ce84ccdc997f9fc164beb",
+    "outputs/freeu_moment_followup_v1/images/p1_seed7_afreeu_backbone_only.png": "e2c39716759e42afc0b6542e24a516e039071d52462f1bc5a4076709a33c18a3",
+    "outputs/freeu_moment_followup_v1/images/p1_seed7_amp_backbone_only.png": "26760b806c90412216866b11b8d66af4574f1aef6dc9514aa9b562c161b219ad",
+    "outputs/freeu_moment_followup_v1/images/p1_seed7_ano_freeu.png": "c0f9d8232a83195812c5d35a4f028200d382658dda7e8bfefb23fd2ed357d8b2",
+    "outputs/freeu_moment_followup_v1/images/p2_seed7_afreeu_backbone_only.png": "36dbd7ab4c27295d51dbf0a77b260a8af67343b2ebf6899eef011423c4db173b",
+    "outputs/freeu_moment_followup_v1/images/p2_seed7_amp_backbone_only.png": "80bb4b275daf4505d1cedb74d0173fd25a21a2f161a2d9ae5f77988101d326dc",
+    "outputs/freeu_moment_followup_v1/images/p2_seed7_ano_freeu.png": "4ccdbce93f470532f03c70398198825306ffea8f40d395149b9bbeb826cdd49c",
+    "outputs/freeu_moment_followup_v1/scores.jsonl": "338013ecf0c5ef383757b1361c5fb86f9c53f988fa213cb7c362c06ba43b1f19",
+    "outputs/latent_renderer/lr1_fixed_train_searchseeds_v2/action_comparisons.csv": "782c798f695251cd61e89f07d4acf7e661119550d463fb5fe80eeed09f907c06",
+    "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/images/p0_seed1932556753_aspectral_mid_native.json": "00b1aadb2df84aca106970734ca12d19ae87100cca77d15fd999f7cdfc2acfb5",
+    "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/scheduler_native_fixed_headroom_evaluation.csv": "dadcf5b55eb0d88683a2bee184164bfdb0f94774af5f3e5eeb443485308c1c90",
+    "outputs/latent_renderer/wiring_smoke_50_fee18b3/no_renderer.png": "d38d7ad59154599ff4514758378a102b18a1dd9fc0d85e89aea321da3614c953",
+    "outputs/latent_renderer/wiring_smoke_50_fee18b3/probe_renderer.png": "4a6d38b0889fc63cc1d1d6c4125f13b5bb9d3cb8ad29065a8135ede32b29e51c",
+    "outputs/latent_renderer/wiring_smoke_50_fee18b3/zero_renderer.png": "d38d7ad59154599ff4514758378a102b18a1dd9fc0d85e89aea321da3614c953"
+  },
+  "outputs": {
+    "01_evidence_scale.png": {
+      "sha256": "ef1a2db4d8f619ba498e39a5b71479a1fba39e1c194cea91e24d1a53141d83fe",
+      "width": 1830,
+      "height": 1004
+    },
+    "02_topiq_overview.png": {
+      "sha256": "b19798bbecd068035564d92bad107f4a0896f2ba1bcd6af60905d110533065b7",
+      "width": 2000,
+      "height": 1452
+    },
+    "03_guidance_progression.jpg": {
+      "sha256": "06a463ab754627c737a7a68f303b20ff6707c26d9856d8e99f78f83165e9ef20",
+      "width": 1752,
+      "height": 802
+    },
+    "04_stage2_examples.jpg": {
+      "sha256": "2ec2d07f45b85afb0c6904ca908f80827183c89701b2900240a3b904484bb332",
+      "width": 1752,
+      "height": 802
+    },
+    "05_renderer_wiring.jpg": {
+      "sha256": "2b105b794d8f5916cada43bb88e46224e7383c0aa2786fe4b81c206aa732d922",
+      "width": 1652,
+      "height": 452
+    },
+    "06_freeu_tradeoff.png": {
+      "sha256": "509c6da68d1dba891a0118abf1452f48096eb646b04a279b09b5e3a17edc980e",
+      "width": 1826,
+      "height": 1000
+    },
+    "07_freeu_examples.jpg": {
+      "sha256": "b52b707b08055c40157a0bca1174ddcf8d36bc640b3bb2a65e27f2c129ed01b7",
+      "width": 1212,
+      "height": 1252
+    },
+    "08_scheduler_gain.png": {
+      "sha256": "dc3c5e7b3a7259b96db92599774d92d3372035680751b1fbee129af857185b99",
+      "width": 1623,
+      "height": 905
+    }
+  }
+}
