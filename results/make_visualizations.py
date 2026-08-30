@@ -1,4 +1,4 @@
-"""Build the figures embedded in results-08-30.md from frozen artifacts."""
+"""Build figures for results/results-08-30.md from frozen artifacts."""
 
 from __future__ import annotations
 
@@ -43,6 +43,17 @@ EVIDENCE_SCALE = (
     ("LR-1 fixed renderer", 144, "48 prompts x 3 seeds"),
     ("Formal 1024px target", 3000, "1,000 prompts x 3 seeds"),
     ("Formal 2048px target", 6000, "2,000 prompts x 3 seeds"),
+)
+
+OUTPUT_NAMES = (
+    "01_evidence_scale.png",
+    "02_topiq_overview.png",
+    "03_guidance_progression.jpg",
+    "04_stage2_examples.jpg",
+    "05_renderer_wiring.jpg",
+    "06_freeu_tradeoff.png",
+    "07_freeu_examples.jpg",
+    "08_scheduler_gain.png",
 )
 
 SOURCES: set[Path] = set()
@@ -717,7 +728,15 @@ def make_scheduler_gain() -> None:
 
 
 def write_manifest() -> None:
-    outputs = sorted(path for path in FIGURES.iterdir() if path.suffix.lower() in {".png", ".jpg"})
+    expected = {FIGURES / name for name in OUTPUT_NAMES}
+    actual = {
+        path for path in FIGURES.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    }
+    if actual != expected:
+        missing = sorted(path.name for path in expected - actual)
+        unexpected = sorted(path.name for path in actual - expected)
+        raise ValueError(f"Figure set mismatch; missing={missing}, unexpected={unexpected}")
+    outputs = [FIGURES / name for name in OUTPUT_NAMES]
     manifest = {
         "schema": "repldm_result_visualizations_v1",
         "generator": str(Path(__file__).resolve().relative_to(ROOT)),
@@ -768,7 +787,7 @@ def main() -> None:
     make_freeu_examples()
     make_scheduler_gain()
     write_manifest()
-    print(f"Wrote 8 figures and manifest to {FIGURES}")
+    print(f"Wrote {len(OUTPUT_NAMES)} figures and manifest to {FIGURES}")
 
 
 if __name__ == "__main__":
