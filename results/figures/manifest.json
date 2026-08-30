@@ -1,7 +1,7 @@
 {
   "schema": "repldm_result_visualizations_v1",
   "generator": "results/make_visualizations.py",
-  "generator_sha256": "b7b1cc41ede3e82c9b9a430139c864f91b4e28d674340e3635a0d119eeeac367",
+  "generator_sha256": "9ba4791b057a864fa1f374361ed17ca7654bc01d740a90f8e8484e41950992ab",
   "embedded_data": {
     "01_evidence_scale.png": [
       {
@@ -61,6 +61,7 @@
   "inputs": {
     "eval-pipeline/prompts/eval_v1.csv": "61ff7418b40581be7312a27a771a9f7ffee4e752e68759693d132c084227a4ef",
     "eval-pipeline/prompts/latent_renderer_validation.csv": "6ae2ec66045a6ee517d3350b1f10978cc818e40eb0287379d7542bc07207b6f3",
+    "eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv": "065a86b95200eb89dc367ffe0f9f8c2d0a64fdab827e4004a1b629b169a6173f",
     "outputs/exp_moment_tangent/development_12prompt_3seed_v1/action_comparisons.csv": "068ae7759142c9771dce7d31dd05ccb7362075fbe18f2abc4ea8000fc6b8192b",
     "outputs/exp_moment_tangent/development_12prompt_3seed_v1/config.json": "b05959153154822d687e43efcf193a3d7a28fc5ea001e8ec5ab05a93b01ccd01",
     "outputs/exp_moment_tangent/development_12prompt_3seed_v1/images/p0_seed0_amoment_tangent_0.002.json": "bc2928eda3ec5e1f79cc73f1f8a5ddbcad95734a9c4671e46e5940caa2cf459a",
@@ -131,6 +132,7 @@
     "outputs/freeu_moment_followup_v1/images/p2_seed7_ano_freeu.png": "4ccdbce93f470532f03c70398198825306ffea8f40d395149b9bbeb826cdd49c",
     "outputs/freeu_moment_followup_v1/scores.jsonl": "338013ecf0c5ef383757b1361c5fb86f9c53f988fa213cb7c362c06ba43b1f19",
     "outputs/latent_renderer/lr1_fixed_train_searchseeds_v2/action_comparisons.csv": "782c798f695251cd61e89f07d4acf7e661119550d463fb5fe80eeed09f907c06",
+    "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/config.json": "4566993c16a8fd918bd7067303cf8f6b8b76dbc539f269c385b96fb4789bf1de",
     "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/images/p0_seed1932556753_aspectral_mid_native.json": "00b1aadb2df84aca106970734ca12d19ae87100cca77d15fd999f7cdfc2acfb5",
     "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/scheduler_native_fixed_headroom_evaluation.csv": "dadcf5b55eb0d88683a2bee184164bfdb0f94774af5f3e5eeb443485308c1c90",
     "outputs/latent_renderer/wiring_smoke_50_fee18b3/no_renderer.png": "d38d7ad59154599ff4514758378a102b18a1dd9fc0d85e89aea321da3614c953",

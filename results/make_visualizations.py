@@ -99,6 +99,13 @@ def load_run_provenance(run_dir: Path) -> tuple[dict, pd.DataFrame]:
     return config, prompts
 
 
+def registered_prompt(prompts: pd.DataFrame, prompt_index: int, source: str) -> str:
+    prompt_rows = prompts[prompts["index"] == prompt_index]
+    if len(prompt_rows) != 1:
+        raise ValueError(f"Expected one registered prompt {prompt_index} in {source}")
+    return str(prompt_rows.iloc[0]["TEXT"])
+
+
 def validated_generated_image(
     run_dir: Path,
     config: dict,
@@ -111,10 +118,7 @@ def validated_generated_image(
     image_path = register(image_path)
     metadata = load_json(image_path.with_suffix(".json"))
 
-    prompt_rows = prompts[prompts["index"] == prompt_index]
-    if len(prompt_rows) != 1:
-        raise ValueError(f"Expected one registered prompt {prompt_index} in {config['prompts_csv']}")
-    expected_prompt = str(prompt_rows.iloc[0]["TEXT"])
+    expected_prompt = registered_prompt(prompts, prompt_index, config["prompts_csv"])
     configured_actions = {item["id"] for item in config["actions"]}
     if action_id not in configured_actions or seed not in config["seeds"]:
         raise ValueError(f"Image setting is absent from run config: {image_path}")
@@ -575,18 +579,43 @@ def make_renderer_wiring() -> None:
 
 
 def paired_score_deltas(run: str, actions: Iterable[str], baseline: str) -> dict[str, dict[str, float]]:
-    path = register(ROOT / run / "scores.jsonl")
+    run_dir = ROOT / run
+    config, prompts = load_run_provenance(run_dir)
+    path = register(run_dir / "scores.jsonl")
     frame = pd.read_json(path, lines=True)
     index = ["prompt_index", "seed"]
-    baseline_rows = frame[frame.action_id == baseline].set_index(index).sort_index()
+    identity = ["action_id", *index]
+    duplicates = frame[frame.duplicated(identity, keep=False)]
+    if not duplicates.empty:
+        raise ValueError(f"Duplicate scored pairs in {path}: {duplicates[identity].to_dict('records')}")
+
+    selected = [baseline, *actions]
+    configured_actions = {item["id"] for item in config["actions"]}
+    if not set(selected).issubset(configured_actions):
+        raise ValueError(f"Scored setting is absent from run config: {path}")
+    expected_index = pd.MultiIndex.from_product(
+        [prompts["index"].astype(int).tolist(), [int(seed) for seed in config["seeds"]]],
+        names=index,
+    ).sort_values()
+
+    rows_by_action = {}
+    for action in selected:
+        rows = frame[frame.action_id == action].set_index(index).sort_index()
+        if not rows.index.equals(expected_index):
+            raise ValueError(f"Incomplete prompt/seed matrix for {action}: {path}")
+        rows_by_action[action] = rows
+    metrics = ["topiq_nr", "clipped_fraction", "mean_saturation"]
+    selected_scores = frame[frame.action_id.isin(selected)][metrics].to_numpy(dtype=float)
+    if not np.isfinite(selected_scores).all():
+        raise ValueError(f"Non-finite paired score in {path}")
+
+    baseline_rows = rows_by_action[baseline]
     result: dict[str, dict[str, float]] = {}
     for action in actions:
-        action_rows = frame[frame.action_id == action].set_index(index).sort_index()
-        if not action_rows.index.equals(baseline_rows.index):
-            raise ValueError(f"Pairing mismatch for {action} vs {baseline}")
+        action_rows = rows_by_action[action]
         result[action] = {
             metric: float((action_rows[metric] - baseline_rows[metric]).mean())
-            for metric in ("topiq_nr", "clipped_fraction", "mean_saturation")
+            for metric in metrics
         }
     return result
 
@@ -692,15 +721,51 @@ def make_freeu_examples() -> None:
 
 
 def make_scheduler_gain() -> None:
-    path = register(
-        ROOT
-        / "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/images/"
-        "p0_seed1932556753_aspectral_mid_native.json"
+    run = ROOT / "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2"
+    config, prompts = load_run_provenance(run)
+    path = run / "images/p0_seed1932556753_aspectral_mid_native.json"
+    data = load_json(path)
+    prompt_index, seed, action_id = 0, 1932556753, "spectral_mid_native"
+    expected = {
+        "id": path.stem,
+        "prompt_index": prompt_index,
+        "prompt": registered_prompt(prompts, prompt_index, config["prompts_csv"]),
+        "seed": seed,
+        "action_id": action_id,
+        "height": int(config["resolution"]),
+        "width": int(config["resolution"]),
+        "num_inference_steps": int(config["num_inference_steps"]),
+        "model_name": config["model_name"],
+        "model_revision": config["model_revision"],
+        "scheduler_name": config["registered_sampling"]["scheduler"],
+        "git_commit": config["git_commit"],
+    }
+    configured_actions = {item["id"] for item in config["actions"]}
+    mismatches = {
+        key: (data.get(key), value) for key, value in expected.items() if data.get(key) != value
+    }
+    if action_id not in configured_actions or seed not in config["seeds"] or mismatches:
+        raise ValueError(f"Scheduler diagnostic provenance mismatch: {mismatches}")
+
+    diagnostics = data["latent_renderer_step_diagnostics"]
+    step_count = int(config["num_inference_steps"])
+    if len(diagnostics) != step_count or [step["step_index"] for step in diagnostics] != list(
+        range(step_count)
+    ):
+        raise ValueError("Scheduler diagnostic steps are incomplete or out of order")
+    gains = np.asarray(
+        [step["clean_update_gain"] for step in diagnostics], dtype=np.float64
     )
-    data = json.loads(path.read_text(encoding="utf-8"))
-    gains = np.array(
-        [float(step["clean_update_gain"][0]) for step in data["latent_renderer_step_diagnostics"]]
-    )
+    if gains.shape != (step_count, 1) or not np.isfinite(gains).all() or np.any(gains <= 0):
+        raise ValueError("Scheduler clean-update gains must be finite positive scalars")
+    gains = gains[:, 0]
+    sigma_from = np.asarray([step["sigma_from"] for step in diagnostics], dtype=np.float64)
+    sigma_to = np.asarray([step["sigma_to"] for step in diagnostics], dtype=np.float64)
+    if not np.isfinite(sigma_from).all() or not np.isfinite(sigma_to).all() or np.any(sigma_from <= 0):
+        raise ValueError("Scheduler diagnostics contain invalid sigma values")
+    expected_gains = 1.0 - sigma_to / sigma_from
+    if not np.allclose(gains, expected_gains, rtol=1e-6, atol=1e-8):
+        raise ValueError("Scheduler gains disagree with 1 - sigma_to / sigma_from")
     amplification = 1.0 / gains
     steps = np.arange(len(amplification))
     median = float(np.median(amplification))
