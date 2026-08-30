@@ -106,7 +106,15 @@ The 50-step free schedule is admissible only if it beats the 2-3 stage schedule 
 
 ## Statistical Protocol
 
-Use prompt-disjoint search, validation and test sets. Freeze actions, cutoffs, reward weights and stopping rules before test generation. Every `(prompt, seed)` action block must run on one GPU; deterministically shuffle action order within blocks and record device metadata. Treat prompt and seed as crossed factors, report paired mean differences with crossed-bootstrap 95% CIs, prompt-level sign-flip p-values and Holm correction. Report all failures and all registered actions.
+Use prompt-disjoint search, validation and test sets. Formal sample sizes and the
+three-seed repeat policy are fixed in [`MAINSTREAM_EVALUATION_PROTOCOL.md`](MAINSTREAM_EVALUATION_PROTOCOL.md);
+the 12/33/48-prompt runs below are development pilots only. Freeze actions,
+cutoffs, reward weights and stopping rules before test generation. Every
+`(prompt, seed)` action block must run on one GPU; deterministically shuffle action
+order within blocks and record device metadata. Treat prompt and seed as crossed
+factors, report paired mean differences with crossed-bootstrap 95% CIs,
+prompt-level sign-flip p-values and Holm correction. Report all failures and all
+registered actions.
 
 TOPIQ-NR is the pilot primary endpoint, but it cannot establish semantics. Confirm with HPSv2 and text-image alignment; use ImageReward and patch-IR as diagnostics. Pixel statistics are hacking guards, never optimization targets. The final paper additionally requires blinded human pairwise evaluation with randomized left/right order and prompt-level confidence intervals.
 

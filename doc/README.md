@@ -13,6 +13,8 @@ inside these documents are repository-relative unless a link states otherwise.
 ## Protocols
 
 - [`REVIEWER_PROTOCOL.md`](protocols/REVIEWER_PROTOCOL.md): reviewer-first evidence rules.
+- [`MAINSTREAM_EVALUATION_PROTOCOL.md`](protocols/MAINSTREAM_EVALUATION_PROTOCOL.md):
+  fixed prompt/seed sizes and paired reporting for formal comparisons.
 - [`LATENT_RENDERER_PROTOCOL.md`](protocols/LATENT_RENDERER_PROTOCOL.md): fixed-renderer search protocol.
 - [`SCHEDULER_NATIVE_FIXED_HEADROOM_PROTOCOL.md`](protocols/SCHEDULER_NATIVE_FIXED_HEADROOM_PROTOCOL.md): scheduler-native screen.
 - [`ADAPTIVE_ORACLE_PROTOCOL.md`](protocols/ADAPTIVE_ORACLE_PROTOCOL.md): current adaptive-oracle protocol.

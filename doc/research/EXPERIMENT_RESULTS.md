@@ -1,5 +1,10 @@
 # 实验结果与阶段性结论
 
+> **评测口径：** 正式方法比较遵循
+> [`MAINSTREAM_EVALUATION_PROTOCOL.md`](../protocols/MAINSTREAM_EVALUATION_PROTOCOL.md)。
+> 本文件中已有的 12/33/48-prompt 运行都是历史 pilot 或开发筛选，不能与正式
+> 规模结果混排，也不能据此声称完成 HPSv2 或 RepLDM 主 benchmark。
+
 > 分支：`rl-version` ｜ 方法与停止规则：[`REVIEWER_PROTOCOL.md`](../protocols/REVIEWER_PROTOCOL.md)
 > 截止提交：频谱 pilot `63184bc`，幅度 follow-up `c385223`，固定矩 pilot `65ba734`，轨迹锥 pilot `b0aa343`，Stage-2 pilot `a31cb75`。本文只记录当前产物可复核的事实。
 
@@ -128,7 +133,7 @@ not evidence that a later renderer or representation factorial has been tested.
 | G4 RL necessity | **拒绝进入** | 不以调 reward/控制器复杂度绕过失败门 |
 | G5 transfer | **失败** | 最终 2048² 图像仍无正向 headroom；关闭目标域例外 |
 
-若继续研究，必须先提出**实质不同的残差算子**，而不是在当前频带增益上叠加 RL。新算子首先要以固定动作在全新的 prompt-disjoint 数据集上同时优于 `no_ag`、conference expert 和等预算 scalar，并且不能恶化 clipping/saturation。只有通过这个基础门槛后，才值得设计约 50 prompts × ≥5 seeds、第二 backbone、Stage-2/ControlNet，以及随机左右顺序的人类配对盲评。
+若继续研究，必须先提出**实质不同的残差算子**，而不是在当前频带增益上叠加 RL。新算子首先要以固定动作在全新的 prompt-disjoint 数据集上同时优于 `no_ag`、conference expert 和等预算 scalar，并且不能恶化 clipping/saturation。只有通过这个基础门槛后，才值得做小规模机制确认（约 50 prompts × ≥5 seeds）；最终主结果仍必须回到 [`MAINSTREAM_EVALUATION_PROTOCOL.md`](../protocols/MAINSTREAM_EVALUATION_PROTOCOL.md) 的 2,000/1,000 prompts × 3 次完整重复，并补充第二 backbone、Stage-2/ControlNet 和随机左右顺序的人类配对盲评。
 
 ## 6. 复现
 

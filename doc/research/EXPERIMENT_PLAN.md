@@ -11,6 +11,12 @@
 > 目标：把手调的 guidance 超参 `(scale, density, decay)` 替换成一个**动态、可学习、(content/prompt)自适应**的控制器，去除人工消融、并提升质量与通用性。
 > 说明：本文件是活文档（living doc），随实验推进更新。行号引用基于改动前的代码，仅作定位用，以符号名为准。
 
+> **正式评测规模（2026-08-30）：** 后续主结果遵循
+> [`MAINSTREAM_EVALUATION_PROTOCOL.md`](../protocols/MAINSTREAM_EVALUATION_PROTOCOL.md)：
+> 1024² 方法门槛使用 1,000 prompts，2048² 使用 2,000 prompts，超过 2048² 使用
+> 1,000 prompts；每套清单用 3 个预注册 seeds 完整重复。当前 12-prompt 网格仅
+> 用于 pilot；它的结果不能进入正式主表，也不能替代 prompt-disjoint 确认集。
+
 ---
 
 ## 0. 背景与核心问题
