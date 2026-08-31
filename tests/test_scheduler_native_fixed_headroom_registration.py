@@ -89,6 +89,14 @@ class SchedulerNativeFixedHeadroomRegistrationTest(unittest.TestCase):
             "eval-pipeline/prompts/adaptive_oracle_engineering.csv",
             observed_prior_files,
         )
+        self.assertNotIn(
+            "eval-pipeline/prompts/hpsv2_official_3200.csv",
+            observed_prior_files,
+        )
+        self.assertEqual(
+            tuple(pathlib.Path(path).name for path in manifest_files),
+            builder.PRIOR_PROMPT_CSV_NAMES,
+        )
 
         old_texts = set()
         old_source_rows = set()

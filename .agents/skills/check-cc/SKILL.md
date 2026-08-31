@@ -69,12 +69,13 @@ Cycle the emphasized lens while keeping full coverage:
 1. Attention Guidance shapes, dtype/device, schedules, filtering, numerical edge cases, reverse
    `t_index`, and scheduler-step integration.
 2. SDXL two-stage trigger/restart math, `init_rates`, anchor statistics, VAE tiling/offload,
-   callbacks, return contracts, and diffusers 0.21.4 compatibility.
+   callbacks, return contracts, and the pinned `diffusers>=0.32.1,<0.33` compatibility.
 3. ControlNet condition propagation and FreeScale method binding/window logic, including intentional
    API differences across all three pipelines and their `InferCases/` callers.
 4. Eval manifest/score schemas, resume behavior, scorer registry/config/output keys, metric
-   direction, prompt-seed-scale pairing, generation-versus-scoring environments, and the explicit
-   `eval-pipeline/prestage_weights.py` scoring-weight download exception.
+   direction, prompt-seed-scale pairing, the Python 3.11.10 `diff_attn` generation versus
+   `repldm_eval` scoring environments, and the explicit `eval-pipeline/prestage_weights.py`
+   scoring-weight download exception.
 5. Documentation and runnability: real commands, flags, paths, defaults, exports, branch claims,
    Python 3.9 compatibility, local-only generation/preprocessing model loading, dead references,
    debug leftovers, and accidental artifacts.
@@ -135,15 +136,15 @@ Use a yielded execution session unless `CLAUDE.md` requires a dedicated tmux win
 permission bypass or grant Bash, Edit, Write, notebook-editing, or web tools. The prompt and diff
 artifacts replace Claude's need for Git or shell access.
 
-Immediately after launching Claude, spawn one fresh Codex reviewer with a unique task name and
-`fork_turns="none"`. Give it the same scope, lens, artifacts, prohibitions, and schema. Never reuse a
-reviewer or disclose previous findings.
-
-Before either launch, fingerprint every existing frozen file, all three diff layers, the untracked
+Before launching either reviewer, fingerprint every existing frozen file, all three diff layers, the untracked
 list, status, `HEAD`, and symbolic branch ref, using an explicit detached marker when
 `git symbolic-ref -q HEAD` has no result. Wait for both reviewers, then compare fingerprints.
 Unexpected mutation or a new out-of-scope status entry invalidates the pass; stop without a blanket
 rollback.
+
+After the pre-launch fingerprints match, launch Claude and immediately spawn one fresh Codex reviewer
+with a unique task name and `fork_turns="none"`. Give it the same scope, lens, artifacts,
+prohibitions, and schema. Never reuse a reviewer or disclose previous findings.
 
 ## Run the dual-review loop
 
@@ -166,9 +167,12 @@ Maintain `clean_streak = 0`, `pass = 1`, and a finding-signature counter:
 
 ## Fix and validate
 
-Use `apply_patch` and preserve invocation-time work. Select `${REPLDM_PYTHON}` only when executable
-and Python 3.9-compatible; otherwise prefer `conda run -n repldm python` and report any fallback.
-Use the selected interpreter or command prefix for every `python` placeholder below.
+Use `apply_patch` and preserve invocation-time work. For package-level checks, select
+`${REPLDM_PYTHON}` only when executable and Python `>=3.9`; otherwise use the documented Python
+3.11.10 `diff_attn` interpreter as the fallback. For generation commands use that same `diff_attn`
+interpreter; for scoring-only commands use the documented `repldm_eval` interpreter. Do not assume
+that a conda environment named `repldm` exists. Report any fallback and use the selected interpreter
+or command prefix for every `python` placeholder below.
 
 - For Python changes, run `python -m compileall AttentionGuidance InferencePipelines eval-pipeline`
   and `python -m py_compile` on changed `InferCases/` Python entry points.

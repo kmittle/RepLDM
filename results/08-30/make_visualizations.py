@@ -1,4 +1,4 @@
-"""Build figures for results/results-08-30.md from frozen artifacts."""
+"""Build figures for results/08-30/results-08-30.md from frozen artifacts."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 FIGURES = HERE / "figures"
 FONT_REGULAR = Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
@@ -196,7 +196,7 @@ def comparison_row(
 def native_headroom_row(action: str) -> tuple[float, float, float]:
     path = register(
         ROOT
-        / "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2/"
+        / "outputs/archived_results/latent_renderer/scheduler_native_fixed_headroom_development_v2/"
         "scheduler_native_fixed_headroom_evaluation.csv"
     )
     frame = pd.read_csv(path)
@@ -250,7 +250,7 @@ def make_topiq_overview() -> None:
         (
             "统一 scalar 0.004（合规复现）",
             comparison_row(
-                "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/action_comparisons.csv",
+                "outputs/archived_results/exp_spectral_headroom/pilot_12prompt_3seed_v1/action_comparisons.csv",
                 "topiq_nr",
                 "scalar_0.004",
                 "no_ag",
@@ -260,7 +260,7 @@ def make_topiq_overview() -> None:
         (
             "S1 只增强中频",
             comparison_row(
-                "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1/action_comparisons.csv",
+                "outputs/archived_results/exp_spectral_headroom/pilot_12prompt_3seed_v1/action_comparisons.csv",
                 "topiq_nr",
                 "mid_only_0.004",
                 "no_ag",
@@ -270,7 +270,7 @@ def make_topiq_overview() -> None:
         (
             "S2 固定均值/方差",
             comparison_row(
-                "outputs/exp_moment_tangent/development_12prompt_3seed_v1/action_comparisons.csv",
+                "outputs/archived_results/exp_moment_tangent/development_12prompt_3seed_v1/action_comparisons.csv",
                 "topiq_nr",
                 "moment_tangent_0.002",
                 "no_ag",
@@ -280,7 +280,7 @@ def make_topiq_overview() -> None:
         (
             "S3 删除反向分量",
             comparison_row(
-                "outputs/exp_trajectory_cone/development_12prompt_3seed_v1/action_comparisons.csv",
+                "outputs/archived_results/exp_trajectory_cone/development_12prompt_3seed_v1/action_comparisons.csv",
                 "topiq_nr",
                 "trajectory_cone_0.002",
                 "no_ag",
@@ -290,7 +290,7 @@ def make_topiq_overview() -> None:
         (
             "S4 2048px trajectory cone",
             comparison_row(
-                "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1/action_comparisons.csv",
+                "outputs/archived_results/exp_stage2_transfer/pilot_12prompt_3seed_v1/action_comparisons.csv",
                 "topiq_nr",
                 "trajectory_cone_0.002",
                 "no_ag",
@@ -300,7 +300,7 @@ def make_topiq_overview() -> None:
         (
             "S5 semantic transport",
             comparison_row(
-                "outputs/exp_s5/development_12prompt_3seed_v2/action_comparisons.csv",
+                "outputs/archived_results/exp_s5/development_12prompt_3seed_v2/action_comparisons.csv",
                 "topiq_nr",
                 "reciprocal_semantic_0.01",
                 "no_ag",
@@ -310,7 +310,7 @@ def make_topiq_overview() -> None:
         (
             "LR-1 fixed renderer",
             comparison_row(
-                "outputs/latent_renderer/lr1_fixed_train_searchseeds_v2/action_comparisons.csv",
+                "outputs/archived_results/latent_renderer/lr1_fixed_train_searchseeds_v2/action_comparisons.csv",
                 "topiq_nr",
                 "spectral_mid_pos",
                 "no_ag",
@@ -457,9 +457,9 @@ def make_grid(
 
 
 def make_guidance_examples() -> None:
-    spectral = ROOT / "outputs/exp_spectral_headroom/pilot_12prompt_3seed_v1"
-    moment = ROOT / "outputs/exp_moment_tangent/development_12prompt_3seed_v1"
-    cone = ROOT / "outputs/exp_trajectory_cone/development_12prompt_3seed_v1"
+    spectral = ROOT / "outputs/archived_results/exp_spectral_headroom/pilot_12prompt_3seed_v1"
+    moment = ROOT / "outputs/archived_results/exp_moment_tangent/development_12prompt_3seed_v1"
+    cone = ROOT / "outputs/archived_results/exp_trajectory_cone/development_12prompt_3seed_v1"
     spectral_config, spectral_prompts = load_run_provenance(spectral)
     moment_config, moment_prompts = load_run_provenance(moment)
     cone_config, cone_prompts = load_run_provenance(cone)
@@ -494,7 +494,7 @@ def make_guidance_examples() -> None:
 
 
 def make_stage2_examples() -> None:
-    run = ROOT / "outputs/exp_stage2_transfer/pilot_12prompt_3seed_v1"
+    run = ROOT / "outputs/archived_results/exp_stage2_transfer/pilot_12prompt_3seed_v1"
     config, prompts = load_run_provenance(run)
     actions = [
         ("no-AG", "no_ag"),
@@ -529,7 +529,7 @@ def difference_image(reference: Image.Image, other: Image.Image, factor: float =
 
 
 def make_renderer_wiring() -> None:
-    run = ROOT / "outputs/latent_renderer/wiring_smoke_50_fee18b3"
+    run = ROOT / "outputs/archived_results/latent_renderer/wiring_smoke_50_fee18b3"
     report = load_json(run / "report.json")
     if report.get("schema") != "latent_renderer_wiring_smoke_v1" or report.get("seed") != 123:
         raise ValueError("Unexpected LR-0 wiring report provenance")
@@ -622,7 +622,9 @@ def paired_score_deltas(run: str, actions: Iterable[str], baseline: str) -> dict
 
 def make_freeu_tradeoff() -> None:
     actions = ["freeu_backbone_only", "freeu_low_window", "mp_backbone_only", "mp_low_window"]
-    data = paired_score_deltas("outputs/freeu_moment_followup_v1", actions, "no_freeu")
+    data = paired_score_deltas(
+        "outputs/archived_results/freeu_moment_followup_v1", actions, "no_freeu"
+    )
     labels = {
         "freeu_backbone_only": "普通 FreeU\nbackbone",
         "freeu_low_window": "普通 FreeU\nlow-window",
@@ -693,7 +695,7 @@ def make_freeu_tradeoff() -> None:
 
 
 def make_freeu_examples() -> None:
-    run = ROOT / "outputs/freeu_moment_followup_v1"
+    run = ROOT / "outputs/archived_results/freeu_moment_followup_v1"
     config, prompts = load_run_provenance(run)
     first_indices = [int(value) for value in prompts["index"].head(3)]
     if first_indices != [0, 1, 2]:
@@ -721,7 +723,7 @@ def make_freeu_examples() -> None:
 
 
 def make_scheduler_gain() -> None:
-    run = ROOT / "outputs/latent_renderer/scheduler_native_fixed_headroom_development_v2"
+    run = ROOT / "outputs/archived_results/latent_renderer/scheduler_native_fixed_headroom_development_v2"
     config, prompts = load_run_provenance(run)
     path = run / "images/p0_seed1932556753_aspectral_mid_native.json"
     data = load_json(path)

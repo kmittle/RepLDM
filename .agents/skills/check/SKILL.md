@@ -68,13 +68,15 @@ Cover these lenses across each panel, with emphasis on behavior changed by the d
    runnable `InferCases/` scripts and notebooks.
 3. **Evaluation contracts:** prompt/seed/scale pairing, manifest and score schemas, resume behavior,
    scorer registry/config/output keys, metric direction, offline weight checks, and the separate
-   `repldm` generation and scoring environments documented in `eval-pipeline/README.md`.
+   `diff_attn` generation and `repldm_eval` scoring environments documented in
+   `eval-pipeline/README.md` (the generation lock currently records Python 3.11.10).
 4. **Docs and repository policy:** commands, flags, defaults, paths, links, branch claims, local-only
    generation/preprocessing model loading, the explicit scoring-weight download exception in
    `eval-pipeline/prestage_weights.py`, and generated-artifact exclusions. Distinguish objective
    contradictions from examples explicitly presented as typical values.
 5. **Leftovers and runnability:** undefined or stale symbols, debug output, dead code caused by the
-   change, accidental artifacts, and Python 3.9 or pinned diffusers compatibility.
+   change, accidental artifacts, and Python 3.9 or the pinned `diffusers>=0.32.1,<0.33`
+   compatibility.
 
 Reject subjective style preferences, speculative output-quality changes, unrelated pre-existing
 defects, and failures caused only by unavailable CUDA, weights, datasets, or optional packages.
@@ -108,10 +110,12 @@ Stop and ask if the same finding returns after two attempted fixes or correct be
 
 ## Validate the frozen changes
 
-Use `apply_patch` and preserve all invocation-time work. Select `${REPLDM_PYTHON}` only when it is an
-executable Python 3.9-compatible interpreter; otherwise prefer `conda run -n repldm python`. Report
-any fallback, and use the selected interpreter or command prefix for every `python` placeholder
-below.
+Use `apply_patch` and preserve all invocation-time work. For package-level checks, select
+`${REPLDM_PYTHON}` only when it is executable and Python `>=3.9`; otherwise use the documented
+`diff_attn` Python 3.11.10 interpreter as the fallback. For generation commands use that same
+`diff_attn` interpreter; for scoring-only commands use the documented `repldm_eval` interpreter.
+Do not assume that a conda environment named `repldm` exists. Report any fallback, and use the
+selected interpreter or command prefix for every `python` placeholder below.
 
 - For Python changes, run `python -m compileall AttentionGuidance InferencePipelines eval-pipeline`
   and `python -m py_compile` for changed Python entry points under `InferCases/`.

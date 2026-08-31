@@ -27,9 +27,18 @@ SEED_COUNTS = {"smoke": 1, "development": 3, "validation": 3, "final": 3}
 OBSERVED_GENERATED_SEEDS = (0, 7, 19, 42, 73, 123)
 PRIOR_REGISTERED_SEEDS = (11, 29, 101)
 OUTPUT_PREFIX = "scheduler_native_fixed_headroom_"
-# The fixed-headroom registration predates this separately governed experiment.
-# Its frozen exclusion universe must not expand when that namespace adds prompts.
-POST_REGISTRATION_PROMPT_PREFIXES = ("adaptive_oracle_",)
+PRIOR_PROMPT_CSV_NAMES = (
+    "eval_v1.csv",
+    "latent_renderer_test.csv",
+    "latent_renderer_train.csv",
+    "latent_renderer_validation.csv",
+    "s5_development.csv",
+    "s5_smoke.csv",
+    "smoke.csv",
+    "stage2_smoke.csv",
+    "trajectory_correction_heldout_v1.csv",
+    "trajectory_correction_validation_v1.csv",
+)
 CSV_FIELDS = (
     "index",
     "TEXT",
@@ -61,9 +70,7 @@ def normalize_prompt(value: str) -> str:
 def is_prior_prompt_csv(path: pathlib.Path) -> bool:
     """Return whether a CSV belongs to the fixed-headroom exclusion universe."""
 
-    return path.suffix == ".csv" and not path.name.startswith(
-        (OUTPUT_PREFIX, *POST_REGISTRATION_PROMPT_PREFIXES)
-    )
+    return path.name in PRIOR_PROMPT_CSV_NAMES
 
 
 def _read_csv(path: pathlib.Path, *, delimiter: str = ",") -> list[dict[str, str]]:
@@ -116,9 +123,10 @@ def _existing_prompt_inventory(
     file_inventory = []
     excluded_texts: set[str] = set()
     explicit_source_rows: set[int] = set()
-    for path in sorted(prompt_dir.glob("*.csv")):
-        if not is_prior_prompt_csv(path):
-            continue
+    for name in PRIOR_PROMPT_CSV_NAMES:
+        path = prompt_dir / name
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"registered historical prompt CSV is missing or unsafe: {path}")
         rows = _read_csv(path)
         if rows and "TEXT" not in rows[0]:
             raise ValueError(f"{path} lacks a TEXT column")

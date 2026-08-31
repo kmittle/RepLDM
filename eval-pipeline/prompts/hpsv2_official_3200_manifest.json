@@ -1,0 +1,71 @@
+{
+  "benchmark": "HPSv2",
+  "csv": {
+    "columns": [
+      "index",
+      "TEXT",
+      "bucket",
+      "benchmark_style",
+      "style_index",
+      "source_row_id"
+    ],
+    "encoding": "utf-8",
+    "index_range": [
+      0,
+      3199
+    ],
+    "line_ending": "LF",
+    "path": "eval-pipeline/prompts/hpsv2_official_3200.csv",
+    "sha256": "bf51e0eb6659dcbf5666df1f6813334fb10f65bc40018f22c83abc6a801463c7",
+    "size_bytes": 391751
+  },
+  "duplicate_policy": "preserve_official_rows_and_identify_by_style_and_style_index",
+  "exact_unique_prompt_count": 3172,
+  "official_duplicate_row_count": 28,
+  "official_prompt_count": 3200,
+  "schema": "hpsv2_official_prompt_manifest_v1",
+  "source": {
+    "canonical_url": "https://huggingface.co/datasets/zhwang/HPDv2",
+    "files": {
+      "anime": {
+        "git_blob_oid": "b042bd6096b1337f4a7eef8c9b1233f71910f9c7",
+        "path": "benchmark/anime.json",
+        "sha256": "6b38a479cc6f899866e9b7a8bf91f096b4afc6883b95275a61891327182b14ae",
+        "size_bytes": 62816
+      },
+      "concept-art": {
+        "git_blob_oid": "62f8ba6d263251840631eda54010ad2f91b1d5de",
+        "path": "benchmark/concept-art.json",
+        "sha256": "530d057deafcb82c581e9d1be2ffcb98828fe99f0b54257414d2ab8a5cf2b83e",
+        "size_bytes": 85787
+      },
+      "paintings": {
+        "git_blob_oid": "303e19b56e4c1c336d396a9cf252cade5baaaaf9",
+        "path": "benchmark/paintings.json",
+        "sha256": "6570d39467e08b24b64e5b8a4177b0f61c525631121dc5a91fe2ab956eab4d5f",
+        "size_bytes": 81338
+      },
+      "photo": {
+        "git_blob_oid": "a114fe4a4738353438c5f95dc3e23b85882a1ca4",
+        "path": "benchmark/photo.json",
+        "sha256": "92a3c9a0f743f66eb87bd112cdda830d6bdb4c073c86021d53b74001fcb18052",
+        "size_bytes": 44606
+      }
+    },
+    "repository": "zhwang/HPDv2",
+    "repository_type": "huggingface_dataset",
+    "revision": "b9517430f34b1080d4f741118d2a440155a165cd"
+  },
+  "style_counts": {
+    "anime": 800,
+    "concept-art": 800,
+    "paintings": 800,
+    "photo": 800
+  },
+  "style_order": [
+    "anime",
+    "concept-art",
+    "paintings",
+    "photo"
+  ]
+}

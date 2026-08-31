@@ -29,23 +29,26 @@ working branch immediately before the first loop commit; otherwise remain on the
    `doc/research/EXPERIMENT_RESULTS.md` when the scope touches evaluation or experiments. Treat
    current code and configuration as authoritative over stale
    prose, except that explicit experiment requirements remain requirements.
-3. Record the branch, `HEAD`, `git status --short`, separate cached and unstaged diffs, and
+3. Set `BASE=$(git rev-parse HEAD)` and keep it fixed for the loop. Record the branch, `HEAD`,
+   `git status --short`, separate cached and unstaged diffs, and
    non-ignored untracked paths. Record an explicit detached marker when `git symbolic-ref -q HEAD`
    has no result. Snapshot the existing index so later commits cannot absorb staged work that
-   predates the loop.
+   predates the loop. For every pending tracked change, keep the cached and unstaged diff as
+   separate review artifacts; never give a reviewer only the combined worktree diff.
 4. Preserve every pre-existing dirty hunk. It may be inspected when in scope, but it remains
    user-owned unless a verified fix must overlap it. If a loop fix cannot be isolated from user
    work for staging, stop and ask instead of committing the combined file.
 
 ## Resolve the scope
 
-- With no argument, inspect tracked and non-ignored untracked repository source, notebooks,
-  configuration, shell scripts, and documentation. Include deletions and both sides of renames from
-  the separate index and worktree layers. Exclude `.git` and ignored, untracked generated artifacts.
-  Keep any tracked or non-ignored output, weight, checkpoint, dataset, cache, or generated figure in
-  scope for tracking-policy and reference review, while skipping inspection of opaque binary
-  contents. Treat intentional paper figures under `fig/` as allowed tracked artifacts when their
-  provenance and documentation references are valid.
+- With no argument, enumerate every tracked path and every non-ignored untracked path, then inspect
+  repository source, tests, notebooks, configuration, shell scripts, and documentation. Include
+  deletions and both sides of renames from the separate index and worktree layers. Exclude `.git`
+  and ignored, untracked generated artifacts. Do not silently drop a tracked or non-ignored output,
+  weight, checkpoint, dataset, cache, or generated figure: keep it in scope for tracking-policy and
+  reference review, while skipping inspection of opaque binary contents. Treat intentional paper
+  figures under `fig/` as allowed tracked artifacts when their provenance and documentation
+  references are valid.
 - For paths or globs, inspect those paths and their direct blast radius through callers, exports,
   docs, configs, notebooks, and runnable scripts.
 - For `code` or `docs`, restrict the primary scope to that category. Map `attention` to
@@ -54,7 +57,10 @@ working branch immediately before the first loop commit; otherwise remain on the
 - Treat out-of-scope files as read-only evidence. Report confirmed defects outside scope without
   fixing them or resetting the clean streak. Never expand the writable scope silently.
 
-Announce the resolved scope before the first round.
+Announce the resolved scope before the first round. Create a task-specific temporary `RUN_DIR`
+outside the repository. For each round, write separate artifacts for the committed-since-`BASE`
+diff, the cached diff against `HEAD`, and the unstaged diff, plus the frozen path list; pass all
+artifact paths to every reviewer. Never collapse the index and worktree layers into one diff.
 
 ## Apply RepLDM review lenses
 
@@ -64,7 +70,7 @@ Ask every panel for a full review while rotating emphasis across these project-s
    optional FFT filtering, scaling/decay behavior, and numerical edge cases. Verify from current
    code that pipeline calls obey the reverse `t_index` convention rather than confusing it with a
    scheduler timestep.
-2. **RepLDM pipelines:** diffusers 0.21.4 compatibility; Stage-1 scheduler/guidance ordering;
+2. **RepLDM pipelines:** pinned `diffusers>=0.32.1,<0.33` compatibility; Stage-1 scheduler/guidance ordering;
    aspect-ratio and Stage-2 trigger math; `init_rates` versus upsampling stages; VAE encode/decode,
    anchor-statistic normalization, CPU offload, tiling, and latent dtype/device transitions.
    Check that Attention Guidance remains limited to the intended stage.
@@ -77,8 +83,9 @@ Ask every panel for a full review while rotating emphasis across these project-s
    package.
 5. **Evaluation instrument:** generation/score/aggregate manifest schemas, resume behavior,
    scorer registry/config/output-key consistency, metric direction, prompt/seed/scale pairing,
-   offline weight checks, and the deliberate separation between the Python 3.9 `repldm` generation
-   environment and the scoring environment documented in `eval-pipeline/README.md`.
+   offline weight checks, and the deliberate separation between the Python 3.11.10 `diff_attn`
+   generation environment and the `repldm_eval` scoring environment documented in
+   `eval-pipeline/README.md`.
 6. **Repository policy:** diffusion, ControlNet, and preprocessing model loads must remain
    local-only unless the user explicitly changes that policy. Treat the documented, opt-in
    `eval-pipeline/prestage_weights.py` download as the scoring-weight exception; scoring itself must
@@ -103,10 +110,11 @@ For each round:
 2. Forbid reviewers from editing, creating, deleting, staging, committing, changing branches,
    invoking skills, or launching training/inference. Require `NO_FINDINGS` or findings containing
    `file`, `line`, `severity`, `problem`, `evidence`, and `minimal_fix`.
-3. Before launch, fingerprint in-scope contents, separate cached and unstaged diffs, the untracked
-   list, status, `HEAD`, and symbolic branch ref. Wait for the entire panel and compare every
-   fingerprint. Invalidate the round and stop on unexpected mutation; never blanket-restore user
-   work.
+3. Before launching any reviewer, fingerprint in-scope contents, separate cached and unstaged diffs, the untracked
+   list, status, `HEAD`, and symbolic branch ref. Give each reviewer the separate cached and
+   unstaged diff artifacts (and the committed-since-start baseline when applicable). Wait for the
+   entire panel and compare every fingerprint. Invalidate the round and stop on unexpected
+   mutation; never blanket-restore user work.
 4. Merge duplicates and verify every claim directly in current files and affected callers. Count
    only objective in-scope defects supported by concrete evidence.
 5. If triage is clean, increment `consecutive_clean`. If defects remain, reset it to zero, apply the
@@ -118,10 +126,13 @@ ambiguous.
 ## Validate fixes
 
 Use `apply_patch`, preserve local style, and avoid wholesale formatting of the large pipeline files.
-Select `${REPLDM_PYTHON}` only when it names an executable Python 3.9-compatible interpreter;
-otherwise prefer `conda run -n repldm python`. If neither is available, use another documented
-Python 3.9 environment when possible and report the exact fallback. Use that selected interpreter
-or command prefix for every `python` placeholder below.
+For package-level checks, select `${REPLDM_PYTHON}` only when it names an executable Python `>=3.9`
+interpreter; otherwise use the documented Python 3.11.10 `diff_attn` interpreter as the fallback.
+For generation commands use that same `diff_attn` interpreter; for scoring-only commands use the
+documented `repldm_eval` interpreter. Do not assume that a conda environment named `repldm` exists.
+If neither documented interpreter is available, use another verified interpreter that satisfies the
+relevant runtime contract and report the exact fallback. Use the selected interpreter or command
+prefix for every `python` placeholder below.
 
 Apply the lightest relevant checks, increasing coverage with risk:
 

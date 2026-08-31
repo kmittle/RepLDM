@@ -1,0 +1,33 @@
+schema: hpsv2_full_scoring_v1
+benchmark: HPSv2
+prompt_count: 3200
+subset_evaluation_allowed: false
+exclusive_cuda_process: true
+hps_version: v2.1
+hpsv2_stored_scale: raw_cosine
+hpsv2_official_report_multiplier: 100.0
+
+metrics:
+  - imagereward
+  - pixel
+  - clip
+  - hps
+  - aesthetic
+  - iqa
+
+params:
+  patch_crops: 5
+  clip_model: ViT-B/32
+  clipscore_w: 2.5
+
+scorer_provenance:
+  required_schema: repldm_scorer_provenance_v1
+
+metric_meta:
+  imagereward: higher
+  patch_ir_mean: higher
+  clip_cosine: higher
+  clipscore: higher
+  hpsv2: higher
+  aesthetic: higher
+  topiq_nr: higher

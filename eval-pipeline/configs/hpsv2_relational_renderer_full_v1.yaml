@@ -1,0 +1,153 @@
+schema: hpsv2_relational_renderer_full_v1
+status: frozen_full_benchmark
+experiment_id: hpsv2_relational_renderer_full_v1
+output_dir: outputs/hpsv2_relational_renderer/full_v1
+
+benchmark:
+  name: HPSv2
+  protocol: official_complete_prompt_set
+  prompt_csv: eval-pipeline/prompts/hpsv2_official_3200.csv
+  prompt_csv_sha256: bf51e0eb6659dcbf5666df1f6813334fb10f65bc40018f22c83abc6a801463c7
+  prompt_manifest: eval-pipeline/prompts/hpsv2_official_3200_manifest.json
+  prompt_manifest_sha256: 8df43332f69e46a5457a10aad16da168cc7db365064e7e8cdc8c2fc7a7102c91
+  prompt_count: 3200
+  style_order: [anime, concept-art, paintings, photo]
+  prompts_per_style: 800
+  images_per_prompt_per_setting: 1
+  base_seed: 20260831
+  seed_policy: base_seed_plus_official_prompt_index
+  subset_evaluation_allowed: false
+
+sampling:
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  model_revision: 462165984030d82259a11f4367a4eed129e94a7b
+  model_variant: fp16
+  model_snapshot_loaded_file_count: 18
+  model_snapshot_manifest_sha256: 53ebd71cceb73d660ce163b94bab48f4834e494ff60cbbabcb1feffa77eb8f28
+  pipeline: RepLDMSDXLPipeline
+  resolution: 1024
+  num_inference_steps: 50
+  cfg_scale: 7.5
+  guidance_rescale: 0.0
+  negative_prompt: blurry, ugly, duplicate, poorly drawn, deformed, mosaic
+  scheduler: EulerDiscreteScheduler
+  prediction_type: epsilon
+  scheduler_churn: 0.0
+  stage2: false
+  extra_unet_calls: 0
+  batch_size: 1
+  torch_dtype: float16
+  local_files_only: true
+
+execution:
+  requested_physical_devices: [2, 5, 6, 7]
+  grouping: prompt
+  same_device_for_all_settings_of_one_prompt: true
+  deterministic_setting_order: sha256
+  resumable: true
+  expected_setting_count: 4
+  expected_image_count: 12800
+  require_clean_git_worktree: true
+  require_head_pushed_to_origin: true
+  generation_environment_schema: hpsv2_generation_environment_v1
+  generation_packages:
+    - accelerate
+    - diffusers
+    - einops
+    - entmax
+    - huggingface-hub
+    - numpy
+    - pillow
+    - pyyaml
+    - safetensors
+    - scipy
+    - tokenizers
+    - torch
+    - torchvision
+    - tqdm
+    - transformers
+  worker_determinism:
+    deterministic_algorithms: false
+    cudnn_benchmark: false
+    cudnn_deterministic: true
+    cuda_matmul_allow_tf32: false
+    cudnn_allow_tf32: false
+
+renderer:
+  feature_block: up_blocks.0
+  feature_shape: [2, 1280, 32, 32]
+  pooled_grid: [16, 16]
+  orbit: axis-r1
+  sign: 1
+  target_update_ratio: 0.02
+  hard_update_cap: 0.05
+  scheduler_mapping: euler_clean_endpoint
+  preserve_channel_mean: true
+  preserve_channel_covariance: true
+
+settings:
+  - id: no_ag
+    affinity_source: none
+    role: baseline
+  - id: feature_axis_r1_pos
+    affinity_source: feature
+    role: proposed_structural_direction
+  - id: uniform_axis_r1_pos
+    affinity_source: uniform_local
+    role: local_smoothing_control
+  - id: random_axis_r1_pos
+    affinity_source: random_edge
+    role: matched_random_direction_control
+
+scoring:
+  config: eval-pipeline/configs/hpsv2_full_scoring_v1.yaml
+  config_sha256: 7033266ab566ed2c36fa8249accf2d86fe4b46971900b4dbe3b79d09bfc2f9a1
+  strict: true
+  scorer_provenance_required: true
+  hps_version: v2.1
+  hpsv2_stored_scale: raw_cosine
+  hpsv2_official_report_multiplier: 100.0
+  metrics: [imagereward, pixel, clip, hps, aesthetic, iqa]
+  required_outputs:
+    - hpsv2
+    - topiq_nr
+    - imagereward
+    - patch_ir_mean
+    - patch_ir_std
+    - patch_ir_n
+    - clip_cosine
+    - clipscore
+    - aesthetic
+    - colorfulness
+    - laplacian_sharpness
+    - clipped_fraction
+    - mean_saturation
+    - contrast_std
+
+analysis:
+  statistical_unit: prompt_row
+  paired_on: [benchmark_style, style_index, seed]
+  primary_contrast: feature_axis_r1_pos-minus-no_ag
+  mechanism_contrasts:
+    - feature_axis_r1_pos-minus-uniform_axis_r1_pos
+    - feature_axis_r1_pos-minus-random_axis_r1_pos
+  report_by_style: true
+  report_official_80_prompt_groups: true
+  paired_bootstrap_samples: 10000
+  confidence_level: 0.95
+  bootstrap_unit: exact_prompt_text_cluster
+  bootstrap_cluster_count: 3172
+  official_duplicate_rows_in_point_estimates: true
+  bootstrap_seed: 20260831
+  guards:
+    clip_cosine_ci_lower_min_delta: -0.005
+    topiq_nr_ci_lower_min_delta: -0.005
+    clipped_fraction_ci_upper_max_delta: 0.001
+    mean_saturation_ci_upper_max_delta: 0.005
+    contrast_geometric_ratio_interval: [0.95, 1.05]
+  interpretation_rule:
+    - feature_hpsv2_ci_lower_must_exceed_no_ag
+    - feature_hpsv2_ci_lower_must_exceed_uniform
+    - feature_hpsv2_ci_lower_must_exceed_random
+    - all_quality_and_pixel_guards_must_pass
+    - otherwise_do_not_use_this_direction_for_rl_or_distillation

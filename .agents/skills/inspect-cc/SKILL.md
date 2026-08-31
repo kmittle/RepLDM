@@ -63,16 +63,18 @@ RepLDM audit surface and set `BASE_LABEL=surface+pending-fallback`: `AGENTS.md`,
 `README.md`, `pyproject.toml`, `requirements.txt`, package `__init__.py` files,
 `AttentionGuidance/**/*.py`, `InferencePipelines/**/*.py`, runnable `InferCases/**/*.{py,ipynb}`,
 `eval-pipeline/**/*.py`, `eval-pipeline/README.md`, `eval-pipeline/configs/**`, project shell scripts,
-and `.agents/skills/**`. If a usable base exists but branch/WIP scope is empty, audit that surface
-alone with `BASE_LABEL=surface-fallback`.
+`.agents/skills/**`, and all current project documentation under `doc/README.md`, `doc/audits/**`,
+`doc/research/**`, `doc/protocols/**`, and `doc/literature/**`. If a usable base exists but branch/WIP
+scope is empty, audit that same surface alone with `BASE_LABEL=surface-fallback`.
 
 With `--all`, use the union of `git ls-files --cached --others --exclude-standard`, the separate
 cached path list, and the separate unstaged path list; set `BASE_LABEL=whole-tree` and do not invent
-a `BASE_SHA`. The file listing already excludes ignored, untracked artifacts. Keep any tracked or
-non-ignored output, cache, weight, checkpoint, dataset, or generated experiment artifact in scope
-for tracking-policy and reference review. Identify binaries and symlinks explicitly without
-pretending to review opaque contents; allow intentional paper figures under `fig/` when their
-provenance and documentation references are valid.
+a `BASE_SHA`. This listing includes every tracked path, including tracked generated/output files;
+it excludes only ignored, untracked artifacts. Keep every tracked or non-ignored output, cache,
+weight, checkpoint, dataset, or generated experiment artifact in scope for tracking-policy and
+reference review. Identify binaries and symlinks explicitly without pretending to review opaque
+contents; allow intentional paper figures under `fig/` when their provenance and documentation
+references are valid.
 
 Files outside the frozen scope are read-only evidence. Report confirmed defects there without
 fixing them or resetting the streak. Never expand writable scope silently.
@@ -84,15 +86,17 @@ Rotate one emphasized lens per pass while requiring a full audit:
 1. Attention Guidance tensor shapes, dtype/device, schedules, optional filtering, reverse
    `t_index`, numerical stability, and scheduler-step integration.
 2. SDXL two-stage flow, aspect-ratio and Stage-2 trigger math, restart indices, `init_rates`, anchor
-   statistics, VAE tiling, offload paths, callbacks, and diffusers 0.21.4 compatibility.
+   statistics, VAE tiling, offload paths, callbacks, and the pinned `diffusers>=0.32.1,<0.33`
+   compatibility.
 3. ControlNet condition propagation and FreeScale transformer binding/window logic, including their
    intentionally different Attention Guidance argument names.
 4. Public package exports and `InferCases/` callers; docs versus actual signatures, defaults,
    return values, paths, commands, and `main` versus `base` claims.
 5. Eval generation/scoring separation, manifest and score schemas, resume behavior, scorer
    registry/config/output keys, prompt-seed-scale pairing, metric direction, offline weights, and
-   Python environment boundaries. Distinguish offline generation/scoring from the documented,
-   explicit `eval-pipeline/prestage_weights.py` scoring-weight download step.
+   Python environment boundaries (Python 3.11.10 `diff_attn` for generation, `repldm_eval` for
+   scoring). Distinguish offline generation/scoring from the documented, explicit
+   `eval-pipeline/prestage_weights.py` scoring-weight download step.
 
 Also catch undefined names, broken imports, stale references, debug leftovers, accidental artifacts,
 and Python 3.9 incompatibilities. Reject subjective style, speculative image-quality suggestions,
@@ -163,10 +167,10 @@ restore.
 
 ## Run the dual-review loop
 
-For pass `P`, launch Claude and immediately spawn one fresh Codex reviewer with a unique task name
-and `fork_turns="none"`. Give Codex the same frozen scope, artifacts, lens, mutation prohibitions,
-and finding schema. Do not include previous findings or expected answers. Wait for both in parallel
-and keep the user updated at least once per minute.
+For pass `P`, after the pre-launch fingerprints match, launch Claude and immediately spawn one fresh
+Codex reviewer with a unique task name and `fork_turns="none"`. Give Codex the same frozen scope,
+artifacts, lens, mutation prohibitions, and finding schema. Do not include previous findings or
+expected answers. Wait for both in parallel and keep the user updated at least once per minute.
 
 A failure, cancellation, timeout, malformed result, or reviewer mutation is not clean. Retry an
 infrastructure-failed Claude launch once with attempt `A=2` and fresh artifact names. If Claude
@@ -187,9 +191,12 @@ Maintain `clean_streak = 0`, `pass = 1`, and a finding-signature counter:
 ## Fix, validate, and commit
 
 Edit only in-scope paths with `apply_patch`; preserve existing work and avoid broad pipeline
-reformatting. Select `${REPLDM_PYTHON}` only when executable and Python 3.9-compatible; otherwise
-prefer `conda run -n repldm python` and report any fallback. Use the selected interpreter or command
-prefix for every `python` placeholder below.
+reformatting. For package-level checks, select `${REPLDM_PYTHON}` only when executable and Python
+`>=3.9`; otherwise use the documented Python 3.11.10 `diff_attn` interpreter as the fallback. For
+generation commands use that same `diff_attn` interpreter; for scoring-only commands use the
+documented `repldm_eval` interpreter. Do not assume that a conda environment named `repldm` exists.
+Report any fallback and use the selected interpreter or command prefix for every `python` placeholder
+below.
 
 - Run `python -m compileall AttentionGuidance InferencePipelines eval-pipeline` for Python changes
   and `python -m py_compile` for changed `InferCases/` Python entry points.

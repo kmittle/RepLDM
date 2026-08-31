@@ -9,6 +9,7 @@ inside these documents are repository-relative unless a link states otherwise.
 - [`EXPERIMENT_RESULTS.md`](research/EXPERIMENT_RESULTS.md): quantitative results and gate decisions.
 - [`MODEL_ITERATIONS.md`](research/MODEL_ITERATIONS.md): chronological method iterations.
 - [`RL_RESEARCH_DESIGN.md`](research/RL_RESEARCH_DESIGN.md): learned-renderer and RL design constraints.
+- [`TODO_2026_08_31.md`](research/TODO_2026_08_31.md): ordered execution queue and completion gates.
 
 ## Protocols
 
@@ -23,3 +24,5 @@ inside these documents are repository-relative unless a link states otherwise.
 
 `literature/` contains related-work surveys. `audits/` records baseline
 provenance, representation-side limits, and frozen novelty assessments.
+
+- [`BENCHMARK_AND_PREFERENCE_LEARNING_SURVEY_2026_08_31.md`](literature/BENCHMARK_AND_PREFERENCE_LEARNING_SURVEY_2026_08_31.md): full-benchmark sizes, preference-data risks, and the OPD renderer route.

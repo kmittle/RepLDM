@@ -272,7 +272,7 @@ PLADIS 的正差值是相对 CFG 5 的描述性比较，不能直接和 `no_ag` 
 在包含 NumPy、pandas、Matplotlib 和 Pillow 的评测环境中运行：
 
 ```bash
-python results/make_visualizations.py
+python results/08-30/make_visualizations.py
 ```
 
-`results/figures/manifest.json` 记录了审计常量、字体和每个输入文件的 SHA-256，以及输出图片的 SHA-256 与尺寸。
+`results/08-30/figures/manifest.json` 记录了审计常量、字体和每个输入文件的 SHA-256，以及输出图片的 SHA-256 与尺寸。

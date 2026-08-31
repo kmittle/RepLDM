@@ -3,7 +3,10 @@
 ###################################################################
 wandb/
 output/
-outputs/
+outputs/*
+!outputs/archived_results/
+outputs/archived_results/*
+!outputs/archived_results/README.md
 pretrained_ckpts/
 /_experiments_expansion/
 ###################################################################
