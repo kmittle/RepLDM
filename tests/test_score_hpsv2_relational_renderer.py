@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import hashlib
 import json
@@ -48,7 +49,7 @@ class ScoreHashBindingTest(unittest.TestCase):
         self.assertIsNone(contract)
         self.assertEqual(
             digest,
-            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3",
+            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2",
         )
 
     def test_hash_binding_is_all_or_none_and_requires_sha256(self) -> None:
@@ -289,26 +290,37 @@ class ScoringReceiptTest(unittest.TestCase):
 
 
 class TransactionalScoringTest(unittest.TestCase):
+    def assert_private_progress_count(self, run_dir: Path, expected: int) -> None:
+        self.assertEqual(
+            len(score._scoring_progress_payload_paths(run_dir)), expected
+        )
+
     @staticmethod
-    def make_run(root: Path):
+    def make_run(root: Path, row_count: int = 1):
         run_dir = root / "run"
         image_dir = run_dir / "images"
         image_dir.mkdir(parents=True)
-        image_path = image_dir / "task-0.png"
-        Image.new("RGB", (4, 4), color=(20, 30, 40)).save(image_path)
-        image_hash = hashlib.sha256(image_path.read_bytes()).hexdigest()
         run_contract_sha256 = "b" * 64
-        manifest = [
-            {
-                "id": "task-0",
-                "prompt": "a prompt",
-                "image_path": "images/task-0.png",
-                "image_sha256": image_hash,
-                "run_contract_sha256": run_contract_sha256,
-            }
-        ]
+        manifest = []
+        for index in range(row_count):
+            image_path = image_dir / f"task-{index}.png"
+            Image.new(
+                "RGB", (4, 4), color=(20 + index, 30, 40)
+            ).save(image_path)
+            manifest.append(
+                {
+                    "id": f"task-{index}",
+                    "prompt": f"prompt {index}",
+                    "image_path": f"images/task-{index}.png",
+                    "image_sha256": hashlib.sha256(
+                        image_path.read_bytes()
+                    ).hexdigest(),
+                    "run_contract_sha256": run_contract_sha256,
+                }
+            )
         (run_dir / "manifest.jsonl").write_text(
-            json.dumps(manifest[0]) + "\n", encoding="utf-8"
+            "".join(json.dumps(row) + "\n" for row in manifest),
+            encoding="utf-8",
         )
         (run_dir / "config.json").write_text(
             json.dumps({"run_contract_sha256": run_contract_sha256}),
@@ -331,7 +343,7 @@ class TransactionalScoringTest(unittest.TestCase):
         return run_dir, scoring_config_path, manifest
 
     @staticmethod
-    def registry(calls, *, value=0.75):
+    def registry(calls, *, value=0.75, fail_on_call=None):
         class DummyScorer:
             OUTPUT_KEYS = (("fixture_score", "higher"),)
             PROVENANCE_PACKAGES = ()
@@ -354,6 +366,8 @@ class TransactionalScoringTest(unittest.TestCase):
 
             def score_image(self, _image, _prompt):
                 calls["fixture"] += 1
+                if calls["fixture"] == fail_on_call:
+                    raise RuntimeError("planned scorer interruption")
                 return {"fixture_score": value}
 
         return {"fixture": DummyScorer}
@@ -417,7 +431,7 @@ class TransactionalScoringTest(unittest.TestCase):
             )
             self.assertEqual(published["fixture_score"], 0.75)
 
-    def test_strict_failure_leaves_no_canonical_or_attempt_output(self) -> None:
+    def test_strict_failure_keeps_only_bound_private_progress(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir, scoring_config, _ = self.make_run(Path(temporary))
             calls = {"fixture": 0}
@@ -430,7 +444,110 @@ class TransactionalScoringTest(unittest.TestCase):
 
             self.assertFalse((run_dir / "scores.jsonl").exists())
             self.assertFalse((run_dir / score.SCORING_SUCCESS_NAME).exists())
-            self.assertEqual(list(run_dir.glob(".scores.attempt-*.jsonl")), [])
+            self.assert_private_progress_count(run_dir, 1)
+            self.assertTrue(
+                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).is_file()
+            )
+
+            calls["fixture"] = 0
+            self.invoke(run_dir, scoring_config, self.registry(calls))
+            self.assertEqual(calls["fixture"], 1)
+            self.assert_private_progress_count(run_dir, 0)
+            self.assertFalse(
+                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).exists()
+            )
+
+    def test_partial_progress_resumes_only_unfinished_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, scoring_config, _ = self.make_run(
+                Path(temporary), row_count=2
+            )
+            calls = {"fixture": 0}
+            with self.assertRaisesRegex(RuntimeError, "fixture failed"):
+                self.invoke(
+                    run_dir,
+                    scoring_config,
+                    self.registry(calls, fail_on_call=2),
+                )
+            self.assertEqual(calls["fixture"], 2)
+            self.assert_private_progress_count(run_dir, 1)
+
+            calls["fixture"] = 0
+            self.invoke(run_dir, scoring_config, self.registry(calls))
+            self.assertEqual(calls["fixture"], 1)
+            self.assertTrue((run_dir / score.SCORING_SUCCESS_NAME).is_file())
+            self.assert_private_progress_count(run_dir, 0)
+
+    def test_tampered_private_progress_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, scoring_config, _ = self.make_run(
+                Path(temporary), row_count=2
+            )
+            calls = {"fixture": 0}
+            with self.assertRaisesRegex(RuntimeError, "fixture failed"):
+                self.invoke(
+                    run_dir,
+                    scoring_config,
+                    self.registry(calls, fail_on_call=2),
+                )
+            progress_path = Path(
+                score._scoring_progress_payload_paths(run_dir)[0]
+            )
+            progress_path.write_text(
+                progress_path.read_text(encoding="utf-8") + "{}\n",
+                encoding="utf-8",
+            )
+
+            calls["fixture"] = 0
+            self.invoke(run_dir, scoring_config, self.registry(calls))
+            self.assertEqual(calls["fixture"], 2)
+            self.assertTrue((run_dir / score.SCORING_SUCCESS_NAME).is_file())
+
+    def test_interrupted_checkpoint_keeps_previous_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, scoring_config, _ = self.make_run(
+                Path(temporary), row_count=52
+            )
+            calls = {"fixture": 0}
+            receipt_writes = 0
+            real_atomic_writer = score.atomic_text_writer
+
+            @contextlib.contextmanager
+            def interrupt_second_receipt(path):
+                nonlocal receipt_writes
+                if Path(path).name == score.SCORING_PROGRESS_RECEIPT_NAME:
+                    receipt_writes += 1
+                    if receipt_writes == 2:
+                        raise OSError("planned checkpoint interruption")
+                with real_atomic_writer(path) as handle:
+                    yield handle
+
+            with (
+                mock.patch.object(
+                    score, "atomic_text_writer", interrupt_second_receipt
+                ),
+                self.assertRaisesRegex(OSError, "checkpoint interruption"),
+            ):
+                self.invoke(
+                    run_dir,
+                    scoring_config,
+                    self.registry(calls, fail_on_call=52),
+                )
+            self.assertEqual(calls["fixture"], 52)
+            receipt = json.loads(
+                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            progress_path = run_dir / receipt["scores"]["path"]
+            progress_rows = score.load_jsonl(progress_path)
+            self.assertEqual(len(progress_rows), 50)
+            self.assertTrue(progress_path.is_file())
+
+            calls["fixture"] = 0
+            self.invoke(run_dir, scoring_config, self.registry(calls))
+            self.assertEqual(calls["fixture"], 2)
+            self.assertTrue((run_dir / score.SCORING_SUCCESS_NAME).is_file())
 
     def test_watchdog_exit_failure_after_progress_publishes_nothing(self) -> None:
         class ExitFailureWatchdog:
@@ -444,7 +561,9 @@ class TransactionalScoringTest(unittest.TestCase):
 
             def __exit__(self, exc_type, _exc_value, _traceback):
                 if exc_type is None:
-                    raise RuntimeError("exclusive GPU scoring monitor failed")
+                    raise score.ExclusiveCudaWatchdogError(
+                        "exclusive GPU scoring monitor failed"
+                    )
                 return False
 
             def assert_healthy(self):
@@ -461,7 +580,10 @@ class TransactionalScoringTest(unittest.TestCase):
             self.assertEqual(calls["fixture"], 1)
             self.assertFalse((run_dir / "scores.jsonl").exists())
             self.assertFalse((run_dir / score.SCORING_SUCCESS_NAME).exists())
-            self.assertEqual(list(run_dir.glob(".scores.attempt-*.jsonl")), [])
+            self.assert_private_progress_count(run_dir, 0)
+            self.assertFalse(
+                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).exists()
+            )
 
     def test_nvidia_smi_failure_removes_stale_canonical_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

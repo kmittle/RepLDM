@@ -82,13 +82,13 @@ class FrozenMatrixTest(unittest.TestCase):
         self.assertEqual(manifest["official_duplicate_row_count"], 28)
         self.assertEqual(
             self.contract["config"]["scoring"]["config_sha256"],
-            "22a162c7fc2151bbcc8ab08e5a4e3604de6fd56a955e37078577f8e0bd59dfac",
+            "42d626463fa9b2a3dada6db0366d9cc7f0d5d998af928dcb2f98ce785f70812e",
         )
         self.assertEqual(
             self.contract["config"]["scoring"][
                 "registered_scorer_provenance_sha256"
             ],
-            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3",
+            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2",
         )
 
     def test_analysis_and_duplicate_contracts_fail_closed(self):
@@ -121,7 +121,31 @@ class FrozenMatrixTest(unittest.TestCase):
         for rows in blocks.values():
             self.assertEqual({row["action_id"] for row in rows}, expected_settings)
             self.assertEqual(len({row["physical_device_index"] for row in rows}), 1)
-            self.assertEqual(sorted(row["execution_rank"] for row in rows), [0, 1, 2, 3])
+            self.assertEqual(
+                sorted(row["execution_rank"] for row in rows), [0, 1, 2, 3]
+            )
+
+    def test_generation_resume_is_bounded_to_prompt_batches(self):
+        batches = runner._generation_attempt_batches(
+            self.tasks, runner.EXPECTED_DEVICES
+        )
+        self.assertEqual(len(batches), 16)
+        self.assertEqual(sum(len(batch) for batch in batches), 12800)
+        observed_ids = [row["id"] for batch in batches for row in batch]
+        self.assertEqual(len(set(observed_ids)), 12800)
+        prompt_to_batch = {}
+        for batch_index, batch in enumerate(batches):
+            self.assertLessEqual(len(batch), 800)
+            per_device_prompts = defaultdict(set)
+            for row in batch:
+                prompt_index = row["prompt_index"]
+                per_device_prompts[row["physical_device_index"]].add(prompt_index)
+                previous = prompt_to_batch.setdefault(prompt_index, batch_index)
+                self.assertEqual(previous, batch_index)
+            self.assertTrue(
+                all(len(prompts) <= 50 for prompts in per_device_prompts.values())
+            )
+        self.assertEqual(len(prompt_to_batch), 3200)
 
     def test_setting_order_is_deterministic(self):
         repeated = runner.build_tasks(self.contract, runner.EXPECTED_DEVICES)
@@ -520,7 +544,7 @@ class ArtifactAndDiagnosticTest(unittest.TestCase):
 
     def _stage_single_task_attempt(self, output, task):
         run_config = self._attempt_run_config()
-        (output / "images").mkdir(parents=True)
+        (output / "images").mkdir(parents=True, exist_ok=True)
         attempt, attempt_sha256, staging = runner._begin_generation_attempt(
             output, [task], run_config
         )
@@ -557,6 +581,35 @@ class ArtifactAndDiagnosticTest(unittest.TestCase):
                 runner.sha256_file(receipt_path),
             )
             self.assertEqual(receipt["task_count"], 1)
+
+    def test_later_poisoned_batch_keeps_prior_accepted_batch(self):
+        candidates = [
+            task for task in self.tasks if task["action_id"] == "no_ag"
+        ][:2]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            run_config, first_attempt, first_staging = (
+                self._stage_single_task_attempt(output, candidates[0])
+            )
+            runner._promote_and_accept_generation_attempt(
+                output,
+                first_staging,
+                [candidates[0]],
+                run_config,
+                first_attempt,
+            )
+            _, second_attempt, _ = self._stage_single_task_attempt(
+                output, candidates[1]
+            )
+            runner._poison_generation_attempt(
+                output, second_attempt, RuntimeError("later batch failed")
+            )
+
+            accepted, running = runner._load_generation_attempt_index(
+                output, run_config, candidates
+            )
+            self.assertFalse(running)
+            self.assertEqual(set(accepted), {candidates[0]["id"]})
 
     def test_complete_pair_without_accepted_receipt_is_quarantined(self):
         task = next(task for task in self.tasks if task["action_id"] == "no_ag")

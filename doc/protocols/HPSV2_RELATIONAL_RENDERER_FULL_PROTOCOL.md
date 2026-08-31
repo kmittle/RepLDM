@@ -53,9 +53,10 @@ write only inside a private attempt directory. The parent publishes files to
 the canonical `images/` directory only after every worker, GPU watchdog, and
 model post-audit succeeds. An atomic `accepted.json` binds the ordered task IDs
 and every PNG/sidecar hash; attempts that fail or never reach this receipt are
-poisoned and cannot be resumed. The final manifest must contain exactly 12,800
-distinct task IDs and the complete Cartesian product; partial manifests cannot
-be scored.
+poisoned and cannot be resumed. Each attempt contains at most 50 prompt blocks
+per GPU (800 images across four GPUs), so a later failure preserves all earlier
+accepted batches. The final manifest must contain exactly 12,800 distinct task
+IDs and the complete Cartesian product; partial manifests cannot be scored.
 
 The run contract also records the Python and generation-package versions,
 CUDA/cuDNN runtime, driver, GPU UUID/PCI inventory, deterministic flags, and
@@ -103,11 +104,15 @@ and plain-language report artifacts before the queue is considered complete.
 For hash-bound runs, the scorer hashes the exact bytes it decodes and performs
 another complete image audit after scoring, so cached or new scores cannot be
 silently attached to replaced PNG files.
-Scoring progress is written to an attempt-specific temporary JSONL. The
-canonical `scores.jsonl` is published only after the watchdog exits cleanly,
-followed by an atomic `scoring_success.json` that binds the complete score-file
-hash, ordered task IDs, manifest, run contract, scoring configuration, scorer
-weights, and CUDA execution record. Analysis recomputes every binding; missing
+Scoring progress is written to a content-addressed private JSONL. One atomic
+progress receipt points to the latest complete JSONL and binds the manifest, run
+contract, scoring configuration, scorer weights, and CUDA execution record. A
+new JSONL becomes resumable only when that receipt is replaced, so interruption
+during a checkpoint leaves the previous checkpoint valid. Invalid or changed
+progress is discarded, and a GPU-watchdog failure clears the whole private
+attempt. The canonical `scores.jsonl` is published only after the watchdog exits
+cleanly, followed by an atomic `scoring_success.json` that binds the complete
+score-file hash and ordered task IDs. Analysis recomputes every binding; missing
 receipts and changed finite score values both fail.
 The scoring YAML itself enables the exclusive-GPU watchdog even if a caller
 omits the matching CLI flag. Every score row records the exact watchdog mode,

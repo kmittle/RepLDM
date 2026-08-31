@@ -45,6 +45,7 @@ execution:
   same_device_for_all_settings_of_one_prompt: true
   deterministic_setting_order: sha256
   resumable: true
+  prompt_blocks_per_device_per_attempt: 50
   expected_setting_count: 4
   expected_image_count: 12800
   require_clean_git_worktree: true
@@ -101,10 +102,10 @@ settings:
 
 scoring:
   config: eval-pipeline/configs/hpsv2_full_scoring_v1.yaml
-  config_sha256: 22a162c7fc2151bbcc8ab08e5a4e3604de6fd56a955e37078577f8e0bd59dfac
+  config_sha256: 42d626463fa9b2a3dada6db0366d9cc7f0d5d998af928dcb2f98ce785f70812e
   strict: true
   scorer_provenance_required: true
-  registered_scorer_provenance_sha256: af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3
+  registered_scorer_provenance_sha256: c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2
   hps_version: v2.1
   hpsv2_stored_scale: raw_cosine
   hpsv2_official_report_multiplier: 100.0

@@ -50,6 +50,7 @@ RUN_CONFIG_SCHEMA = "hpsv2_relational_renderer_run_v2"
 GENERATION_ATTEMPT_SCHEMA = "hpsv2_generation_attempt_v1"
 GENERATION_ATTEMPT_TERMINAL_SCHEMA = "hpsv2_generation_attempt_terminal_v1"
 GENERATION_ATTEMPTS_DIR_NAME = "generation_attempts"
+GENERATION_PROMPT_BLOCKS_PER_DEVICE_PER_ATTEMPT = 50
 PARTIAL_MANIFEST_NAME = "partial_manifest.jsonl"
 FINAL_MANIFEST_NAME = "manifest.jsonl"
 EXPECTED_CONFIG_SCHEMA = "hpsv2_relational_renderer_full_v1"
@@ -365,7 +366,7 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
         "strict": True,
         "scorer_provenance_required": True,
         "registered_scorer_provenance_sha256": (
-            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3"
+            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2"
         ),
         "hps_version": "v2.1",
         "hpsv2_stored_scale": "raw_cosine",
@@ -398,7 +399,7 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
             "required_schema": "repldm_scorer_provenance_v1",
         },
         "registered_scorer_provenance_sha256": (
-            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3"
+            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2"
         ),
         "metric_meta": {
             "imagereward": "higher",
@@ -528,6 +529,9 @@ def load_contract(config_path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
         "same_device_for_all_settings_of_one_prompt": True,
         "deterministic_setting_order": "sha256",
         "resumable": True,
+        "prompt_blocks_per_device_per_attempt": (
+            GENERATION_PROMPT_BLOCKS_PER_DEVICE_PER_ATTEMPT
+        ),
         "expected_setting_count": EXPECTED_SETTING_COUNT,
         "expected_image_count": EXPECTED_TASK_COUNT,
         "require_clean_git_worktree": True,
@@ -2683,6 +2687,34 @@ def _pending_blocks(
     return result
 
 
+def _generation_attempt_batches(
+    pending: Sequence[Mapping[str, Any]], devices: Sequence[int]
+) -> list[list[dict[str, Any]]]:
+    """Bound restart loss while keeping every prompt's settings together."""
+    blocks = _pending_blocks(pending, devices)
+    max_blocks = max(
+        (len(device_blocks) for device_blocks in blocks.values()), default=0
+    )
+    batches = []
+    for start in range(
+        0, max_blocks, GENERATION_PROMPT_BLOCKS_PER_DEVICE_PER_ATTEMPT
+    ):
+        batch = []
+        stop = start + GENERATION_PROMPT_BLOCKS_PER_DEVICE_PER_ATTEMPT
+        for device in devices:
+            for prompt_block in blocks[int(device)][start:stop]:
+                batch.extend(prompt_block)
+        if batch:
+            batches.append(batch)
+    observed_ids = [str(task["id"]) for batch in batches for task in batch]
+    expected_ids = [str(task["id"]) for task in pending]
+    if len(observed_ids) != len(set(observed_ids)) or set(observed_ids) != set(
+        expected_ids
+    ):
+        raise RuntimeError("generation attempt batches differ from pending tasks")
+    return batches
+
+
 def _run_workers(
     pending: Sequence[Mapping[str, Any]],
     devices: Sequence[int],
@@ -2887,6 +2919,51 @@ def _run_workers_with_model_postaudit(
         raise model_error.with_traceback(model_error.__traceback__)
 
 
+def _run_generation_attempt_batch(
+    *,
+    output_dir: Path,
+    tasks: Sequence[Mapping[str, Any]],
+    devices: Sequence[int],
+    contract: Mapping[str, Any],
+    run_config: Mapping[str, Any],
+    generation_environment: Mapping[str, Any],
+    model_snapshot_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    attempt, attempt_sha256, staging_dir = _begin_generation_attempt(
+        output_dir, tasks, run_config
+    )
+    attempt_contract = dict(contract)
+    attempt_contract["output_dir"] = staging_dir
+    attempt_contract["attempt_id"] = attempt["attempt_id"]
+    attempt_contract["attempt_sha256"] = attempt_sha256
+    try:
+        _require_generation_devices_process_free(generation_environment)
+        _run_workers_with_model_postaudit(
+            tasks,
+            devices,
+            attempt_contract,
+            run_config,
+            model_snapshot_record,
+        )
+        _require_generation_devices_process_free(generation_environment)
+        return _promote_and_accept_generation_attempt(
+            output_dir,
+            staging_dir,
+            tasks,
+            run_config,
+            attempt,
+        )
+    except BaseException as generation_error:
+        try:
+            _poison_generation_attempt(output_dir, attempt, generation_error)
+        except BaseException as poison_error:
+            raise RuntimeError(
+                "generation failed and its attempt could not be poisoned: "
+                f"{type(poison_error).__name__}: {poison_error}"
+            ) from generation_error
+        raise
+
+
 def run(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     contract = load_contract()
@@ -2989,42 +3066,22 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             f"pending {len(pending)}; quarantined {moved}",
             flush=True,
         )
-        if pending:
-            attempt, attempt_sha256, staging_dir = _begin_generation_attempt(
-                output_dir, pending, run_config
+        batches = _generation_attempt_batches(pending, args.devices)
+        for batch_index, batch in enumerate(batches, 1):
+            print(
+                f"generation attempt batch {batch_index}/{len(batches)}: "
+                f"{len(batch)} tasks",
+                flush=True,
             )
-            attempt_contract = dict(contract)
-            attempt_contract["output_dir"] = staging_dir
-            attempt_contract["attempt_id"] = attempt["attempt_id"]
-            attempt_contract["attempt_sha256"] = attempt_sha256
-            try:
-                _require_generation_devices_process_free(generation_environment)
-                _run_workers_with_model_postaudit(
-                    pending,
-                    args.devices,
-                    attempt_contract,
-                    run_config,
-                    model_snapshot_record,
-                )
-                _require_generation_devices_process_free(generation_environment)
-                _promote_and_accept_generation_attempt(
-                    output_dir,
-                    staging_dir,
-                    pending,
-                    run_config,
-                    attempt,
-                )
-            except BaseException as generation_error:
-                try:
-                    _poison_generation_attempt(
-                        output_dir, attempt, generation_error
-                    )
-                except BaseException as poison_error:
-                    raise RuntimeError(
-                        "generation failed and its attempt could not be poisoned: "
-                        f"{type(poison_error).__name__}: {poison_error}"
-                    ) from generation_error
-                raise
+            _run_generation_attempt_batch(
+                output_dir=output_dir,
+                tasks=batch,
+                devices=args.devices,
+                contract=contract,
+                run_config=run_config,
+                generation_environment=generation_environment,
+                model_snapshot_record=model_snapshot_record,
+            )
             accepted_index, running_attempts = _load_generation_attempt_index(
                 output_dir, run_config, tasks
             )
@@ -3032,6 +3089,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError("accepted generation left an unterminated attempt")
             complete, pending = _consolidate(
                 contract, tasks, run_config, accepted_index
+            )
+            print(
+                f"accepted batch {batch_index}/{len(batches)}; "
+                f"{len(complete)}/{EXPECTED_TASK_COUNT} tasks durable",
+                flush=True,
             )
         if pending:
             raise RuntimeError(

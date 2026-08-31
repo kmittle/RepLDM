@@ -7,8 +7,9 @@ so a missing metric is SKIPPED with a warning instead of crashing the run.
 
 Resume is additive when enabled metrics and their execution provenance still match.
 Strict runs bind source, package/runtime, model asset, and preprocessing metadata;
-any drift invalidates the row before old columns can be reused. Progress is written
-only to an attempt file; canonical scores and their receipt are published at success.
+any drift invalidates the row before old columns can be reused. Private progress and
+its hash-bound receipt survive ordinary interruption; canonical scores and their
+receipt are published only after complete scoring and a clean watchdog exit.
 
   /home/bycao/miniforge3/envs/repldm_eval/bin/python \
       eval-pipeline/score_hpsv2_relational_renderer.py \
@@ -60,7 +61,17 @@ EXCLUSIVE_CUDA_EXECUTION_SCHEMA = "repldm_exclusive_cuda_execution_v1"
 EXCLUSIVE_CUDA_POLL_SECONDS = 2.0
 SCORING_SUCCESS_SCHEMA = "repldm_scoring_success_v1"
 SCORING_SUCCESS_NAME = "scoring_success.json"
+SCORING_PROGRESS_SCHEMA = "repldm_scoring_progress_v1"
+SCORING_PROGRESS_RECEIPT_NAME = ".scoring_progress.json"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_SCORING_PROGRESS_PAYLOAD_RE = re.compile(
+    r"^\.scoring_progress\.([0-9a-f]{32})\.([0-9a-f]{64})\.jsonl$"
+)
+
+
+class ExclusiveCudaWatchdogError(RuntimeError):
+    """The formal scoring GPU could not be proven exclusive."""
 
 
 def exclusive_cuda_execution_contract(device):
@@ -367,6 +378,19 @@ def validate_hash_bound_images(run_dir, manifest):
         load_hash_bound_image_bytes(run_dir, row)
 
 
+def validate_partial_score_bindings(manifest, scores):
+    """Bind any resumable subset to current manifest images and run contract."""
+    manifest_by_id = _unique_rows(manifest, "manifest")
+    for score_id, score in _unique_rows(scores, "scoring progress").items():
+        row = manifest_by_id.get(score_id)
+        if row is None:
+            raise ValueError(f"scoring progress contains unknown id {score_id!r}")
+        if score.get("image_sha256") != row.get("image_sha256"):
+            raise ValueError(f"{score_id}: scoring progress image hash differs")
+        if score.get("run_contract_sha256") != row.get("run_contract_sha256"):
+            raise ValueError(f"{score_id}: scoring progress run contract differs")
+
+
 def _nvidia_smi(arguments):
     try:
         result = subprocess.run(
@@ -447,9 +471,16 @@ class ExclusiveCudaWatchdog:
         self.thread = None
 
     def _check_now(self):
-        conflicts = _exclusive_cuda_conflicts(self.device, self.pid)
+        try:
+            conflicts = _exclusive_cuda_conflicts(self.device, self.pid)
+        except ExclusiveCudaWatchdogError:
+            raise
+        except BaseException as exc:
+            raise ExclusiveCudaWatchdogError(
+                f"exclusive GPU scoring query failed: {exc}"
+            ) from exc
         if conflicts:
-            raise RuntimeError(
+            raise ExclusiveCudaWatchdogError(
                 "foreign compute process appeared during scoring: "
                 + json.dumps(conflicts, sort_keys=True)
             )
@@ -465,7 +496,9 @@ class ExclusiveCudaWatchdog:
 
     def assert_healthy(self):
         if self.failures:
-            raise RuntimeError("exclusive GPU scoring monitor failed") from self.failures[0]
+            raise ExclusiveCudaWatchdogError(
+                "exclusive GPU scoring monitor failed"
+            ) from self.failures[0]
 
     def __enter__(self):
         if self.enabled:
@@ -484,11 +517,12 @@ class ExclusiveCudaWatchdog:
         self.stop_event.set()
         if self.thread is not None:
             self.thread.join(timeout=max(5.0, self.poll_seconds * 2.0))
-            if self.thread.is_alive() and exc_type is None:
-                raise RuntimeError("exclusive GPU scoring monitor did not stop")
-        if exc_type is None:
-            self._check_now()
-            self.assert_healthy()
+            if self.thread.is_alive():
+                raise ExclusiveCudaWatchdogError(
+                    "exclusive GPU scoring monitor did not stop"
+                )
+        self.assert_healthy()
+        self._check_now()
         return False
 
 
@@ -716,6 +750,183 @@ def load_verified_score_publication(run_dir, receipt_context):
     return score_rows
 
 
+def _scoring_progress_receipt_path(run_dir):
+    return os.path.join(
+        os.path.abspath(run_dir), SCORING_PROGRESS_RECEIPT_NAME
+    )
+
+
+def _scoring_progress_payload_paths(run_dir):
+    root = os.path.abspath(run_dir)
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []
+    return [
+        os.path.join(root, name)
+        for name in sorted(names)
+        if _SCORING_PROGRESS_PAYLOAD_RE.fullmatch(name) is not None
+    ]
+
+
+def _scoring_progress_payload_name(attempt_id, scores_sha256):
+    if _ATTEMPT_ID_RE.fullmatch(str(attempt_id)) is None:
+        raise ValueError("scoring progress attempt id is invalid")
+    _require_sha256(scores_sha256, label="scoring progress SHA-256")
+    return f".scoring_progress.{attempt_id}.{scores_sha256}.jsonl"
+
+
+def _scoring_progress_binding(receipt_context):
+    template = build_scoring_success_receipt(
+        scores_sha256="0" * 64,
+        score_rows=[],
+        **receipt_context,
+    )
+    template.pop("scores")
+    template["schema"] = SCORING_PROGRESS_SCHEMA
+    return template
+
+
+def _progress_rows_follow_manifest(score_rows, manifest_rows):
+    score_ids = [row.get("id") for row in score_rows]
+    score_id_set = set(score_ids)
+    manifest_ids = [row.get("id") for row in manifest_rows]
+    return score_ids == [task_id for task_id in manifest_ids if task_id in score_id_set]
+
+
+def build_scoring_progress_receipt(
+    *, attempt_id, scores_payload, score_rows, receipt_context
+):
+    if not isinstance(attempt_id, str) or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None:
+        raise ValueError("scoring progress attempt id is invalid")
+    if not _progress_rows_follow_manifest(score_rows, receipt_context["manifest_rows"]):
+        raise ValueError("scoring progress task order differs from the manifest")
+    scores_sha256 = hashlib.sha256(scores_payload).hexdigest()
+    scores_name = _scoring_progress_payload_name(attempt_id, scores_sha256)
+    binding = _scoring_progress_binding(receipt_context)
+    return {
+        "schema": SCORING_PROGRESS_SCHEMA,
+        "status": "in_progress",
+        "attempt_id": attempt_id,
+        "binding": binding,
+        "binding_sha256": json_sha256(binding),
+        "scores": {
+            "path": scores_name,
+            "sha256": scores_sha256,
+            **_task_id_binding(score_rows, label="scoring progress"),
+        },
+    }
+
+
+def load_verified_scoring_progress(run_dir, receipt_context):
+    receipt_path = _scoring_progress_receipt_path(run_dir)
+    if not os.path.lexists(receipt_path):
+        return [], None, None
+    receipt_payload = _read_regular_bytes(receipt_path, "scoring progress receipt")
+    try:
+        receipt = json.loads(receipt_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("scoring progress receipt is not valid JSON") from exc
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema",
+        "status",
+        "attempt_id",
+        "binding",
+        "binding_sha256",
+        "scores",
+    }:
+        raise ValueError("scoring progress receipt fields differ")
+    scores = receipt.get("scores")
+    if not isinstance(scores, dict):
+        raise ValueError("scoring progress scores binding is invalid")
+    scores_name = scores.get("path")
+    match = (
+        _SCORING_PROGRESS_PAYLOAD_RE.fullmatch(scores_name)
+        if isinstance(scores_name, str)
+        else None
+    )
+    if match is None or match.group(1) != receipt.get("attempt_id"):
+        raise ValueError("scoring progress payload path is invalid")
+    if match.group(2) != scores.get("sha256"):
+        raise ValueError("scoring progress payload name differs from its hash")
+    scores_path = os.path.join(os.path.abspath(run_dir), scores_name)
+    scores_payload = _read_regular_bytes(scores_path, "scoring progress")
+    score_rows = _jsonl_from_bytes(scores_payload, "scoring progress")
+    expected = build_scoring_progress_receipt(
+        attempt_id=receipt.get("attempt_id"),
+        scores_payload=scores_payload,
+        score_rows=score_rows,
+        receipt_context=receipt_context,
+    )
+    if receipt != expected:
+        raise ValueError("scoring progress receipt differs from current inputs")
+    if receipt_payload != scoring_success_receipt_bytes(expected):
+        raise ValueError("scoring progress receipt is not canonical")
+    return score_rows, str(receipt["attempt_id"]), scores_path
+
+
+def _write_scoring_progress(
+    run_dir, attempt_id, score_rows, receipt_context, *, allow_nan
+):
+    root = os.path.abspath(run_dir)
+    descriptor, staged_path = tempfile.mkstemp(
+        prefix=".scoring_progress.stage.", suffix=".tmp", dir=root
+    )
+    handle = None
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        with handle:
+            for row in score_rows:
+                handle.write(json.dumps(row, allow_nan=allow_nan) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        scores_payload = _read_regular_bytes(staged_path, "staged scoring progress")
+        scores_sha256 = hashlib.sha256(scores_payload).hexdigest()
+        scores_name = _scoring_progress_payload_name(attempt_id, scores_sha256)
+        scores_path = os.path.join(root, scores_name)
+        os.replace(staged_path, scores_path)
+    except BaseException:
+        if handle is None:
+            os.close(descriptor)
+        try:
+            os.unlink(staged_path)
+        except FileNotFoundError:
+            pass
+        raise
+    _fsync_directory(root)
+    receipt = build_scoring_progress_receipt(
+        attempt_id=attempt_id,
+        scores_payload=scores_payload,
+        score_rows=score_rows,
+        receipt_context=receipt_context,
+    )
+    receipt_path = _scoring_progress_receipt_path(root)
+    with atomic_text_writer(receipt_path) as handle:
+        handle.write(scoring_success_receipt_bytes(receipt).decode("ascii"))
+    _fsync_directory(root)
+    _, _, verified_path = load_verified_scoring_progress(root, receipt_context)
+    for path in _scoring_progress_payload_paths(root):
+        if path != verified_path:
+            os.unlink(path)
+    _fsync_directory(root)
+
+
+def _clear_scoring_progress(run_dir):
+    changed = False
+    receipt_path = _scoring_progress_receipt_path(run_dir)
+    paths = [receipt_path, *_scoring_progress_payload_paths(run_dir)]
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        try:
+            os.unlink(path)
+        except IsADirectoryError as exc:
+            raise RuntimeError(f"scoring progress artifact is unsafe: {path}") from exc
+        changed = True
+    if changed:
+        _fsync_directory(run_dir)
+
+
 def _clear_canonical_scoring_outputs(run_dir):
     """Invalidate the receipt first, then remove both canonical artifacts."""
     changed = False
@@ -732,19 +943,19 @@ def _clear_canonical_scoring_outputs(run_dir):
         _fsync_directory(run_dir)
 
 
-def _attempt_scores_path(run_dir):
-    return os.path.join(
-        os.path.abspath(run_dir),
-        f".scores.attempt-{os.getpid()}-{uuid.uuid4().hex}.jsonl",
-    )
-
-
-def _publish_scoring_attempt(run_dir, attempt_path, manifest, receipt_context):
+def _publish_scoring_attempt(run_dir, manifest, receipt_context):
     """Atomically publish scores, then their receipt, or leave neither resumable."""
     scores_path = os.path.join(run_dir, "scores.jsonl")
     receipt_path = os.path.join(run_dir, SCORING_SUCCESS_NAME)
+    verified_rows, _, attempt_path = load_verified_scoring_progress(
+        run_dir, receipt_context
+    )
+    if attempt_path is None:
+        raise RuntimeError("verified scoring progress is missing before publication")
     attempt_payload = _read_regular_bytes(attempt_path, "scoring attempt")
     score_rows = _jsonl_from_bytes(attempt_payload, "scoring attempt")
+    if score_rows != verified_rows:
+        raise RuntimeError("scoring progress changed before final publication")
     if [row.get("id") for row in score_rows] != [row.get("id") for row in manifest]:
         raise RuntimeError("scoring attempt task order differs from the manifest")
     receipt = build_scoring_success_receipt(
@@ -754,7 +965,8 @@ def _publish_scoring_attempt(run_dir, attempt_path, manifest, receipt_context):
     )
     published_scores = False
     try:
-        os.replace(attempt_path, scores_path)
+        with atomic_text_writer(scores_path) as handle:
+            handle.write(attempt_payload.decode("utf-8"))
         published_scores = True
         _fsync_directory(run_dir)
         if _read_regular_bytes(scores_path, "canonical scores") != attempt_payload:
@@ -768,6 +980,10 @@ def _publish_scoring_attempt(run_dir, attempt_path, manifest, receipt_context):
         if published_scores:
             _clear_canonical_scoring_outputs(run_dir)
         raise
+    try:
+        _clear_scoring_progress(run_dir)
+    except RuntimeError as exc:
+        print(f"[warn] could not remove completed scoring progress -> {exc}", flush=True)
     return score_rows
 
 
@@ -868,11 +1084,10 @@ def _score_run(args, ap):
             cfg, getattr(args, "require_exclusive_gpu", False)
         ),
     )
-    attempt_path = _attempt_scores_path(args.run_dir)
     try:
         with watchdog:
             publication = _score_run_impl(
-                args, ap, cfg, torch, device, watchdog, attempt_path
+                args, ap, cfg, torch, device, watchdog
             )
         watchdog.assert_healthy()
         if publication is None:
@@ -884,7 +1099,6 @@ def _score_run(args, ap):
             raise RuntimeError("scoring inputs changed before publication")
         _publish_scoring_attempt(
             args.run_dir,
-            attempt_path,
             publication["manifest"],
             current_context,
         )
@@ -897,17 +1111,14 @@ def _score_run(args, ap):
             flush=True,
         )
         return None
-    except BaseException:
+    except BaseException as exc:
         _clear_canonical_scoring_outputs(args.run_dir)
+        if isinstance(exc, ExclusiveCudaWatchdogError):
+            _clear_scoring_progress(args.run_dir)
         raise
-    finally:
-        try:
-            os.unlink(attempt_path)
-        except FileNotFoundError:
-            pass
 
 
-def _score_run_impl(args, ap, cfg, torch, device, watchdog, attempt_path):
+def _score_run_impl(args, ap, cfg, torch, device, watchdog):
     metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
     params = dict(cfg.get("params", {}))
     exclusive_execution = (
@@ -1081,13 +1292,34 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, attempt_path):
         )
         existing_rows = []
     _clear_canonical_scoring_outputs(args.run_dir)
+    progress_attempt_id = uuid.uuid4().hex
+    loaded_from_progress = False
+    if not existing_rows:
+        try:
+            progress_rows, resumed_attempt_id, _ = load_verified_scoring_progress(
+                args.run_dir, receipt_context
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(
+                f"[warn] private scoring progress is not resumable -> {exc}",
+                flush=True,
+            )
+            _clear_scoring_progress(args.run_dir)
+        else:
+            if resumed_attempt_id is not None:
+                existing_rows = progress_rows
+                progress_attempt_id = resumed_attempt_id
+                loaded_from_progress = True
     existing = _unique_rows(existing_rows, "scores")
     if hash_bound_run and existing_rows:
         try:
-            validate_scores_against_manifest(manifest, existing_rows)
+            validate_partial_score_bindings(manifest, existing_rows)
         except ValueError:
-            # A valid receipt cannot make rows for replaced images reusable.
+            # A private receipt cannot make rows for replaced images reusable.
             existing = {}
+            if loaded_from_progress:
+                _clear_scoring_progress(args.run_dir)
+                progress_attempt_id = uuid.uuid4().hex
 
     output_keys = [key for _, scorer in active for key, _ in scorer.OUTPUT_KEYS]
     if len(output_keys) != len(set(output_keys)):
@@ -1141,16 +1373,14 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, attempt_path):
     print(f"{len(manifest)} images; {len(todo)} to (re)score with {[n for n, _ in active]}", flush=True)
 
     def flush():
-        with atomic_text_writer(attempt_path) as out:
-            for r in manifest:
-                if r["id"] in existing:
-                    out.write(
-                        json.dumps(
-                            existing[r["id"]],
-                            allow_nan=not args.strict and registered_scoring is None,
-                        )
-                        + "\n"
-                    )
+        rows = [existing[r["id"]] for r in manifest if r["id"] in existing]
+        _write_scoring_progress(
+            args.run_dir,
+            progress_attempt_id,
+            rows,
+            receipt_context,
+            allow_nan=not args.strict and registered_scoring is None,
+        )
 
     from PIL import Image
     for i, r in enumerate(todo):
