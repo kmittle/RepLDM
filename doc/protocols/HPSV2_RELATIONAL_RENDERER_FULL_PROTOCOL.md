@@ -114,14 +114,22 @@ attempt. The canonical `scores.jsonl` is published only after the watchdog exits
 cleanly, followed by an atomic `scoring_success.json` that binds the complete
 score-file hash and ordered task IDs. Analysis recomputes every binding; missing
 receipts and changed finite score values both fail.
+An already valid canonical score/receipt pair remains untouched during a rerun.
+If final publication is interrupted after replacing either file, the scorer
+restores the previous pair byte for byte; startup, model-loading, and watchdog
+failures therefore cannot erase an earlier completed evaluation.
 The scoring YAML itself enables the exclusive-GPU watchdog even if a caller
 omits the matching CLI flag. Every score row records the exact watchdog mode,
 physical CUDA device, polling interval, and canonical contract hash; analysis
 rejects absent, disabled, changed, or non-`cuda:2` monitoring provenance.
 The queue also forces Hugging Face and Transformers offline during formal
-scoring. The frozen scoring YAML registers the complete scorer-provenance hash,
-so both scoring and analysis reject changed implementations, packages, or
-checkpoint bytes.
+scoring, and the scorer blocks Python socket and URL access. Before model
+construction, all 29 required model, tokenizer, and ImageReward source files are
+copied into a private read-only directory. Models load only through its pinned
+directory descriptor; file identity and SHA-256 are checked after every model
+load and after scoring. The copied-file manifests are part of the registered
+scorer provenance, so both scoring and analysis reject changed implementations,
+packages, source files, preprocessing, or checkpoint bytes.
 The repository scorer stores raw HPS cosine values; multiply them by 100 only
 for the official table format and keep raw values in all paired calculations.
 

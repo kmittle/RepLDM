@@ -149,7 +149,7 @@ class QueueAnalysisContractTest(unittest.TestCase):
         self.assertIsNone(registered_contract)
         self.assertEqual(
             registered_hash,
-            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2",
+            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926",
         )
         with mock.patch.object(
             analyzer,

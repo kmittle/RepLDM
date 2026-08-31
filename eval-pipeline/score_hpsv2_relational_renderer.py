@@ -26,12 +26,15 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import re
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import urllib.request
 import uuid
 
 THIS = os.path.dirname(os.path.abspath(__file__))
@@ -68,10 +71,539 @@ _ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SCORING_PROGRESS_PAYLOAD_RE = re.compile(
     r"^\.scoring_progress\.([0-9a-f]{32})\.([0-9a-f]{64})\.jsonl$"
 )
+SCORER_ASSET_STAGE_PREFIX = "repldm-scorer-assets-"
+SCORER_ASSET_LOADING_MODE = "pinned_private_stage_v1"
 
 
 class ExclusiveCudaWatchdogError(RuntimeError):
     """The formal scoring GPU could not be proven exclusive."""
+
+
+class ScorerAssetStageError(RuntimeError):
+    """A copied scorer asset changed or could not be handled safely."""
+
+
+def _file_identity(value):
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _safe_stage_relative_path(value):
+    path = Path(str(value))
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
+        raise ValueError("scorer asset staged name is unsafe")
+    return path
+
+
+def _copy_scorer_asset(source, destination):
+    resolved = Path(source).expanduser().resolve(strict=True)
+    source_descriptor = os.open(
+        resolved,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    destination_descriptor = -1
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("scorer asset source is not a regular file")
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                view = view[written:]
+        os.fsync(destination_descriptor)
+        after = os.fstat(source_descriptor)
+        if _file_identity(before) != _file_identity(after) or copied != before.st_size:
+            raise ScorerAssetStageError(
+                "scorer asset changed while it was staged"
+            )
+        os.fchmod(destination_descriptor, 0o400)
+        destination_identity = _file_identity(os.fstat(destination_descriptor))
+        return {
+            "source_path": str(resolved),
+            "source_identity": _file_identity(before),
+            "destination_identity": destination_identity,
+            "size_bytes": copied,
+            "sha256": digest.hexdigest(),
+        }
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        os.close(source_descriptor)
+
+
+def _sha256_descriptor(descriptor):
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 8 * 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scan_stage_directory(directory_descriptor, prefix=Path()):
+    files = {}
+    directories = {}
+    for name in sorted(os.listdir(directory_descriptor)):
+        status = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        relative = prefix / name
+        relative_name = relative.as_posix()
+        if stat.S_ISREG(status.st_mode):
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if _file_identity(opened) != _file_identity(status):
+                    raise ScorerAssetStageError(
+                        "scorer asset changed while it was opened for verification"
+                    )
+                files[relative_name] = {
+                    "identity": _file_identity(opened),
+                    "size_bytes": int(opened.st_size),
+                    "sha256": _sha256_descriptor(descriptor),
+                }
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISDIR(status.st_mode):
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if _file_identity(opened) != _file_identity(status):
+                    raise ScorerAssetStageError(
+                        "scorer asset directory changed during verification"
+                    )
+                directories[relative_name] = _file_identity(opened)
+                child_files, child_directories = _scan_stage_directory(
+                    descriptor, relative
+                )
+                files.update(child_files)
+                directories.update(child_directories)
+            finally:
+                os.close(descriptor)
+        else:
+            raise ScorerAssetStageError(
+                "scorer asset stage contains a non-regular entry"
+            )
+    return files, directories
+
+
+def _clear_stage_directory(directory_descriptor):
+    os.fchmod(directory_descriptor, 0o700)
+    for name in sorted(os.listdir(directory_descriptor)):
+        status = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISDIR(status.st_mode):
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                _clear_stage_directory(descriptor)
+            finally:
+                os.close(descriptor)
+            os.rmdir(name, dir_fd=directory_descriptor)
+        else:
+            os.unlink(name, dir_fd=directory_descriptor)
+
+
+class ScorerAssetStage:
+    """Private copied scorer files loaded through one pinned directory FD."""
+
+    def __init__(self, metric_names, params):
+        self.parent = None
+        self.path = None
+        self.proc_root = None
+        self.parent_descriptor = -1
+        self.root_descriptor = -1
+        self.root_identity = None
+        self.rows = []
+        self.asset_paths = {}
+        self.asset_revisions = {}
+        self.asset_manifests = {}
+        self.file_identities = {}
+        self.directory_identities = {}
+        self.closed = False
+        try:
+            raw_parent = Path(tempfile.gettempdir())
+            if raw_parent.is_symlink():
+                raise ScorerAssetStageError(
+                    "scorer asset staging parent must not be a symlink"
+                )
+            parent = raw_parent.resolve(strict=True)
+            parent_stat = parent.stat()
+            if parent_stat.st_mode & 0o022 and not (
+                parent_stat.st_mode & stat.S_ISVTX
+            ):
+                raise ScorerAssetStageError(
+                    "scorer asset staging parent is unsafe"
+                )
+            self.parent = parent
+            self.parent_descriptor = os.open(
+                parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if _file_identity(os.fstat(self.parent_descriptor)) != _file_identity(
+                parent_stat
+            ):
+                raise ScorerAssetStageError(
+                    "scorer asset staging parent changed while it was opened"
+                )
+            self.path = Path(
+                tempfile.mkdtemp(prefix=SCORER_ASSET_STAGE_PREFIX, dir=parent)
+            )
+            self.root_descriptor = os.open(
+                self.path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            self.proc_root = Path("/proc/self/fd") / str(self.root_descriptor)
+            staged_names = set()
+            for metric_name in metric_names:
+                metric_path = _safe_stage_relative_path(metric_name)
+                if len(metric_path.parts) != 1:
+                    raise ValueError("scorer metric name is unsafe for staging")
+                cls = REGISTRY.get(metric_name)
+                builder = getattr(cls, "asset_sources", None)
+                specs = builder(**params) if callable(builder) else {}
+                if not isinstance(specs, dict):
+                    raise ScorerAssetStageError(
+                        "scorer asset source contract is not a mapping"
+                    )
+                self.asset_paths[metric_name] = {}
+                self.asset_revisions[metric_name] = {}
+                for key, raw_spec in sorted(specs.items()):
+                    if not isinstance(key, str) or not key or not isinstance(raw_spec, dict):
+                        raise ScorerAssetStageError(
+                            "scorer asset source entry is invalid"
+                        )
+                    if set(raw_spec) != {"path", "staged_name", "revision"}:
+                        raise ScorerAssetStageError(
+                            "scorer asset source fields differ"
+                        )
+                    relative = metric_path / _safe_stage_relative_path(
+                        raw_spec["staged_name"]
+                    )
+                    relative_name = relative.as_posix()
+                    if relative_name in staged_names:
+                        raise ScorerAssetStageError(
+                            "scorer asset staged names collide"
+                        )
+                    staged_names.add(relative_name)
+                    destination = self.path / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    revision = raw_spec.get("revision")
+                    if revision is not None and (
+                        not isinstance(revision, str) or not revision
+                    ):
+                        raise ScorerAssetStageError(
+                            "scorer asset revision is invalid"
+                        )
+                    copy_record = _copy_scorer_asset(
+                        raw_spec["path"], destination
+                    )
+                    self.rows.append(
+                        {
+                            "metric": metric_name,
+                            "key": key,
+                            "path": relative_name,
+                            "revision": revision,
+                            "size_bytes": copy_record["size_bytes"],
+                            "sha256": copy_record["sha256"],
+                        }
+                    )
+                    self.file_identities[relative_name] = copy_record[
+                        "destination_identity"
+                    ]
+                    self.asset_revisions[metric_name][key] = revision
+            for directory, subdirectories, _ in os.walk(
+                self.path, topdown=False, followlinks=False
+            ):
+                for name in subdirectories:
+                    child = Path(directory) / name
+                    os.chmod(child, 0o500)
+                    descriptor = os.open(
+                        child,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+            os.fchmod(self.root_descriptor, 0o500)
+            os.fsync(self.root_descriptor)
+            self.root_identity = _file_identity(os.fstat(self.root_descriptor))
+            if not self.proc_root.is_dir():
+                raise ScorerAssetStageError(
+                    "pinned scorer asset loading requires procfs"
+                )
+            _, self.directory_identities = _scan_stage_directory(
+                self.root_descriptor
+            )
+            for row in self.rows:
+                self.asset_paths[row["metric"]][row["key"]] = str(
+                    self.proc_root / row["path"]
+                )
+            for metric_name in metric_names:
+                files = [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "metric"
+                    }
+                    for row in self.rows
+                    if row["metric"] == metric_name
+                ]
+                self.asset_manifests[metric_name] = {
+                    "schema": "repldm_scorer_asset_stage_v1",
+                    "loading_mode": SCORER_ASSET_LOADING_MODE,
+                    "files": files,
+                    "files_sha256": json_sha256(files),
+                }
+            self.verify()
+        except BaseException:
+            self.cleanup(verify=False)
+            raise
+
+    def verify(self):
+        if self.closed:
+            raise ScorerAssetStageError(
+                "scorer asset stage is already closed"
+            )
+        if _file_identity(os.fstat(self.root_descriptor)) != self.root_identity:
+            raise ScorerAssetStageError(
+                "scorer asset stage root identity changed"
+            )
+        try:
+            public = os.stat(
+                self.path.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ScorerAssetStageError(
+                "scorer asset stage path disappeared"
+            ) from exc
+        if _file_identity(public) != self.root_identity:
+            raise ScorerAssetStageError(
+                "scorer asset stage path identity changed"
+            )
+        observed, observed_directories = _scan_stage_directory(
+            self.root_descriptor
+        )
+        if observed_directories != self.directory_identities:
+            raise ScorerAssetStageError(
+                "scorer asset stage directory identity changed"
+            )
+        observed_files = sorted(observed)
+        expected_files = sorted(row["path"] for row in self.rows)
+        if observed_files != expected_files:
+            raise ScorerAssetStageError(
+                "scorer asset stage inventory changed"
+            )
+        for row in self.rows:
+            record = observed[row["path"]]
+            if record["identity"] != self.file_identities[row["path"]]:
+                raise ScorerAssetStageError(
+                    "scorer asset stage file identity changed"
+                )
+            if record["size_bytes"] != row["size_bytes"]:
+                raise ScorerAssetStageError(
+                    "scorer asset stage size changed"
+                )
+            if record["sha256"] != row["sha256"]:
+                raise ScorerAssetStageError(
+                    "scorer asset stage hash changed"
+                )
+        return {
+            "schema": "repldm_scorer_asset_stage_v1",
+            "status": "verified_unchanged",
+            "files": list(self.rows),
+            "files_sha256": json_sha256(self.rows),
+        }
+
+    def cleanup(self, *, verify=True):
+        if self.closed:
+            return
+        cleanup_error = None
+        if verify:
+            try:
+                self.verify()
+            except BaseException as exc:
+                cleanup_error = exc
+        proc_prefix = str(self.proc_root) if self.proc_root is not None else None
+        public_prefix = str(self.path) if self.path is not None else None
+
+        def belongs_to_stage(value):
+            if not value or public_prefix is None:
+                return False
+            raw = str(value)
+            if proc_prefix is not None and (
+                raw == proc_prefix or raw.startswith(proc_prefix + os.sep)
+            ):
+                return True
+            try:
+                resolved = str(Path(raw).resolve())
+            except OSError:
+                return False
+            return resolved == public_prefix or resolved.startswith(
+                public_prefix + os.sep
+            )
+
+        for name, module in list(sys.modules.items()):
+            if belongs_to_stage(getattr(module, "__file__", None)):
+                del sys.modules[name]
+        sys.path[:] = [value for value in sys.path if not belongs_to_stage(value)]
+        try:
+            if self.root_descriptor >= 0:
+                _clear_stage_directory(self.root_descriptor)
+            if self.path is not None and self.parent_descriptor >= 0:
+                try:
+                    public = os.stat(
+                        self.path.name,
+                        dir_fd=self.parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    public = None
+                if public is not None:
+                    current_root = (
+                        os.fstat(self.root_descriptor)
+                        if self.root_descriptor >= 0
+                        else None
+                    )
+                    if current_root is None or _file_identity(
+                        public
+                    ) != _file_identity(current_root):
+                        if cleanup_error is None:
+                            cleanup_error = ScorerAssetStageError(
+                                "scorer asset stage path identity changed"
+                            )
+                    else:
+                        os.rmdir(
+                            self.path.name,
+                            dir_fd=self.parent_descriptor,
+                        )
+                        os.fsync(self.parent_descriptor)
+        finally:
+            if self.root_descriptor >= 0:
+                os.close(self.root_descriptor)
+                self.root_descriptor = -1
+            if self.parent_descriptor >= 0:
+                os.close(self.parent_descriptor)
+                self.parent_descriptor = -1
+            self.closed = True
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+@contextmanager
+def staged_scorer_assets(metric_names, params, *, enabled):
+    if not enabled:
+        yield None
+        return
+    stage = ScorerAssetStage(metric_names, params)
+    try:
+        yield stage
+    except BaseException as primary:
+        try:
+            stage.cleanup()
+        except BaseException as cleanup_error:
+            primary.add_note(f"scorer asset cleanup also failed: {cleanup_error}")
+        raise
+    else:
+        stage.cleanup()
+
+
+@contextmanager
+def formal_offline_network_guard(*, enabled):
+    if not enabled:
+        yield
+        return
+    if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get(
+        "TRANSFORMERS_OFFLINE"
+    ) != "1":
+        raise RuntimeError("registered scoring requires offline environment flags")
+    original_socket = socket.socket
+    original_create_connection = socket.create_connection
+    original_urlopen = urllib.request.urlopen
+
+    def blocked_network(*_args, **_kwargs):
+        raise RuntimeError("network access is disabled for registered scoring")
+
+    class OfflineSocket(original_socket):
+        def connect(self, *_args, **_kwargs):
+            return blocked_network()
+
+        def connect_ex(self, *_args, **_kwargs):
+            return blocked_network()
+
+    socket.socket = OfflineSocket
+    socket.create_connection = blocked_network
+    urllib.request.urlopen = blocked_network
+    try:
+        yield
+    finally:
+        urllib.request.urlopen = original_urlopen
+        socket.create_connection = original_create_connection
+        socket.socket = original_socket
 
 
 def exclusive_cuda_execution_contract(device):
@@ -943,6 +1475,43 @@ def _clear_canonical_scoring_outputs(run_dir):
         _fsync_directory(run_dir)
 
 
+def _canonical_scoring_backup(run_dir):
+    scores_path = os.path.join(run_dir, "scores.jsonl")
+    receipt_path = os.path.join(run_dir, SCORING_SUCCESS_NAME)
+    if not os.path.lexists(scores_path) and not os.path.lexists(receipt_path):
+        return None
+    if not os.path.lexists(scores_path) or not os.path.lexists(receipt_path):
+        return None
+    try:
+        return (
+            _read_regular_bytes(scores_path, "previous canonical scores"),
+            _read_regular_bytes(receipt_path, "previous scoring receipt"),
+        )
+    except (RuntimeError, ValueError):
+        return None
+
+
+def _restore_canonical_scoring_backup(run_dir, backup):
+    scores_payload, receipt_payload = backup
+    scores_path = os.path.join(run_dir, "scores.jsonl")
+    receipt_path = os.path.join(run_dir, SCORING_SUCCESS_NAME)
+    try:
+        with atomic_text_writer(scores_path) as handle:
+            handle.write(scores_payload.decode("utf-8"))
+        with atomic_text_writer(receipt_path) as handle:
+            handle.write(receipt_payload.decode("utf-8"))
+        _fsync_directory(run_dir)
+        if _read_regular_bytes(
+            scores_path, "restored canonical scores"
+        ) != scores_payload or _read_regular_bytes(
+            receipt_path, "restored scoring receipt"
+        ) != receipt_payload:
+            raise RuntimeError("restored canonical scoring bytes differ")
+    except BaseException:
+        _clear_canonical_scoring_outputs(run_dir)
+        raise
+
+
 def _publish_scoring_attempt(run_dir, manifest, receipt_context):
     """Atomically publish scores, then their receipt, or leave neither resumable."""
     scores_path = os.path.join(run_dir, "scores.jsonl")
@@ -963,11 +1532,12 @@ def _publish_scoring_attempt(run_dir, manifest, receipt_context):
         score_rows=score_rows,
         **receipt_context,
     )
-    published_scores = False
+    previous_publication = _canonical_scoring_backup(run_dir)
+    if previous_publication is None:
+        _clear_canonical_scoring_outputs(run_dir)
     try:
         with atomic_text_writer(scores_path) as handle:
             handle.write(attempt_payload.decode("utf-8"))
-        published_scores = True
         _fsync_directory(run_dir)
         if _read_regular_bytes(scores_path, "canonical scores") != attempt_payload:
             raise RuntimeError("canonical scores changed during publication")
@@ -977,8 +1547,12 @@ def _publish_scoring_attempt(run_dir, manifest, receipt_context):
         _fsync_directory(run_dir)
         load_verified_score_publication(run_dir, receipt_context)
     except BaseException:
-        if published_scores:
+        if previous_publication is None:
             _clear_canonical_scoring_outputs(run_dir)
+        else:
+            _restore_canonical_scoring_backup(
+                run_dir, previous_publication
+            )
         raise
     try:
         _clear_scoring_progress(run_dir)
@@ -1084,11 +1658,43 @@ def _score_run(args, ap):
             cfg, getattr(args, "require_exclusive_gpu", False)
         ),
     )
+    metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
+    params = dict(cfg.get("params", {}))
+    registrations = [cfg]
+    run_config_path = os.path.join(args.run_dir, "config.json")
+    if os.path.isfile(run_config_path):
+        with open(run_config_path) as handle:
+            candidate_run_config = json.load(handle)
+        if isinstance(candidate_run_config, dict):
+            registrations.append(candidate_run_config)
+    registered_hashes = []
+    for registration in registrations:
+        _, candidate_hash = registered_scorer_provenance_contract(registration)
+        if candidate_hash is not None:
+            registered_hashes.append(candidate_hash)
+    if len(set(registered_hashes)) > 1:
+        raise RuntimeError("registered scorer provenance hashes disagree")
+    formal_registered_scoring = bool(registered_hashes)
     try:
-        with watchdog:
-            publication = _score_run_impl(
-                args, ap, cfg, torch, device, watchdog
-            )
+        with formal_offline_network_guard(
+            enabled=formal_registered_scoring
+        ), staged_scorer_assets(
+            metric_names,
+            params,
+            enabled=formal_registered_scoring,
+        ) as asset_stage:
+            with watchdog:
+                publication = _score_run_impl(
+                    args,
+                    ap,
+                    cfg,
+                    torch,
+                    device,
+                    watchdog,
+                    asset_stage,
+                )
+            if asset_stage is not None:
+                asset_stage.verify()
         watchdog.assert_healthy()
         if publication is None:
             return None
@@ -1112,13 +1718,14 @@ def _score_run(args, ap):
         )
         return None
     except BaseException as exc:
-        _clear_canonical_scoring_outputs(args.run_dir)
-        if isinstance(exc, ExclusiveCudaWatchdogError):
+        if isinstance(
+            exc, (ExclusiveCudaWatchdogError, ScorerAssetStageError)
+        ):
             _clear_scoring_progress(args.run_dir)
         raise
 
 
-def _score_run_impl(args, ap, cfg, torch, device, watchdog):
+def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
     metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
     params = dict(cfg.get("params", {}))
     exclusive_execution = (
@@ -1205,8 +1812,36 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog):
             unavailable.append(message)
             continue
         try:
-            active.append((name, cls(device=device, **params)))
+            staged_paths = (
+                asset_stage.asset_paths.get(name, {})
+                if asset_stage is not None
+                else {}
+            )
+            staged_revisions = (
+                asset_stage.asset_revisions.get(name, {})
+                if asset_stage is not None
+                else {}
+            )
+            staged_manifest = (
+                asset_stage.asset_manifests.get(name)
+                if asset_stage is not None and staged_paths
+                else None
+            )
+            active.append(
+                (
+                    name,
+                    cls(
+                        device=device,
+                        scorer_assets=staged_paths,
+                        scorer_asset_revisions=staged_revisions,
+                        scorer_asset_manifest=staged_manifest,
+                        **params,
+                    ),
+                )
+            )
             print(f"[ok] loaded scorer '{name}' on {device}", flush=True)
+            if asset_stage is not None:
+                asset_stage.verify()
             watchdog.assert_healthy()
         except Exception as e:
             message = f"'{name}' failed to init -> {e}"
@@ -1215,7 +1850,6 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog):
     if args.strict and unavailable:
         raise RuntimeError("requested scorers unavailable: " + "; ".join(unavailable))
     if not active:
-        _clear_canonical_scoring_outputs(args.run_dir)
         print("no active scorers; nothing to do", flush=True)
         return None
 
@@ -1281,6 +1915,7 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog):
         "cuda_execution_provenance_sha256": exclusive_execution_sha256,
     }
     receipt_context = _scoring_receipt_context(**receipt_context_args)
+    canonical_publication_loaded = False
     try:
         existing_rows = load_verified_score_publication(
             args.run_dir, receipt_context
@@ -1291,10 +1926,13 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog):
             flush=True,
         )
         existing_rows = []
-    _clear_canonical_scoring_outputs(args.run_dir)
+    else:
+        canonical_publication_loaded = bool(
+            os.path.lexists(os.path.join(args.run_dir, "scores.jsonl"))
+        )
     progress_attempt_id = uuid.uuid4().hex
     loaded_from_progress = False
-    if not existing_rows:
+    if not canonical_publication_loaded:
         try:
             progress_rows, resumed_attempt_id, _ = load_verified_scoring_progress(
                 args.run_dir, receipt_context
@@ -1382,6 +2020,9 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog):
             allow_nan=not args.strict and registered_scoring is None,
         )
 
+    if canonical_publication_loaded and not todo:
+        print("canonical scores are complete and current; nothing to do", flush=True)
+        return None
     from PIL import Image
     for i, r in enumerate(todo):
         watchdog.assert_healthy()
@@ -1484,6 +2125,8 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog):
             expected_sha256=registered_scorer_hash,
             expected_contract=registered_scorer_contract,
         )
+    if asset_stage is not None:
+        asset_stage.verify()
     return {
         "manifest": manifest,
         "receipt_context_args": receipt_context_args,

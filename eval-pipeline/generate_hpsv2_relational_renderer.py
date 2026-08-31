@@ -366,7 +366,7 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
         "strict": True,
         "scorer_provenance_required": True,
         "registered_scorer_provenance_sha256": (
-            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2"
+            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926"
         ),
         "hps_version": "v2.1",
         "hpsv2_stored_scale": "raw_cosine",
@@ -399,7 +399,7 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
             "required_schema": "repldm_scorer_provenance_v1",
         },
         "registered_scorer_provenance_sha256": (
-            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2"
+            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926"
         ),
         "metric_meta": {
             "imagereward": "higher",
@@ -2493,6 +2493,11 @@ def _publish_generated_artifacts(
         _atomic_write_json(json_path, sidecar)
 
 
+def _request_generation_abort(abort_event: Any) -> None:
+    """Signal rejection without waiting on a lock a dead worker may own."""
+    abort_event.set()
+
+
 def _worker(
     device_index: int,
     blocks: Sequence[Sequence[Mapping[str, Any]]],
@@ -2660,8 +2665,7 @@ def _worker(
         if cleanup_error is not None:
             raise cleanup_error.with_traceback(cleanup_error.__traceback__)
     except BaseException:
-        with publication_lock:
-            abort_event.set()
+        _request_generation_abort(abort_event)
         error_queue.put((f"cuda:{device_index}", current_task, traceback.format_exc()))
         raise
 
@@ -2766,8 +2770,7 @@ def _run_workers(
         while any(process.is_alive() for process in processes):
             try:
                 failures.append(error_queue.get(timeout=0.5))
-                with publication_lock:
-                    abort_event.set()
+                _request_generation_abort(abort_event)
             except queue.Empty:
                 pass
             for process in processes:
@@ -2775,8 +2778,7 @@ def _run_workers(
                     failures.append(
                         (process.name, "unknown", f"worker exited {process.exitcode}")
                     )
-                    with publication_lock:
-                        abort_event.set()
+                    _request_generation_abort(abort_event)
             now = time.monotonic()
             if now >= next_gpu_monitor and not failures:
                 try:
@@ -2788,8 +2790,7 @@ def _run_workers(
                     failures.append(
                         ("gpu-monitor", "nvidia-smi", traceback.format_exc())
                     )
-                    with publication_lock:
-                        abort_event.set()
+                    _request_generation_abort(abort_event)
                 else:
                     if conflicts:
                         failures.append(
@@ -2799,19 +2800,16 @@ def _run_workers(
                                 json.dumps(conflicts, sort_keys=True),
                             )
                         )
-                        with publication_lock:
-                            abort_event.set()
+                        _request_generation_abort(abort_event)
                 next_gpu_monitor = now + 2.0
             if failures:
                 break
     except KeyboardInterrupt as exc:
-        with publication_lock:
-            abort_event.set()
+        _request_generation_abort(abort_event)
         failures.append(("parent", "signal", "generation interrupted"))
         lifecycle_error = exc
     except BaseException as exc:
-        with publication_lock:
-            abort_event.set()
+        _request_generation_abort(abort_event)
         lifecycle_error = exc
     finally:
         join_deadline = time.monotonic() + 60.0

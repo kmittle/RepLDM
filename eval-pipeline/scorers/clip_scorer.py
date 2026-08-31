@@ -23,6 +23,17 @@ class ClipScorer(Scorer):
     OUTPUT_KEYS = (("clip_cosine", "higher"), ("clipscore", "higher"))
     PROVENANCE_PACKAGES = ("openai-clip", "Pillow", "torch", "torchvision")
 
+    @classmethod
+    def asset_sources(cls, clip_model="ViT-B/32", **p):
+        filename = _MODEL_FILE.get(clip_model, "ViT-B-32.pt")
+        return {
+            "clip_checkpoint": {
+                "path": os.path.join(CLIP_CACHE, filename),
+                "staged_name": filename,
+                "revision": None,
+            }
+        }
+
     def __init__(self, device="cuda", clip_model="ViT-B/32", clipscore_w=2.5, **p):
         super().__init__(
             device, clip_model=clip_model, clipscore_w=clipscore_w, **p
@@ -31,7 +42,13 @@ class ClipScorer(Scorer):
         self.clip = clip
         self.clip_model = clip_model
         self.w = clipscore_w
-        self.model, self.preprocess = clip.load(clip_model, device=device, download_root=CLIP_CACHE)
+        filename = _MODEL_FILE[self.clip_model]
+        self.checkpoint_path = self.asset_path(
+            "clip_checkpoint", os.path.join(CLIP_CACHE, filename)
+        )
+        self.model, self.preprocess = clip.load(
+            self.checkpoint_path, device=device, download_root=CLIP_CACHE
+        )
         self.model.eval()
 
     @classmethod
@@ -57,7 +74,7 @@ class ClipScorer(Scorer):
             ],
             "checkpoint_files": [
                 checkpoint_file_record(
-                    os.path.join(CLIP_CACHE, filename),
+                    self.checkpoint_path,
                     role="clip_checkpoint",
                     filename=filename,
                     repository_id="openai/CLIP",
@@ -77,6 +94,7 @@ class ClipScorer(Scorer):
             "parameters": {
                 "clip_model": self.clip_model,
                 "clipscore_w": self.w,
+                **self.asset_provenance_parameters(),
             },
             "supporting_sources": [],
         }

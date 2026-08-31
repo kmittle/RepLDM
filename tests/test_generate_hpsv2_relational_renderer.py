@@ -82,13 +82,13 @@ class FrozenMatrixTest(unittest.TestCase):
         self.assertEqual(manifest["official_duplicate_row_count"], 28)
         self.assertEqual(
             self.contract["config"]["scoring"]["config_sha256"],
-            "42d626463fa9b2a3dada6db0366d9cc7f0d5d998af928dcb2f98ce785f70812e",
+            "0ce5056c7c77e43fe1c57a6e6d2378368b2d14171dfd1fa92a9fe52314f203e9",
         )
         self.assertEqual(
             self.contract["config"]["scoring"][
                 "registered_scorer_provenance_sha256"
             ],
-            "c8b2adf8f4f7d2aa7812f6a0c5e8f8cf33d709bed4b769c8bc3e47c8e16743b2",
+            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926",
         )
 
     def test_analysis_and_duplicate_contracts_fail_closed(self):
@@ -355,6 +355,13 @@ class FrozenMatrixTest(unittest.TestCase):
         write_json.assert_not_called()
 
     def test_partial_worker_start_failure_reaps_started_worker(self):
+        class PoisonedPublicationLock:
+            def __enter__(self):
+                raise AssertionError("abort path waited on publication lock")
+
+            def __exit__(self, *_args):
+                return False
+
         class FakeEvent:
             def __init__(self):
                 self.was_set = False
@@ -406,7 +413,7 @@ class FrozenMatrixTest(unittest.TestCase):
                 return event
 
             def Lock(self):
-                return contextlib.nullcontext()
+                return PoisonedPublicationLock()
 
             def Queue(self):
                 return FakeQueue()

@@ -4,7 +4,10 @@ import os
 import torch
 from torchvision.transforms.functional import pil_to_tensor
 
-from scorer_provenance import checkpoint_file_record, hf_checkpoint_file_record
+from scorer_provenance import (
+    checkpoint_file_record,
+    resolved_hf_revision,
+)
 from .base import Scorer, register_metric
 
 
@@ -27,11 +30,81 @@ class IQAScorer(Scorer):
         "torchvision",
     )
 
+    @classmethod
+    def asset_sources(cls, **params):
+        from huggingface_hub import hf_hub_download
+
+        backbone = hf_hub_download(
+            "timm/resnet50.a1_in1k",
+            "model.safetensors",
+            local_files_only=True,
+        )
+        return {
+            "topiq_checkpoint": {
+                "path": TOPIQ_CHECKPOINT,
+                "staged_name": os.path.basename(TOPIQ_CHECKPOINT),
+                "revision": None,
+            },
+            "resnet50_backbone": {
+                "path": backbone,
+                "staged_name": "resnet50.a1_in1k.safetensors",
+                "revision": resolved_hf_revision(backbone),
+            },
+        }
+
     def __init__(self, device="cuda", **params):
         super().__init__(device, **params)
         import pyiqa
+        self.topiq_path = self.asset_path(
+            "topiq_checkpoint", TOPIQ_CHECKPOINT
+        )
+        if self.scorer_assets:
+            self.backbone_path = self.asset_path("resnet50_backbone", "")
+            import timm
 
-        self.metric = pyiqa.create_metric("topiq_nr", device=device)
+            original_create_model = timm.create_model
+
+            def create_staged_backbone(model_name, *args, **kwargs):
+                if model_name != "resnet50":
+                    raise RuntimeError(
+                        f"unexpected TOPIQ backbone {model_name!r}"
+                    )
+                kwargs["pretrained"] = False
+                kwargs.pop("checkpoint_path", None)
+                model = original_create_model(model_name, *args, **kwargs)
+                incompatible = timm.models.load_checkpoint(
+                    model,
+                    self.backbone_path,
+                    strict=False,
+                )
+                missing = set(incompatible.missing_keys)
+                unexpected = set(incompatible.unexpected_keys)
+                if missing or unexpected != {"fc.bias", "fc.weight"}:
+                    raise RuntimeError(
+                        "staged TOPIQ backbone checkpoint keys differ: "
+                        f"missing={sorted(missing)}, "
+                        f"unexpected={sorted(unexpected)}"
+                    )
+                return model
+
+            timm.create_model = create_staged_backbone
+            try:
+                self.metric = pyiqa.create_metric(
+                    "topiq_nr",
+                    device=device,
+                    pretrained_model_path=self.topiq_path,
+                )
+            finally:
+                timm.create_model = original_create_model
+        else:
+            from huggingface_hub import hf_hub_download
+
+            self.backbone_path = hf_hub_download(
+                "timm/resnet50.a1_in1k",
+                "model.safetensors",
+                local_files_only=True,
+            )
+            self.metric = pyiqa.create_metric("topiq_nr", device=device)
 
     @classmethod
     def weights_status(cls, **params):
@@ -52,15 +125,18 @@ class IQAScorer(Scorer):
 
     def provenance_metadata(self):
         topiq = checkpoint_file_record(
-            TOPIQ_CHECKPOINT,
+            self.topiq_path,
             role="topiq_nr_checkpoint",
             filename=os.path.basename(TOPIQ_CHECKPOINT),
             repository_id="chaofengc/IQA-PyTorch",
         )
-        backbone = hf_checkpoint_file_record(
-            "timm/resnet50.a1_in1k",
-            "model.safetensors",
+        backbone = checkpoint_file_record(
+            self.backbone_path,
             role="resnet50_backbone",
+            filename="model.safetensors",
+            repository_id="timm/resnet50.a1_in1k",
+            revision=self.asset_revision("resnet50_backbone")
+            or resolved_hf_revision(self.backbone_path),
         )
         return {
             "models": [
@@ -83,7 +159,10 @@ class IQAScorer(Scorer):
                 "spatial_resolution": "native",
                 "resize": None,
             },
-            "parameters": {"metric": "topiq_nr"},
+            "parameters": {
+                "metric": "topiq_nr",
+                **self.asset_provenance_parameters(),
+            },
             "supporting_sources": [],
         }
 
