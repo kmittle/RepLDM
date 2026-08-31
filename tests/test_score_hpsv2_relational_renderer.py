@@ -38,6 +38,19 @@ score = load_module(
 
 
 class ScoreHashBindingTest(unittest.TestCase):
+    def test_frozen_config_registers_the_complete_scorer_contract_hash(self) -> None:
+        config = yaml.safe_load(
+            (EVAL_PIPELINE / "configs/hpsv2_full_scoring_v1.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        contract, digest = score.registered_scorer_provenance_contract(config)
+        self.assertIsNone(contract)
+        self.assertEqual(
+            digest,
+            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3",
+        )
+
     def test_hash_binding_is_all_or_none_and_requires_sha256(self) -> None:
         self.assertFalse(score.manifest_uses_hash_binding([{"id": "plain"}]))
         bound = [
@@ -215,7 +228,13 @@ class ScoringReceiptTest(unittest.TestCase):
         contract = {
             "config": {
                 "scoring": {
-                    "config": "eval-pipeline/configs/hpsv2_full_scoring_v1.yaml"
+                    "config": "eval-pipeline/configs/hpsv2_full_scoring_v1.yaml",
+                    "config_sha256": hashlib.sha256(
+                        scoring_config_payload
+                    ).hexdigest(),
+                    "registered_scorer_provenance_sha256": scoring_config[
+                        "registered_scorer_provenance_sha256"
+                    ],
                 }
             }
         }

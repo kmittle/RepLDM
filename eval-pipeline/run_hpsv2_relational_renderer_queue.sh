@@ -279,6 +279,7 @@ require_repository_snapshot_or_fail pre_scoring_repository_snapshot
 write_state running scoring "" "$REQUIRED_STABLE_POLLS"
 log "starting strict HPSv2 scoring on physical cuda:2"
 env -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   "$EVAL_PYTHON" "$SCORER" \
     --run_dir "$RUN_DIR" \
     --config "$SCORING_CONFIG" \

@@ -141,6 +141,32 @@ class HPSv2AnalysisTest(unittest.TestCase):
 
 
 class QueueAnalysisContractTest(unittest.TestCase):
+    def test_analysis_binds_the_registered_scorer_hash(self) -> None:
+        contract = analyzer.load_contract()
+        scoring_config, _, registered_contract, registered_hash = (
+            analyzer._load_frozen_scoring_config(contract)
+        )
+        self.assertIsNone(registered_contract)
+        self.assertEqual(
+            registered_hash,
+            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3",
+        )
+        with mock.patch.object(
+            analyzer,
+            "validate_hardened_score_rows",
+            return_value=registered_hash,
+        ) as validator:
+            self.assertEqual(
+                analyzer.validate_registered_scorer_rows([{"id": "fixture"}], contract),
+                registered_hash,
+            )
+        validator.assert_called_once_with(
+            [{"id": "fixture"}],
+            required_schema=scoring_config["scorer_provenance"]["required_schema"],
+            expected_sha256=registered_hash,
+            expected_contract=None,
+        )
+
     def test_queue_runs_analysis_only_after_strict_scoring(self) -> None:
         source = (
             EVAL_PIPELINE / "run_hpsv2_relational_renderer_queue.sh"
@@ -150,6 +176,7 @@ class QueueAnalysisContractTest(unittest.TestCase):
         self.assertLess(scoring, analysis)
         self.assertIn("score_hpsv2_relational_renderer.py", source)
         self.assertIn("paired_analysis", source)
+        self.assertIn("HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1", source)
 
 
 if __name__ == "__main__":

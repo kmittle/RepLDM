@@ -36,7 +36,10 @@ from score_hpsv2_relational_renderer import (
     validate_exclusive_cuda_execution_contract,
     validate_scoring_success_receipt,
 )
-from scorer_provenance import validate_hardened_score_rows
+from scorer_provenance import (
+    registered_scorer_provenance_contract,
+    validate_hardened_score_rows,
+)
 from s7_provenance import validate_scores_against_manifest
 
 
@@ -53,6 +56,53 @@ CONTRASTS = (
     ("feature_axis_r1_pos", "uniform_axis_r1_pos"),
     ("feature_axis_r1_pos", "random_axis_r1_pos"),
 )
+
+
+def _load_frozen_scoring_config(
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], bytes, Optional[dict], str]:
+    scoring_contract = contract["config"]["scoring"]
+    scoring_config_path = ROOT / str(scoring_contract["config"])
+    if not scoring_config_path.is_file() or scoring_config_path.is_symlink():
+        raise ValueError("frozen scoring config is missing or unsafe")
+    try:
+        scoring_config_payload = scoring_config_path.read_bytes()
+        scoring_config = yaml.safe_load(scoring_config_payload) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError("cannot read the frozen scoring config") from exc
+    if not isinstance(scoring_config, dict):
+        raise ValueError("frozen scoring config must contain a mapping")
+    if hashlib.sha256(scoring_config_payload).hexdigest() != scoring_contract.get(
+        "config_sha256"
+    ):
+        raise ValueError("frozen scoring config hash differs")
+    registered_contract, registered_hash = registered_scorer_provenance_contract(
+        scoring_config
+    )
+    if (
+        registered_hash is None
+        or registered_hash
+        != scoring_contract.get("registered_scorer_provenance_sha256")
+    ):
+        raise ValueError("frozen scorer provenance registration differs")
+    return scoring_config, scoring_config_payload, registered_contract, registered_hash
+
+
+def validate_registered_scorer_rows(
+    scores: Sequence[Mapping[str, Any]], contract: Mapping[str, Any]
+) -> str:
+    scoring_config, _, registered_contract, registered_hash = (
+        _load_frozen_scoring_config(contract)
+    )
+    required_schema = scoring_config.get("scorer_provenance", {}).get(
+        "required_schema"
+    )
+    return validate_hardened_score_rows(
+        scores,
+        required_schema=required_schema,
+        expected_sha256=registered_hash,
+        expected_contract=registered_contract,
+    )
 
 
 def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
@@ -96,15 +146,9 @@ def validate_scoring_publication(
     """Recompute the scoring receipt from the current frozen artifacts."""
     if not scores:
         raise ValueError("scoring receipt validation requires score rows")
-    scoring_contract = contract["config"]["scoring"]
-    scoring_config_path = ROOT / str(scoring_contract["config"])
-    try:
-        scoring_config_payload = scoring_config_path.read_bytes()
-        scoring_config = yaml.safe_load(scoring_config_payload) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-        raise ValueError("cannot read the frozen scoring config") from exc
-    if not isinstance(scoring_config, dict):
-        raise ValueError("frozen scoring config must contain a mapping")
+    scoring_config, scoring_config_payload, _, _ = _load_frozen_scoring_config(
+        contract
+    )
     run_config, run_config_payload = _read_json(
         run_dir / "config.json", "recorded run config"
     )
@@ -173,9 +217,8 @@ def load_verified_frame(
     if len(manifest) != EXPECTED_TASK_COUNT or len(scores) != EXPECTED_TASK_COUNT:
         raise ValueError("analysis requires exactly 12,800 manifest and score rows")
     validate_scores_against_manifest(manifest, scores)
-    scorer_hash = validate_hardened_score_rows(scores)
-
     contract = load_contract()
+    scorer_hash = validate_registered_scorer_rows(scores, contract)
     metrics = list(contract["config"]["scoring"]["required_outputs"])
     scorer_contract = scores[0].get("scorer_provenance")
     expected_scorers = list(contract["config"]["scoring"]["metrics"])

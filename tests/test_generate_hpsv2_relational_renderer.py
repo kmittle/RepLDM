@@ -82,7 +82,13 @@ class FrozenMatrixTest(unittest.TestCase):
         self.assertEqual(manifest["official_duplicate_row_count"], 28)
         self.assertEqual(
             self.contract["config"]["scoring"]["config_sha256"],
-            "7033266ab566ed2c36fa8249accf2d86fe4b46971900b4dbe3b79d09bfc2f9a1",
+            "22a162c7fc2151bbcc8ab08e5a4e3604de6fd56a955e37078577f8e0bd59dfac",
+        )
+        self.assertEqual(
+            self.contract["config"]["scoring"][
+                "registered_scorer_provenance_sha256"
+            ],
+            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3",
         )
 
     def test_analysis_and_duplicate_contracts_fail_closed(self):

@@ -364,6 +364,9 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
         "config_sha256": scoring_sha256,
         "strict": True,
         "scorer_provenance_required": True,
+        "registered_scorer_provenance_sha256": (
+            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3"
+        ),
         "hps_version": "v2.1",
         "hpsv2_stored_scale": "raw_cosine",
         "hpsv2_official_report_multiplier": 100.0,
@@ -394,6 +397,9 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
         "scorer_provenance": {
             "required_schema": "repldm_scorer_provenance_v1",
         },
+        "registered_scorer_provenance_sha256": (
+            "af8ec22593bb551b0af06c56a692211ba48a9e52f40e13e5557a04fd53f747e3"
+        ),
         "metric_meta": {
             "imagereward": "higher",
             "patch_ir_mean": "higher",

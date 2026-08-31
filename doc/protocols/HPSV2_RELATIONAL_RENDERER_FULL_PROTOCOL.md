@@ -113,6 +113,10 @@ The scoring YAML itself enables the exclusive-GPU watchdog even if a caller
 omits the matching CLI flag. Every score row records the exact watchdog mode,
 physical CUDA device, polling interval, and canonical contract hash; analysis
 rejects absent, disabled, changed, or non-`cuda:2` monitoring provenance.
+The queue also forces Hugging Face and Transformers offline during formal
+scoring. The frozen scoring YAML registers the complete scorer-provenance hash,
+so both scoring and analysis reject changed implementations, packages, or
+checkpoint bytes.
 The repository scorer stores raw HPS cosine values; multiply them by 100 only
 for the official table format and keep raw values in all paired calculations.
 
