@@ -37,3 +37,21 @@ This repository currently has no automated test suite, coverage threshold, or CI
 ## Commit & Pull Request Guidelines
 
 Recent commits use short scoped summaries such as `inspect(iter 13): fix ControlNet Stage-2 trigger`. Prefer an imperative, specific subject (`eval: handle missing scorer weights`) over the older generic `update` style. Pull requests should describe the behavior changed, exact validation commands, required hardware/checkpoints, and any output-quality or VRAM impact. Link relevant issues or experiments and include representative images when generation behavior changes. Use `main` for current behavior; consult `base` when reproducing paper results.
+
+## GPU Reservation During Idle Periods
+
+GPUs 4-7 are scarce shared resources. When no formal experiment is running, reserve those cards with the marked utility below so another job does not take them unexpectedly:
+
+```bash
+python scripts/gpu_reservation.py start --devices 4 5 6 7
+python scripts/gpu_reservation.py status --devices 4 5 6 7
+```
+
+Each worker allocates nearly all available memory and continuously performs an FP16 matrix multiply. This is only a resource lock, not an experiment, and its processes are labeled `repldm-gpu-reservation-v1`. Before starting generation, training, or scoring, stop only these workers and verify the cards with `nvidia-smi`:
+
+```bash
+python scripts/gpu_reservation.py stop --devices 4 5 6 7
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
+```
+
+After a run finishes, restart the reservation while debugging or waiting for the next approved job. Do not kill unrelated GPU processes; the utility keeps PID files and logs under `/tmp/repldm_gpu_reservation`.
