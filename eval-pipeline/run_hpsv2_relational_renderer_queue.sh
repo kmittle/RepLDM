@@ -15,7 +15,7 @@ QUEUE_DIR=$ROOT/outputs/hpsv2_relational_renderer/queue_v1
 STATE_PATH=$QUEUE_DIR/state.json
 LOG_PATH=$QUEUE_DIR/queue.log
 QUEUE_LOCK=$QUEUE_DIR/queue.lock
-DEVICES=2,5,6,7
+DEVICES=4,5,6,7
 MIN_FREE_MIB=22000
 MAX_UTILIZATION=5
 POLL_SECONDS=30
@@ -250,10 +250,10 @@ unexpected_failure() {
 trap 'unexpected_failure "$?" "$BASH_COMMAND"' ERR
 
 require_repository_snapshot_or_fail initial_repository_snapshot
-wait_for_devices waiting_for_all_gpus gpu_wait 2 5 6 7
-while ! require_devices_ready_now 2 5 6 7; do
+wait_for_devices waiting_for_all_gpus gpu_wait 4 5 6 7
+while ! require_devices_ready_now 4 5 6 7; do
     log "GPU state changed before launch; returning to the stable-wait gate"
-    wait_for_devices waiting_for_all_gpus gpu_wait 2 5 6 7
+    wait_for_devices waiting_for_all_gpus gpu_wait 4 5 6 7
 done
 require_repository_snapshot_or_fail pre_generation_repository_snapshot
 write_state running generation "" "$REQUIRED_STABLE_POLLS"
@@ -269,21 +269,21 @@ env -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER \
   || fail_stage complete_run_audit "$?"
 
 require_repository_snapshot_or_fail pre_scoring_wait_repository_snapshot
-log "complete-run audit passed; waiting for physical cuda:2 before strict scoring"
-wait_for_devices waiting_for_scoring_gpu scoring_gpu_wait 2
-while ! require_devices_ready_now 2; do
-    log "cuda:2 state changed before scoring; returning to the stable-wait gate"
-    wait_for_devices waiting_for_scoring_gpu scoring_gpu_wait 2
+log "complete-run audit passed; waiting for physical cuda:4 before strict scoring"
+wait_for_devices waiting_for_scoring_gpu scoring_gpu_wait 4
+while ! require_devices_ready_now 4; do
+    log "cuda:4 state changed before scoring; returning to the stable-wait gate"
+    wait_for_devices waiting_for_scoring_gpu scoring_gpu_wait 4
 done
 require_repository_snapshot_or_fail pre_scoring_repository_snapshot
 write_state running scoring "" "$REQUIRED_STABLE_POLLS"
-log "starting strict HPSv2 scoring on physical cuda:2"
+log "starting strict HPSv2 scoring on physical cuda:4"
 env -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER \
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   "$EVAL_PYTHON" "$SCORER" \
     --run_dir "$RUN_DIR" \
     --config "$SCORING_CONFIG" \
-    --device cuda:2 \
+    --device cuda:4 \
     --strict \
     --require-scorer-provenance \
     --require-exclusive-gpu \

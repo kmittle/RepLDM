@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib.util
 import hashlib
 import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import urllib.request
@@ -39,9 +42,37 @@ score = load_module(
     "hpsv2_score_hash_test",
     EVAL_PIPELINE / "score_hpsv2_relational_renderer.py",
 )
+import scorer_provenance as provenance  # noqa: E402
+
+
+def cuda_identity(index):
+    gpu_uuid = f"GPU-{int(index):08x}-0000-0000-0000-000000000000"
+    return {
+        "physical_device_index": int(index),
+        "gpu_uuid": gpu_uuid,
+        "pci_bus_id": f"00000000:{int(index):02X}:00.0",
+        "gpu_name": "NVIDIA GeForce RTX 3090",
+        "torch_device_uuid": gpu_uuid,
+    }
 
 
 class ScoreHashBindingTest(unittest.TestCase):
+    def test_legacy_shared_scorer_sources_remain_frozen(self) -> None:
+        expected = {
+            "base.py": "6b1c2cbd36577a514fc8ced2b1b5955a315cf2bae49ab30c7d26f1ff71096dc0",
+            "aesthetic_scorer.py": "f165a62a87f1c10b23b00c701931676ce3d99cb1e2bb526fdee77c2d3b05f245",
+            "clip_scorer.py": "e2fd82e9cc9c315bd5a4e84f57d90b3013fc005debaa8d676d34cab705d035fd",
+            "hps_scorer.py": "cd22a92b3e7c8e17c637a3c26d1c25674c4df7e2fa938ee9f86d229bcbe75aaa",
+            "imagereward_scorer.py": "7e37d87156fbad635cad29888cc53ed44a0ee5db4a7b0c8c4ccb659340495633",
+            "iqa_scorer.py": "9ecb76347c20c0f1e0acefb72788dcdd97b07cf8179d205083bde9395d572926",
+        }
+        scorer_root = EVAL_PIPELINE / "scorers"
+        observed = {
+            name: hashlib.sha256((scorer_root / name).read_bytes()).hexdigest()
+            for name in expected
+        }
+        self.assertEqual(observed, expected)
+
     def test_frozen_config_registers_the_complete_scorer_contract_hash(self) -> None:
         config = yaml.safe_load(
             (EVAL_PIPELINE / "configs/hpsv2_full_scoring_v1.yaml").read_text(
@@ -52,7 +83,7 @@ class ScoreHashBindingTest(unittest.TestCase):
         self.assertIsNone(contract)
         self.assertEqual(
             digest,
-            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926",
+            "f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42",
         )
 
     def test_hash_binding_is_all_or_none_and_requires_sha256(self) -> None:
@@ -76,6 +107,41 @@ class ScoreHashBindingTest(unittest.TestCase):
                         "run_contract_sha256": "b" * 64,
                     }
                 ]
+            )
+
+    def test_formal_scoring_config_is_bound_to_recorded_path_and_bytes(self) -> None:
+        config_path = EVAL_PIPELINE / "configs/hpsv2_full_scoring_v1.yaml"
+        payload = config_path.read_bytes()
+        run_config = {
+            "scoring": {
+                "config": "eval-pipeline/configs/hpsv2_full_scoring_v1.yaml",
+                "config_sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        }
+        score._validate_formal_scoring_config_binding(
+            config_path, payload, run_config
+        )
+        with self.assertRaisesRegex(RuntimeError, "path differs"):
+            score._validate_formal_scoring_config_binding(
+                config_path,
+                payload,
+                {
+                    "scoring": {
+                        "config": "eval-pipeline/configs/other.yaml",
+                        "config_sha256": run_config["scoring"]["config_sha256"],
+                    }
+                },
+            )
+        with self.assertRaisesRegex(RuntimeError, "bytes differ"):
+            score._validate_formal_scoring_config_binding(
+                config_path,
+                payload,
+                {
+                    "scoring": {
+                        "config": run_config["scoring"]["config"],
+                        "config_sha256": "b" * 64,
+                    }
+                },
             )
 
     def test_hash_bound_images_are_verified_before_score_reuse(self) -> None:
@@ -103,31 +169,194 @@ class ScoreHashBindingTest(unittest.TestCase):
 
 
 class ExclusiveCudaWatchdogTest(unittest.TestCase):
+    GPU_UUID = "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    OTHER_UUID = "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    PCI_BUS_ID = "00000000:89:00.0"
+
+    @property
+    def identity(self):
+        return {
+            "physical_device_index": 5,
+            "gpu_uuid": self.GPU_UUID,
+            "pci_bus_id": self.PCI_BUS_ID,
+            "gpu_name": "NVIDIA GeForce RTX 3090",
+            "torch_device_uuid": self.GPU_UUID,
+        }
+
     def query(self, process_rows: str):
         return mock.patch.object(
             score,
             "_nvidia_smi",
-            side_effect=["5, GPU-target\n", process_rows],
+            side_effect=[
+                (
+                    f"5, {self.GPU_UUID}, {self.PCI_BUS_ID}, "
+                    "NVIDIA GeForce RTX 3090\n"
+                ),
+                process_rows,
+            ],
         )
+
+    def patch_start_ticks(self, value=5678):
+        return mock.patch.object(score, "_process_start_ticks", return_value=value)
 
     def test_allows_only_the_scorer_pid_on_the_target_gpu(self) -> None:
         scorer_pid = 1234
         processes = (
-            f"GPU-target, {scorer_pid}, python, 1024\n"
-            "GPU-other, 9999, python, 2048\n"
+            f"{self.GPU_UUID}, {scorer_pid}, python, 1024\n"
+            f"{self.OTHER_UUID}, 9999, python, 2048\n"
         )
-        with mock.patch.dict(score.os.environ, {}, clear=True), self.query(processes):
+        with mock.patch.dict(score.os.environ, {}, clear=True), self.query(processes), self.patch_start_ticks():
             self.assertEqual(
-                score._exclusive_cuda_conflicts("cuda:5", scorer_pid), []
+                score._exclusive_cuda_conflicts(
+                    "cuda:5", scorer_pid, target_identity=self.identity
+                ),
+                [],
             )
 
     def test_rejects_a_foreign_pid_on_the_target_gpu(self) -> None:
-        processes = "GPU-target, 9999, other-python, 2048\n"
-        with mock.patch.dict(score.os.environ, {}, clear=True), self.query(processes):
-            watchdog = score.ExclusiveCudaWatchdog("cuda:5", enabled=True)
+        processes = (
+            f"{self.GPU_UUID}, 1234, python, 1024\n"
+            f"{self.GPU_UUID}, 9999, other-python, 2048\n"
+        )
+        with mock.patch.dict(score.os.environ, {}, clear=True), self.query(processes), self.patch_start_ticks():
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5", enabled=True, target_identity=self.identity
+            )
             watchdog.pid = 1234
             with self.assertRaisesRegex(RuntimeError, "foreign compute process"):
                 watchdog._check_now()
+
+    def test_rejects_missing_scorer_pid(self) -> None:
+        processes = f"{self.OTHER_UUID}, 9999, python, 2048\n"
+        with mock.patch.dict(score.os.environ, {}, clear=True), self.query(processes), self.patch_start_ticks():
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5", enabled=True, target_identity=self.identity
+            )
+            watchdog.pid = 1234
+            with self.assertRaisesRegex(RuntimeError, "scorer PID is missing"):
+                watchdog._check_now()
+
+    def test_rejects_scorer_pid_on_another_gpu(self) -> None:
+        processes = f"{self.OTHER_UUID}, 1234, python, 1024\n"
+        with mock.patch.dict(score.os.environ, {}, clear=True), self.query(processes), self.patch_start_ticks():
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5", enabled=True, target_identity=self.identity
+            )
+            watchdog.pid = 1234
+            with self.assertRaisesRegex(RuntimeError, "different physical GPU"):
+                watchdog._check_now()
+
+    def test_rejects_scorer_pid_reuse_during_gpu_query(self) -> None:
+        processes = f"{self.GPU_UUID}, 1234, python, 1024\n"
+        inventory = (
+            f"5, {self.GPU_UUID}, {self.PCI_BUS_ID}, "
+            "NVIDIA GeForce RTX 3090\n"
+        )
+        with (
+            mock.patch.dict(score.os.environ, {}, clear=True),
+            mock.patch.object(
+                score,
+                "_nvidia_smi",
+                side_effect=[inventory, processes],
+            ),
+            mock.patch.object(
+                score, "_process_start_ticks", side_effect=[5678, 5678, 1234]
+            ),
+        ):
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5", enabled=True, target_identity=self.identity
+            )
+            watchdog.pid = 1234
+            watchdog.process_start_ticks = 5678
+            with self.assertRaisesRegex(RuntimeError, "changed while GPU state was queried"):
+                watchdog._check_now()
+
+    def test_rejects_gpu_pci_identity_drift(self) -> None:
+        inventory = (
+            f"5, {self.GPU_UUID}, 00000000:88:00.0, "
+            "NVIDIA GeForce RTX 3090\n"
+        )
+        with (
+            mock.patch.dict(score.os.environ, {}, clear=True),
+            mock.patch.object(score, "_nvidia_smi", return_value=inventory),
+            self.patch_start_ticks(),
+        ):
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5", enabled=True, target_identity=self.identity
+            )
+            with self.assertRaisesRegex(RuntimeError, "identity drifted"):
+                watchdog._check_now()
+
+    def test_resolves_physical_identity_by_torch_uuid(self) -> None:
+        properties = type(
+            "FixtureCudaProperties",
+            (),
+            {
+                "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "name": "NVIDIA GeForce RTX 3090",
+            },
+        )()
+        torch_module = mock.Mock()
+        torch_module.cuda.current_device.return_value = 5
+        torch_module.cuda.get_device_properties.return_value = properties
+        inventory = (
+            f"5, {self.GPU_UUID}, {self.PCI_BUS_ID}, NVIDIA GeForce RTX 3090\n"
+        )
+        with (
+            mock.patch.dict(score.os.environ, {}, clear=True),
+            mock.patch.object(score, "_nvidia_smi", return_value=inventory),
+        ):
+            self.assertEqual(
+                score.resolve_scoring_cuda_identity(torch_module, "cuda:5"),
+                self.identity,
+            )
+
+    def test_watchdog_requires_entry_and_final_pid_observations(self) -> None:
+        scorer_pid = 1234
+        processes = f"{self.GPU_UUID}, {scorer_pid}, python, 1024\n"
+        inventory = (
+            f"5, {self.GPU_UUID}, {self.PCI_BUS_ID}, "
+            "NVIDIA GeForce RTX 3090\n"
+        )
+        with (
+            mock.patch.dict(score.os.environ, {}, clear=True),
+            mock.patch.object(
+                score,
+                "_nvidia_smi",
+                side_effect=[inventory, processes, inventory, processes],
+            ),
+            self.patch_start_ticks(),
+        ):
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5",
+                enabled=True,
+                poll_seconds=3600,
+                target_identity=self.identity,
+            )
+            watchdog.pid = scorer_pid
+            watchdog.process_start_ticks = 5678
+            with watchdog:
+                pass
+        self.assertTrue(watchdog.finalized)
+        self.assertEqual(len(watchdog.observations), 2)
+        execution = score.exclusive_cuda_execution_contract(
+            "cuda:5", target_identity=self.identity
+        )
+        execution_hash = score.json_sha256(execution)
+        observation = score.exclusive_cuda_observation_contract(
+            execution_hash,
+            scorer_pid=watchdog.pid,
+            process_start_ticks=watchdog.process_start_ticks,
+        )
+        score.validate_exclusive_cuda_observation_contract(
+            observation, execution_sha256=execution_hash
+        )
+        tampered = copy.deepcopy(observation)
+        tampered["final_observation"]["scorer_pid_present_on_target_only"] = False
+        with self.assertRaisesRegex(ValueError, "observation differs"):
+            score.validate_exclusive_cuda_observation_contract(
+                tampered, execution_sha256=execution_hash
+            )
 
     def test_gpu_query_failure_is_fatal(self) -> None:
         with (
@@ -138,7 +367,9 @@ class ExclusiveCudaWatchdogTest(unittest.TestCase):
                 side_effect=RuntimeError("cannot query NVIDIA compute-process state"),
             ),
         ):
-            watchdog = score.ExclusiveCudaWatchdog("cuda:5", enabled=True)
+            watchdog = score.ExclusiveCudaWatchdog(
+                "cuda:5", enabled=True, target_identity=self.identity
+            )
             with self.assertRaisesRegex(RuntimeError, "cannot query"):
                 watchdog.__enter__()
 
@@ -156,7 +387,9 @@ class ExclusiveCudaWatchdogTest(unittest.TestCase):
             )
 
     def test_analyzer_requires_hash_bound_monitor_provenance(self) -> None:
-        contract = score.exclusive_cuda_execution_contract("cuda:2")
+        contract = score.exclusive_cuda_execution_contract(
+            "cuda:2", target_identity=cuda_identity(2)
+        )
         digest = score.json_sha256(contract)
         self.assertEqual(
             analyzer.validate_exclusive_cuda_execution_contract(
@@ -187,8 +420,13 @@ class ScoringReceiptTest(unittest.TestCase):
         manifest_payload = (json.dumps(manifest[0]) + "\n").encode("utf-8")
         scorer_contract = {"schema": "test-scorer-provenance"}
         scorer_hash = score.json_sha256(scorer_contract)
-        cuda_contract = score.exclusive_cuda_execution_contract("cuda:2")
+        cuda_contract = score.exclusive_cuda_execution_contract(
+            "cuda:4", target_identity=cuda_identity(4)
+        )
         cuda_hash = score.json_sha256(cuda_contract)
+        cuda_observation = score.exclusive_cuda_observation_contract(
+            cuda_hash, scorer_pid=1234, process_start_ticks=5678
+        )
         scores = [
             {
                 "id": "task-0",
@@ -198,6 +436,7 @@ class ScoringReceiptTest(unittest.TestCase):
                 "scorer_provenance_sha256": scorer_hash,
                 "scoring_execution_provenance": cuda_contract,
                 "scoring_execution_provenance_sha256": cuda_hash,
+                "scoring_execution_observation": cuda_observation,
             }
         ]
         scores_payload = (json.dumps(scores[0]) + "\n").encode("utf-8")
@@ -565,6 +804,101 @@ class TransactionalScoringTest(unittest.TestCase):
             self.assertEqual(calls["fixture"], 2)
             self.assertTrue((run_dir / score.SCORING_SUCCESS_NAME).is_file())
 
+    def test_dead_poison_recovery_clears_progress_and_all_temporary_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            attempt_id = "a" * 32
+            poison = {
+                "schema": score.SCORING_PROGRESS_POISON_SCHEMA,
+                "status": "in_progress",
+                "attempt_id": attempt_id,
+                "pid": 2_147_483_647,
+                "process_start_ticks": 1,
+                "boot_id": score._boot_id(),
+            }
+            (run_dir / score.SCORING_PROGRESS_POISON_NAME).write_bytes(
+                score._scoring_poison_bytes(poison)
+            )
+            progress_name = (
+                f".scoring_progress.{attempt_id}.{'b' * 64}.jsonl"
+            )
+            for name in (
+                progress_name,
+                score.SCORING_PROGRESS_RECEIPT_NAME,
+                ".scoring_progress.stage.orphan.tmp",
+                "..scoring_progress.json.orphan.tmp",
+                "..scoring_progress.poison.orphan.tmp",
+            ):
+                (run_dir / name).write_text("stale\n", encoding="utf-8")
+            (run_dir / "scores.jsonl").write_text(
+                "canonical\n", encoding="utf-8"
+            )
+            (run_dir / score.SCORING_SUCCESS_NAME).write_text(
+                "{}\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                score.ScoringAttemptPoisonedError, "not resumable"
+            ):
+                score.load_verified_scoring_progress(run_dir, {})
+            self.assertEqual(
+                score._recover_poisoned_scoring_progress(run_dir), attempt_id
+            )
+
+            self.assertFalse(
+                (run_dir / score.SCORING_PROGRESS_POISON_NAME).exists()
+            )
+            self.assertFalse(
+                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).exists()
+            )
+            self.assertEqual(score._scoring_progress_payload_paths(run_dir), [])
+            self.assertEqual(score._scoring_progress_temporary_paths(run_dir), [])
+            self.assertEqual(
+                (run_dir / "scores.jsonl").read_text(encoding="utf-8"),
+                "canonical\n",
+            )
+            self.assertEqual(
+                (run_dir / score.SCORING_SUCCESS_NAME).read_text(
+                    encoding="utf-8"
+                ),
+                "{}\n",
+            )
+
+    def test_live_poison_cannot_be_recovered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            attempt_id = "c" * 32
+            score._begin_scoring_progress_poison(
+                run_dir, attempt_id=attempt_id
+            )
+            with self.assertRaisesRegex(
+                score.ScoringAttemptPoisonedError, "owned by a live process"
+            ):
+                score._recover_poisoned_scoring_progress(run_dir)
+            self.assertTrue(
+                (run_dir / score.SCORING_PROGRESS_POISON_NAME).is_file()
+            )
+
+    def test_asset_primary_and_cleanup_errors_are_both_preserved(self):
+        class BrokenStage:
+            def cleanup(self):
+                raise OSError("cleanup-failed")
+
+        primary = ValueError("score-failed")
+        with (
+            mock.patch.object(score, "ScorerAssetStage", return_value=BrokenStage()),
+            self.assertRaises(score.ScoringAttemptPoisonedError) as raised,
+        ):
+            with score.staged_scorer_assets(
+                [], {}, enabled=True, run_dir="ignored"
+            ):
+                raise primary
+        self.assertIs(raised.exception.primary_error, primary)
+        self.assertIsInstance(raised.exception.cleanup_error, OSError)
+        self.assertIn("cleanup-failed", str(raised.exception.cleanup_error))
+
     def test_watchdog_exit_failure_after_progress_publishes_nothing(self) -> None:
         class ExitFailureWatchdog:
             enabled = False
@@ -596,10 +930,17 @@ class TransactionalScoringTest(unittest.TestCase):
             self.assertEqual(calls["fixture"], 1)
             self.assertFalse((run_dir / "scores.jsonl").exists())
             self.assertFalse((run_dir / score.SCORING_SUCCESS_NAME).exists())
-            self.assert_private_progress_count(run_dir, 0)
-            self.assertFalse(
-                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).exists()
+            self.assert_private_progress_count(run_dir, 1)
+            self.assertTrue(
+                (run_dir / score.SCORING_PROGRESS_RECEIPT_NAME).is_file()
             )
+            self.assertTrue(
+                (run_dir / score.SCORING_PROGRESS_POISON_NAME).is_file()
+            )
+            with self.assertRaisesRegex(
+                score.ScoringAttemptPoisonedError, "not resumable"
+            ):
+                score.load_verified_scoring_progress(run_dir, {})
 
     def test_watchdog_entry_failure_preserves_valid_canonical_publication(self) -> None:
         class EntryFailureWatchdog:
@@ -690,24 +1031,17 @@ class TransactionalScoringTest(unittest.TestCase):
             scoring_config.write_text(
                 yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
             )
-            real_atomic_writer = score.atomic_text_writer
             failed_once = False
 
-            @contextlib.contextmanager
-            def fail_first_success_receipt(path):
+            def fail_after_scores(state):
                 nonlocal failed_once
-                if (
-                    Path(path).name == score.SCORING_SUCCESS_NAME
-                    and not failed_once
-                ):
+                if state == "scores_replaced" and not failed_once:
                     failed_once = True
                     raise OSError("planned final receipt interruption")
-                with real_atomic_writer(path) as handle:
-                    yield handle
 
             calls["fixture"] = 0
             with mock.patch.object(
-                score, "atomic_text_writer", fail_first_success_receipt
+                score, "_publication_fault_point", fail_after_scores
             ), self.assertRaisesRegex(OSError, "final receipt interruption"):
                 self.invoke(run_dir, scoring_config, self.registry(calls, value=0.9))
 
@@ -717,6 +1051,197 @@ class TransactionalScoringTest(unittest.TestCase):
                 (run_dir / score.SCORING_SUCCESS_NAME).read_bytes(), receipt_bytes
             )
             self.assert_private_progress_count(run_dir, 1)
+
+    def test_publication_and_recovery_failures_are_both_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir, scoring_config, _ = self.make_run(root)
+            calls = {"fixture": 0}
+            self.invoke(run_dir, scoring_config, self.registry(calls, value=0.75))
+            config = yaml.safe_load(scoring_config.read_text(encoding="utf-8"))
+            config["params"] = {"revision": 2}
+            scoring_config.write_text(
+                yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+            )
+            real_reconcile = score._reconcile_scoring_publication
+
+            def fail_after_scores(state):
+                if state == "scores_replaced":
+                    raise OSError("planned publication failure")
+
+            def fail_durable_recovery(path):
+                if (Path(path) / score.SCORING_PUBLICATION_JOURNAL_NAME).exists():
+                    raise RuntimeError("planned durable recovery failure")
+                return real_reconcile(path)
+
+            calls["fixture"] = 0
+            with (
+                mock.patch.object(
+                    score, "_publication_fault_point", fail_after_scores
+                ),
+                mock.patch.object(
+                    score,
+                    "_reconcile_scoring_publication",
+                    side_effect=fail_durable_recovery,
+                ),
+                self.assertRaises(score.ScoringAttemptPoisonedError) as raised,
+            ):
+                self.invoke(run_dir, scoring_config, self.registry(calls, value=0.9))
+
+            self.assertIsInstance(raised.exception.primary_error, OSError)
+            self.assertIn("publication failure", str(raised.exception.primary_error))
+            self.assertIsInstance(raised.exception.cleanup_error, RuntimeError)
+            self.assertIn("recovery failure", str(raised.exception.cleanup_error))
+            self.assertIs(raised.exception.__cause__, raised.exception.primary_error)
+
+    def test_process_death_recovery_after_every_publication_transition(self) -> None:
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        transitions = (
+            "backups_persisted",
+            "journal_persisted",
+            "scores_replaced",
+            "receipt_replaced",
+            "new_pair_verified",
+        )
+        for transition in transitions:
+            with self.subTest(transition=transition), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run_dir, scoring_config, _ = self.make_run(root)
+                calls = {"fixture": 0}
+                self.invoke(
+                    run_dir,
+                    scoring_config,
+                    self.registry(calls, value=0.75),
+                )
+                old_scores = (run_dir / "scores.jsonl").read_bytes()
+                old_receipt = (
+                    run_dir / score.SCORING_SUCCESS_NAME
+                ).read_bytes()
+                config = yaml.safe_load(
+                    scoring_config.read_text(encoding="utf-8")
+                )
+                config["params"] = {"revision": 2}
+                scoring_config.write_text(
+                    yaml.safe_dump(config, sort_keys=False),
+                    encoding="utf-8",
+                )
+
+                def terminate_at(state):
+                    if state == transition:
+                        raise SimulatedProcessDeath(state)
+
+                calls["fixture"] = 0
+                with (
+                    mock.patch.object(
+                        score, "_publication_fault_point", terminate_at
+                    ),
+                    self.assertRaises(SimulatedProcessDeath),
+                ):
+                    self.invoke(
+                        run_dir,
+                        scoring_config,
+                        self.registry(calls, value=0.9),
+                    )
+
+                recovery = score._reconcile_scoring_publication(run_dir)
+                if transition in ("receipt_replaced", "new_pair_verified"):
+                    self.assertEqual(recovery, "committed")
+                    row = json.loads(
+                        (run_dir / "scores.jsonl").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(row["fixture_score"], 0.9)
+                else:
+                    self.assertIn(recovery, ("clean", "restored"))
+                    self.assertEqual(
+                        (run_dir / "scores.jsonl").read_bytes(), old_scores
+                    )
+                    self.assertEqual(
+                        (run_dir / score.SCORING_SUCCESS_NAME).read_bytes(),
+                        old_receipt,
+                    )
+                self.assertFalse(
+                    (run_dir / score.SCORING_PUBLICATION_JOURNAL_NAME).exists()
+                )
+                self.assertFalse(
+                    any(
+                        path.name.startswith(".scoring_publication")
+                        for path in run_dir.iterdir()
+                    )
+                )
+
+    def test_process_death_without_previous_pair_removes_partial_output(self) -> None:
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir, scoring_config, _ = self.make_run(Path(temporary))
+            calls = {"fixture": 0}
+
+            def terminate_after_scores(state):
+                if state == "scores_replaced":
+                    raise SimulatedProcessDeath(state)
+
+            with (
+                mock.patch.object(
+                    score, "_publication_fault_point", terminate_after_scores
+                ),
+                self.assertRaises(SimulatedProcessDeath),
+            ):
+                self.invoke(run_dir, scoring_config, self.registry(calls))
+            self.assertTrue((run_dir / "scores.jsonl").exists())
+            self.assertEqual(
+                score._reconcile_scoring_publication(run_dir), "restored"
+            )
+            self.assertFalse((run_dir / "scores.jsonl").exists())
+            self.assertFalse(
+                (run_dir / score.SCORING_SUCCESS_NAME).exists()
+            )
+
+    def test_changed_durable_backup_blocks_unsafe_recovery(self) -> None:
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir, scoring_config, _ = self.make_run(root)
+            calls = {"fixture": 0}
+            self.invoke(run_dir, scoring_config, self.registry(calls))
+            config = yaml.safe_load(scoring_config.read_text(encoding="utf-8"))
+            config["params"] = {"revision": 2}
+            scoring_config.write_text(
+                yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+            )
+
+            def terminate_after_scores(state):
+                if state == "scores_replaced":
+                    raise SimulatedProcessDeath(state)
+
+            calls["fixture"] = 0
+            with (
+                mock.patch.object(
+                    score, "_publication_fault_point", terminate_after_scores
+                ),
+                self.assertRaises(SimulatedProcessDeath),
+            ):
+                self.invoke(
+                    run_dir,
+                    scoring_config,
+                    self.registry(calls, value=0.9),
+                )
+            journal = json.loads(
+                (run_dir / score.SCORING_PUBLICATION_JOURNAL_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            backup_path = run_dir / journal["old_publication"]["scores"]["path"]
+            backup_path.write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeError, "backup changed"):
+                score._reconcile_scoring_publication(run_dir)
+            self.assertTrue(
+                (run_dir / score.SCORING_PUBLICATION_JOURNAL_NAME).is_file()
+            )
 
     def test_nvidia_smi_failure_preserves_existing_canonical_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -743,6 +1268,20 @@ class TransactionalScoringTest(unittest.TestCase):
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch("torch.cuda.is_available", return_value=True),
+                mock.patch("torch.cuda.current_device", return_value=2),
+                mock.patch(
+                    "torch.cuda.get_device_properties",
+                    return_value=type(
+                        "FixtureCudaProperties",
+                        (),
+                        {
+                            "uuid": (
+                                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                            ),
+                            "name": "NVIDIA GeForce RTX 3090",
+                        },
+                    )(),
+                ),
                 mock.patch.object(
                     score,
                     "_nvidia_smi",
@@ -782,6 +1321,29 @@ class ScorerAssetStageTest(unittest.TestCase):
 
         return AssetScorer
 
+    @staticmethod
+    def write_stage_owner(run_dir, *, pid, process_start_ticks, run_identity=None):
+        stage_dir = run_dir / score.SCORER_ASSET_STAGE_NAME
+        stage_dir.mkdir()
+        owner = {
+            "schema": score.SCORER_ASSET_OWNER_SCHEMA,
+            "attempt_id": "a" * 32,
+            "pid": pid,
+            "process_start_ticks": process_start_ticks,
+            "boot_id": score._boot_id(),
+            "run_directory_identity": list(
+                run_identity
+                or score._directory_owner_identity(run_dir.stat())
+            ),
+            "stage_directory_identity": list(
+                score._directory_owner_identity(stage_dir.stat())
+            ),
+        }
+        (stage_dir / score.SCORER_ASSET_OWNER_NAME).write_bytes(
+            score._scorer_stage_owner_bytes(owner)
+        )
+        return stage_dir
+
     def test_stage_namespaces_assets_binds_manifest_and_cleans_nested_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "weights.bin"
@@ -790,8 +1352,12 @@ class ScorerAssetStageTest(unittest.TestCase):
                 "first": self.asset_class(source),
                 "second": self.asset_class(source),
             }
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
             with mock.patch.dict(score.REGISTRY, registry, clear=True):
-                stage = score.ScorerAssetStage(["first", "second"], {})
+                stage = score.ScorerAssetStage(
+                    ["first", "second"], {}, run_dir=run_dir
+                )
             stage_root = stage.path
             first = Path(stage.asset_paths["first"]["weights"])
             second = Path(stage.asset_paths["second"]["weights"])
@@ -813,12 +1379,16 @@ class ScorerAssetStageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "weights.bin"
             source.write_bytes(b"same-bytes")
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
             with mock.patch.dict(
                 score.REGISTRY,
                 {"fixture": self.asset_class(source)},
                 clear=True,
             ):
-                stage = score.ScorerAssetStage(["fixture"], {})
+                stage = score.ScorerAssetStage(
+                    ["fixture"], {}, run_dir=run_dir
+                )
             stage_root = stage.path
             staged = Path(stage.asset_paths["fixture"]["weights"])
             os.chmod(staged, 0o600)
@@ -830,6 +1400,59 @@ class ScorerAssetStageTest(unittest.TestCase):
                 stage.verify()
             stage.cleanup(verify=False)
             self.assertFalse(stage_root.exists())
+
+    def test_stage_recovers_a_dead_owner_after_process_death(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            stale = self.write_stage_owner(
+                run_dir, pid=2_147_483_647, process_start_ticks=1
+            )
+            (stale / "left-by-sigkill.bin").write_bytes(b"stale")
+            source = root / "weights.bin"
+            source.write_bytes(b"fresh")
+            registry = {"fixture": self.asset_class(source)}
+            stage = score.ScorerAssetStage(
+                ["fixture"], {}, run_dir=run_dir, registry=registry
+            )
+            try:
+                self.assertEqual(stage.path, stale)
+                self.assertFalse((stale / "left-by-sigkill.bin").exists())
+                stage.verify()
+            finally:
+                stage.cleanup()
+
+    def test_stage_does_not_take_over_a_live_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            stage_dir = self.write_stage_owner(
+                run_dir,
+                pid=os.getpid(),
+                process_start_ticks=score._process_start_ticks(os.getpid()),
+            )
+            with self.assertRaisesRegex(
+                score.ScorerAssetStageError, "owned by a live process"
+            ):
+                score.ScorerAssetStage([], {}, run_dir=run_dir, registry={})
+            self.assertTrue(stage_dir.is_dir())
+
+    def test_stage_recovery_rejects_an_owner_inode_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            stage_dir = self.write_stage_owner(
+                run_dir,
+                pid=2_147_483_647,
+                process_start_ticks=1,
+                run_identity=(0, 0),
+            )
+            with self.assertRaisesRegex(
+                score.ScorerAssetStageError, "directory identity differs"
+            ):
+                score.ScorerAssetStage([], {}, run_dir=run_dir, registry={})
+            self.assertTrue(stage_dir.is_dir())
 
     def test_copy_rejects_source_changed_during_read(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -874,6 +1497,298 @@ class ScorerAssetStageTest(unittest.TestCase):
         self.assertIs(socket.socket, original_socket)
         self.assertIs(urllib.request.urlopen, original_urlopen)
 
+    def test_seccomp_blocks_cached_native_and_child_network_access(self):
+        program = f"""
+import array
+import ctypes
+import errno
+import importlib.util
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+
+sys.path.insert(0, {str(EVAL_PIPELINE)!r})
+spec = importlib.util.spec_from_file_location(
+    'isolated_hps_score', {str(EVAL_PIPELINE / 'score_hpsv2_relational_renderer.py')!r}
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert 'hpsv2_scorers' not in sys.modules
+import numpy
+cached_socket = socket.socket
+attempt = threading.Event()
+result_ready = threading.Event()
+release = threading.Event()
+sibling_results = []
+def sibling_socket_attempt():
+    attempt.wait()
+    try:
+        sibling_socket = cached_socket()
+    except OSError as exc:
+        sibling_results.append(exc.errno)
+    else:
+        sibling_socket.close()
+        sibling_results.append(None)
+    finally:
+        result_ready.set()
+        release.wait()
+sibling = threading.Thread(target=sibling_socket_attempt, daemon=True)
+sibling.start()
+assert module.install_network_seccomp_filter() == module.NETWORK_ISOLATION_SCHEMA
+attempt.set()
+assert result_ready.wait(10)
+assert sibling_results == [errno.EPERM]
+modes = module._process_seccomp_modes()
+assert modes
+assert all(mode == 2 for mode in modes.values())
+try:
+    cached_socket()
+except OSError as exc:
+    assert exc.errno == errno.EPERM
+else:
+    raise AssertionError('cached socket constructor bypassed seccomp')
+libc = ctypes.CDLL(None, use_errno=True)
+for syscall_number in module._NETWORK_DENIED_SYSCALLS_X86_64:
+    ctypes.set_errno(0)
+    assert libc.syscall(syscall_number, -1, -1, -1, -1, -1, -1) == -1
+    assert ctypes.get_errno() == errno.EPERM, syscall_number
+try:
+    socket.socketpair(socket.AF_INET, socket.SOCK_STREAM)
+except OSError as exc:
+    assert exc.errno == errno.EPERM
+else:
+    raise AssertionError('non-UNIX socketpair bypassed seccomp')
+left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    assert os.write(left.fileno(), b'x') == 1
+    assert os.read(right.fileno(), 1) == b'x'
+    descriptor, path = tempfile.mkstemp()
+    try:
+        rights = array.array('i', [descriptor])
+        try:
+            left.sendmsg([b'f'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+        except OSError as exc:
+            assert exc.errno == errno.EPERM
+        else:
+            raise AssertionError('SCM_RIGHTS bypassed seccomp')
+    finally:
+        os.close(descriptor)
+        os.unlink(path)
+finally:
+    left.close()
+    right.close()
+descriptor, path = tempfile.mkstemp()
+try:
+    assert os.write(descriptor, b'file-ok') == 7
+finally:
+    os.close(descriptor)
+with open(path, 'rb') as handle:
+    assert handle.read() == b'file-ok'
+os.unlink(path)
+ordinary_child = subprocess.run(
+    [sys.executable, '-c', 'print("child-ok")'],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=True,
+)
+assert ordinary_child.stdout.strip() == 'child-ok'
+child = subprocess.run(
+    [sys.executable, '-c', 'import socket; socket.socket()'],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+assert child.returncode != 0
+registry, _ = module._load_scorer_registry(formal_registered_scoring=True)
+assert set(registry) == {{'imagereward', 'pixel', 'clip', 'hps', 'aesthetic', 'iqa'}}
+release.set()
+sibling.join(10)
+assert not sibling.is_alive()
+print('seccomp-ok')
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertIn("seccomp-ok", result.stdout)
+
+    def test_seccomp_rejects_an_inherited_unix_socket(self):
+        program = f"""
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location(
+    'inherited_socket_hps_score',
+    {str(EVAL_PIPELINE / 'score_hpsv2_relational_renderer.py')!r},
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    module.install_network_seccomp_filter()
+except RuntimeError as exc:
+    assert 'inherited a socket descriptor' in str(exc)
+else:
+    raise AssertionError('inherited UNIX socket was accepted')
+print('inherited-socket-rejected')
+"""
+        parent, child = socket.socketpair()
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", program],
+                pass_fds=(child.fileno(),),
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        finally:
+            child.close()
+            parent.close()
+        self.assertIn("inherited-socket-rejected", result.stdout)
+
+    def test_formal_asset_inventory_closes_tokenizer_and_model_config_inputs(self):
+        registry, _ = score._load_scorer_registry(
+            formal_registered_scoring=True
+        )
+        params = {
+            "patch_crops": 5,
+            "clip_model": "ViT-B/32",
+            "clipscore_w": 2.5,
+        }
+        inventories = {
+            name: getattr(registry[name], "asset_sources", lambda **values: {})(
+                **params
+            )
+            for name in ("imagereward", "pixel", "clip", "hps", "aesthetic", "iqa")
+        }
+        self.assertEqual(sum(map(len, inventories.values())), 31)
+        self.assertIn("tokenizer_vocabulary", inventories["clip"])
+        self.assertIn("model_config", inventories["hps"])
+        for metric_inventory in inventories.values():
+            for record in metric_inventory.values():
+                self.assertTrue(Path(record["path"]).is_file())
+        for name in ("clip", "hps"):
+            packages = set(registry[name].PROVENANCE_PACKAGES)
+            self.assertIn("ftfy", packages)
+            self.assertIn("regex", packages)
+        self.assertIn("safetensors", set(registry["iqa"].PROVENANCE_PACKAGES))
+
+        closures = {}
+        for name, scorer_class in registry.items():
+            probe = scorer_class.__new__(scorer_class)
+            self.assertEqual(
+                provenance.scorer_framework_source_records(
+                    probe, root=EVAL_PIPELINE
+                ),
+                [],
+            )
+            closures[name] = provenance.scorer_framework_source_records(
+                probe,
+                root=EVAL_PIPELINE,
+                source_closure=provenance.HPSV2_PRIVATE_SOURCE_CLOSURE,
+            )
+            closure_paths = {record["path"] for record in closures[name]}
+            self.assertIn("hpsv2_scorers/__init__.py", closure_paths)
+            self.assertIn("hpsv2_scorers/base.py", closure_paths)
+            self.assertIn(f"hpsv2_scorers/{name}_scorer.py", closure_paths)
+            self.assertIn("scorers/__init__.py", closure_paths)
+            self.assertIn("scorers/base.py", closure_paths)
+            self.assertIn(f"scorers/{name}_scorer.py", closure_paths)
+            self.assertIn("scorer_provenance.py", closure_paths)
+
+        framework_sources = closures["clip"]
+        sources_by_label = {record["label"]: record for record in framework_sources}
+        self.assertEqual(
+            sources_by_label["scorer_package_initializer"]["path"],
+            "hpsv2_scorers/__init__.py",
+        )
+        self.assertEqual(
+            sources_by_label["scorer_provenance_builder"]["path"],
+            "scorer_provenance.py",
+        )
+        self.assertEqual(
+            {record["path"] for record in framework_sources},
+            {
+                "hpsv2_scorers/__init__.py",
+                "hpsv2_scorers/base.py",
+                "hpsv2_scorers/clip_scorer.py",
+                "scorer_provenance.py",
+                "scorers/__init__.py",
+                "scorers/base.py",
+                "scorers/clip_scorer.py",
+            },
+        )
+        pixel_manifest = {
+            "schema": "repldm_scorer_asset_stage_v1",
+            "loading_mode": score.SCORER_ASSET_LOADING_MODE,
+            "files": [],
+            "files_sha256": score.json_sha256([]),
+        }
+        pixel = registry["pixel"](
+            device="cpu", scorer_asset_manifest=pixel_manifest
+        )
+        self.assertEqual(
+            pixel.provenance_metadata()["parameters"]["network_isolation"],
+            score.NETWORK_ISOLATION_SCHEMA,
+        )
+
+    def test_explicit_tokenizers_and_hps_config_match_legacy_inputs(self):
+        import clip
+        import torch
+        from clip.simple_tokenizer import SimpleTokenizer as ClipTokenizer
+        from hpsv2.src.open_clip import factory as hps_factory
+        from hpsv2.src.open_clip import get_tokenizer as get_hps_tokenizer
+        from hpsv2.src.open_clip.tokenizer import SimpleTokenizer as HPSTokenizer
+
+        registry, _ = score._load_scorer_registry(
+            formal_registered_scoring=True
+        )
+        clip_assets = registry["clip"].asset_sources(clip_model="ViT-B/32")
+        clip_scorer = registry["clip"].__new__(registry["clip"])
+        clip_scorer.tokenizer = ClipTokenizer(
+            bpe_path=clip_assets["tokenizer_vocabulary"]["path"]
+        )
+        prompts = (
+            "a detailed red bicycle beside a tree",
+            "unicode cafe and a deliberately long " + "word " * 120,
+        )
+        for prompt in prompts:
+            self.assertTrue(
+                torch.equal(
+                    clip_scorer._tokenize(prompt),
+                    clip.tokenize([prompt], truncate=True),
+                )
+            )
+
+        hps_assets = registry["hps"].asset_sources()
+        staged_tokenizer = HPSTokenizer(
+            bpe_path=hps_assets["tokenizer_vocabulary"]["path"]
+        )
+        hps_scorer = registry["hps"].__new__(registry["hps"])
+        hps_scorer.simple_tokenizer = staged_tokenizer
+        legacy_tokenizer = get_hps_tokenizer("ViT-H-14")
+        self.assertIs(registry["hps"].TOKENIZER_TRUNCATE, True)
+        for prompt in prompts:
+            self.assertTrue(
+                torch.equal(
+                    hps_scorer._tokenize([prompt]),
+                    legacy_tokenizer([prompt]),
+                )
+            )
+        staged_config = json.loads(
+            Path(hps_assets["model_config"]["path"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(staged_config, hps_factory.get_model_config("ViT-H-14"))
+
     @staticmethod
     def fixture_manifest(path):
         files = [
@@ -894,29 +1809,48 @@ class ScorerAssetStageTest(unittest.TestCase):
 
     def test_openai_clip_scorers_receive_explicit_local_paths(self):
         import clip
+        import clip.simple_tokenizer
+
+        registry, _ = score._load_scorer_registry(
+            formal_registered_scoring=True
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             clip_b = root / "ViT-B-32.pt"
             clip_l = root / "ViT-L-14.pt"
             aesthetic = root / "aesthetic.pth"
-            for path in (clip_b, clip_l, aesthetic):
+            vocabulary = root / "bpe_simple_vocab_16e6.txt.gz"
+            for path in (clip_b, clip_l, aesthetic, vocabulary):
                 path.write_bytes(path.name.encode("ascii"))
             model = mock.Mock()
 
             def preprocess(image):
                 return image
 
-            with mock.patch.object(
-                clip, "load", return_value=(model, preprocess)
-            ) as clip_load:
-                scorer = score.REGISTRY["clip"](
+            with (
+                mock.patch.object(
+                    clip, "load", return_value=(model, preprocess)
+                ) as clip_load,
+                mock.patch.object(
+                    clip.simple_tokenizer,
+                    "SimpleTokenizer",
+                    return_value=mock.Mock(),
+                ) as tokenizer,
+            ):
+                scorer = registry["clip"](
                     device="cpu",
                     clip_model="ViT-B/32",
-                    scorer_assets={"clip_checkpoint": str(clip_b)},
+                    scorer_assets={
+                        "clip_checkpoint": str(clip_b),
+                        "tokenizer_vocabulary": str(vocabulary),
+                    },
                     scorer_asset_manifest=self.fixture_manifest(clip_b),
                 )
             self.assertEqual(clip_load.call_args.args[0], str(clip_b))
+            self.assertEqual(
+                tokenizer.call_args.kwargs["bpe_path"], str(vocabulary)
+            )
             self.assertEqual(
                 scorer.provenance_metadata()["parameters"]["asset_stage"][
                     "schema"
@@ -925,7 +1859,7 @@ class ScorerAssetStageTest(unittest.TestCase):
             )
 
             aesthetic_module = sys.modules[
-                score.REGISTRY["aesthetic"].__module__
+                registry["aesthetic"].__module__
             ]
             with (
                 mock.patch.object(
@@ -941,7 +1875,7 @@ class ScorerAssetStageTest(unittest.TestCase):
                     "load_state_dict",
                 ),
             ):
-                score.REGISTRY["aesthetic"](
+                registry["aesthetic"](
                     device="cpu",
                     scorer_assets={
                         "clip_checkpoint": str(clip_l),
@@ -953,16 +1887,21 @@ class ScorerAssetStageTest(unittest.TestCase):
             self.assertEqual(torch_load.call_args.args[0], str(aesthetic))
 
     def test_hps_and_topiq_receive_explicit_local_paths(self):
-        import hpsv2.src.open_clip as hps_open_clip
+        import hpsv2.src.open_clip.factory as hps_factory
         import hpsv2.src.open_clip.tokenizer as hps_tokenizer
         import pyiqa
         import timm
+
+        registry, _ = score._load_scorer_registry(
+            formal_registered_scoring=True
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             hps_checkpoint = root / "HPS_v2.1_compressed.pt"
             hps_backbone = root / "open_clip_pytorch_model.bin"
             vocabulary = root / "bpe.txt.gz"
+            model_config = root / "ViT-H-14.json"
             topiq = root / "topiq.pth"
             resnet = root / "resnet.safetensors"
             for path in (
@@ -973,16 +1912,25 @@ class ScorerAssetStageTest(unittest.TestCase):
                 resnet,
             ):
                 path.write_bytes(path.name.encode("ascii"))
+            model_config.write_text(
+                json.dumps(
+                    {"embed_dim": 8, "vision_cfg": {}, "text_cfg": {}}
+                ),
+                encoding="utf-8",
+            )
 
             model = mock.Mock()
             model.to.return_value = model
             model.eval.return_value = model
-            hps_module = sys.modules[score.REGISTRY["hps"].__module__]
+            def hps_preprocess(image):
+                return image
+
+            hps_module = sys.modules[registry["hps"].__module__]
             with (
                 mock.patch.object(
-                    hps_open_clip,
+                    hps_factory,
                     "create_model_and_transforms",
-                    return_value=(model, None, mock.Mock()),
+                    return_value=(model, None, hps_preprocess),
                 ) as create_hps,
                 mock.patch.object(
                     hps_tokenizer, "SimpleTokenizer", return_value=mock.Mock()
@@ -992,13 +1940,19 @@ class ScorerAssetStageTest(unittest.TestCase):
                     "load",
                     return_value={"state_dict": {}},
                 ) as torch_load,
+                mock.patch.object(
+                    hps_factory,
+                    "_MODEL_CONFIGS",
+                    dict(hps_factory._MODEL_CONFIGS),
+                ),
             ):
-                score.REGISTRY["hps"](
+                hps_instance = registry["hps"](
                     device="cpu",
                     scorer_assets={
                         "hpsv2_checkpoint": str(hps_checkpoint),
                         "open_clip_backbone": str(hps_backbone),
                         "tokenizer_vocabulary": str(vocabulary),
+                        "model_config": str(model_config),
                     },
                     scorer_asset_manifest=self.fixture_manifest(hps_checkpoint),
                 )
@@ -1007,6 +1961,12 @@ class ScorerAssetStageTest(unittest.TestCase):
             )
             self.assertEqual(torch_load.call_args.args[0], str(hps_checkpoint))
             self.assertEqual(tokenizer.call_args.kwargs["bpe_path"], str(vocabulary))
+            self.assertIs(
+                hps_instance.provenance_metadata()["preprocessing"][
+                    "text_tokenizer"
+                ]["truncate"],
+                True,
+            )
 
             original_create_model = mock.Mock(return_value=mock.Mock())
 
@@ -1028,7 +1988,7 @@ class ScorerAssetStageTest(unittest.TestCase):
                 ) as load_checkpoint,
                 mock.patch.object(pyiqa, "create_metric", side_effect=create_metric),
             ):
-                score.REGISTRY["iqa"](
+                registry["iqa"](
                     device="cpu",
                     scorer_assets={
                         "topiq_checkpoint": str(topiq),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from enum import Enum
 import hashlib
+import importlib.util
 from importlib import metadata
 import inspect
 import json
@@ -24,7 +25,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 SCORER_PROVENANCE_SCHEMA = "repldm_scorer_provenance_v1"
 CHECKPOINT_MANIFEST_SCHEMA = "repldm_scorer_assets_v1"
+HPSV2_PRIVATE_SOURCE_CLOSURE = "hpsv2_private_v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_TREE_SCHEMA = "python_source_tree_sha256_v1"
+_OUTPUT_DIRECTIONS = {"higher", "lower", "witness"}
 _TRANSFORM_ATTRIBUTES = (
     "size",
     "interpolation",
@@ -263,7 +267,13 @@ def _structural_control_scoring_gate(
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
 
 
 def json_sha256(value: Any) -> str:
@@ -287,6 +297,22 @@ def _relative_name(path: Path, root: str | os.PathLike[str] | None) -> str:
     return path.name
 
 
+def _reject_symlink_components(path: Path, *, label: str) -> None:
+    """Reject symlinks in an executable-source path before resolution."""
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            status = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"cannot inspect {label}: {current}") from exc
+        if stat.S_ISLNK(status.st_mode):
+            raise RuntimeError(f"{label} cannot contain a symlink: {current}")
+
+
 def source_file_record(
     path: str | os.PathLike[str],
     *,
@@ -307,7 +333,79 @@ def source_file_record(
     return record
 
 
-def plugin_source_record(scorer: object, *, root: str | os.PathLike[str]) -> dict:
+def python_source_tree_record(
+    root: str | os.PathLike[str],
+    *,
+    label: str,
+    module: str | None = None,
+) -> dict:
+    """Return one compact digest for every Python source file below ``root``."""
+    raw_root = Path(root)
+    try:
+        root_status = raw_root.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"Python source tree is missing: {raw_root}") from exc
+    if stat.S_ISLNK(root_status.st_mode):
+        raise RuntimeError(f"Python source tree root cannot be a symlink: {raw_root}")
+    root_path = raw_root.resolve()
+    if not root_path.is_dir():
+        raise RuntimeError(f"Python source tree is missing: {root_path}")
+    entries = []
+    for candidate in sorted(root_path.rglob("*.py")):
+        _reject_symlink_components(candidate, label="Python source tree file")
+        try:
+            candidate_status = candidate.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"Python source tree contains an unreadable file: {candidate}") from exc
+        if stat.S_ISLNK(candidate_status.st_mode):
+            raise RuntimeError(f"Python source tree contains a symlink: {candidate}")
+        if not candidate.is_file():
+            continue
+        source = candidate.resolve()
+        try:
+            relative_path = source.relative_to(root_path).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Python source tree contains an external link: {candidate}"
+            ) from exc
+        entries.append(
+            {
+                "path": relative_path,
+                "size_bytes": source.stat().st_size,
+                "sha256": sha256_file(source),
+            }
+        )
+    if not entries:
+        raise RuntimeError(f"Python source tree has no .py files: {root_path}")
+    record = {
+        "label": str(label),
+        "path": str(module or root_path.name),
+        "tree_schema": "python_source_tree_sha256_v1",
+        "file_count": len(entries),
+        "sha256": json_sha256(entries),
+    }
+    if module is not None:
+        record["module"] = str(module)
+    return record
+
+
+def package_python_source_tree_record(module: str, *, label: str) -> dict:
+    """Resolve an installed package and bind its complete Python source tree."""
+    spec = importlib.util.find_spec(module)
+    locations = tuple(spec.submodule_search_locations or ()) if spec else ()
+    if len(locations) != 1:
+        raise RuntimeError(
+            f"cannot resolve one Python package source root for {module!r}"
+        )
+    return python_source_tree_record(locations[0], label=label, module=module)
+
+
+def plugin_source_record(
+    scorer: object,
+    *,
+    root: str | os.PathLike[str],
+    require_containment: bool = True,
+) -> dict:
     cls = scorer.__class__
     module_name = str(getattr(cls, "__module__", ""))
     module = sys.modules.get(module_name)
@@ -321,12 +419,160 @@ def plugin_source_record(scorer: object, *, root: str | os.PathLike[str]) -> dic
         raise RuntimeError(
             f"cannot resolve scorer plugin source for {module_name}.{cls.__qualname__}"
         )
-    return source_file_record(
+    # A scorer plugin is executable code and must be an ordinary repository
+    # file.  Do not use the permissive source_file_record path here: resolving
+    # a symlink before containment would allow code outside the provenance root
+    # to be hashed under a misleading basename.
+    return _repository_source_file_record(
         path,
         label="scorer_plugin",
         root=root,
         module=module_name,
+        require_containment=require_containment,
     )
+
+
+def _repository_source_file_record(
+    path: str | os.PathLike[str],
+    *,
+    label: str,
+    root: str | os.PathLike[str],
+    module: str,
+    require_containment: bool = True,
+) -> dict:
+    """Bind one ordinary source without following a symlink.
+
+    Scorer plugins are executable code and must be bound to the declared source
+    root. Keeping this check here (before ``source_file_record`` resolves the
+    path) prevents an outside file from being represented by an in-root
+    basename.
+    """
+    raw_root = Path(root)
+    raw_path = Path(path)
+    _reject_symlink_components(raw_root, label="provenance source root")
+    _reject_symlink_components(raw_path, label="provenance source")
+    root_path = raw_root.resolve(strict=True)
+    try:
+        raw_status = raw_path.lstat()
+        source = raw_path.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"provenance source is unavailable: {raw_path}"
+        ) from exc
+    if stat.S_ISLNK(raw_status.st_mode) or not stat.S_ISREG(raw_status.st_mode):
+        raise RuntimeError(f"provenance source is not an ordinary file: {raw_path}")
+    if not stat.S_ISREG(source.stat().st_mode):
+        raise RuntimeError(f"provenance source is not a regular file: {source}")
+    if require_containment:
+        try:
+            source.relative_to(root_path)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"provenance source is outside the source root: {raw_path}"
+            ) from exc
+    return source_file_record(
+        source,
+        label=label,
+        root=root_path,
+        module=module,
+    )
+
+
+def _scorer_mro_source_records(
+    scorer: object, *, root: str | os.PathLike[str]
+) -> list[dict]:
+    records: dict[str, dict] = {}
+    for cls in scorer.__class__.__mro__:
+        if cls is object:
+            continue
+        module_name = str(getattr(cls, "__module__", ""))
+        module = sys.modules.get(module_name)
+        path = getattr(module, "__file__", None)
+        if path is None:
+            try:
+                path = inspect.getsourcefile(cls)
+            except (OSError, TypeError):
+                path = None
+        if path is None:
+            raise RuntimeError(
+                f"cannot resolve scorer MRO source for {module_name}.{cls.__qualname__}"
+            )
+        record = _repository_source_file_record(
+            path,
+            label="scorer_mro_source",
+            root=root,
+            module=module_name,
+            require_containment=True,
+        )
+        records.setdefault(record["path"], record)
+        if "." in module_name:
+            package_name = module_name.split(".", 1)[0]
+            package = sys.modules.get(package_name)
+            package_path = getattr(package, "__file__", None)
+            if package_path is None:
+                raise RuntimeError(
+                    f"cannot bind scorer MRO package initializer for {module_name!r}"
+                )
+            package_record = _repository_source_file_record(
+                package_path,
+                label="scorer_mro_package_initializer",
+                root=root,
+                module=package_name,
+                require_containment=True,
+            )
+            records.setdefault(package_record["path"], package_record)
+    return [records[path] for path in sorted(records)]
+
+
+def scorer_framework_source_records(
+    scorer: object,
+    *,
+    root: str | os.PathLike[str],
+    source_closure: str | None = None,
+) -> list[dict]:
+    """Return an explicitly selected scorer framework source closure.
+
+    The default is intentionally empty to preserve the frozen provenance bytes
+    used by legacy ``score.py`` registrations. Formal HPSv2 scoring opts into a
+    complete repository-local closure explicitly.
+    """
+    if source_closure is None:
+        return []
+    if source_closure != HPSV2_PRIVATE_SOURCE_CLOSURE:
+        raise ValueError(f"unsupported scorer source closure: {source_closure!r}")
+
+    records = [
+        _repository_source_file_record(
+            __file__,
+            label="scorer_provenance_builder",
+            root=root,
+            module=__name__,
+            require_containment=True,
+        )
+    ]
+    module_name = str(getattr(scorer.__class__, "__module__", ""))
+    if "." in module_name:
+        package_name = module_name.split(".", 1)[0]
+        package = sys.modules.get(package_name)
+        package_path = getattr(package, "__file__", None)
+        if package_path is None:
+            raise RuntimeError(
+                f"cannot bind scorer package initializer for {module_name!r}"
+            )
+        records.append(
+            _repository_source_file_record(
+                package_path,
+                label="scorer_package_initializer",
+                root=root,
+                module=package_name,
+                require_containment=True,
+            )
+        )
+    records.extend(_scorer_mro_source_records(scorer, root=root))
+    unique = {}
+    for record in records:
+        unique.setdefault(record["path"], record)
+    return [unique[path] for path in sorted(unique)]
 
 
 def package_version_manifest(distributions: Iterable[str]) -> dict[str, str]:
@@ -404,12 +650,6 @@ def hf_checkpoint_file_record(
 def checkpoint_manifest(records: Iterable[Mapping[str, Any]]) -> dict:
     files = [dict(record) for record in records]
     files.sort(key=canonical_json)
-    identities = [
-        (record.get("role"), record.get("repository_id"), record.get("filename"))
-        for record in files
-    ]
-    if len(identities) != len(set(identities)):
-        raise RuntimeError("scorer provenance contains duplicate asset identities")
     for record in files:
         if set(record) != {
             "role",
@@ -423,9 +663,25 @@ def checkpoint_manifest(records: Iterable[Mapping[str, Any]]) -> dict:
             raise RuntimeError("scorer asset record fields differ from the v1 schema")
         if not _SHA256_RE.fullmatch(str(record.get("sha256", ""))):
             raise RuntimeError("scorer asset record has an invalid SHA-256")
+        for key in ("role", "filename"):
+            value = record.get(key)
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(f"scorer asset record has an invalid {key}")
+        if Path(record["filename"]).name != record["filename"]:
+            raise RuntimeError("scorer asset filename must be a basename")
+        for key in ("repository_id", "revision", "artifact_uri"):
+            value = record.get(key)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise RuntimeError(f"scorer asset record has an invalid {key}")
         size = record.get("size_bytes")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
             raise RuntimeError("scorer asset record has an invalid byte size")
+    identities = [
+        (record["role"], record.get("repository_id"), record["filename"])
+        for record in files
+    ]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("scorer provenance contains duplicate asset identities")
     return {
         "schema": CHECKPOINT_MANIFEST_SCHEMA,
         "files": files,
@@ -546,11 +802,127 @@ def _validate_model_records(models: object) -> list[dict]:
         raise RuntimeError("scorer provenance models must be a list")
     result = []
     for model in models:
-        if not isinstance(model, Mapping) or not isinstance(model.get("identifier"), str):
+        if not _valid_model_record(model):
             raise RuntimeError("each scorer model must have a string identifier")
         result.append(dict(model))
+    identifiers = [model["identifier"] for model in result]
+    if len(identifiers) != len(set(identifiers)):
+        raise RuntimeError("scorer provenance model identifiers are duplicated")
     canonical_json(result)
     return result
+
+
+def _valid_model_record(value: object) -> bool:
+    """Validate one persisted model identity without accepting lookalikes."""
+    if not isinstance(value, Mapping):
+        return False
+    identifier = value.get("identifier")
+    if not isinstance(identifier, str) or not identifier:
+        return False
+    if not set(value).issubset(
+        {"identifier", "repository_id", "revision", "artifact_uri"}
+    ):
+        return False
+    for key in ("repository_id", "revision", "artifact_uri"):
+        field = value.get(key)
+        if field is not None and (not isinstance(field, str) or not field):
+            return False
+    try:
+        canonical_json(dict(value))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _valid_source_record(
+    value: object, *, allow_tree: bool, allow_legacy_hash_only: bool = False
+) -> bool:
+    """Validate a source digest record used by a persisted contract."""
+    if not isinstance(value, Mapping):
+        return False
+    # Older score fixtures predate structured source metadata and persist only
+    # the digest. Keep accepting that exact shape for implementation/plugin
+    # fields, while rejecting partial or malformed structured records.
+    if allow_legacy_hash_only and set(value) == {"sha256"}:
+        digest = value.get("sha256")
+        return isinstance(digest, str) and _SHA256_RE.fullmatch(digest) is not None
+    label = value.get("label")
+    path = value.get("path")
+    digest = value.get("sha256")
+    if (
+        not isinstance(label, str)
+        or not label
+        or not isinstance(path, str)
+        or not path
+        or not isinstance(digest, str)
+        or _SHA256_RE.fullmatch(digest) is None
+    ):
+        return False
+    source_path = Path(path)
+    if source_path.is_absolute() or ".." in source_path.parts:
+        return False
+    module = value.get("module")
+    if module is not None and (not isinstance(module, str) or not module):
+        return False
+    if "tree_schema" in value or "file_count" in value:
+        if not allow_tree:
+            return False
+        if value.get("tree_schema") != _SOURCE_TREE_SCHEMA:
+            return False
+        count = value.get("file_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            return False
+    allowed = {"label", "path", "sha256", "module"}
+    if value.get("tree_schema") is not None:
+        allowed.update(("tree_schema", "file_count"))
+    return set(value).issubset(allowed)
+
+
+def _valid_runtime_manifest(runtime: object) -> bool:
+    """Validate runtime identity fields in a persisted contract."""
+    if not isinstance(runtime, Mapping):
+        return False
+    for key in ("device", "python_implementation", "python_version", "torch_version"):
+        value = runtime.get(key)
+        if not isinstance(value, str) or not value:
+            return False
+    cuda_runtime = runtime.get("cuda_runtime_version")
+    if cuda_runtime is not None and (not isinstance(cuda_runtime, str) or not cuda_runtime):
+        return False
+    cudnn = runtime.get("cudnn_version")
+    if cudnn is not None and (isinstance(cudnn, bool) or not isinstance(cudnn, int) or cudnn < 0):
+        return False
+    cuda_device = runtime.get("cuda_device")
+    if cuda_device is not None:
+        if not isinstance(cuda_device, Mapping) or set(cuda_device) != {"index", "name", "capability"}:
+            return False
+        index = cuda_device.get("index")
+        name = cuda_device.get("name")
+        capability = cuda_device.get("capability")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            return False
+        if not isinstance(name, str) or not name:
+            return False
+        if (
+            not isinstance(capability, list)
+            or len(capability) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in capability)
+        ):
+            return False
+    versions = runtime.get("runner_package_versions")
+    if not isinstance(versions, Mapping) or any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(version, str)
+        or not version
+        for name, version in versions.items()
+    ):
+        return False
+    try:
+        canonical_json(dict(runtime))
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def build_scorer_record(
@@ -558,6 +930,7 @@ def build_scorer_record(
     scorer: object,
     *,
     source_root: str | os.PathLike[str],
+    source_closure: str | None = None,
 ) -> dict:
     distributions = getattr(scorer, "PROVENANCE_PACKAGES", None)
     metadata_builder = getattr(scorer, "provenance_metadata", None)
@@ -584,16 +957,50 @@ def build_scorer_record(
     supporting_sources = payload["supporting_sources"]
     if not isinstance(supporting_sources, list):
         raise RuntimeError(f"strict scorer {name!r} supporting_sources must be a list")
-    output_keys = [
-        {"name": str(key), "direction": str(direction)}
-        for key, direction in getattr(scorer, "OUTPUT_KEYS", ())
+    if any(
+        not _valid_source_record(source, allow_tree=True)
+        for source in supporting_sources
+    ):
+        raise RuntimeError(f"strict scorer {name!r} supporting_sources are invalid")
+    try:
+        output_keys = [
+            {"name": key, "direction": direction}
+            for key, direction in getattr(scorer, "OUTPUT_KEYS", ())
+        ]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"strict scorer {name!r} output keys are invalid") from exc
+    if any(
+        not isinstance(item["name"], str)
+        or not item["name"]
+        or not isinstance(item["direction"], str)
+        or item["direction"] not in _OUTPUT_DIRECTIONS
+        for item in output_keys
+    ) or len({item["name"] for item in output_keys}) != len(output_keys):
+        raise RuntimeError(f"strict scorer {name!r} output keys are invalid")
+    all_supporting_sources = [
+        *[dict(value) for value in supporting_sources],
+        *scorer_framework_source_records(
+            scorer,
+            root=source_root,
+            source_closure=source_closure,
+        ),
     ]
+    # A closure can rediscover a file already declared by a scorer's metadata
+    # (for example, an inherited implementation). Keep one canonical record per
+    # path so persisted validation can unambiguously identify each source.
+    unique_supporting_sources = {}
+    for value in all_supporting_sources:
+        unique_supporting_sources.setdefault(value["path"], value)
     record = {
         "name": str(name),
         "class": f"{scorer.__class__.__module__}.{scorer.__class__.__qualname__}",
-        "plugin_source": plugin_source_record(scorer, root=source_root),
+        "plugin_source": plugin_source_record(
+            scorer,
+            root=source_root,
+            require_containment=source_closure == HPSV2_PRIVATE_SOURCE_CLOSURE,
+        ),
         "supporting_sources": sorted(
-            [dict(value) for value in supporting_sources], key=canonical_json
+            unique_supporting_sources.values(), key=canonical_json
         ),
         "package_versions": package_version_manifest(distributions),
         "models": _validate_model_records(payload["models"]),
@@ -614,9 +1021,15 @@ def build_scorer_provenance(
     runner_path: str | os.PathLike[str],
     base_path: str | os.PathLike[str],
     source_root: str | os.PathLike[str],
+    source_closure: str | None = None,
 ) -> tuple[dict, str]:
     scorers = [
-        build_scorer_record(name, scorer, source_root=source_root)
+        build_scorer_record(
+            name,
+            scorer,
+            source_root=source_root,
+            source_closure=source_closure,
+        )
         for name, scorer in active
     ]
     contract = {
@@ -666,8 +1079,8 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
     }:
         raise ValueError("scorer provenance implementation sources are invalid")
     for source in implementation.values():
-        if not isinstance(source, Mapping) or not _SHA256_RE.fullmatch(
-            str(source.get("sha256", ""))
+        if not _valid_source_record(
+            source, allow_tree=False, allow_legacy_hash_only=True
         ):
             raise ValueError("scorer provenance implementation source hash is invalid")
     runtime = contract.get("runtime")
@@ -683,17 +1096,18 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
     }
     if not isinstance(runtime, Mapping) or set(runtime) != runtime_keys:
         raise ValueError("scorer provenance runtime fields are invalid")
-    if not all(
-        isinstance(runtime.get(key), str) and runtime[key]
-        for key in ("device", "python_implementation", "python_version", "torch_version")
-    ):
+    if not _valid_runtime_manifest(runtime):
         raise ValueError("scorer provenance runtime identity is invalid")
-    if not isinstance(runtime.get("runner_package_versions"), Mapping):
-        raise ValueError("scorer provenance runner package versions are invalid")
     scorers = contract.get("scorers")
     metrics = contract.get("metrics")
     if not isinstance(scorers, list) or not isinstance(metrics, list):
         raise ValueError("scorer provenance metrics/scorers must be lists")
+    if (
+        any(not isinstance(name, str) or not name for name in metrics)
+        or len(metrics) != len(set(metrics))
+        or not metrics
+    ):
+        raise ValueError("scorer provenance metric names are invalid")
     if metrics != [record.get("name") for record in scorers if isinstance(record, Mapping)]:
         raise ValueError("scorer provenance metric order differs from scorer records")
     for record in scorers:
@@ -712,9 +1126,16 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
             "output_keys",
         }:
             raise ValueError("scorer provenance record fields differ from v1")
+        if (
+            not isinstance(record.get("name"), str)
+            or not record["name"]
+            or not isinstance(record.get("class"), str)
+            or not record["class"]
+        ):
+            raise ValueError("scorer provenance scorer identity is invalid")
         source = record.get("plugin_source")
-        if not isinstance(source, Mapping) or not _SHA256_RE.fullmatch(
-            str(source.get("sha256", ""))
+        if not _valid_source_record(
+            source, allow_tree=False, allow_legacy_hash_only=True
         ):
             raise ValueError("scorer provenance plugin source hash is invalid")
         versions = record.get("package_versions")
@@ -725,19 +1146,23 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
             raise ValueError("scorer provenance package versions are invalid")
         models = record.get("models")
         if not isinstance(models, list) or any(
-            not isinstance(model, Mapping)
-            or not isinstance(model.get("identifier"), str)
-            or not model["identifier"]
-            for model in models
+            not _valid_model_record(model) for model in models
         ):
             raise ValueError("scorer provenance model identifiers are invalid")
+        model_ids = [model["identifier"] for model in models]
+        if len(model_ids) != len(set(model_ids)):
+            raise ValueError("scorer provenance model identifiers are duplicated")
         supporting_sources = record.get("supporting_sources")
         if not isinstance(supporting_sources, list) or any(
-            not isinstance(item, Mapping)
-            or not _SHA256_RE.fullmatch(str(item.get("sha256", "")))
+            not _valid_source_record(item, allow_tree=True)
             for item in supporting_sources
         ):
             raise ValueError("scorer provenance supporting source hashes are invalid")
+        source_paths = [item["path"] for item in supporting_sources]
+        if len(source_paths) != len(set(source_paths)):
+            raise ValueError("scorer provenance supporting sources are duplicated")
+        if supporting_sources != sorted(supporting_sources, key=canonical_json):
+            raise ValueError("scorer provenance supporting sources are not canonical")
         checkpoints = record.get("checkpoints")
         if not isinstance(checkpoints, Mapping):
             raise ValueError("scorer provenance checkpoint manifest is missing")
@@ -748,6 +1173,7 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
             raise ValueError("scorer provenance checkpoint manifest hash is invalid")
         if files != sorted(files, key=canonical_json):
             raise ValueError("scorer provenance checkpoint files are not canonical")
+        identities = []
         for asset in files:
             if not isinstance(asset, Mapping) or set(asset) != {
                 "role",
@@ -759,8 +1185,31 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
                 "sha256",
             }:
                 raise ValueError("scorer provenance asset fields are invalid")
-            if not _SHA256_RE.fullmatch(str(asset.get("sha256", ""))):
+            if (
+                not isinstance(asset.get("role"), str)
+                or not asset["role"]
+                or not isinstance(asset.get("filename"), str)
+                or not asset["filename"]
+                or any(
+                    asset.get(key) is not None
+                    and (not isinstance(asset.get(key), str) or not asset.get(key))
+                    for key in ("repository_id", "revision", "artifact_uri")
+                )
+                or isinstance(asset.get("size_bytes"), bool)
+                or not isinstance(asset.get("size_bytes"), int)
+                or asset["size_bytes"] < 0
+                or not isinstance(asset.get("sha256"), str)
+                or not _SHA256_RE.fullmatch(asset["sha256"])
+            ):
                 raise ValueError("scorer provenance asset SHA-256 is invalid")
+            identity = (
+                asset["role"],
+                asset.get("repository_id"),
+                asset["filename"],
+            )
+            identities.append(identity)
+        if len(identities) != len(set(identities)):
+            raise ValueError("scorer provenance checkpoint identities are duplicated")
         if not isinstance(record.get("preprocessing"), Mapping):
             raise ValueError("scorer provenance preprocessing is invalid")
         if not isinstance(record.get("parameters"), Mapping):
@@ -771,9 +1220,15 @@ def validate_scorer_provenance(contract: object, observed_sha256: object) -> str
             or set(item) != {"name", "direction"}
             or not isinstance(item["name"], str)
             or not isinstance(item["direction"], str)
+            or not item["name"]
+            or not item["direction"]
+            or item["direction"] not in _OUTPUT_DIRECTIONS
             for item in output_keys
         ):
             raise ValueError("scorer provenance output key contract is invalid")
+        output_names = [item["name"] for item in output_keys]
+        if len(output_names) != len(set(output_names)):
+            raise ValueError("scorer provenance output keys are duplicated")
     recomputed = json_sha256(contract)
     if observed_sha256 != recomputed:
         raise ValueError("scorer provenance SHA-256 does not match its payload")
@@ -864,6 +1319,7 @@ def registered_scorer_provenance_contract(
 
 __all__ = [
     "CHECKPOINT_MANIFEST_SCHEMA",
+    "HPSV2_PRIVATE_SOURCE_CLOSURE",
     "SCORER_PROVENANCE_SCHEMA",
     "build_scorer_provenance",
     "checkpoint_file_record",

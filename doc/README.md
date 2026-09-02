@@ -19,6 +19,8 @@ inside these documents are repository-relative unless a link states otherwise.
 - [`LATENT_RENDERER_PROTOCOL.md`](protocols/LATENT_RENDERER_PROTOCOL.md): fixed-renderer search protocol.
 - [`SCHEDULER_NATIVE_FIXED_HEADROOM_PROTOCOL.md`](protocols/SCHEDULER_NATIVE_FIXED_HEADROOM_PROTOCOL.md): scheduler-native screen.
 - [`ADAPTIVE_ORACLE_PROTOCOL.md`](protocols/ADAPTIVE_ORACLE_PROTOCOL.md): current adaptive-oracle protocol.
+- [`OPD_DPO_RL_LATENT_RENDERER_PROTOCOL.md`](protocols/OPD_DPO_RL_LATENT_RENDERER_PROTOCOL.md):
+  current shared renderer, data, budget, training, and evaluation contract.
 
 ## Literature And Audits
 

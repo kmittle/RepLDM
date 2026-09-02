@@ -1,5 +1,12 @@
 # 实验计划：动态可学习的 Attention Guidance Scale
 
+> **主线修订（2026-09-01）：本文件已降为历史方案。** 当前唯一研究主线是使用
+> **OPD、DPO 和 RL 训练小型 latent renderer**。Attention Guidance 只作为会议版
+> 基线、teacher 构造方式或“latent 结构渲染”的思想联系；不得再把动态 scale、
+> DRaFT 或静态 guidance sweep 当作默认下一步。当前执行顺序以
+> [`TODO_2026_08_31.md`](TODO_2026_08_31.md) 为准。三种训练方法必须共享 renderer、
+> 数据、NFE、seed、reward 查询和完整 benchmark 预算。
+
 > **状态修订（2026-08-24）：** 下面的 DRaFT/RL 计划是历史设计，当前不满足进入条件。
 > S5、LR-1 和 S6（FreeU 结构 baseline 及 feature-moment 对照）均未产生通过 guards
 > 的固定动作，因此不得按本文旧计划启动训练。下一轮必须先登记新的

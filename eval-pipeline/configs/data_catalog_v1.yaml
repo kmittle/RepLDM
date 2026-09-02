@@ -1,0 +1,622 @@
+schema: repldm.data_catalog.v1
+output_dir: DATA
+
+training_license_policy:
+  allowed_statuses:
+    - verified_from_dataset_card
+    - verified_from_local_geneval_repository
+  mode: fail_closed
+
+payload_integrity_policy:
+  catalog_role: candidate_inventory
+  training_ready: false
+  requirement: A selected training view must have a complete SHA-256 payload manifest before training.
+
+expected_protected_normalized_unique_prompts: 46619
+expected_protected_unique_images: 37160
+expected_holdout_stats:
+  rows: 49393
+  training_eligible_rows: 0
+  rows_with_prompt: 49393
+  rows_with_image: 39712
+  missing_images: 0
+  benchmark_exact_match_rows: 49393
+  modalities:
+    benchmark_image_text: 39712
+    benchmark_prompt: 9681
+  splits:
+    heldout: 49393
+
+physical_sources:
+  - id: pixel_render_miah204
+    path: /mnt/miah204/bycao/Pixel-Render
+    role: code_and_high_resolution_data
+    logical_datasets:
+      - pixel_render_image_only
+      - aesthetic_4k
+      - style30k
+      - omnistyle_available
+      - 4klsdb_metadata_mirror
+    notes: Contains the 5,058,099-row image manifest and several extracted datasets.
+  - id: sana_miah204
+    path: /mnt/miah204/bycao/Sana
+    role: code_manifests_and_post_training_prompts
+    logical_datasets:
+      - four_k_lsdb
+      - sana_pickscore_prompts
+      - sana_ocr_prompts
+      - sana_geneval_prompts
+      - sana_drawbench_prompts
+    notes: Contains the usable 4KLSDB manifest and prompt pools used by Sana post-training.
+  - id: pixel_render_miah209
+    path: /mnt/miah209/bycao/Pixel-Render
+    role: image_payloads_and_benchmarks
+    logical_datasets:
+      - four_k_lsdb_images
+      - pixverve_95k
+      - pixverve_benchmark
+      - mjhq_30k_benchmark
+      - geneval_repository
+    notes: Holds image payloads; MJHQ, GenEval test, and PixVerve-Bench are benchmark-only.
+  - id: sana_data_miah209
+    path: /mnt/miah209/bycao/sana_data
+    role: derived_feature_cache
+    logical_datasets:
+      - sana_4klsdb_text_features
+    notes: Eight packed Gemma-2-2B feature shards derived from the 4KLSDB manifest.
+  - id: sana_runs_miah209
+    path: /mnt/miah209/bycao/sana_runs
+    role: run_provenance_not_training_data
+    logical_datasets: []
+    notes: Checkpoints, logs, and resolved configs; this directory is not a new dataset.
+
+protected_prompt_sources:
+  - id: hpsv2_official
+    path: eval-pipeline/prompts/hpsv2_official_3200.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: HPSv2 benchmark terms
+    license_status: benchmark_only
+    expected_prompts: 3200
+    expected_bytes: 391751
+    expected_sha256: bf51e0eb6659dcbf5666df1f6813334fb10f65bc40018f22c83abc6a801463c7
+  - id: geneval_test
+    path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/test_metadata.jsonl
+    format: jsonl
+    prompt_keys: [prompt]
+    source_roots: [sana_miah204]
+    license: MIT
+    license_status: verified_from_local_geneval_repository
+    expected_prompts: 2212
+    expected_bytes: 340836
+    expected_sha256: eb9d9f624e76c2efb1bf8495494121d30e86d73358022502b071bebcfc8a2ad7
+  - id: drawbench_test
+    path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/drawbench/test.txt
+    format: text
+    prompt_keys: [prompt]
+    source_roots: [sana_miah204]
+    license: DrawBench evaluation prompts
+    license_status: benchmark_only
+    expected_prompts: 1000
+    expected_bytes: 65165
+    expected_sha256: e90795ab8b9118f0d8251bff71f54b04d9dc5c19490d22003d5d7c942d473ebe
+  - id: pickscore_test
+    path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/pickscore/test.txt
+    format: text
+    prompt_keys: [prompt]
+    source_roots: [sana_miah204]
+    license: Pick-a-Pic v1 upstream terms
+    license_status: review_required
+    expected_prompts: 2048
+    expected_bytes: 239891
+    expected_sha256: d75c025fa451866e70f7e36243f7cdd93095523cb51f5f9651f2ce3236d20262
+  - id: ocr_test
+    path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/ocr/test.txt
+    format: text
+    prompt_keys: [prompt]
+    source_roots: [sana_miah204]
+    license: Sana repository copy
+    license_status: review_required
+    expected_prompts: 1018
+    expected_bytes: 217566
+    expected_sha256: 3cc501e3d935b1ce72b2b423af648a67b2b98b8a03fcdf3eed4cf6c6ea2a2f78
+  - id: pixverve_benchmark
+    path: /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-95K-metadata/benchmark.jsonl
+    format: jsonl
+    prompt_keys: [long_caption, short_caption]
+    source_roots: [pixel_render_miah209]
+    image_root: /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-Bench
+    image_path_mode: flat_file_name
+    license: Apache-2.0
+    license_status: verified_from_dataset_card
+    expected_prompts: 400
+    expected_bytes: 387869
+    expected_sha256: 444797a605809ff3a6eb7e9a095f2a2909bb3c87aa0ccbf27de84059401e98ea
+  - id: mjhq_30k
+    path: /mnt/miah209/bycao/Pixel-Render/data/MJHQ-30K/meta_data.json
+    format: json_map
+    prompt_keys: [prompt]
+    source_roots: [pixel_render_miah209]
+    image_root: /mnt/miah209/bycao/Pixel-Render/data/MJHQ-30K
+    image_path_mode: category_key_jpg
+    license: terms_not_bundled
+    license_status: benchmark_only
+    expected_prompts: 30000
+    expected_bytes: 8819316
+    expected_sha256: db9cc0a0c637adbb16eda4c644e46dd23b63111f70434649d66a601e0f0eef30
+  - id: aesthetic_4k_eval_2048
+    path: /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/eval/size_2048/metadata.jsonl
+    format: jsonl
+    prompt_keys: [text]
+    source_roots: [pixel_render_miah204]
+    image_root: /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/eval/size_2048
+    image_path_mode: flat_file_name
+    license: MIT
+    license_status: benchmark_only
+    expected_prompts: 2781
+    expected_bytes: 681092
+    expected_sha256: cf7693e850ebc885ac083f750804aa1cee92e1d1178dbf90518adedec0a54e1d
+  - id: aesthetic_4k_eval_4096
+    path: /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/eval/size_4096/metadata.jsonl
+    format: jsonl
+    prompt_keys: [text]
+    source_roots: [pixel_render_miah204]
+    image_root: /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/eval/size_4096
+    image_path_mode: flat_file_name
+    license: MIT
+    license_status: benchmark_only
+    expected_prompts: 195
+    expected_bytes: 47989
+    expected_sha256: 2601b1a16c5ab26739148aa3876a96076347ab15e4c8aefca091e7a42c5b12b8
+  - id: four_k_lsdb_validation
+    path: /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/validation_metadata.csv
+    format: csv
+    prompt_keys: [caption, cogvlm_caption]
+    source_roots: [pixel_render_miah209]
+    image_root: /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/image
+    image_path_mode: sharded_id_jpg
+    image_shard_glob: validation_x4-*-of-00004
+    image_subdir: hr
+    image_id_key: id
+    expected_image_shards: 4
+    expected_unique_images: 2000
+    license: CC-BY-4.0
+    license_status: verified_from_dataset_card
+    expected_prompts: 3174
+    expected_bytes: 703833
+    expected_sha256: 77195c7b7bcd5f6169e2aaec1086be45e310fa713bebc0d3373c5c365a0c7880
+  - id: four_k_lsdb_test
+    path: /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/test_metadata.csv
+    format: csv
+    prompt_keys: [caption, cogvlm_caption]
+    source_roots: [pixel_render_miah209]
+    image_root: /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/image
+    image_path_mode: sharded_id_jpg
+    image_shard_glob: test_bicubic_x4-*-of-00004
+    image_subdir: hr
+    image_id_key: id
+    expected_image_shards: 4
+    expected_unique_images: 1984
+    license: CC-BY-4.0
+    license_status: verified_from_dataset_card
+    expected_prompts: 3162
+    expected_bytes: 704532
+    expected_sha256: 8964fb39584e00428bbfcb8a1a155b378ca34171a298aced16e4023d9c6a178b
+  - id: repldm_eval_v1
+    path: eval-pipeline/prompts/eval_v1.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 12
+    expected_bytes: 1661
+    expected_sha256: 61ff7418b40581be7312a27a771a9f7ffee4e752e68759693d132c084227a4ef
+  - id: repldm_latent_renderer_validation
+    path: eval-pipeline/prompts/latent_renderer_validation.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 24
+    expected_bytes: 3008
+    expected_sha256: 6ae2ec66045a6ee517d3350b1f10978cc818e40eb0287379d7542bc07207b6f3
+  - id: repldm_latent_renderer_test
+    path: eval-pipeline/prompts/latent_renderer_test.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 24
+    expected_bytes: 2963
+    expected_sha256: 5ce5f20a2103e72f293a56063e4793a03fadba75e729347082f3dcdd2efde699
+  - id: repldm_fixed_headroom_development
+    path: eval-pipeline/prompts/scheduler_native_fixed_headroom_development.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 33
+    expected_bytes: 3693
+    expected_sha256: 065a86b95200eb89dc367ffe0f9f8c2d0a64fdab827e4004a1b629b169a6173f
+  - id: repldm_fixed_headroom_validation
+    path: eval-pipeline/prompts/scheduler_native_fixed_headroom_validation.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 22
+    expected_bytes: 2543
+    expected_sha256: 928d3d3ea5cb4df39b86d78803028b9fb238ac8a57201737f7f59d00ee9b7a18
+  - id: repldm_fixed_headroom_final
+    path: eval-pipeline/prompts/scheduler_native_fixed_headroom_final.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 22
+    expected_bytes: 2353
+    expected_sha256: dd4dd54488c10b6254aa7edf9183219f2ac841603b16e149bf938b4d0f1bbe14
+  - id: repldm_trajectory_validation
+    path: eval-pipeline/prompts/trajectory_correction_validation_v1.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 44
+    expected_bytes: 4886
+    expected_sha256: 232367e83b84641ffdd4ee2973cdb962c5c0e5fbc5a636cffea890b9f8a22f82
+  - id: repldm_trajectory_heldout
+    path: eval-pipeline/prompts/trajectory_correction_heldout_v1.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 11
+    expected_bytes: 1619
+    expected_sha256: 120ffaeae40cef1e29d1bf77139713b440514314d8b0df6b29dcbe29a078999a
+  - id: repldm_adaptive_oracle_engineering
+    path: eval-pipeline/prompts/adaptive_oracle_engineering.csv
+    format: csv
+    prompt_keys: [TEXT]
+    source_roots: [repldm]
+    license: internal_evaluation_split
+    license_status: benchmark_only
+    expected_prompts: 11
+    expected_bytes: 1647
+    expected_sha256: 84b723ff9e2aab6a892e23bd9780a47e97c75be2d7c3fcd3f8185620564ac1d0
+
+datasets:
+  - id: four_k_lsdb
+    adapter: four_k_lsdb
+    output: four_k_lsdb.jsonl
+    expected_rows: 129484
+    include_in_training_candidates: true
+    source_roots: [sana_miah204, pixel_render_miah209]
+    manifest: /mnt/miah204/bycao/Sana/data/4klsdb/index.jsonl
+    expected_stats:
+      training_eligible_rows: 129484
+      rows_with_prompt: 129484
+      rows_with_image: 129484
+      missing_images: 0
+      benchmark_exact_match_rows: 0
+      modalities: {image_text: 129484}
+      splits: {train: 129484}
+  - id: pixverve_95k
+    adapter: pixverve
+    output: pixverve_95k.jsonl
+    expected_rows: 95735
+    include_in_training_candidates: true
+    source_roots: [pixel_render_miah209]
+    manifest: /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-95K-metadata/data.jsonl
+    image_root: /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-95K
+    expected_stats:
+      training_eligible_rows: 95733
+      rows_with_prompt: 95735
+      rows_with_image: 95735
+      missing_images: 0
+      benchmark_exact_match_rows: 2
+      modalities: {image_text: 95735}
+      splits: {train: 95735}
+  - id: sana_pickscore_prompts
+    adapter: sana_prompts
+    output: sana_pickscore_prompts.jsonl
+    expected_rows: 27480
+    include_in_training_candidates: false
+    source_roots: [sana_miah204]
+    license: Pick-a-Pic v1 upstream terms not bundled
+    license_status: review_required_before_release
+    intended_use: [rl_prompt_pool, dpo_candidate_generation]
+    splits:
+      - name: train
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/pickscore/train.txt
+        format: text
+        training_eligible: false
+        exclusion_reason: source_license_review_required
+      - name: test
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/pickscore/test.txt
+        format: text
+        training_eligible: false
+        exclusion_reason: heldout_prompt_split
+    expected_stats:
+      training_eligible_rows: 0
+      rows_with_prompt: 27480
+      rows_with_image: 0
+      missing_images: 0
+      benchmark_exact_match_rows: 2055
+      modalities: {prompt: 27480}
+      splits: {test: 2048, train: 25432}
+  - id: sana_ocr_prompts
+    adapter: sana_prompts
+    output: sana_ocr_prompts.jsonl
+    expected_rows: 20671
+    include_in_training_candidates: false
+    source_roots: [sana_miah204]
+    license: Sana repository copy; upstream prompt provenance not bundled
+    license_status: review_required_before_release
+    intended_use: [rl_prompt_pool, text_rendering_reward_training]
+    splits:
+      - name: train
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/ocr/train.txt
+        format: text
+        training_eligible: false
+        exclusion_reason: source_license_review_required
+      - name: test
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/ocr/test.txt
+        format: text
+        training_eligible: false
+        exclusion_reason: heldout_prompt_split
+    expected_stats:
+      training_eligible_rows: 0
+      rows_with_prompt: 20671
+      rows_with_image: 0
+      missing_images: 0
+      benchmark_exact_match_rows: 1019
+      modalities: {prompt: 20671}
+      splits: {test: 1018, train: 19653}
+  - id: sana_geneval_prompts
+    adapter: sana_prompts
+    output: sana_geneval_prompts.jsonl
+    expected_rows: 52212
+    include_in_training_candidates: true
+    source_roots: [sana_miah204]
+    license: MIT
+    license_status: verified_from_local_geneval_repository
+    intended_use: [rl_prompt_pool, compositional_reward_training]
+    splits:
+      - name: train
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/train_metadata.jsonl
+        format: jsonl
+        training_eligible: true
+      - name: test
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/test_metadata.jsonl
+        format: jsonl
+        training_eligible: false
+        exclusion_reason: formal_geneval_test_split
+    expected_stats:
+      training_eligible_rows: 50000
+      rows_with_prompt: 52212
+      rows_with_image: 0
+      missing_images: 0
+      benchmark_exact_match_rows: 2212
+      modalities: {prompt: 52212}
+      splits: {test: 2212, train: 50000}
+  - id: sana_drawbench_prompts
+    adapter: sana_prompts
+    output: sana_drawbench_prompts.jsonl
+    expected_rows: 1001
+    include_in_training_candidates: false
+    source_roots: [sana_miah204]
+    license: DrawBench evaluation prompts
+    license_status: benchmark_only
+    intended_use: [benchmark_only]
+    splits:
+      - name: train_named_file
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/drawbench/train.txt
+        format: text
+        training_eligible: false
+        exclusion_reason: drawbench_reserved_for_evaluation
+      - name: test
+        path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/drawbench/test.txt
+        format: text
+        training_eligible: false
+        exclusion_reason: drawbench_reserved_for_evaluation
+    expected_stats:
+      training_eligible_rows: 0
+      rows_with_prompt: 1001
+      rows_with_image: 0
+      missing_images: 0
+      benchmark_exact_match_rows: 1001
+      modalities: {prompt: 1001}
+      splits: {test: 1000, train_named_file: 1}
+  - id: aesthetic_4k
+    adapter: aesthetic_4k
+    output: aesthetic_4k.jsonl
+    expected_rows: 14985
+    include_in_training_candidates: true
+    source_roots: [pixel_render_miah204]
+    root: /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K
+    expected_stats:
+      training_eligible_rows: 12009
+      rows_with_prompt: 2976
+      rows_with_image: 14985
+      missing_images: 0
+      benchmark_exact_match_rows: 2976
+      modalities: {benchmark_image_text: 2976, image_only: 12009}
+      splits: {size_2048: 2781, size_4096: 195, train: 12009}
+  - id: style30k
+    adapter: style30k
+    output: style30k.jsonl
+    expected_rows: 25868
+    include_in_training_candidates: true
+    source_roots: [pixel_render_miah204]
+    root: /mnt/miah204/bycao/Pixel-Render/data/Style30K
+    expected_stats:
+      training_eligible_rows: 25868
+      rows_with_prompt: 0
+      rows_with_image: 25868
+      missing_images: 0
+      benchmark_exact_match_rows: 0
+      modalities: {image_style: 25868}
+      splits: {train: 25868}
+  - id: omnistyle_available
+    adapter: omnistyle
+    output: omnistyle_available.jsonl
+    expected_rows: 2762
+    include_in_training_candidates: false
+    source_roots: [pixel_render_miah204]
+    root: /mnt/miah204/bycao/Pixel-Render/data/OmniStyle-150k
+    style_mapper: /mnt/miah204/bycao/Pixel-Render/data/Style30K/style30k/style_mapper.json
+    expected_stats:
+      training_eligible_rows: 0
+      rows_with_prompt: 1812
+      rows_with_image: 2762
+      missing_images: 0
+      benchmark_exact_match_rows: 0
+      modalities: {image_style: 950, image_text: 1812}
+      splits: {available_content: 1812, available_style: 950}
+  - id: pixel_render_image_only
+    adapter: pixel_render_images
+    output: pixel_render_image_only.jsonl
+    expected_rows: 5058099
+    expected_stats:
+      rows_with_prompt: 0
+      rows_with_image: 3287110
+      missing_images: 1770989
+      training_eligible_rows: 0
+      benchmark_exact_match_rows: 0
+      modalities: {image_only: 3287110, missing_image_reference: 1770989}
+      splits: {train: 5058099}
+    include_in_training_candidates: false
+    source_roots: [pixel_render_miah204]
+    manifest: /mnt/miah204/bycao/Pixel-Render/data/SR-pretrain-data.jsonl
+    data_root: /mnt/miah204/bycao/Pixel-Render
+  - id: sana_4klsdb_text_features
+    adapter: sana_feature_cache
+    output: sana_4klsdb_text_features.jsonl
+    expected_rows: 8
+    include_in_training_candidates: false
+    source_roots: [sana_data_miah209, sana_miah204]
+    root: /mnt/miah209/bycao/sana_data/4klsdb_text_feat_packed
+    expected_stats:
+      training_eligible_rows: 0
+      rows_with_prompt: 0
+      rows_with_image: 0
+      missing_images: 0
+      benchmark_exact_match_rows: 0
+      modalities: {text_feature_cache: 8}
+      splits: {derived_cache: 8}
+
+expected_training_candidate_stats:
+  rows: 313094
+  training_eligible_rows: 313094
+  rows_with_prompt: 275217
+  rows_with_image: 263094
+  missing_images: 0
+  benchmark_exact_match_rows: 0
+  modalities:
+    image_only: 12009
+    image_style: 25868
+    image_text: 225217
+    prompt: 50000
+  splits:
+    train: 313094
+
+training_views:
+  - schema: repldm.training_view.v1
+    id: opd_prompt_pool
+    artifact: training_candidates.jsonl
+    filter: {prompt_is_not_null: true}
+    expected_rows: 275217
+    notes: Prompts for on-policy student rollout followed by teacher labeling.
+  - schema: repldm.training_view.v1
+    id: opd_reference_image_text
+    artifact: training_candidates.jsonl
+    filter: {modality_in: [image_text]}
+    expected_rows: 225217
+    notes: High-quality image-text pairs for initialization and representation checks.
+  - schema: repldm.training_view.v1
+    id: dpo_prompt_pool_requires_pair_generation
+    artifact: training_candidates.jsonl
+    filter: {prompt_is_not_null: true}
+    expected_rows: 275217
+    notes: These are prompts, not preference pairs; generate matched candidates and labels before DPO.
+  - schema: repldm.training_view.v1
+    id: rl_prompt_pool
+    artifact: training_candidates.jsonl
+    filter: {prompt_is_not_null: true}
+    expected_rows: 275217
+    notes: Prompt pool for reward-guided rollout; keep evaluation prompts excluded.
+  - schema: repldm.training_view.v1
+    id: latent_structure_pretraining
+    artifact: training_candidates.jsonl
+    filter: {modality_in: [image_only, image_style]}
+    expected_rows: 37877
+    notes: Image-only initialization; do not treat these rows as text supervision.
+
+expected_artifact_order:
+  - benchmark_holdouts.jsonl
+  - four_k_lsdb.jsonl
+  - pixverve_95k.jsonl
+  - sana_pickscore_prompts.jsonl
+  - sana_ocr_prompts.jsonl
+  - sana_geneval_prompts.jsonl
+  - sana_drawbench_prompts.jsonl
+  - aesthetic_4k.jsonl
+  - style30k.jsonl
+  - omnistyle_available.jsonl
+  - pixel_render_image_only.jsonl
+  - sana_4klsdb_text_features.jsonl
+  - training_candidates.jsonl
+  - training_views.jsonl
+  - source_inventory.jsonl
+
+# Frozen from a development derivation after adding the complete local 4KLSDB holdouts.
+# A formal clean build must reproduce every byte count and SHA-256 below.
+expected_artifact_hashes: {}
+
+cross_checks:
+  four_k_lsdb_manifest: /mnt/miah204/bycao/Sana/data/4klsdb/index.jsonl
+  sana_cache_meta: /mnt/miah209/bycao/sana_data/4klsdb_text_feat_packed/meta.json
+
+provenance_files:
+  - /mnt/miah204/bycao/Pixel-Render/data/unsplash-full/TERMS.md
+  - /mnt/miah204/bycao/Sana/data/4klsdb/index.jsonl
+  - /mnt/miah204/bycao/Pixel-Render/data/4KLSDB/README.md
+  - /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/README.md
+  - /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/README.md
+  - /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-95K-metadata/data.jsonl
+  - /mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-95K-metadata/benchmark.jsonl
+  - /mnt/miah204/bycao/Pixel-Render/data/SR-pretrain-data.jsonl
+  - /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/README.md
+  - /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/eval/size_2048/metadata.jsonl
+  - /mnt/miah204/bycao/Pixel-Render/data/Aesthetic-4K/eval/size_4096/metadata.jsonl
+  - /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/validation_metadata.csv
+  - /mnt/miah209/bycao/Pixel-Render/data/4KLSDB/test_metadata.csv
+  - /mnt/miah204/bycao/Pixel-Render/data/Style30K/README.md
+  - /mnt/miah204/bycao/Pixel-Render/data/Style30K/style30k/list.txt
+  - /mnt/miah204/bycao/Pixel-Render/data/Style30K/style30k/style_mapper.json
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/pickscore/train.txt
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/pickscore/test.txt
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/ocr/train.txt
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/ocr/test.txt
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/train_metadata.jsonl
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/test_metadata.jsonl
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/drawbench/train.txt
+  - /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/drawbench/test.txt
+  - /mnt/miah209/bycao/Pixel-Render/data/MJHQ-30K/meta_data.json
+  - /mnt/miah209/bycao/Pixel-Render/data/MJHQ-30K/README.md
+  - /mnt/miah209/bycao/sana_data/4klsdb_text_feat_packed/meta.json
+  - /mnt/miah209/bycao/sana_runs/xsa_1600m_1024_a3_bf16base/config.yaml
+  - /mnt/miah209/bycao/sana_runs/xsa_1600m_1024_a3_ginit0.01_bf16base/config.yaml
+  - /mnt/miah209/bycao/sana_runs/xsa_1600m_1024_a4_ginit0.01_bf16base/config.yaml
+  - /mnt/miah209/bycao/sana_runs/xsa_1600m_1024_a4_ginit0.01_v2_bf16base/config.yaml
+  - /mnt/miah209/bycao/sana_runs/xsa_1600m_1024_a4_ginit0.01_v3_bf16base/config.yaml

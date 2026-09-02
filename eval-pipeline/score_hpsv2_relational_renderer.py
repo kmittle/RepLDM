@@ -1,9 +1,9 @@
 """Transactional scorer for the frozen HPSv2 relational-renderer experiment.
 
-Reads a run's manifest, runs the configured Scorers (self-contained metric modules
-under scorers/, each decoupled from Sana), and writes scores.jsonl. Each metric is
-declared in a yaml config (configs/eval_common.yaml). Weights are validated up front
-so a missing metric is SKIPPED with a warning instead of crashing the run.
+Reads a run's manifest, runs the configured private-asset Scorers under
+hpsv2_scorers/, and writes scores.jsonl. Each metric is declared in a YAML config.
+Weights are validated up front so a missing metric is SKIPPED with a warning instead
+of crashing the run. The shared scorers/ package remains frozen for older runs.
 
 Resume is additive when enabled metrics and their execution provenance still match.
 Strict runs bind source, package/runtime, model asset, and preprocessing metadata;
@@ -15,11 +15,14 @@ receipt are published only after complete scoring and a clean watchdog exit.
       eval-pipeline/score_hpsv2_relational_renderer.py \
       --run_dir outputs/hpsv2_relational_renderer/full_v1 \
       --config eval-pipeline/configs/hpsv2_full_scoring_v1.yaml \
-      --device cuda:2 --strict --require-scorer-provenance \
+      --device cuda:4 --strict --require-scorer-provenance \
       --require-exclusive-gpu
 """
 import argparse
+from collections.abc import Mapping
 from contextlib import contextmanager
+import ctypes
+import errno
 import fcntl
 import hashlib
 import io
@@ -41,10 +44,8 @@ THIS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, THIS)
 
 import yaml  # noqa: E402
-import scorers  # noqa: E402,F401  (import registers all metrics)
-import scorers.base as scorer_base  # noqa: E402
-from scorers.base import REGISTRY  # noqa: E402
 from scorer_provenance import (  # noqa: E402
+    HPSV2_PRIVATE_SOURCE_CLOSURE,
     SCORER_PROVENANCE_SCHEMA,
     build_scorer_provenance,
     registered_scorer_provenance_contract,
@@ -60,19 +61,62 @@ from s7_provenance import (  # noqa: E402
 )
 
 
-EXCLUSIVE_CUDA_EXECUTION_SCHEMA = "repldm_exclusive_cuda_execution_v1"
+EXCLUSIVE_CUDA_EXECUTION_SCHEMA = "repldm_exclusive_cuda_execution_v3"
+EXCLUSIVE_CUDA_OBSERVATION_SCHEMA = "repldm_exclusive_cuda_observation_v2"
 EXCLUSIVE_CUDA_POLL_SECONDS = 2.0
 SCORING_SUCCESS_SCHEMA = "repldm_scoring_success_v1"
 SCORING_SUCCESS_NAME = "scoring_success.json"
 SCORING_PROGRESS_SCHEMA = "repldm_scoring_progress_v1"
 SCORING_PROGRESS_RECEIPT_NAME = ".scoring_progress.json"
+SCORING_PROGRESS_POISON_SCHEMA = "repldm_scoring_progress_poison_v1"
+SCORING_PROGRESS_POISON_NAME = ".scoring_progress.poison"
+SCORING_PUBLICATION_JOURNAL_SCHEMA = "repldm_scoring_publication_journal_v1"
+SCORING_PUBLICATION_JOURNAL_NAME = ".scoring_publication.json"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SCORING_PROGRESS_PAYLOAD_RE = re.compile(
     r"^\.scoring_progress\.([0-9a-f]{32})\.([0-9a-f]{64})\.jsonl$"
 )
-SCORER_ASSET_STAGE_PREFIX = "repldm-scorer-assets-"
+_SCORING_PUBLICATION_BACKUP_RE = re.compile(
+    r"^\.scoring_publication\.backup\.(scores|receipt)\.([0-9a-f]{64})"
+    r"\.(jsonl|json)$"
+)
+SCORER_ASSET_STAGE_NAME = ".scorer_asset_stage"
+SCORER_ASSET_OWNER_NAME = ".owner.json"
+SCORER_ASSET_OWNER_SCHEMA = "repldm_scorer_asset_stage_owner_v1"
 SCORER_ASSET_LOADING_MODE = "pinned_private_stage_v1"
+NETWORK_ISOLATION_SCHEMA = "linux_seccomp_network_deny_v2"
+REGISTRY = {}
+_NETWORK_SECCOMP_INSTALLED = False
+
+# Socket operations are denied even for inherited descriptors. This closes
+# AF_INET descriptors transferred over SCM_RIGHTS as well as ordinary socket
+# creation. AF_UNIX socketpair is handled separately for pipe-style read/write.
+_NETWORK_DENIED_SYSCALLS_X86_64 = (
+    40,  # sendfile
+    41,  # socket
+    42,  # connect
+    43,  # accept
+    44,  # sendto / send
+    45,  # recvfrom / recv
+    46,  # sendmsg
+    47,  # recvmsg
+    48,  # shutdown
+    49,  # bind
+    50,  # listen
+    51,  # getsockname
+    52,  # getpeername
+    54,  # setsockopt
+    55,  # getsockopt
+    288,  # accept4
+    299,  # recvmmsg
+    307,  # sendmmsg
+    425,  # io_uring_setup
+    426,  # io_uring_enter
+    427,  # io_uring_register
+    438,  # pidfd_getfd
+)
+_SOCKETPAIR_SYSCALL_X86_64 = 53
 
 
 class ExclusiveCudaWatchdogError(RuntimeError):
@@ -81,6 +125,199 @@ class ExclusiveCudaWatchdogError(RuntimeError):
 
 class ScorerAssetStageError(RuntimeError):
     """A copied scorer asset changed or could not be handled safely."""
+
+
+class ScoringAttemptPoisonedError(RuntimeError):
+    """A scoring attempt and its cleanup both failed; progress is unusable."""
+
+
+def _load_scorer_registry(*, formal_registered_scoring):
+    """Import result-affecting scorer plugins only after the formal sandbox."""
+    if formal_registered_scoring:
+        import hpsv2_scorers
+        import hpsv2_scorers.base as base_module
+
+        if base_module.NETWORK_ISOLATION_SCHEMA != NETWORK_ISOLATION_SCHEMA:
+            raise RuntimeError(
+                "private scorer and runner network-isolation schemas differ"
+            )
+        return hpsv2_scorers.REGISTRY, base_module.__file__
+
+    import scorers
+    import scorers.base as base_module
+
+    return (REGISTRY or scorers.REGISTRY), base_module.__file__
+
+
+def _seccomp_instruction_type():
+    class SockFilter(ctypes.Structure):
+        _fields_ = [
+            ("code", ctypes.c_ushort),
+            ("jt", ctypes.c_ubyte),
+            ("jf", ctypes.c_ubyte),
+            ("k", ctypes.c_uint32),
+        ]
+
+    return SockFilter
+
+
+def _reject_open_network_sockets():
+    """Fail closed when scoring inherited any socket descriptor."""
+    for descriptor_name in os.listdir("/proc/self/fd"):
+        descriptor_path = f"/proc/self/fd/{descriptor_name}"
+        try:
+            target = os.readlink(descriptor_path)
+        except OSError:
+            continue
+        if not target.startswith("socket:["):
+            continue
+        raise RuntimeError(
+            "registered scoring inherited a socket descriptor"
+        )
+
+
+def _process_seccomp_modes():
+    """Read the kernel seccomp mode for every currently live process thread."""
+    modes = {}
+    for task_name in sorted(os.listdir("/proc/self/task"), key=int):
+        if not task_name.isdigit():
+            continue
+        try:
+            with open(
+                f"/proc/self/task/{task_name}/status", encoding="utf-8"
+            ) as handle:
+                status = handle.read()
+        except FileNotFoundError:
+            continue
+        mode = None
+        for line in status.splitlines():
+            if line.startswith("Seccomp:"):
+                mode = int(line.split(":", 1)[1].strip())
+                break
+        if mode is None:
+            raise RuntimeError(
+                f"cannot verify seccomp mode for scoring thread {task_name}"
+            )
+        modes[int(task_name)] = mode
+    if not modes:
+        raise RuntimeError("cannot enumerate scoring process threads")
+    return modes
+
+
+def _verify_process_network_seccomp():
+    modes = _process_seccomp_modes()
+    unfiltered = sorted(tid for tid, mode in modes.items() if mode != 2)
+    if unfiltered:
+        raise RuntimeError(
+            "offline scoring seccomp filter is missing from threads "
+            + ",".join(map(str, unfiltered))
+        )
+    _reject_open_network_sockets()
+
+
+def install_network_seccomp_filter():
+    """Irreversibly deny network syscalls in this process and all descendants."""
+    global _NETWORK_SECCOMP_INSTALLED
+    if _NETWORK_SECCOMP_INSTALLED:
+        _verify_process_network_seccomp()
+        return NETWORK_ISOLATION_SCHEMA
+    if sys.platform != "linux" or os.uname().machine not in ("x86_64", "amd64"):
+        raise RuntimeError("registered scoring requires Linux x86-64 seccomp")
+    _reject_open_network_sockets()
+
+    bpf_ld = 0x00
+    bpf_w = 0x00
+    bpf_abs = 0x20
+    bpf_jmp = 0x05
+    bpf_jeq = 0x10
+    bpf_jge = 0x30
+    bpf_k = 0x00
+    bpf_ret = 0x06
+    seccomp_ret_kill_process = 0x80000000
+    seccomp_ret_errno = 0x00050000
+    seccomp_ret_allow = 0x7FFF0000
+    audit_arch_x86_64 = 0xC000003E
+    pr_set_no_new_privs = 38
+    sys_seccomp = 317
+    seccomp_set_mode_filter = 1
+    seccomp_filter_flag_tsync = 1
+    sock_filter = _seccomp_instruction_type()
+
+    def statement(code, value):
+        return sock_filter(code, 0, 0, value)
+
+    def jump(code, value, jump_true, jump_false):
+        return sock_filter(code, jump_true, jump_false, value)
+
+    instructions = [
+        statement(bpf_ld | bpf_w | bpf_abs, 4),
+        jump(bpf_jmp | bpf_jeq | bpf_k, audit_arch_x86_64, 1, 0),
+        statement(bpf_ret | bpf_k, seccomp_ret_kill_process),
+        statement(bpf_ld | bpf_w | bpf_abs, 0),
+        jump(bpf_jmp | bpf_jge | bpf_k, 0x40000000, 0, 1),
+        statement(bpf_ret | bpf_k, seccomp_ret_errno | errno.EPERM),
+    ]
+    for syscall_number in _NETWORK_DENIED_SYSCALLS_X86_64:
+        instructions.extend(
+            (
+                jump(bpf_jmp | bpf_jeq | bpf_k, syscall_number, 0, 1),
+                statement(
+                    bpf_ret | bpf_k,
+                    seccomp_ret_errno | errno.EPERM,
+                ),
+            )
+        )
+    instructions.extend(
+        (
+            jump(
+                bpf_jmp | bpf_jeq | bpf_k,
+                _SOCKETPAIR_SYSCALL_X86_64,
+                0,
+                4,
+            ),
+            statement(bpf_ld | bpf_w | bpf_abs, 16),
+            jump(bpf_jmp | bpf_jeq | bpf_k, socket.AF_UNIX, 1, 0),
+            statement(bpf_ret | bpf_k, seccomp_ret_errno | errno.EPERM),
+            statement(bpf_ret | bpf_k, seccomp_ret_allow),
+        )
+    )
+    instructions.append(statement(bpf_ret | bpf_k, seccomp_ret_allow))
+    instruction_array = (sock_filter * len(instructions))(*instructions)
+
+    class SockFprog(ctypes.Structure):
+        _fields_ = [
+            ("len", ctypes.c_ushort),
+            ("filter", ctypes.POINTER(sock_filter)),
+        ]
+
+    program = SockFprog(len(instructions), instruction_array)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(pr_set_no_new_privs, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise RuntimeError(
+            f"cannot enable no_new_privs for offline scoring: {os.strerror(error)}"
+        )
+    libc.syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    result = libc.syscall(
+        ctypes.c_long(sys_seccomp),
+        ctypes.c_uint(seccomp_set_mode_filter),
+        ctypes.c_ulong(seccomp_filter_flag_tsync),
+        ctypes.byref(program),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        if result > 0:
+            raise RuntimeError(
+                "cannot synchronize offline scoring seccomp filter to thread "
+                f"{result}"
+            )
+        raise RuntimeError(
+            f"cannot install offline scoring seccomp filter: {os.strerror(error)}"
+        )
+    _verify_process_network_seccomp()
+    _NETWORK_SECCOMP_INSTALLED = True
+    return NETWORK_ISOLATION_SCHEMA
 
 
 def _file_identity(value):
@@ -92,6 +329,10 @@ def _file_identity(value):
         int(value.st_mtime_ns),
         int(value.st_ctime_ns),
     )
+
+
+def _directory_owner_identity(value):
+    return (int(value.st_dev), int(value.st_ino))
 
 
 def _safe_stage_relative_path(value):
@@ -256,10 +497,215 @@ def _clear_stage_directory(directory_descriptor):
             os.unlink(name, dir_fd=directory_descriptor)
 
 
+def _process_start_ticks(pid):
+    """Return Linux /proc start ticks, or None when the process is gone."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii") as handle:
+            value = handle.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (OSError, ValueError) as exc:
+        raise ScorerAssetStageError("cannot inspect scorer stage owner") from exc
+    closing = value.rfind(")")
+    fields = value[closing + 2 :].split() if closing >= 0 else []
+    if len(fields) <= 19:
+        raise ScorerAssetStageError("scorer stage owner process record is invalid")
+    try:
+        ticks = int(fields[19])
+    except ValueError as exc:
+        raise ScorerAssetStageError(
+            "scorer stage owner process start time is invalid"
+        ) from exc
+    return ticks if ticks >= 0 else None
+
+
+def _boot_id():
+    try:
+        payload = _read_regular_bytes(
+            "/proc/sys/kernel/random/boot_id", "kernel boot id"
+        )
+        value = payload.decode("ascii").strip().lower()
+    except (RuntimeError, UnicodeDecodeError) as exc:
+        raise ScorerAssetStageError("cannot bind scorer stage boot id") from exc
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) is None:
+        raise ScorerAssetStageError("kernel boot id is invalid")
+    return value
+
+
+def _scorer_stage_owner_bytes(owner):
+    return (
+        json.dumps(
+            owner,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _validate_scorer_stage_owner(owner, payload):
+    expected = {
+        "schema",
+        "attempt_id",
+        "pid",
+        "process_start_ticks",
+        "boot_id",
+        "run_directory_identity",
+        "stage_directory_identity",
+    }
+    if not isinstance(owner, dict) or set(owner) != expected:
+        raise ScorerAssetStageError("scorer stage owner fields differ")
+    if owner.get("schema") != SCORER_ASSET_OWNER_SCHEMA:
+        raise ScorerAssetStageError("scorer stage owner schema differs")
+    if _ATTEMPT_ID_RE.fullmatch(str(owner.get("attempt_id", ""))) is None:
+        raise ScorerAssetStageError("scorer stage owner attempt id is invalid")
+    for key in ("pid", "process_start_ticks"):
+        value = owner.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ScorerAssetStageError(f"scorer stage owner {key} is invalid")
+    boot_id = owner.get("boot_id")
+    if not isinstance(boot_id, str) or not boot_id:
+        raise ScorerAssetStageError("scorer stage owner boot id is invalid")
+    for key in ("run_directory_identity", "stage_directory_identity"):
+        identity = owner.get(key)
+        if (
+            not isinstance(identity, list)
+            or len(identity) != 2
+            or any(not isinstance(value, int) for value in identity)
+        ):
+            raise ScorerAssetStageError(f"scorer stage owner {key} is invalid")
+    if payload != _scorer_stage_owner_bytes(owner):
+        raise ScorerAssetStageError("scorer stage owner is not canonical")
+    return owner
+
+
+def _stage_owner_is_live(owner):
+    if owner.get("boot_id") != _boot_id():
+        return False
+    observed = _process_start_ticks(owner["pid"])
+    return observed is not None and observed == owner["process_start_ticks"]
+
+
+def _recover_stale_scorer_asset_stage(run_dir):
+    """Remove only a dead, identity-bound run-local scorer stage."""
+    raw_parent = Path(run_dir)
+    try:
+        raw_parent_status = raw_parent.lstat()
+        parent = raw_parent.resolve(strict=True)
+    except OSError as exc:
+        raise ScorerAssetStageError("scorer run directory is unavailable") from exc
+    if stat.S_ISLNK(raw_parent_status.st_mode) or not stat.S_ISDIR(
+        raw_parent_status.st_mode
+    ):
+        raise ScorerAssetStageError("scorer run directory is unsafe")
+    parent_descriptor = os.open(
+        parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    root_descriptor = -1
+    try:
+        try:
+            public = os.stat(
+                SCORER_ASSET_STAGE_NAME,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return parent, parent_descriptor
+        if not stat.S_ISDIR(public.st_mode):
+            raise ScorerAssetStageError("scorer asset stage path is unsafe")
+        root_descriptor = os.open(
+            SCORER_ASSET_STAGE_NAME,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(root_descriptor)
+        if _file_identity(public) != _file_identity(opened):
+            raise ScorerAssetStageError(
+                "scorer asset stage changed during stale recovery"
+            )
+        names = sorted(os.listdir(root_descriptor))
+        if names:
+            if SCORER_ASSET_OWNER_NAME not in names:
+                raise ScorerAssetStageError(
+                    "nonempty scorer asset stage has no owner marker"
+                )
+            owner_path = parent / SCORER_ASSET_STAGE_NAME / SCORER_ASSET_OWNER_NAME
+            payload = _read_regular_bytes(owner_path, "scorer stage owner")
+            try:
+                owner = json.loads(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ScorerAssetStageError(
+                    "scorer stage owner is invalid JSON"
+                ) from exc
+            owner = _validate_scorer_stage_owner(owner, payload)
+            if tuple(owner["run_directory_identity"]) != _directory_owner_identity(
+                os.fstat(parent_descriptor)
+            ) or tuple(owner["stage_directory_identity"]) != _directory_owner_identity(
+                opened
+            ):
+                raise ScorerAssetStageError(
+                    "scorer stage owner directory identity differs"
+                )
+            if _stage_owner_is_live(owner):
+                raise ScorerAssetStageError(
+                    "scorer asset stage is owned by a live process"
+                )
+        _clear_stage_directory(root_descriptor)
+        os.rmdir(SCORER_ASSET_STAGE_NAME, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+        os.close(root_descriptor)
+        root_descriptor = -1
+        return parent, parent_descriptor
+    except BaseException:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        os.close(parent_descriptor)
+        raise
+
+
+def _write_scorer_stage_owner(root_descriptor, owner):
+    payload = _scorer_stage_owner_bytes(owner)
+    descriptor = os.open(
+        SCORER_ASSET_OWNER_NAME,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o400,
+        dir_fd=root_descriptor,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+        status = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(root_descriptor)
+    return {
+        "identity": _file_identity(status),
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
 class ScorerAssetStage:
     """Private copied scorer files loaded through one pinned directory FD."""
 
-    def __init__(self, metric_names, params):
+    def __init__(
+        self, metric_names, params, *, run_dir, registry=None, attempt_id=None
+    ):
         self.parent = None
         self.path = None
         self.proc_root = None
@@ -273,51 +719,71 @@ class ScorerAssetStage:
         self.file_identities = {}
         self.directory_identities = {}
         self.closed = False
+        self.cleanup_verified = False
+        self.owns_stage = False
+        self.registry = REGISTRY if registry is None else registry
+        self.attempt_id = str(attempt_id or uuid.uuid4().hex)
+        if _ATTEMPT_ID_RE.fullmatch(self.attempt_id) is None:
+            raise ValueError("scorer asset stage attempt id is invalid")
         try:
-            raw_parent = Path(tempfile.gettempdir())
-            if raw_parent.is_symlink():
-                raise ScorerAssetStageError(
-                    "scorer asset staging parent must not be a symlink"
-                )
-            parent = raw_parent.resolve(strict=True)
-            parent_stat = parent.stat()
-            if parent_stat.st_mode & 0o022 and not (
-                parent_stat.st_mode & stat.S_ISVTX
-            ):
-                raise ScorerAssetStageError(
-                    "scorer asset staging parent is unsafe"
-                )
-            self.parent = parent
-            self.parent_descriptor = os.open(
-                parent,
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
+            self.parent, self.parent_descriptor = (
+                _recover_stale_scorer_asset_stage(run_dir)
             )
-            if _file_identity(os.fstat(self.parent_descriptor)) != _file_identity(
-                parent_stat
-            ):
-                raise ScorerAssetStageError(
-                    "scorer asset staging parent changed while it was opened"
-                )
-            self.path = Path(
-                tempfile.mkdtemp(prefix=SCORER_ASSET_STAGE_PREFIX, dir=parent)
+            self.path = self.parent / SCORER_ASSET_STAGE_NAME
+            os.mkdir(
+                SCORER_ASSET_STAGE_NAME,
+                mode=0o700,
+                dir_fd=self.parent_descriptor,
             )
+            os.fsync(self.parent_descriptor)
+            self.owns_stage = True
             self.root_descriptor = os.open(
-                self.path,
+                SCORER_ASSET_STAGE_NAME,
                 os.O_RDONLY
                 | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self.parent_descriptor,
             )
+            public = os.stat(
+                SCORER_ASSET_STAGE_NAME,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(self.root_descriptor)
+            if _file_identity(public) != _file_identity(opened):
+                raise ScorerAssetStageError(
+                    "scorer asset stage changed while it was opened"
+                )
             self.proc_root = Path("/proc/self/fd") / str(self.root_descriptor)
-            staged_names = set()
+            owner = {
+                "schema": SCORER_ASSET_OWNER_SCHEMA,
+                "attempt_id": self.attempt_id,
+                "pid": os.getpid(),
+                "process_start_ticks": _process_start_ticks(os.getpid()),
+                "boot_id": _boot_id(),
+                "run_directory_identity": list(
+                    _directory_owner_identity(os.fstat(self.parent_descriptor))
+                ),
+                "stage_directory_identity": list(
+                    _directory_owner_identity(opened)
+                ),
+            }
+            owner_record = _write_scorer_stage_owner(
+                self.root_descriptor, owner
+            )
+            self.file_identities[SCORER_ASSET_OWNER_NAME] = owner_record[
+                "identity"
+            ]
+            self.control_file_records = {
+                SCORER_ASSET_OWNER_NAME: owner_record
+            }
+            staged_names = {SCORER_ASSET_OWNER_NAME}
             for metric_name in metric_names:
                 metric_path = _safe_stage_relative_path(metric_name)
                 if len(metric_path.parts) != 1:
                     raise ValueError("scorer metric name is unsafe for staging")
-                cls = REGISTRY.get(metric_name)
+                cls = self.registry.get(metric_name)
                 builder = getattr(cls, "asset_sources", None)
                 specs = builder(**params) if callable(builder) else {}
                 if not isinstance(specs, dict):
@@ -453,7 +919,7 @@ class ScorerAssetStage:
                 "scorer asset stage directory identity changed"
             )
         observed_files = sorted(observed)
-        expected_files = sorted(row["path"] for row in self.rows)
+        expected_files = sorted(self.file_identities)
         if observed_files != expected_files:
             raise ScorerAssetStageError(
                 "scorer asset stage inventory changed"
@@ -471,6 +937,20 @@ class ScorerAssetStage:
             if record["sha256"] != row["sha256"]:
                 raise ScorerAssetStageError(
                     "scorer asset stage hash changed"
+                )
+        for path, expected in self.control_file_records.items():
+            record = observed[path]
+            if record["identity"] != expected["identity"]:
+                raise ScorerAssetStageError(
+                    "scorer asset stage control-file identity changed"
+                )
+            if record["size_bytes"] != expected["size_bytes"]:
+                raise ScorerAssetStageError(
+                    "scorer asset stage control-file size changed"
+                )
+            if record["sha256"] != expected["sha256"]:
+                raise ScorerAssetStageError(
+                    "scorer asset stage control-file hash changed"
                 )
         return {
             "schema": "repldm_scorer_asset_stage_v1",
@@ -512,9 +992,13 @@ class ScorerAssetStage:
                 del sys.modules[name]
         sys.path[:] = [value for value in sys.path if not belongs_to_stage(value)]
         try:
-            if self.root_descriptor >= 0:
+            if self.owns_stage and self.root_descriptor >= 0:
                 _clear_stage_directory(self.root_descriptor)
-            if self.path is not None and self.parent_descriptor >= 0:
+            if (
+                self.owns_stage
+                and self.path is not None
+                and self.parent_descriptor >= 0
+            ):
                 try:
                     public = os.stat(
                         self.path.name,
@@ -542,6 +1026,7 @@ class ScorerAssetStage:
                             dir_fd=self.parent_descriptor,
                         )
                         os.fsync(self.parent_descriptor)
+                        self.owns_stage = False
         finally:
             if self.root_descriptor >= 0:
                 os.close(self.root_descriptor)
@@ -552,21 +1037,41 @@ class ScorerAssetStage:
             self.closed = True
         if cleanup_error is not None:
             raise cleanup_error
+        self.cleanup_verified = bool(verify)
 
 
 @contextmanager
-def staged_scorer_assets(metric_names, params, *, enabled):
+def staged_scorer_assets(
+    metric_names,
+    params,
+    *,
+    enabled,
+    run_dir,
+    registry=None,
+    attempt_id=None,
+):
     if not enabled:
         yield None
         return
-    stage = ScorerAssetStage(metric_names, params)
+    stage = ScorerAssetStage(
+        metric_names,
+        params,
+        run_dir=run_dir,
+        registry=registry,
+        attempt_id=attempt_id,
+    )
     try:
         yield stage
     except BaseException as primary:
         try:
             stage.cleanup()
         except BaseException as cleanup_error:
-            primary.add_note(f"scorer asset cleanup also failed: {cleanup_error}")
+            poisoned = ScoringAttemptPoisonedError(
+                "scoring failed and scorer asset cleanup also failed"
+            )
+            poisoned.primary_error = primary
+            poisoned.cleanup_error = cleanup_error
+            raise poisoned from primary
         raise
     else:
         stage.cleanup()
@@ -606,32 +1111,116 @@ def formal_offline_network_guard(*, enabled):
         socket.socket = original_socket
 
 
-def exclusive_cuda_execution_contract(device):
-    """Describe the fail-closed process monitor used by one scoring run."""
+def exclusive_cuda_execution_contract(device, *, target_identity):
+    """Bind one Torch CUDA device to the stable watchdog policy and hardware."""
     normalized_device = str(device)
     if re.fullmatch(r"cuda:\d+", normalized_device) is None:
         raise ValueError("exclusive CUDA execution requires an explicit cuda:N device")
+    expected_identity_fields = {
+        "physical_device_index",
+        "gpu_uuid",
+        "pci_bus_id",
+        "gpu_name",
+        "torch_device_uuid",
+    }
+    if not isinstance(target_identity, Mapping) or set(target_identity) != (
+        expected_identity_fields
+    ):
+        raise ValueError("exclusive CUDA target identity fields differ")
+    identity = dict(target_identity)
+    if identity["physical_device_index"] != int(normalized_device.split(":", 1)[1]):
+        raise ValueError("exclusive CUDA physical device index differs")
+    if _normalize_gpu_uuid(identity["gpu_uuid"]) != identity["gpu_uuid"]:
+        raise ValueError("exclusive CUDA GPU UUID is not canonical")
+    if identity["torch_device_uuid"] != identity["gpu_uuid"]:
+        raise ValueError("exclusive CUDA Torch UUID differs")
+    if _normalize_pci_bus_id(identity["pci_bus_id"]) != identity["pci_bus_id"]:
+        raise ValueError("exclusive CUDA PCI bus id is not canonical")
+    if not isinstance(identity["gpu_name"], str) or not identity["gpu_name"]:
+        raise ValueError("exclusive CUDA GPU name is invalid")
     return {
         "schema": EXCLUSIVE_CUDA_EXECUTION_SCHEMA,
         "exclusive_cuda_process": True,
         "device": normalized_device,
+        "target_identity": identity,
         "poll_seconds": EXCLUSIVE_CUDA_POLL_SECONDS,
         "query_backend": "nvidia-smi",
         "allowed_process_policy": "scorer_pid_only",
+        "gpu_identity_policy": "torch_uuid_to_nvidia_uuid_index_pci_v2",
+        "scorer_pid_presence_policy": "required_on_target_only_each_observation",
+        "scorer_pid_start_time_policy": "required_and_unchanged_each_observation",
+        "final_observation_required": True,
     }
 
 
 def validate_exclusive_cuda_execution_contract(
     contract, observed_sha256, *, expected_device
 ):
-    """Require the exact watchdog contract and its canonical hash."""
-    expected = exclusive_cuda_execution_contract(expected_device)
-    if contract != expected:
+    """Validate a hardware-bound watchdog contract and its canonical hash."""
+    if not isinstance(contract, Mapping):
+        raise ValueError("exclusive CUDA scoring execution contract is invalid")
+    target_identity = contract.get("target_identity")
+    try:
+        expected = exclusive_cuda_execution_contract(
+            expected_device, target_identity=target_identity
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError("exclusive CUDA scoring execution contract differs") from exc
+    if dict(contract) != expected:
         raise ValueError("exclusive CUDA scoring execution contract differs")
-    digest = json_sha256(expected)
+    digest = json_sha256(dict(contract))
     if observed_sha256 != digest:
         raise ValueError("exclusive CUDA scoring execution hash differs")
     return digest
+
+
+def exclusive_cuda_observation_contract(
+    execution_sha256, *, scorer_pid, process_start_ticks
+):
+    _require_sha256(
+        execution_sha256, label="CUDA execution observation parent SHA-256"
+    )
+    for label, value in (
+        ("scorer PID", scorer_pid),
+        ("scorer process start ticks", process_start_ticks),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{label} is invalid")
+    return {
+        "schema": EXCLUSIVE_CUDA_OBSERVATION_SCHEMA,
+        "execution_provenance_sha256": execution_sha256,
+        "scorer_pid": int(scorer_pid),
+        "process_start_ticks": int(process_start_ticks),
+        "entry_observation": {
+            "gpu_identity_unchanged": True,
+            "scorer_pid_present_on_target_only": True,
+            "foreign_process_count": 0,
+        },
+        "final_observation": {
+            "gpu_identity_unchanged": True,
+            "scorer_pid_present_on_target_only": True,
+            "foreign_process_count": 0,
+        },
+        "minimum_observation_count": 2,
+    }
+
+
+def validate_exclusive_cuda_observation_contract(
+    contract, *, execution_sha256
+):
+    if not isinstance(contract, Mapping):
+        raise ValueError("exclusive CUDA scoring observation is invalid")
+    try:
+        expected = exclusive_cuda_observation_contract(
+            execution_sha256,
+            scorer_pid=contract.get("scorer_pid"),
+            process_start_ticks=contract.get("process_start_ticks"),
+        )
+    except ValueError as exc:
+        raise ValueError("exclusive CUDA scoring observation differs") from exc
+    if dict(contract) != expected:
+        raise ValueError("exclusive CUDA scoring observation differs")
+    return json_sha256(expected)
 
 
 def _task_id_binding(rows, *, label):
@@ -943,79 +1532,257 @@ def _nvidia_smi(arguments):
     return result.stdout
 
 
-def _exclusive_cuda_conflicts(device, allowed_pid):
+def _normalize_gpu_uuid(value):
+    raw = str(value).strip().lower()
+    if raw.startswith("gpu-"):
+        raw = raw[4:]
+    if re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", raw
+    ) is None:
+        raise RuntimeError("CUDA GPU UUID is invalid")
+    return f"GPU-{raw}"
+
+
+def _normalize_pci_bus_id(value):
+    raw = str(value).strip().upper()
+    if re.fullmatch(r"[0-9A-F]{4}:[0-9A-F]{2}:[0-9A-F]{2}\.[0-7]", raw):
+        raw = "0000" + raw
+    if re.fullmatch(
+        r"[0-9A-F]{8}:[0-9A-F]{2}:[0-9A-F]{2}\.[0-7]", raw
+    ) is None:
+        raise RuntimeError("CUDA PCI bus id is invalid")
+    return raw
+
+
+def _nvidia_gpu_inventory():
+    output = _nvidia_smi(
+        [
+            "--query-gpu=index,uuid,pci.bus_id,name",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    rows = []
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",", 3)]
+        if len(fields) != 4:
+            raise RuntimeError("nvidia-smi returned an invalid GPU inventory row")
+        try:
+            index = int(fields[0])
+        except ValueError as exc:
+            raise RuntimeError("nvidia-smi returned an invalid GPU index") from exc
+        rows.append(
+            {
+                "physical_device_index": index,
+                "gpu_uuid": _normalize_gpu_uuid(fields[1]),
+                "pci_bus_id": _normalize_pci_bus_id(fields[2]),
+                "gpu_name": fields[3],
+            }
+        )
+    if not rows:
+        raise RuntimeError("nvidia-smi returned an empty GPU inventory")
+    if len({row["physical_device_index"] for row in rows}) != len(rows):
+        raise RuntimeError("nvidia-smi GPU indices are duplicated")
+    if len({row["gpu_uuid"] for row in rows}) != len(rows):
+        raise RuntimeError("nvidia-smi GPU UUIDs are duplicated")
+    if len({row["pci_bus_id"] for row in rows}) != len(rows):
+        raise RuntimeError("nvidia-smi GPU PCI bus ids are duplicated")
+    return rows
+
+
+def _torch_cuda_uuid(properties):
+    value = getattr(properties, "uuid", None)
+    if value is None:
+        raise RuntimeError("Torch CUDA properties do not expose a GPU UUID")
+    return _normalize_gpu_uuid(value)
+
+
+def resolve_scoring_cuda_identity(torch_module, device):
+    """Bind a Torch CUDA device to one unique NVML index, UUID, and PCI id."""
     if "CUDA_VISIBLE_DEVICES" in os.environ or "CUDA_DEVICE_ORDER" in os.environ:
         raise RuntimeError("exclusive GPU scoring requires unmasked physical CUDA ids")
     matched = re.fullmatch(r"cuda:(\d+)", str(device))
     if matched is None:
         raise RuntimeError("exclusive GPU scoring requires an explicit cuda:N device")
-    physical_index = int(matched.group(1))
-    inventory = _nvidia_smi(
-        ["--query-gpu=index,uuid", "--format=csv,noheader,nounits"]
-    )
-    matches = []
-    for line in inventory.splitlines():
-        fields = [field.strip() for field in line.split(",", 1)]
-        if len(fields) == 2 and fields[0] == str(physical_index):
-            matches.append(fields[1])
+    requested_index = int(matched.group(1))
+    if torch_module.cuda.current_device() != requested_index:
+        raise RuntimeError("Torch current device differs from scoring cuda:N")
+    properties = torch_module.cuda.get_device_properties(requested_index)
+    torch_uuid = _torch_cuda_uuid(properties)
+    matches = [
+        row for row in _nvidia_gpu_inventory() if row["gpu_uuid"] == torch_uuid
+    ]
     if len(matches) != 1:
-        raise RuntimeError("exclusive scoring GPU is absent or ambiguous")
-    target_uuid = matches[0]
+        raise RuntimeError("Torch GPU UUID is absent or ambiguous in nvidia-smi")
+    identity = dict(matches[0])
+    if identity["physical_device_index"] != requested_index:
+        raise RuntimeError("Torch GPU UUID maps to a different physical GPU index")
+    if identity["gpu_name"] != str(properties.name):
+        raise RuntimeError("Torch and nvidia-smi GPU names differ")
+    identity["torch_device_uuid"] = torch_uuid
+    return identity
+
+
+def _exclusive_cuda_observation(
+    target_identity, allowed_pid, *, allowed_process_start_ticks=None
+):
+    """Observe one GPU while binding the allowed PID to its original process."""
+    expected_fields = {
+        "physical_device_index",
+        "gpu_uuid",
+        "pci_bus_id",
+        "gpu_name",
+        "torch_device_uuid",
+    }
+    if not isinstance(target_identity, dict) or set(target_identity) != expected_fields:
+        raise RuntimeError("exclusive scoring GPU identity is invalid")
+    if target_identity["gpu_uuid"] != target_identity["torch_device_uuid"]:
+        raise RuntimeError("Torch and nvidia-smi GPU UUIDs differ")
+    if (
+        not isinstance(allowed_process_start_ticks, int)
+        or isinstance(allowed_process_start_ticks, bool)
+        or allowed_process_start_ticks < 0
+    ):
+        raise RuntimeError("scorer process start time is missing or invalid")
+    observed_start_before = _process_start_ticks(allowed_pid)
+    if observed_start_before != allowed_process_start_ticks:
+        raise RuntimeError("scorer process start time differs from the bound PID")
+    matches = [
+        row
+        for row in _nvidia_gpu_inventory()
+        if row["gpu_uuid"] == target_identity["gpu_uuid"]
+    ]
+    expected_public_identity = {
+        key: target_identity[key]
+        for key in (
+            "physical_device_index",
+            "gpu_uuid",
+            "pci_bus_id",
+            "gpu_name",
+        )
+    }
+    if len(matches) != 1 or matches[0] != expected_public_identity:
+        raise RuntimeError("exclusive scoring GPU identity drifted")
     processes = _nvidia_smi(
         [
             "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
             "--format=csv,noheader,nounits",
         ]
     )
-    conflicts = []
+    target_processes = []
+    own_processes = []
     for line in processes.splitlines():
         fields = [field.strip() for field in line.split(",", 3)]
-        if len(fields) != 4 or fields[0] != target_uuid:
-            continue
+        if len(fields) != 4:
+            raise RuntimeError("nvidia-smi returned an invalid compute-process row")
+        gpu_uuid = _normalize_gpu_uuid(fields[0])
         try:
             pid = int(fields[1])
-        except ValueError:
-            pid = -1
-        if pid != int(allowed_pid):
-            conflicts.append(
-                {
-                    "gpu_uuid": fields[0],
-                    "pid": pid,
-                    "process_name": fields[2],
-                    "used_memory_mib": fields[3],
-                }
+        except ValueError as exc:
+            raise RuntimeError("nvidia-smi returned an invalid compute PID") from exc
+        row = {
+            "gpu_uuid": gpu_uuid,
+            "pid": pid,
+            "process_name": fields[2],
+            "used_memory_mib": fields[3],
+        }
+        if gpu_uuid == target_identity["gpu_uuid"]:
+            target_processes.append(row)
+        if pid == int(allowed_pid):
+            own_processes.append(row)
+    if len(own_processes) != 1:
+        raise RuntimeError(
+            "scorer PID is missing or duplicated in NVIDIA compute-process state"
+        )
+    if own_processes[0]["gpu_uuid"] != target_identity["gpu_uuid"]:
+        raise RuntimeError("scorer PID is running on a different physical GPU")
+    observed_start_after = _process_start_ticks(allowed_pid)
+    if observed_start_after != allowed_process_start_ticks:
+        raise RuntimeError("scorer process changed while GPU state was queried")
+    conflicts = [row for row in target_processes if row["pid"] != int(allowed_pid)]
+    return {
+        "target_identity": dict(target_identity),
+        "scorer_pid": int(allowed_pid),
+        "scorer_process_start_ticks": int(allowed_process_start_ticks),
+        "scorer_pid_present": True,
+        "scorer_process_start_time_unchanged": True,
+        "foreign_processes": conflicts,
+    }
+
+
+def _exclusive_cuda_conflicts(device, allowed_pid, *, target_identity=None):
+    if target_identity is None:
+        matched = re.fullmatch(r"cuda:(\d+)", str(device))
+        if matched is None:
+            raise RuntimeError(
+                "exclusive GPU scoring requires an explicit cuda:N device"
             )
-    return conflicts
+        requested_index = int(matched.group(1))
+        matches = [
+            row
+            for row in _nvidia_gpu_inventory()
+            if row["physical_device_index"] == requested_index
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("exclusive scoring GPU is absent or ambiguous")
+        target_identity = {
+            **matches[0],
+            "torch_device_uuid": matches[0]["gpu_uuid"],
+        }
+    process_start_ticks = _process_start_ticks(allowed_pid)
+    observation = _exclusive_cuda_observation(
+        target_identity,
+        allowed_pid,
+        allowed_process_start_ticks=process_start_ticks,
+    )
+    return observation["foreign_processes"]
 
 
 class ExclusiveCudaWatchdog:
     """Continuously fail scoring if a foreign process appears on its GPU."""
 
     def __init__(
-        self, device, enabled, poll_seconds=EXCLUSIVE_CUDA_POLL_SECONDS
+        self,
+        device,
+        enabled,
+        poll_seconds=EXCLUSIVE_CUDA_POLL_SECONDS,
+        *,
+        target_identity=None,
     ):
         self.device = device
         self.enabled = bool(enabled)
         self.poll_seconds = float(poll_seconds)
         self.pid = os.getpid()
+        self.process_start_ticks = _process_start_ticks(self.pid)
         self.stop_event = threading.Event()
         self.failures = []
         self.thread = None
+        self.target_identity = target_identity
+        self.observations = []
+        self.finalized = False
 
     def _check_now(self):
         try:
-            conflicts = _exclusive_cuda_conflicts(self.device, self.pid)
+            if self.target_identity is None:
+                raise RuntimeError("exclusive scoring GPU identity is missing")
+            observation = _exclusive_cuda_observation(
+                self.target_identity,
+                self.pid,
+                allowed_process_start_ticks=self.process_start_ticks,
+            )
         except ExclusiveCudaWatchdogError:
             raise
         except BaseException as exc:
             raise ExclusiveCudaWatchdogError(
                 f"exclusive GPU scoring query failed: {exc}"
             ) from exc
+        conflicts = observation["foreign_processes"]
         if conflicts:
             raise ExclusiveCudaWatchdogError(
                 "foreign compute process appeared during scoring: "
                 + json.dumps(conflicts, sort_keys=True)
             )
+        self.observations.append(observation)
+        return observation
 
     def _monitor(self):
         while not self.stop_event.wait(self.poll_seconds):
@@ -1034,6 +1801,10 @@ class ExclusiveCudaWatchdog:
 
     def __enter__(self):
         if self.enabled:
+            if self.target_identity is None:
+                raise ExclusiveCudaWatchdogError(
+                    "exclusive scoring GPU identity is missing"
+                )
             self._check_now()
             self.thread = threading.Thread(
                 target=self._monitor,
@@ -1055,6 +1826,7 @@ class ExclusiveCudaWatchdog:
                 )
         self.assert_healthy()
         self._check_now()
+        self.finalized = True
         return False
 
 
@@ -1136,6 +1908,32 @@ def atomic_text_writer(path):
     except BaseException:
         if handle is None:
             os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_atomic_bytes(path, payload):
+    """Durably replace one regular file with exact bytes in the same directory."""
+    destination = os.path.abspath(path)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        dir=os.path.dirname(destination),
+    )
+    handle = None
+    try:
+        handle = os.fdopen(descriptor, "wb")
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        if handle is None:
+            os.close(descriptor)
         try:
             os.unlink(temporary)
         except FileNotFoundError:
@@ -1282,6 +2080,155 @@ def load_verified_score_publication(run_dir, receipt_context):
     return score_rows
 
 
+def _scoring_poison_path(run_dir):
+    return os.path.join(os.path.abspath(run_dir), SCORING_PROGRESS_POISON_NAME)
+
+
+def _scoring_poison_bytes(payload):
+    return (
+        json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _validate_scoring_poison(payload, raw):
+    expected = {
+        "schema",
+        "status",
+        "attempt_id",
+        "pid",
+        "process_start_ticks",
+        "boot_id",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise ScoringAttemptPoisonedError("scoring progress poison fields differ")
+    if payload.get("schema") != SCORING_PROGRESS_POISON_SCHEMA:
+        raise ScoringAttemptPoisonedError("scoring progress poison schema differs")
+    if payload.get("status") != "in_progress":
+        raise ScoringAttemptPoisonedError("scoring progress poison status differs")
+    if _ATTEMPT_ID_RE.fullmatch(str(payload.get("attempt_id", ""))) is None:
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison attempt id is invalid"
+        )
+    for key in ("pid", "process_start_ticks"):
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ScoringAttemptPoisonedError(
+                f"scoring progress poison {key} is invalid"
+            )
+    try:
+        boot_id = _boot_id()
+    except ScorerAssetStageError as exc:
+        raise ScoringAttemptPoisonedError(
+            "cannot validate scoring progress poison boot id"
+        ) from exc
+    value = payload.get("boot_id")
+    if not isinstance(value, str) or not value:
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison boot id is invalid"
+        )
+    if raw != _scoring_poison_bytes(payload):
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison is not canonical"
+        )
+    payload["current_boot"] = value == boot_id
+    return payload
+
+
+def _load_scoring_poison(run_dir):
+    path = _scoring_poison_path(run_dir)
+    raw = _read_regular_bytes(path, "scoring progress poison")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison is invalid JSON"
+        ) from exc
+    return _validate_scoring_poison(payload, raw)
+
+
+def _scoring_progress_temporary_paths(run_dir):
+    root = os.path.abspath(run_dir)
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []
+    prefixes = (
+        ".scoring_progress.stage.",
+        f".{SCORING_PROGRESS_RECEIPT_NAME}.",
+        f".{SCORING_PROGRESS_POISON_NAME}.",
+    )
+    return [
+        os.path.join(root, name)
+        for name in sorted(names)
+        if name.endswith(".tmp") and name.startswith(prefixes)
+    ]
+
+
+def _recover_poisoned_scoring_progress(run_dir):
+    """Discard every progress artifact left by a dead poisoned attempt."""
+    poison_path = _scoring_poison_path(run_dir)
+    if not os.path.lexists(poison_path):
+        changed = False
+        for path in _scoring_progress_temporary_paths(run_dir):
+            os.unlink(path)
+            changed = True
+        if changed:
+            _fsync_directory(run_dir)
+        return None
+    poison = _load_scoring_poison(run_dir)
+    if poison["current_boot"]:
+        observed = _process_start_ticks(poison["pid"])
+        if observed is not None and observed == poison["process_start_ticks"]:
+            raise ScoringAttemptPoisonedError(
+                "scoring progress poison is owned by a live process"
+            )
+    _clear_scoring_progress(run_dir)
+    os.unlink(poison_path)
+    _fsync_directory(run_dir)
+    return str(poison["attempt_id"])
+
+
+def _begin_scoring_progress_poison(run_dir, *, attempt_id):
+    path = _scoring_poison_path(run_dir)
+    if os.path.lexists(path):
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison already exists"
+        )
+    payload = {
+        "schema": SCORING_PROGRESS_POISON_SCHEMA,
+        "status": "in_progress",
+        "attempt_id": str(attempt_id),
+        "pid": os.getpid(),
+        "process_start_ticks": _process_start_ticks(os.getpid()),
+        "boot_id": _boot_id(),
+    }
+    _write_atomic_bytes(path, _scoring_poison_bytes(payload))
+    _fsync_directory(run_dir)
+    observed = _load_scoring_poison(run_dir)
+    if observed["attempt_id"] != str(attempt_id):
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison changed after publication"
+        )
+    return payload
+
+
+def _finish_scoring_progress_poison(run_dir, *, attempt_id):
+    poison = _load_scoring_poison(run_dir)
+    if poison["attempt_id"] != str(attempt_id):
+        raise ScoringAttemptPoisonedError(
+            "scoring progress poison attempt id differs"
+        )
+    os.unlink(_scoring_poison_path(run_dir))
+    _fsync_directory(run_dir)
+
+
 def _scoring_progress_receipt_path(run_dir):
     return os.path.join(
         os.path.abspath(run_dir), SCORING_PROGRESS_RECEIPT_NAME
@@ -1350,7 +2297,15 @@ def build_scoring_progress_receipt(
     }
 
 
-def load_verified_scoring_progress(run_dir, receipt_context):
+def load_verified_scoring_progress(
+    run_dir, receipt_context, *, allow_poison_attempt_id=None
+):
+    if os.path.lexists(_scoring_poison_path(run_dir)):
+        poison = _load_scoring_poison(run_dir)
+        if poison["attempt_id"] != str(allow_poison_attempt_id):
+            raise ScoringAttemptPoisonedError(
+                "poisoned scoring progress is not resumable"
+            )
     receipt_path = _scoring_progress_receipt_path(run_dir)
     if not os.path.lexists(receipt_path):
         return [], None, None
@@ -1436,7 +2391,11 @@ def _write_scoring_progress(
     with atomic_text_writer(receipt_path) as handle:
         handle.write(scoring_success_receipt_bytes(receipt).decode("ascii"))
     _fsync_directory(root)
-    _, _, verified_path = load_verified_scoring_progress(root, receipt_context)
+    _, _, verified_path = load_verified_scoring_progress(
+        root,
+        receipt_context,
+        allow_poison_attempt_id=attempt_id,
+    )
     for path in _scoring_progress_payload_paths(root):
         if path != verified_path:
             os.unlink(path)
@@ -1446,7 +2405,11 @@ def _write_scoring_progress(
 def _clear_scoring_progress(run_dir):
     changed = False
     receipt_path = _scoring_progress_receipt_path(run_dir)
-    paths = [receipt_path, *_scoring_progress_payload_paths(run_dir)]
+    paths = [
+        receipt_path,
+        *_scoring_progress_payload_paths(run_dir),
+        *_scoring_progress_temporary_paths(run_dir),
+    ]
     for path in paths:
         if not os.path.lexists(path):
             continue
@@ -1475,45 +2438,277 @@ def _clear_canonical_scoring_outputs(run_dir):
         _fsync_directory(run_dir)
 
 
-def _canonical_scoring_backup(run_dir):
-    scores_path = os.path.join(run_dir, "scores.jsonl")
-    receipt_path = os.path.join(run_dir, SCORING_SUCCESS_NAME)
-    if not os.path.lexists(scores_path) and not os.path.lexists(receipt_path):
-        return None
-    if not os.path.lexists(scores_path) or not os.path.lexists(receipt_path):
-        return None
-    try:
-        return (
-            _read_regular_bytes(scores_path, "previous canonical scores"),
-            _read_regular_bytes(receipt_path, "previous scoring receipt"),
+def _publication_journal_bytes(journal):
+    return (
+        json.dumps(
+            journal,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
         )
-    except (RuntimeError, ValueError):
-        return None
+        + "\n"
+    ).encode("ascii")
 
 
-def _restore_canonical_scoring_backup(run_dir, backup):
-    scores_payload, receipt_payload = backup
-    scores_path = os.path.join(run_dir, "scores.jsonl")
-    receipt_path = os.path.join(run_dir, SCORING_SUCCESS_NAME)
+def _publication_backup_name(kind, digest):
+    if kind not in ("scores", "receipt"):
+        raise ValueError("scoring publication backup kind is invalid")
+    _require_sha256(digest, label="scoring publication backup SHA-256")
+    extension = "jsonl" if kind == "scores" else "json"
+    return f".scoring_publication.backup.{kind}.{digest}.{extension}"
+
+
+def _publication_payload_record(payload, *, kind, include_path):
+    digest = hashlib.sha256(payload).hexdigest()
+    record = {"sha256": digest, "size_bytes": len(payload)}
+    if include_path:
+        record["path"] = _publication_backup_name(kind, digest)
+    return record
+
+
+def _validate_publication_payload_record(record, *, kind, include_path):
+    expected_fields = {"sha256", "size_bytes"}
+    if include_path:
+        expected_fields.add("path")
+    if not isinstance(record, dict) or set(record) != expected_fields:
+        raise RuntimeError("scoring publication payload binding fields differ")
+    _require_sha256(record.get("sha256"), label="scoring publication payload SHA-256")
+    size = record.get("size_bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise RuntimeError("scoring publication payload size is invalid")
+    if include_path and record.get("path") != _publication_backup_name(
+        kind, record["sha256"]
+    ):
+        raise RuntimeError("scoring publication backup path is invalid")
+    return record
+
+
+def _load_publication_journal(run_dir):
+    journal_path = os.path.join(run_dir, SCORING_PUBLICATION_JOURNAL_NAME)
+    payload = _read_regular_bytes(journal_path, "scoring publication journal")
     try:
-        with atomic_text_writer(scores_path) as handle:
-            handle.write(scores_payload.decode("utf-8"))
-        with atomic_text_writer(receipt_path) as handle:
-            handle.write(receipt_payload.decode("utf-8"))
+        journal = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("scoring publication journal is invalid JSON") from exc
+    if not isinstance(journal, dict) or set(journal) != {
+        "schema",
+        "transaction_id",
+        "old_publication",
+        "new_publication",
+    }:
+        raise RuntimeError("scoring publication journal fields differ")
+    if journal.get("schema") != SCORING_PUBLICATION_JOURNAL_SCHEMA:
+        raise RuntimeError("scoring publication journal schema differs")
+    transaction_id = journal.get("transaction_id")
+    if not isinstance(transaction_id, str) or _ATTEMPT_ID_RE.fullmatch(
+        transaction_id
+    ) is None:
+        raise RuntimeError("scoring publication transaction id is invalid")
+    new_publication = journal.get("new_publication")
+    if not isinstance(new_publication, dict) or set(new_publication) != {
+        "scores",
+        "receipt",
+    }:
+        raise RuntimeError("new scoring publication binding fields differ")
+    for kind in ("scores", "receipt"):
+        _validate_publication_payload_record(
+            new_publication.get(kind), kind=kind, include_path=False
+        )
+    old_publication = journal.get("old_publication")
+    if old_publication is not None:
+        if not isinstance(old_publication, dict) or set(old_publication) != {
+            "scores",
+            "receipt",
+        }:
+            raise RuntimeError("old scoring publication binding fields differ")
+        for kind in ("scores", "receipt"):
+            _validate_publication_payload_record(
+                old_publication.get(kind), kind=kind, include_path=True
+            )
+    if payload != _publication_journal_bytes(journal):
+        raise RuntimeError("scoring publication journal is not canonical")
+    return journal
+
+
+def _payload_matches(path, record, label):
+    if not os.path.lexists(path):
+        return False
+    try:
+        payload = _read_regular_bytes(path, label)
+    except RuntimeError:
+        return False
+    return len(payload) == record["size_bytes"] and hashlib.sha256(
+        payload
+    ).hexdigest() == record["sha256"]
+
+
+def _canonical_pair_matches(run_dir, publication):
+    return _payload_matches(
+        os.path.join(run_dir, "scores.jsonl"),
+        publication["scores"],
+        "canonical scores",
+    ) and _payload_matches(
+        os.path.join(run_dir, SCORING_SUCCESS_NAME),
+        publication["receipt"],
+        "canonical scoring receipt",
+    )
+
+
+def _publication_orphan_names(run_dir):
+    names = []
+    for name in os.listdir(run_dir):
+        if _SCORING_PUBLICATION_BACKUP_RE.fullmatch(name) is not None:
+            names.append(name)
+            continue
+        if name.endswith(".tmp") and name.startswith(
+            (
+                f".{SCORING_PUBLICATION_JOURNAL_NAME}.",
+                "..scoring_publication.backup.",
+                ".scores.jsonl.",
+                f".{SCORING_SUCCESS_NAME}.",
+            )
+        ):
+            names.append(name)
+    return sorted(names)
+
+
+def _remove_publication_orphans(run_dir):
+    changed = False
+    for name in _publication_orphan_names(run_dir):
+        path = os.path.join(run_dir, name)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            continue
+        except IsADirectoryError as exc:
+            raise RuntimeError(
+                f"scoring publication artifact is unsafe: {path}"
+            ) from exc
+        changed = True
+    if changed:
         _fsync_directory(run_dir)
-        if _read_regular_bytes(
-            scores_path, "restored canonical scores"
-        ) != scores_payload or _read_regular_bytes(
-            receipt_path, "restored scoring receipt"
-        ) != receipt_payload:
-            raise RuntimeError("restored canonical scoring bytes differ")
-    except BaseException:
-        _clear_canonical_scoring_outputs(run_dir)
-        raise
+
+
+def _finish_publication_transaction(run_dir):
+    journal_path = os.path.join(run_dir, SCORING_PUBLICATION_JOURNAL_NAME)
+    try:
+        os.unlink(journal_path)
+    except FileNotFoundError:
+        pass
+    except IsADirectoryError as exc:
+        raise RuntimeError("scoring publication journal is unsafe") from exc
+    _fsync_directory(run_dir)
+    _remove_publication_orphans(run_dir)
+
+
+def _read_verified_publication_backup(run_dir, record, *, kind):
+    path = os.path.join(run_dir, record["path"])
+    payload = _read_regular_bytes(path, f"previous canonical {kind} backup")
+    if len(payload) != record["size_bytes"] or hashlib.sha256(
+        payload
+    ).hexdigest() != record["sha256"]:
+        raise RuntimeError(f"previous canonical {kind} backup changed")
+    return payload
+
+
+def _restore_publication_from_journal(run_dir, old_publication):
+    scores_payload = _read_verified_publication_backup(
+        run_dir, old_publication["scores"], kind="scores"
+    )
+    receipt_payload = _read_verified_publication_backup(
+        run_dir, old_publication["receipt"], kind="receipt"
+    )
+    _write_atomic_bytes(os.path.join(run_dir, "scores.jsonl"), scores_payload)
+    _fsync_directory(run_dir)
+    _write_atomic_bytes(
+        os.path.join(run_dir, SCORING_SUCCESS_NAME), receipt_payload
+    )
+    _fsync_directory(run_dir)
+    if not _canonical_pair_matches(run_dir, old_publication):
+        raise RuntimeError("restored canonical scoring bytes differ")
+
+
+def _reconcile_scoring_publication(run_dir):
+    """Recover or commit one journaled publication before any scorer loads."""
+    root = os.path.abspath(run_dir)
+    journal_path = os.path.join(root, SCORING_PUBLICATION_JOURNAL_NAME)
+    if not os.path.lexists(journal_path):
+        _remove_publication_orphans(root)
+        return "clean"
+    journal = _load_publication_journal(root)
+    if _canonical_pair_matches(root, journal["new_publication"]):
+        _finish_publication_transaction(root)
+        return "committed"
+    old_publication = journal["old_publication"]
+    if old_publication is None:
+        _clear_canonical_scoring_outputs(root)
+    else:
+        _restore_publication_from_journal(root, old_publication)
+    _finish_publication_transaction(root)
+    return "restored"
+
+
+def _persist_publication_backup(run_dir, payload, *, kind):
+    record = _publication_payload_record(payload, kind=kind, include_path=True)
+    path = os.path.join(run_dir, record["path"])
+    if os.path.lexists(path):
+        existing = _read_regular_bytes(path, f"canonical {kind} backup")
+        if existing != payload:
+            raise RuntimeError(f"canonical {kind} backup hash collision")
+    else:
+        _write_atomic_bytes(path, payload)
+    return record
+
+
+def _publication_fault_point(_state):
+    """Test hook called only after a publication transition is durable."""
+    return None
+
+
+def _start_publication_transaction(run_dir, scores_payload, receipt_payload):
+    root = os.path.abspath(run_dir)
+    scores_path = os.path.join(root, "scores.jsonl")
+    receipt_path = os.path.join(root, SCORING_SUCCESS_NAME)
+    old_publication = None
+    if os.path.lexists(scores_path) and os.path.lexists(receipt_path):
+        old_scores = _read_regular_bytes(scores_path, "previous canonical scores")
+        old_receipt = _read_regular_bytes(
+            receipt_path, "previous canonical scoring receipt"
+        )
+        old_publication = {
+            "scores": _persist_publication_backup(
+                root, old_scores, kind="scores"
+            ),
+            "receipt": _persist_publication_backup(
+                root, old_receipt, kind="receipt"
+            ),
+        }
+    _fsync_directory(root)
+    _publication_fault_point("backups_persisted")
+    journal = {
+        "schema": SCORING_PUBLICATION_JOURNAL_SCHEMA,
+        "transaction_id": uuid.uuid4().hex,
+        "old_publication": old_publication,
+        "new_publication": {
+            "scores": _publication_payload_record(
+                scores_payload, kind="scores", include_path=False
+            ),
+            "receipt": _publication_payload_record(
+                receipt_payload, kind="receipt", include_path=False
+            ),
+        },
+    }
+    journal_path = os.path.join(root, SCORING_PUBLICATION_JOURNAL_NAME)
+    _write_atomic_bytes(journal_path, _publication_journal_bytes(journal))
+    _fsync_directory(root)
+    _load_publication_journal(root)
+    _publication_fault_point("journal_persisted")
+    return journal
 
 
 def _publish_scoring_attempt(run_dir, manifest, receipt_context):
-    """Atomically publish scores, then their receipt, or leave neither resumable."""
+    """Publish a crash-recoverable canonical score/receipt transaction."""
     scores_path = os.path.join(run_dir, "scores.jsonl")
     receipt_path = os.path.join(run_dir, SCORING_SUCCESS_NAME)
     verified_rows, _, attempt_path = load_verified_scoring_progress(
@@ -1532,27 +2727,31 @@ def _publish_scoring_attempt(run_dir, manifest, receipt_context):
         score_rows=score_rows,
         **receipt_context,
     )
-    previous_publication = _canonical_scoring_backup(run_dir)
-    if previous_publication is None:
-        _clear_canonical_scoring_outputs(run_dir)
+    receipt_payload = scoring_success_receipt_bytes(receipt)
+    _reconcile_scoring_publication(run_dir)
     try:
-        with atomic_text_writer(scores_path) as handle:
-            handle.write(attempt_payload.decode("utf-8"))
+        _start_publication_transaction(run_dir, attempt_payload, receipt_payload)
+        _write_atomic_bytes(scores_path, attempt_payload)
         _fsync_directory(run_dir)
+        _publication_fault_point("scores_replaced")
         if _read_regular_bytes(scores_path, "canonical scores") != attempt_payload:
             raise RuntimeError("canonical scores changed during publication")
-        receipt_payload = scoring_success_receipt_bytes(receipt)
-        with atomic_text_writer(receipt_path) as handle:
-            handle.write(receipt_payload.decode("ascii"))
+        _write_atomic_bytes(receipt_path, receipt_payload)
         _fsync_directory(run_dir)
+        _publication_fault_point("receipt_replaced")
         load_verified_score_publication(run_dir, receipt_context)
-    except BaseException:
-        if previous_publication is None:
-            _clear_canonical_scoring_outputs(run_dir)
-        else:
-            _restore_canonical_scoring_backup(
-                run_dir, previous_publication
+        _publication_fault_point("new_pair_verified")
+        _finish_publication_transaction(run_dir)
+    except Exception as primary:
+        try:
+            _reconcile_scoring_publication(run_dir)
+        except BaseException as recovery_error:
+            poisoned = ScoringAttemptPoisonedError(
+                "scoring publication and durable recovery both failed"
             )
+            poisoned.primary_error = primary
+            poisoned.cleanup_error = recovery_error
+            raise poisoned from primary
         raise
     try:
         _clear_scoring_progress(run_dir)
@@ -1641,32 +2840,59 @@ def main():
         return _score_run(args, ap)
 
 
+def _validate_formal_scoring_config_binding(
+    config_path,
+    config_payload,
+    run_config,
+):
+    """Bind a formal scorer invocation to the run's recorded YAML path and bytes."""
+    scoring = run_config.get("scoring")
+    if not isinstance(scoring, Mapping):
+        raise RuntimeError(
+            "formal scoring requires a recorded scoring config binding"
+        )
+    recorded_path = scoring.get("config")
+    recorded_hash = scoring.get("config_sha256")
+    if not isinstance(recorded_path, str) or not recorded_path:
+        raise RuntimeError("formal scoring config path binding is missing")
+    if not isinstance(recorded_hash, str) or _SHA256_RE.fullmatch(recorded_hash) is None:
+        raise RuntimeError("formal scoring config hash binding is invalid")
+
+    repository_root = Path(THIS).parent.resolve()
+    actual_path = Path(config_path).resolve()
+    expected_path = Path(recorded_path)
+    if not expected_path.is_absolute():
+        expected_path = repository_root / expected_path
+    expected_path = expected_path.resolve()
+    if actual_path != expected_path:
+        raise RuntimeError(
+            "formal scoring config path differs from the recorded run binding"
+        )
+    actual_hash = hashlib.sha256(config_payload).hexdigest()
+    if actual_hash != recorded_hash:
+        raise RuntimeError(
+            "formal scoring config bytes differ from the recorded run binding"
+        )
+
+
 def _score_run(args, ap):
-    with open(args.config) as handle:
-        cfg = yaml.safe_load(handle) or {}
+    _recover_poisoned_scoring_progress(args.run_dir)
+    _reconcile_scoring_publication(args.run_dir)
+    scoring_config_payload = _read_regular_bytes(args.config, "scoring config")
+    try:
+        cfg = yaml.safe_load(scoring_config_payload.decode("utf-8")) or {}
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise RuntimeError("scoring config is not valid UTF-8 YAML") from exc
     if not isinstance(cfg, dict):
         raise RuntimeError("scoring config must contain a YAML mapping")
-    import torch
-    device = resolve_device(args.device, torch.cuda.is_available())
-    try:
-        torch.device(device)
-    except (RuntimeError, TypeError) as exc:
-        ap.error(f"invalid --device {args.device!r}: {exc}")
-    watchdog = ExclusiveCudaWatchdog(
-        device,
-        exclusive_cuda_required(
-            cfg, getattr(args, "require_exclusive_gpu", False)
-        ),
-    )
-    metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
-    params = dict(cfg.get("params", {}))
-    registrations = [cfg]
     run_config_path = os.path.join(args.run_dir, "config.json")
+    candidate_run_config = {}
     if os.path.isfile(run_config_path):
         with open(run_config_path) as handle:
             candidate_run_config = json.load(handle)
-        if isinstance(candidate_run_config, dict):
-            registrations.append(candidate_run_config)
+        if not isinstance(candidate_run_config, dict):
+            candidate_run_config = {}
+    registrations = [cfg, candidate_run_config]
     registered_hashes = []
     for registration in registrations:
         _, candidate_hash = registered_scorer_provenance_contract(registration)
@@ -1675,6 +2901,51 @@ def _score_run(args, ap):
     if len(set(registered_hashes)) > 1:
         raise RuntimeError("registered scorer provenance hashes disagree")
     formal_registered_scoring = bool(registered_hashes)
+    if formal_registered_scoring:
+        _validate_formal_scoring_config_binding(
+            args.config,
+            scoring_config_payload,
+            candidate_run_config,
+        )
+    import numpy  # noqa: F401  (initialize MKL before PyTorch/OpenMP scorer imports)
+    import torch
+    device = resolve_device(args.device, torch.cuda.is_available())
+    try:
+        torch_device = torch.device(device)
+    except (RuntimeError, TypeError) as exc:
+        ap.error(f"invalid --device {args.device!r}: {exc}")
+    if formal_registered_scoring:
+        if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get(
+            "TRANSFORMERS_OFFLINE"
+        ) != "1":
+            raise RuntimeError("registered scoring requires offline environment flags")
+        if torch_device.type == "cuda":
+            torch.cuda.set_device(torch_device)
+            torch.empty(0, device=torch_device)
+            torch.cuda.synchronize(torch_device)
+        install_network_seccomp_filter()
+    registry, scorer_base_path = _load_scorer_registry(
+        formal_registered_scoring=formal_registered_scoring
+    )
+    watchdog_enabled = exclusive_cuda_required(
+        cfg, getattr(args, "require_exclusive_gpu", False)
+    )
+    target_identity = (
+        resolve_scoring_cuda_identity(torch, device)
+        if watchdog_enabled
+        else None
+    )
+    watchdog = ExclusiveCudaWatchdog(
+        device,
+        watchdog_enabled,
+        target_identity=target_identity,
+    )
+    metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
+    params = dict(cfg.get("params", {}))
+    attempt_id = uuid.uuid4().hex
+    _begin_scoring_progress_poison(args.run_dir, attempt_id=attempt_id)
+    poison_finished = False
+    asset_stage = None
     try:
         with formal_offline_network_guard(
             enabled=formal_registered_scoring
@@ -1682,6 +2953,9 @@ def _score_run(args, ap):
             metric_names,
             params,
             enabled=formal_registered_scoring,
+            run_dir=args.run_dir,
+            registry=registry,
+            attempt_id=attempt_id,
         ) as asset_stage:
             with watchdog:
                 publication = _score_run_impl(
@@ -1692,10 +2966,17 @@ def _score_run(args, ap):
                     device,
                     watchdog,
                     asset_stage,
+                    registry,
+                    scorer_base_path,
+                    attempt_id=attempt_id,
                 )
             if asset_stage is not None:
                 asset_stage.verify()
         watchdog.assert_healthy()
+        _finish_scoring_progress_poison(
+            args.run_dir, attempt_id=attempt_id
+        )
+        poison_finished = True
         if publication is None:
             return None
         current_context = _scoring_receipt_context(
@@ -1718,21 +2999,67 @@ def _score_run(args, ap):
         )
         return None
     except BaseException as exc:
-        if isinstance(
-            exc, (ExclusiveCudaWatchdogError, ScorerAssetStageError)
-        ):
-            _clear_scoring_progress(args.run_dir)
+        progress_is_reusable = (
+            not isinstance(
+                exc,
+                (
+                    ExclusiveCudaWatchdogError,
+                    ScorerAssetStageError,
+                    ScoringAttemptPoisonedError,
+                ),
+            )
+            and (not watchdog.enabled or watchdog.finalized)
+            and (asset_stage is None or asset_stage.cleanup_verified)
+        )
+        if progress_is_reusable and not poison_finished:
+            try:
+                _finish_scoring_progress_poison(
+                    args.run_dir, attempt_id=attempt_id
+                )
+                poison_finished = True
+            except BaseException as cleanup_error:
+                poisoned = ScoringAttemptPoisonedError(
+                    "scoring failed and progress finalization also failed"
+                )
+                poisoned.primary_error = exc
+                poisoned.cleanup_error = cleanup_error
+                raise poisoned from exc
         raise
 
 
-def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
+def _score_run_impl(
+    args,
+    ap,
+    cfg,
+    torch,
+    device,
+    watchdog,
+    asset_stage=None,
+    registry=None,
+    scorer_base_path=None,
+    attempt_id=None,
+):
+    registry = REGISTRY if registry is None else registry
     metric_names = args.metrics.split(",") if args.metrics else cfg.get("metrics", [])
     params = dict(cfg.get("params", {}))
     exclusive_execution = (
-        exclusive_cuda_execution_contract(device) if watchdog.enabled else None
+        exclusive_cuda_execution_contract(
+            device, target_identity=watchdog.target_identity
+        )
+        if watchdog.enabled
+        else None
     )
     exclusive_execution_sha256 = (
         json_sha256(exclusive_execution) if exclusive_execution is not None else None
+    )
+    exclusive_observation = (
+        exclusive_cuda_observation_contract(
+            exclusive_execution_sha256,
+            scorer_pid=watchdog.pid,
+            process_start_ticks=watchdog.process_start_ticks,
+        )
+        if watchdog.enabled
+        else None
     )
 
     manifest = load_jsonl(os.path.join(args.run_dir, "manifest.jsonl"))
@@ -1799,12 +3126,12 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
     active = []
     unavailable = []
     for name in metric_names:
-        if name not in REGISTRY:
+        if name not in registry:
             message = f"unknown metric '{name}'"
             print(f"[warn] {message}, skipping", flush=True)
             unavailable.append(message)
             continue
-        cls = REGISTRY[name]
+        cls = registry[name]
         ready, msg = cls.weights_status(**params)
         if not ready:
             message = f"'{name}' weights missing -> {msg}"
@@ -1824,7 +3151,7 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
             )
             staged_manifest = (
                 asset_stage.asset_manifests.get(name)
-                if asset_stage is not None and staged_paths
+                if asset_stage is not None
                 else None
             )
             active.append(
@@ -1861,8 +3188,13 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
             params=params,
             device=device,
             runner_path=__file__,
-            base_path=scorer_base.__file__,
+            base_path=scorer_base_path,
             source_root=THIS,
+            source_closure=(
+                HPSV2_PRIVATE_SOURCE_CLOSURE
+                if asset_stage is not None
+                else None
+            ),
         )
     registered_scorer_contract = None
     registered_scorer_hash = None
@@ -1930,12 +3262,14 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
         canonical_publication_loaded = bool(
             os.path.lexists(os.path.join(args.run_dir, "scores.jsonl"))
         )
-    progress_attempt_id = uuid.uuid4().hex
+    progress_attempt_id = str(attempt_id or uuid.uuid4().hex)
     loaded_from_progress = False
     if not canonical_publication_loaded:
         try:
             progress_rows, resumed_attempt_id, _ = load_verified_scoring_progress(
-                args.run_dir, receipt_context
+                args.run_dir,
+                receipt_context,
+                allow_poison_attempt_id=attempt_id,
             )
         except (RuntimeError, ValueError) as exc:
             print(
@@ -1946,7 +3280,6 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
         else:
             if resumed_attempt_id is not None:
                 existing_rows = progress_rows
-                progress_attempt_id = resumed_attempt_id
                 loaded_from_progress = True
     existing = _unique_rows(existing_rows, "scores")
     if hash_bound_run and existing_rows:
@@ -1957,7 +3290,6 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
             existing = {}
             if loaded_from_progress:
                 _clear_scoring_progress(args.run_dir)
-                progress_attempt_id = uuid.uuid4().hex
 
     output_keys = [key for _, scorer in active for key, _ in scorer.OUTPUT_KEYS]
     if len(output_keys) != len(set(output_keys)):
@@ -1975,6 +3307,14 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
             != exclusive_execution_sha256
         ):
             return False
+        if exclusive_execution is not None:
+            try:
+                validate_exclusive_cuda_observation_contract(
+                    score.get("scoring_execution_observation"),
+                    execution_sha256=exclusive_execution_sha256,
+                )
+            except ValueError:
+                return False
         if hash_bound_run:
             if (
                 score.get("image_sha256") != row.get("image_sha256")
@@ -2077,6 +3417,7 @@ def _score_run_impl(args, ap, cfg, torch, device, watchdog, asset_stage=None):
                     "scoring_execution_provenance_sha256": (
                         exclusive_execution_sha256
                     ),
+                    "scoring_execution_observation": exclusive_observation,
                 }
             )
         for name, sc in active:

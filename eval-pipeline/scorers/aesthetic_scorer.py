@@ -33,38 +33,13 @@ class AestheticScorer(Scorer):
     OUTPUT_KEYS = (("aesthetic", "higher"),)
     PROVENANCE_PACKAGES = ("openai-clip", "Pillow", "torch", "torchvision")
 
-    @classmethod
-    def asset_sources(cls, **p):
-        return {
-            "clip_checkpoint": {
-                "path": os.path.join(CLIP_CACHE, "ViT-L-14.pt"),
-                "staged_name": "ViT-L-14.pt",
-                "revision": None,
-            },
-            "aesthetic_checkpoint": {
-                "path": AESTHETIC_PATH,
-                "staged_name": os.path.basename(AESTHETIC_PATH),
-                "revision": None,
-            },
-        }
-
     def __init__(self, device="cuda", **p):
         super().__init__(device, **p)
         import clip
-        self.clip_path = self.asset_path(
-            "clip_checkpoint", os.path.join(CLIP_CACHE, "ViT-L-14.pt")
-        )
-        self.aesthetic_path = self.asset_path(
-            "aesthetic_checkpoint", AESTHETIC_PATH
-        )
-        self.model, self.preprocess = clip.load(
-            self.clip_path, device=device, download_root=CLIP_CACHE
-        )
+        self.model, self.preprocess = clip.load("ViT-L/14", device=device, download_root=CLIP_CACHE)
         self.model.eval()
         self.mlp = _AestheticMLP().to(device)
-        self.mlp.load_state_dict(
-            torch.load(self.aesthetic_path, map_location="cpu")
-        )
+        self.mlp.load_state_dict(torch.load(AESTHETIC_PATH, map_location="cpu"))
         self.mlp.eval()
 
     @classmethod
@@ -73,6 +48,7 @@ class AestheticScorer(Scorer):
         return (not miss), ("" if not miss else f"missing {miss}")
 
     def provenance_metadata(self):
+        clip_path = os.path.join(CLIP_CACHE, "ViT-L-14.pt")
         return {
             "models": [
                 {
@@ -88,13 +64,13 @@ class AestheticScorer(Scorer):
             ],
             "checkpoint_files": [
                 checkpoint_file_record(
-                    self.clip_path,
+                    clip_path,
                     role="clip_checkpoint",
                     filename="ViT-L-14.pt",
                     repository_id="openai/CLIP",
                 ),
                 checkpoint_file_record(
-                    self.aesthetic_path,
+                    AESTHETIC_PATH,
                     role="aesthetic_mlp_checkpoint",
                     filename=os.path.basename(AESTHETIC_PATH),
                     repository_id="christophschuhmann/improved-aesthetic-predictor",
@@ -107,7 +83,6 @@ class AestheticScorer(Scorer):
             "parameters": {
                 "clip_model": "ViT-L/14",
                 "mlp_dimensions": [768, 1024, 128, 64, 16, 1],
-                **self.asset_provenance_parameters(),
             },
             "supporting_sources": [],
         }

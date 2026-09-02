@@ -34,6 +34,7 @@ from score_hpsv2_relational_renderer import (
     SCORING_SUCCESS_NAME,
     scoring_success_receipt_bytes,
     validate_exclusive_cuda_execution_contract,
+    validate_exclusive_cuda_observation_contract,
     validate_scoring_success_receipt,
 )
 from scorer_provenance import (
@@ -186,6 +187,30 @@ def validate_scoring_publication(
     return sha256_file(run_dir / SCORING_SUCCESS_NAME)
 
 
+def _validate_uniform_scoring_execution_rows(
+    scores: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require one immutable CUDA execution observation across the score table."""
+    if not scores:
+        raise ValueError("scoring execution validation requires score rows")
+    first = scores[0]
+    reference = (
+        first.get("scoring_execution_provenance"),
+        first.get("scoring_execution_provenance_sha256"),
+        first.get("scoring_execution_observation"),
+    )
+    for row in scores[1:]:
+        observed = (
+            row.get("scoring_execution_provenance"),
+            row.get("scoring_execution_provenance_sha256"),
+            row.get("scoring_execution_observation"),
+        )
+        if observed != reference:
+            raise ValueError(
+                f"{row.get('id')}: scoring execution provenance drifted across rows"
+            )
+
+
 def _finite(value: Any) -> bool:
     return (
         not isinstance(value, bool)
@@ -252,7 +277,13 @@ def load_verified_frame(
         validate_exclusive_cuda_execution_contract(
             score.get("scoring_execution_provenance"),
             score.get("scoring_execution_provenance_sha256"),
-            expected_device="cuda:2",
+            expected_device="cuda:4",
+        )
+        validate_exclusive_cuda_observation_contract(
+            score.get("scoring_execution_observation"),
+            execution_sha256=score.get(
+                "scoring_execution_provenance_sha256"
+            ),
         )
         score_id = score.get("id")
         if not isinstance(score_id, str) or not score_id or score_id in score_by_id:
@@ -263,6 +294,8 @@ def load_verified_frame(
         if any(not _finite(score[metric]) for metric in metrics):
             raise ValueError(f"score {score_id} contains a non-finite required metric")
         score_by_id[score_id] = score
+
+    _validate_uniform_scoring_execution_rows(scores)
 
     validate_scoring_publication(
         run_dir, manifest, scores, contract, scorer_hash
@@ -364,8 +397,12 @@ def cluster_bootstrap_mean_interval(
     codes, unique_labels = pd.factorize(labels, sort=False)
     if len(unique_labels) != EXPECTED_UNIQUE_PROMPT_COUNT:
         raise ValueError("cluster bootstrap requires exactly 3,172 prompt clusters")
+    # The statistical unit is the exact prompt, not an individual duplicate
+    # row.  Collapse each cluster first so HPSv2's repeated prompt strings do
+    # not receive extra weight in either the point estimate or its bootstrap.
     cluster_sums = np.bincount(codes, weights=array)
     cluster_counts = np.bincount(codes).astype(np.float64)
+    cluster_means = cluster_sums / cluster_counts
     rng = np.random.default_rng(seed)
     means = np.empty(samples, dtype=np.float64)
     batch_size = 250
@@ -376,9 +413,7 @@ def cluster_bootstrap_mean_interval(
             len(unique_labels),
             size=(stop - start, len(unique_labels)),
         )
-        means[start:stop] = cluster_sums[indices].sum(axis=1) / cluster_counts[
-            indices
-        ].sum(axis=1)
+        means[start:stop] = cluster_means[indices].mean(axis=1)
     alpha = (1.0 - confidence) / 2.0
     low, high = np.quantile(means, [alpha, 1.0 - alpha])
     return float(low), float(high)

@@ -61,6 +61,23 @@ def generation_environment_fixture():
     return environment
 
 
+def nvidia_inventory_fixture(environment):
+    return "\n".join(
+        ", ".join(
+            str(row[key])
+            for key in (
+                "index",
+                "uuid",
+                "pci_bus_id",
+                "name",
+                "total_memory_mib",
+                "driver_version",
+            )
+        )
+        for row in environment["gpu_inventory"]
+    )
+
+
 class FrozenMatrixTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -82,13 +99,13 @@ class FrozenMatrixTest(unittest.TestCase):
         self.assertEqual(manifest["official_duplicate_row_count"], 28)
         self.assertEqual(
             self.contract["config"]["scoring"]["config_sha256"],
-            "0ce5056c7c77e43fe1c57a6e6d2378368b2d14171dfd1fa92a9fe52314f203e9",
+            "e2bb1f33cc8bbf33258d50999012c84055b2d2b1df3217ade38241a38a3ab057",
         )
         self.assertEqual(
             self.contract["config"]["scoring"][
                 "registered_scorer_provenance_sha256"
             ],
-            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926",
+            "f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42",
         )
 
     def test_analysis_and_duplicate_contracts_fail_closed(self):
@@ -112,7 +129,7 @@ class FrozenMatrixTest(unittest.TestCase):
         for task in self.tasks:
             self.assertEqual(task["seed"], 20260831 + task["prompt_index"])
         device_counts = Counter(task["physical_device_index"] for task in self.tasks)
-        self.assertEqual(device_counts, {2: 3200, 5: 3200, 6: 3200, 7: 3200})
+        self.assertEqual(device_counts, {4: 3200, 5: 3200, 6: 3200, 7: 3200})
         blocks = defaultdict(list)
         for task in self.tasks:
             blocks[task["prompt_index"]].append(task)
@@ -158,12 +175,12 @@ class FrozenMatrixTest(unittest.TestCase):
     def test_cli_rejects_device_or_subset_overrides(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
-                runner.parse_args(["--devices", "4,5,6,7"])
+                runner.parse_args(["--devices", "2,5,6,7"])
             with self.assertRaises(SystemExit):
-                runner.parse_args(["--devices", "2,5,6,7", "--seeds", "1"])
+                runner.parse_args(["--devices", "4,5,6,7", "--seeds", "1"])
             with self.assertRaises(SystemExit):
                 runner.parse_args(
-                    ["--devices", "2,5,6,7", "--validate-only", "--audit-only"]
+                    ["--devices", "4,5,6,7", "--validate-only", "--audit-only"]
                 )
 
     def _matrix_rows(self):
@@ -287,18 +304,196 @@ class FrozenMatrixTest(unittest.TestCase):
                 )
         post_audit.assert_called_once_with(runner.ROOT)
 
-    def test_gpu_monitor_allows_only_registered_worker_pids(self):
+    def test_gpu_monitor_binds_registered_worker_pids_to_frozen_gpus(self):
         environment = generation_environment_fixture()
+        expected_workers = {
+            111: environment["gpu_inventory"][0],
+            222: environment["gpu_inventory"][1],
+        }
+        expected_start_ticks = {111: 5678, 222: 5678}
         process_rows = (
-            "GPU-2, 111, worker, 100\n"
+            "GPU-4, 111, worker, 100\n"
+            "GPU-5, 222, worker, 100\n"
             "GPU-5, 999, foreign, 100\n"
             "GPU-0, 888, unrelated, 100\n"
         )
-        with mock.patch.object(runner, "_run_command", return_value=process_rows):
+        with mock.patch.object(
+            runner,
+            "_run_command",
+            side_effect=[nvidia_inventory_fixture(environment), process_rows],
+        ), mock.patch.object(
+            runner, "_process_start_ticks", return_value=5678
+        ):
             conflicts = runner._generation_compute_conflicts(
-                environment, allowed_pids=[111]
+                environment,
+                expected_workers=expected_workers,
+                required_pids=[111, 222],
+                expected_worker_start_ticks=expected_start_ticks,
             )
         self.assertEqual([row["pid"] for row in conflicts], [999])
+        self.assertEqual(conflicts[0]["kind"], "foreign_compute_process")
+
+    def test_gpu_monitor_rejects_missing_wrong_and_duplicate_worker_bindings(self):
+        environment = generation_environment_fixture()
+        expected_workers = {
+            111: environment["gpu_inventory"][0],
+            222: environment["gpu_inventory"][1],
+        }
+        expected_start_ticks = {111: 5678, 222: 5678}
+        process_rows = (
+            "GPU-5, 111, worker, 100\n"
+            "GPU-6, 111, worker, 100\n"
+        )
+        with mock.patch.object(
+            runner,
+            "_run_command",
+            side_effect=[nvidia_inventory_fixture(environment), process_rows],
+        ), mock.patch.object(
+            runner, "_process_start_ticks", return_value=5678
+        ):
+            conflicts = runner._generation_compute_conflicts(
+                environment,
+                expected_workers=expected_workers,
+                required_pids=[111, 222],
+                expected_worker_start_ticks=expected_start_ticks,
+            )
+        self.assertEqual(
+            {row["kind"] for row in conflicts},
+            {
+                "worker_on_wrong_gpu",
+                "worker_pid_observed_multiple_times",
+                "required_worker_missing",
+            },
+        )
+
+    def test_gpu_monitor_rejects_frozen_inventory_drift(self):
+        environment = generation_environment_fixture()
+        inventory = nvidia_inventory_fixture(environment).replace(
+            "0000:04:00.0", "0000:44:00.0"
+        )
+        with mock.patch.object(runner, "_run_command", return_value=inventory):
+            with self.assertRaisesRegex(RuntimeError, "inventory drifted"):
+                runner._generation_compute_conflicts(environment)
+
+    def test_gpu_monitor_rejects_worker_pid_reuse(self):
+        environment = generation_environment_fixture()
+        expected_workers = {111: environment["gpu_inventory"][0]}
+        process_rows = "GPU-4, 111, worker, 100\n"
+        with mock.patch.object(
+            runner,
+            "_run_command",
+            side_effect=[nvidia_inventory_fixture(environment), process_rows],
+        ), mock.patch.object(
+            runner, "_process_start_ticks", side_effect=[1234, 1234]
+        ):
+            conflicts = runner._generation_compute_conflicts(
+                environment,
+                expected_workers=expected_workers,
+                required_pids=[111],
+                expected_worker_start_ticks={111: 5678},
+            )
+        self.assertIn("worker_pid_reused", {row["kind"] for row in conflicts})
+
+    def test_worker_ready_record_is_bound_to_pid_and_frozen_identity(self):
+        environment = generation_environment_fixture()
+        frozen = environment["gpu_inventory"][0]
+        record = {
+            "schema": runner.WORKER_READY_SCHEMA,
+            "pid": 111,
+            "process_start_ticks": 5678,
+            "physical_device_index": frozen["index"],
+            "gpu_uuid": frozen["uuid"],
+            "torch_device_uuid": frozen["uuid"],
+            "pci_bus_id": frozen["pci_bus_id"],
+            "gpu": frozen["name"],
+        }
+        with mock.patch.object(runner, "_process_start_ticks", return_value=5678):
+            self.assertEqual(
+                runner._validate_worker_ready_record(
+                    record, {111: frozen}, {111: 5678}
+                ),
+                111,
+            )
+        tampered = dict(record)
+        tampered["physical_device_index"] = 5
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            with mock.patch.object(runner, "_process_start_ticks", return_value=5678):
+                runner._validate_worker_ready_record(
+                    tampered, {111: frozen}, {111: 5678}
+                )
+        reused = dict(record)
+        reused["process_start_ticks"] = 1234
+        with self.assertRaisesRegex(ValueError, "start time differs"):
+            with mock.patch.object(runner, "_process_start_ticks", return_value=5678):
+                runner._validate_worker_ready_record(
+                    reused, {111: frozen}, {111: 5678}
+                )
+
+    def test_worker_completion_record_is_held_until_parent_gpu_audit(self):
+        environment = generation_environment_fixture()
+        frozen = environment["gpu_inventory"][0]
+        with mock.patch.object(runner, "_process_start_ticks", return_value=5678):
+            record = runner._worker_completion_record(
+                4,
+                {
+                    "gpu_uuid": frozen["uuid"],
+                    "torch_device_uuid": frozen["uuid"],
+                    "pci_bus_id": frozen["pci_bus_id"],
+                    "gpu": frozen["name"],
+                },
+                4,
+            )
+            record["pid"] = 111
+            self.assertEqual(
+                runner._validate_worker_completion_record(
+                    record,
+                    {111: frozen},
+                    {111: 5678},
+                    {111: 4},
+                ),
+                111,
+            )
+            self.assertEqual(
+                runner._validate_worker_completion_record(
+                    record,
+                    {111: frozen},
+                    {111: 5678},
+                    {111: 4},
+                    require_live_process=False,
+                ),
+                111,
+            )
+            broken = dict(record)
+            broken["completed_task_count"] = 3
+            with self.assertRaisesRegex(ValueError, "task count differs"):
+                runner._validate_worker_completion_record(
+                    broken,
+                    {111: frozen},
+                    {111: 5678},
+                    {111: 4},
+                    require_live_process=False,
+                )
+
+    def test_worker_completion_is_required_after_workers_exit(self):
+        # A complete image set without the parent-approved completion handshake
+        # must fail closed; otherwise a worker can exit before its final audit.
+        expected = {
+            111: {"index": 4},
+            222: {"index": 5},
+        }
+        failures = runner._worker_handshake_failures(
+            expected, ready_pids=[111, 222], completed_pids=[111], gpu_verified_pids=[111, 222]
+        )
+        self.assertEqual(
+            [(stage, kind) for stage, kind, _ in failures],
+            [("gpu-monitor", "worker-completion-missing")],
+        )
+        self.assertEqual(
+            runner._worker_handshake_failures(
+                expected, ready_pids=[111, 222], completed_pids=[111, 222], gpu_verified_pids=[111, 222]
+            ),
+            [],
+        )
 
     def test_monitor_command_timeout_fails_closed(self):
         timeout = runner.subprocess.TimeoutExpired(["nvidia-smi"], 10)
@@ -316,9 +511,13 @@ class FrozenMatrixTest(unittest.TestCase):
             major = 8
             minor = 6
             total_memory = 24 * 1024**3
+            uuid = "92dc1db5-4d49-5d72-62e8-0f1f83132831"
 
         torch.cuda.get_device_properties.return_value = Properties()
-        inventory = "2, GPU-2, 0000:02:00.0, NVIDIA GeForce RTX 3090, 24576"
+        inventory = (
+            "2, GPU-92dc1db5-4d49-5d72-62e8-0f1f83132831, "
+            "0000:02:00.0, NVIDIA GeForce RTX 3090, 24576"
+        )
         with mock.patch.dict(runner.os.environ, {}, clear=True), mock.patch.object(
             runner, "_run_command", return_value=inventory
         ) as command:
@@ -331,7 +530,10 @@ class FrozenMatrixTest(unittest.TestCase):
             ]
         )
         self.assertEqual(identity["physical_device_index"], 2)
-        self.assertEqual(identity["gpu_uuid"], "GPU-2")
+        self.assertEqual(
+            identity["gpu_uuid"], "GPU-92dc1db5-4d49-5d72-62e8-0f1f83132831"
+        )
+        self.assertEqual(identity["torch_device_uuid"], identity["gpu_uuid"])
 
     def test_abort_prevents_artifact_publication(self):
         abort_event = mock.Mock()
@@ -532,9 +734,12 @@ class ArtifactAndDiagnosticTest(unittest.TestCase):
                 "logical_device_index": task["physical_device_index"],
                 "physical_device_index": task["physical_device_index"],
                 "gpu_uuid": "GPU-test",
+                "torch_device_uuid": "GPU-test",
                 "pci_bus_id": "0000:01:00.0",
                 "gpu": "test-gpu",
                 "cuda_visible_devices": None,
+                "worker_pid": 1234,
+                "worker_process_start_ticks": 5678,
             },
             "worker_model_snapshot_provenance": model_evidence,
             "worker_model_snapshot_sha256": runner.canonical_sha256(model_evidence),
@@ -837,15 +1042,15 @@ class ArtifactAndDiagnosticTest(unittest.TestCase):
 class QueueContractTest(unittest.TestCase):
     def test_queue_waits_for_all_frozen_devices_then_audits_and_scores(self):
         source = (ROOT / "eval-pipeline/run_hpsv2_relational_renderer_queue.sh").read_text()
-        self.assertIn("DEVICES=2,5,6,7", source)
+        self.assertIn("DEVICES=4,5,6,7", source)
         self.assertIn("waiting_for_all_gpus", source)
         self.assertIn("--query-compute-apps", source)
         self.assertIn("waiting_for_scoring_gpu", source)
-        self.assertLess(source.index("waiting_for_scoring_gpu"), source.index("--device cuda:2"))
+        self.assertLess(source.index("waiting_for_scoring_gpu"), source.index("--device cuda:4"))
         self.assertIn("--audit-only", source)
         self.assertIn("--require-scorer-provenance", source)
         self.assertIn("--require-exclusive-gpu", source)
-        self.assertIn("--device cuda:2", source)
+        self.assertIn("--device cuda:4", source)
         self.assertIn("nvidia_smi_gpu_error", source)
         self.assertIn("unexpected_queue_error", source)
         self.assertIn('timeout --foreground "$GPU_QUERY_TIMEOUT_SECONDS"', source)

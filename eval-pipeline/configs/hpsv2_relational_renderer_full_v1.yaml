@@ -40,7 +40,7 @@ sampling:
   local_files_only: true
 
 execution:
-  requested_physical_devices: [2, 5, 6, 7]
+  requested_physical_devices: [4, 5, 6, 7]
   grouping: prompt
   same_device_for_all_settings_of_one_prompt: true
   deterministic_setting_order: sha256
@@ -102,10 +102,10 @@ settings:
 
 scoring:
   config: eval-pipeline/configs/hpsv2_full_scoring_v1.yaml
-  config_sha256: 0ce5056c7c77e43fe1c57a6e6d2378368b2d14171dfd1fa92a9fe52314f203e9
+  config_sha256: e2bb1f33cc8bbf33258d50999012c84055b2d2b1df3217ade38241a38a3ab057
   strict: true
   scorer_provenance_required: true
-  registered_scorer_provenance_sha256: 4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926
+  registered_scorer_provenance_sha256: f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42
   hps_version: v2.1
   hpsv2_stored_scale: raw_cosine
   hpsv2_official_report_multiplier: 100.0

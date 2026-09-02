@@ -22,7 +22,7 @@ params:
 
 scorer_provenance:
   required_schema: repldm_scorer_provenance_v1
-registered_scorer_provenance_sha256: 4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926
+registered_scorer_provenance_sha256: f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42
 
 metric_meta:
   imagereward: higher

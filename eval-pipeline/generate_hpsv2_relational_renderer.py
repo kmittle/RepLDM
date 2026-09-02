@@ -44,7 +44,7 @@ if str(EVAL_PIPELINE) not in sys.path:
 import adaptive_oracle_model_snapshot as model_snapshot  # noqa: E402
 DEFAULT_CONFIG = ROOT / "eval-pipeline/configs/hpsv2_relational_renderer_full_v1.yaml"
 RUNNER_RELATIVE_PATH = "eval-pipeline/generate_hpsv2_relational_renderer.py"
-SIDECAR_SCHEMA = "hpsv2_relational_renderer_sidecar_v3"
+SIDECAR_SCHEMA = "hpsv2_relational_renderer_sidecar_v4"
 MANIFEST_SCHEMA = "hpsv2_relational_renderer_manifest_v3"
 RUN_CONFIG_SCHEMA = "hpsv2_relational_renderer_run_v2"
 GENERATION_ATTEMPT_SCHEMA = "hpsv2_generation_attempt_v1"
@@ -61,7 +61,7 @@ EXPECTED_TASK_COUNT = EXPECTED_PROMPT_COUNT * EXPECTED_SETTING_COUNT
 EXPECTED_BASE_SEED = 20260831
 EXPECTED_SEED_POLICY = "base_seed_plus_official_prompt_index"
 EXPECTED_UNIQUE_PROMPT_COUNT = 3172
-EXPECTED_DEVICES = (2, 5, 6, 7)
+EXPECTED_DEVICES = (4, 5, 6, 7)
 EXPECTED_STYLES = ("anime", "concept-art", "paintings", "photo")
 EXPECTED_SETTINGS = (
     ("no_ag", "none", "baseline"),
@@ -79,6 +79,8 @@ RESOLUTION = 1024
 RANDOM_EDGE_COUNTER_SCHEMA = "ao-random-edge-counter-v1"
 GENERATION_ENVIRONMENT_SCHEMA = "hpsv2_generation_environment_v1"
 WORKER_MODEL_SNAPSHOT_SCHEMA = "hpsv2_worker_model_snapshot_v1"
+WORKER_READY_SCHEMA = "hpsv2_generation_worker_ready_v2"
+WORKER_COMPLETION_SCHEMA = "hpsv2_generation_worker_completion_v1"
 GENERATION_PACKAGES = (
     "accelerate",
     "diffusers",
@@ -366,7 +368,7 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
         "strict": True,
         "scorer_provenance_required": True,
         "registered_scorer_provenance_sha256": (
-            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926"
+            "f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42"
         ),
         "hps_version": "v2.1",
         "hpsv2_stored_scale": "raw_cosine",
@@ -399,7 +401,7 @@ def _validate_scoring_and_analysis(config: Mapping[str, Any]) -> None:
             "required_schema": "repldm_scorer_provenance_v1",
         },
         "registered_scorer_provenance_sha256": (
-            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926"
+            "f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42"
         ),
         "metric_meta": {
             "imagereward": "higher",
@@ -585,7 +587,7 @@ def _setting_execution_order(
 
 def build_tasks(contract: Mapping[str, Any], devices: Sequence[int]) -> list[dict[str, Any]]:
     if tuple(devices) != EXPECTED_DEVICES:
-        raise ValueError("--devices must be exactly 2,5,6,7 in that order")
+        raise ValueError("--devices must be exactly 4,5,6,7 in that order")
     settings = {setting["id"]: setting for setting in contract["settings"]}
     tasks: list[dict[str, Any]] = []
     for prompt in contract["prompts"]:
@@ -873,15 +875,75 @@ def _validate_worker_model_snapshot_evidence(record: Any) -> None:
 def _generation_compute_conflicts(
     generation_environment: Mapping[str, Any],
     *,
-    allowed_pids: Sequence[int] = (),
+    expected_workers: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    required_pids: Sequence[int] = (),
+    expected_worker_start_ticks: Optional[Mapping[int, int]] = None,
 ) -> list[dict[str, Any]]:
-    """Return compute processes on the frozen GPUs that are not ours."""
+    """Audit frozen GPU identity and bind each observed worker PID to one GPU."""
     _validate_generation_environment(generation_environment)
-    allowed = {int(pid) for pid in allowed_pids}
-    targets = {
-        str(row["uuid"]): int(row["index"])
-        for row in generation_environment["gpu_inventory"]
+    frozen_inventory = [dict(row) for row in generation_environment["gpu_inventory"]]
+    inventory_output = _run_command(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,pci.bus_id,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    requested_indices = {int(row["index"]) for row in frozen_inventory}
+    observed_inventory = []
+    for line in inventory_output.splitlines():
+        fields = [field.strip() for field in line.split(",", 5)]
+        if len(fields) != 6:
+            raise RuntimeError("nvidia-smi returned a malformed GPU inventory row")
+        try:
+            index = int(fields[0])
+            total_memory_mib = int(fields[4])
+        except ValueError as exc:
+            raise RuntimeError("nvidia-smi returned invalid GPU inventory values") from exc
+        if index in requested_indices:
+            observed_inventory.append(
+                {
+                    "index": index,
+                    "uuid": fields[1],
+                    "pci_bus_id": fields[2],
+                    "name": fields[3],
+                    "total_memory_mib": total_memory_mib,
+                    "driver_version": fields[5],
+                }
+            )
+    observed_inventory.sort(key=lambda row: row["index"])
+    if observed_inventory != frozen_inventory:
+        raise RuntimeError("generation GPU inventory drifted from the frozen run contract")
+
+    targets = {str(row["uuid"]).lower(): row for row in frozen_inventory}
+    workers: dict[int, dict[str, Any]] = {}
+    for raw_pid, raw_identity in (expected_workers or {}).items():
+        if isinstance(raw_pid, bool):
+            raise ValueError("expected generation worker PID is invalid")
+        pid = int(raw_pid)
+        if pid <= 0 or pid in workers:
+            raise ValueError("expected generation worker PID is invalid or duplicated")
+        identity = dict(raw_identity)
+        frozen = targets.get(str(identity.get("uuid", "")).lower())
+        if frozen is None or identity != frozen:
+            raise ValueError("expected generation worker identity is not frozen")
+        workers[pid] = identity
+    if len({row["uuid"].lower() for row in workers.values()}) != len(workers):
+        raise ValueError("multiple generation workers target the same frozen GPU")
+    required = {int(pid) for pid in required_pids}
+    if not required.issubset(workers):
+        raise ValueError("required generation worker is not registered")
+    start_ticks = {
+        int(pid): value
+        for pid, value in (expected_worker_start_ticks or {}).items()
     }
+    if required and expected_worker_start_ticks is None:
+        raise ValueError("required generation worker start times are not registered")
+    for pid in required:
+        value = start_ticks.get(pid)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("required generation worker start time is invalid")
+
     output = _run_command(
         [
             "nvidia-smi",
@@ -889,26 +951,322 @@ def _generation_compute_conflicts(
             "--format=csv,noheader,nounits",
         ]
     )
-    conflicts = []
-    for line in output.splitlines():
-        fields = [field.strip() for field in line.split(",", 3)]
-        if len(fields) != 4 or fields[0] not in targets:
-            continue
-        try:
-            pid = int(fields[1])
-        except ValueError:
-            pid = -1
-        if pid not in allowed:
+    conflicts: list[dict[str, Any]] = []
+    worker_observations: dict[int, list[dict[str, Any]]] = {
+        pid: [] for pid in workers
+    }
+    observed_start_ticks = {}
+    for pid in sorted(required):
+        observed = _process_start_ticks(pid)
+        observed_start_ticks[pid] = observed
+        if observed is None:
             conflicts.append(
                 {
-                    "device": targets[fields[0]],
-                    "gpu_uuid": fields[0],
+                    "kind": "required_worker_process_missing",
                     "pid": pid,
-                    "process_name": fields[2],
-                    "used_memory_mib": fields[3],
+                    "expected_process_start_ticks": start_ticks[pid],
+                }
+            )
+        elif observed != start_ticks[pid]:
+            conflicts.append(
+                {
+                    "kind": "worker_pid_reused",
+                    "pid": pid,
+                    "expected_process_start_ticks": start_ticks[pid],
+                    "observed_process_start_ticks": observed,
+                }
+            )
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",", 3)]
+        if len(fields) != 4:
+            raise RuntimeError("nvidia-smi returned a malformed compute-process row")
+        try:
+            pid = int(fields[1])
+        except ValueError as exc:
+            raise RuntimeError("nvidia-smi returned an invalid compute-process PID") from exc
+        gpu_uuid = fields[0]
+        target = targets.get(gpu_uuid.lower())
+        expected = workers.get(pid)
+        if target is None and expected is None:
+            continue
+        observation = {
+            "device": None if target is None else int(target["index"]),
+            "gpu_uuid": gpu_uuid,
+            "pid": pid,
+            "process_name": fields[2],
+            "used_memory_mib": fields[3],
+        }
+        if expected is not None:
+            worker_observations[pid].append(observation)
+            if gpu_uuid.lower() != str(expected["uuid"]).lower():
+                conflicts.append(
+                    {
+                        "kind": "worker_on_wrong_gpu",
+                        "expected_device": int(expected["index"]),
+                        "expected_gpu_uuid": expected["uuid"],
+                        **observation,
+                    }
+                )
+        elif target is not None:
+            conflicts.append(
+                {
+                    "kind": "foreign_compute_process",
+                    **observation,
+                }
+            )
+    for pid, observations in worker_observations.items():
+        if len(observations) > 1:
+            conflicts.append(
+                {
+                    "kind": "worker_pid_observed_multiple_times",
+                    "pid": pid,
+                    "expected_device": int(workers[pid]["index"]),
+                    "observed_gpu_uuids": [row["gpu_uuid"] for row in observations],
+                }
+            )
+        if pid in required and not observations:
+            conflicts.append(
+                {
+                    "kind": "required_worker_missing",
+                    "pid": pid,
+                    "expected_device": int(workers[pid]["index"]),
+                    "expected_gpu_uuid": workers[pid]["uuid"],
+                }
+            )
+    for pid in sorted(required):
+        observed = _process_start_ticks(pid)
+        if observed != start_ticks[pid]:
+            conflicts.append(
+                {
+                    "kind": "worker_process_changed_during_gpu_query",
+                    "pid": pid,
+                    "expected_process_start_ticks": start_ticks[pid],
+                    "observed_process_start_ticks": observed,
                 }
             )
     return conflicts
+
+
+def _process_start_ticks(pid: int) -> Optional[int]:
+    """Return Linux /proc start ticks, or None when a worker has exited."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii") as handle:
+            value = handle.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("cannot inspect generation worker process identity") from exc
+    closing = value.rfind(")")
+    fields = value[closing + 2 :].split() if closing >= 0 else []
+    if len(fields) <= 19:
+        raise RuntimeError("generation worker process record is invalid")
+    try:
+        ticks = int(fields[19])
+    except ValueError as exc:
+        raise RuntimeError("generation worker process start time is invalid") from exc
+    return ticks if ticks >= 0 else None
+
+
+def _worker_ready_record(
+    device_index: int, device_identity: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Create the one-shot IPC record emitted after CUDA context initialization."""
+    process_start_ticks = _process_start_ticks(os.getpid())
+    if process_start_ticks is None:
+        raise RuntimeError("generation worker process start time is unavailable")
+    return {
+        "schema": WORKER_READY_SCHEMA,
+        "pid": os.getpid(),
+        "process_start_ticks": process_start_ticks,
+        "physical_device_index": int(device_index),
+        "gpu_uuid": device_identity["gpu_uuid"],
+        "torch_device_uuid": device_identity["torch_device_uuid"],
+        "pci_bus_id": device_identity["pci_bus_id"],
+        "gpu": device_identity["gpu"],
+    }
+
+
+def _validate_worker_ready_record(
+    record: Any,
+    expected_workers: Mapping[int, Mapping[str, Any]],
+    expected_worker_start_ticks: Mapping[int, int],
+) -> int:
+    if not isinstance(record, Mapping) or set(record) != {
+        "schema",
+        "pid",
+        "process_start_ticks",
+        "physical_device_index",
+        "gpu_uuid",
+        "torch_device_uuid",
+        "pci_bus_id",
+        "gpu",
+    }:
+        raise ValueError("generation worker-ready record fields differ")
+    if record.get("schema") != WORKER_READY_SCHEMA:
+        raise ValueError("generation worker-ready schema differs")
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid not in expected_workers:
+        raise ValueError("generation worker-ready PID is not registered")
+    expected_start_ticks = expected_worker_start_ticks.get(pid)
+    if (
+        not isinstance(expected_start_ticks, int)
+        or isinstance(expected_start_ticks, bool)
+        or expected_start_ticks < 0
+        or record.get("process_start_ticks") != expected_start_ticks
+    ):
+        raise ValueError("generation worker-ready process start time differs")
+    if _process_start_ticks(pid) != expected_start_ticks:
+        raise ValueError("generation worker-ready PID was reused")
+    expected = expected_workers[pid]
+    observed = {
+        "index": record.get("physical_device_index"),
+        "uuid": record.get("gpu_uuid"),
+        "pci_bus_id": record.get("pci_bus_id"),
+        "name": record.get("gpu"),
+    }
+    frozen = {
+        "index": expected.get("index"),
+        "uuid": expected.get("uuid"),
+        "pci_bus_id": expected.get("pci_bus_id"),
+        "name": expected.get("name"),
+    }
+    if observed != frozen:
+        raise ValueError("generation worker-ready GPU identity differs")
+    if str(record.get("torch_device_uuid", "")).lower() != str(
+        record.get("gpu_uuid", "")
+    ).lower():
+        raise ValueError("generation worker-ready Torch UUID differs")
+    return pid
+
+
+def _worker_completion_record(
+    device_index: int,
+    device_identity: Mapping[str, Any],
+    completed_task_count: int,
+) -> dict[str, Any]:
+    """Create the completion handshake held until the parent audits the GPU."""
+    process_start_ticks = _process_start_ticks(os.getpid())
+    if process_start_ticks is None:
+        raise RuntimeError("generation worker process start time is unavailable")
+    return {
+        "schema": WORKER_COMPLETION_SCHEMA,
+        "pid": os.getpid(),
+        "process_start_ticks": process_start_ticks,
+        "physical_device_index": int(device_index),
+        "gpu_uuid": device_identity["gpu_uuid"],
+        "torch_device_uuid": device_identity["torch_device_uuid"],
+        "pci_bus_id": device_identity["pci_bus_id"],
+        "gpu": device_identity["gpu"],
+        "completed_task_count": int(completed_task_count),
+    }
+
+
+def _worker_handshake_failures(
+    expected_workers: Mapping[int, Mapping[str, Any]],
+    ready_pids: Sequence[int],
+    completed_pids: Sequence[int],
+    gpu_verified_pids: Sequence[int],
+) -> list[tuple[str, str, str]]:
+    """Return terminal failures for missing worker lifecycle receipts."""
+    expected = {int(pid) for pid in expected_workers}
+    ready = {int(pid) for pid in ready_pids}
+    completed = {int(pid) for pid in completed_pids}
+    verified = {int(pid) for pid in gpu_verified_pids}
+    failures: list[tuple[str, str, str]] = []
+    missing_ready = sorted(expected - ready)
+    if missing_ready:
+        failures.append(
+            (
+                "gpu-monitor",
+                "worker-ready-missing",
+                json.dumps({"missing_pids": missing_ready}, sort_keys=True),
+            )
+        )
+    missing_completion = sorted(expected - completed)
+    if missing_completion:
+        failures.append(
+            (
+                "gpu-monitor",
+                "worker-completion-missing",
+                json.dumps({"missing_pids": missing_completion}, sort_keys=True),
+            )
+        )
+    missing_gpu_verification = sorted(expected - verified)
+    if missing_gpu_verification:
+        failures.append(
+            (
+                "gpu-monitor",
+                "worker-gpu-verification-missing",
+                json.dumps(
+                    {"missing_pids": missing_gpu_verification}, sort_keys=True
+                ),
+            )
+        )
+    return failures
+
+
+def _validate_worker_completion_record(
+    record: Any,
+    expected_workers: Mapping[int, Mapping[str, Any]],
+    expected_worker_start_ticks: Mapping[int, int],
+    expected_task_counts: Mapping[int, int],
+    *,
+    require_live_process: bool = True,
+) -> int:
+    if not isinstance(record, Mapping) or set(record) != {
+        "schema",
+        "pid",
+        "process_start_ticks",
+        "physical_device_index",
+        "gpu_uuid",
+        "torch_device_uuid",
+        "pci_bus_id",
+        "gpu",
+        "completed_task_count",
+    }:
+        raise ValueError("generation worker-completion record fields differ")
+    if record.get("schema") != WORKER_COMPLETION_SCHEMA:
+        raise ValueError("generation worker-completion schema differs")
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid not in expected_workers:
+        raise ValueError("generation worker-completion PID is not registered")
+    expected_start_ticks = expected_worker_start_ticks.get(pid)
+    if (
+        not isinstance(expected_start_ticks, int)
+        or isinstance(expected_start_ticks, bool)
+        or expected_start_ticks < 0
+        or record.get("process_start_ticks") != expected_start_ticks
+    ):
+        raise ValueError("generation worker-completion process start time differs")
+    if require_live_process and _process_start_ticks(pid) != expected_start_ticks:
+        raise ValueError("generation worker-completion PID was reused")
+    expected = expected_workers[pid]
+    observed = {
+        "index": record.get("physical_device_index"),
+        "uuid": record.get("gpu_uuid"),
+        "pci_bus_id": record.get("pci_bus_id"),
+        "name": record.get("gpu"),
+    }
+    frozen = {
+        "index": expected.get("index"),
+        "uuid": expected.get("uuid"),
+        "pci_bus_id": expected.get("pci_bus_id"),
+        "name": expected.get("name"),
+    }
+    if observed != frozen:
+        raise ValueError("generation worker-completion GPU identity differs")
+    if str(record.get("torch_device_uuid", "")).lower() != str(
+        record.get("gpu_uuid", "")
+    ).lower():
+        raise ValueError("generation worker-completion Torch UUID differs")
+    expected_count = expected_task_counts.get(pid)
+    if (
+        not isinstance(expected_count, int)
+        or isinstance(expected_count, bool)
+        or record.get("completed_task_count") != expected_count
+    ):
+        raise ValueError("generation worker-completion task count differs")
+    return pid
 
 
 def _require_generation_devices_process_free(
@@ -949,11 +1307,11 @@ def validate_git_launch_contract() -> str:
 
 
 def _parse_devices(value: str) -> tuple[int, ...]:
-    if value != "2,5,6,7":
-        raise argparse.ArgumentTypeError("devices must be exactly 2,5,6,7")
+    if value != "4,5,6,7":
+        raise argparse.ArgumentTypeError("devices must be exactly 4,5,6,7")
     devices = tuple(int(item) for item in value.split(","))
     if devices != EXPECTED_DEVICES:
-        raise argparse.ArgumentTypeError("devices must be exactly 2,5,6,7")
+        raise argparse.ArgumentTypeError("devices must be exactly 4,5,6,7")
     return devices
 
 
@@ -1748,9 +2106,22 @@ def validate_sidecar(
         raise ValueError("worker physical device differs from the task")
     if worker.get("cuda_visible_devices") is not None:
         raise ValueError("worker used CUDA_VISIBLE_DEVICES remapping")
-    for key in ("gpu_uuid", "pci_bus_id", "gpu"):
+    for key in ("gpu_uuid", "torch_device_uuid", "pci_bus_id", "gpu"):
         if not isinstance(worker.get(key), str) or not worker[key]:
             raise ValueError(f"worker device identity lacks {key}")
+    worker_pid = worker.get("worker_pid")
+    worker_start_ticks = worker.get("worker_process_start_ticks")
+    if (
+        isinstance(worker_pid, bool)
+        or not isinstance(worker_pid, int)
+        or worker_pid <= 0
+        or isinstance(worker_start_ticks, bool)
+        or not isinstance(worker_start_ticks, int)
+        or worker_start_ticks < 0
+    ):
+        raise ValueError("worker process provenance is invalid")
+    if worker["torch_device_uuid"].lower() != worker["gpu_uuid"].lower():
+        raise ValueError("worker Torch and NVIDIA GPU UUIDs differ")
     worker_model = record.get("worker_model_snapshot_provenance")
     _validate_worker_model_snapshot_evidence(worker_model)
     if record.get("worker_model_snapshot_sha256") != canonical_sha256(worker_model):
@@ -2171,7 +2542,26 @@ def _tensor_sha256(value: Any) -> str:
     return sha256_bytes(payload)
 
 
-def _cuda_device_identity(torch: Any, device_index: int) -> dict[str, Any]:
+def _torch_cuda_uuid(properties: Any) -> str:
+    value = getattr(properties, "uuid", None)
+    if value is None:
+        raise RuntimeError("Torch CUDA properties do not expose a GPU UUID")
+    raw = str(value).strip().lower()
+    if raw.startswith("gpu-"):
+        raw = raw[4:]
+    if re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", raw
+    ) is None:
+        raise RuntimeError("Torch CUDA GPU UUID is invalid")
+    return f"GPU-{raw}"
+
+
+def _cuda_device_identity(
+    torch: Any,
+    device_index: int,
+    *,
+    expected_identity: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
     if "CUDA_VISIBLE_DEVICES" in os.environ or "CUDA_DEVICE_ORDER" in os.environ:
         raise RuntimeError(
             "CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER must be unset; device ids are physical"
@@ -2182,6 +2572,7 @@ def _cuda_device_identity(torch: Any, device_index: int) -> dict[str, Any]:
     if torch.cuda.current_device() != device_index:
         raise RuntimeError("CUDA current device differs from the assigned physical GPU")
     properties = torch.cuda.get_device_properties(device_index)
+    torch_uuid = _torch_cuda_uuid(properties)
     output = _run_command(
         [
             "nvidia-smi",
@@ -2192,18 +2583,23 @@ def _cuda_device_identity(torch: Any, device_index: int) -> dict[str, Any]:
     matches = []
     for line in output.splitlines():
         fields = [field.strip() for field in line.split(",", 4)]
-        if len(fields) == 5 and fields[0] == str(device_index):
+        if len(fields) == 5 and fields[1].lower() == torch_uuid.lower():
             matches.append(fields)
     if len(matches) != 1:
-        raise RuntimeError("assigned physical GPU is absent or ambiguous in nvidia-smi")
+        raise RuntimeError("Torch GPU UUID is absent or ambiguous in nvidia-smi")
     physical, gpu_uuid, pci_bus_id, gpu_name, total_memory_mib = matches[0]
+    if int(physical) != int(device_index):
+        raise RuntimeError("Torch GPU UUID maps to a different physical GPU index")
+    if gpu_uuid.lower() != torch_uuid.lower():
+        raise RuntimeError("Torch and nvidia-smi disagree on the assigned GPU UUID")
     if gpu_name != str(properties.name):
         raise RuntimeError("Torch and nvidia-smi disagree on the assigned GPU name")
-    return {
+    identity = {
         "requested_device": f"cuda:{device_index}",
         "logical_device_index": int(torch.cuda.current_device()),
         "physical_device_index": int(physical),
         "gpu_uuid": gpu_uuid,
+        "torch_device_uuid": torch_uuid,
         "pci_bus_id": pci_bus_id,
         "gpu": gpu_name,
         "compute_capability": f"{properties.major}.{properties.minor}",
@@ -2211,6 +2607,29 @@ def _cuda_device_identity(torch: Any, device_index: int) -> dict[str, Any]:
         "nvidia_smi_total_memory_mib": int(total_memory_mib),
         "cuda_visible_devices": None,
     }
+    if expected_identity is not None:
+        expected = {
+            "index": identity["physical_device_index"],
+            "uuid": identity["gpu_uuid"],
+            "pci_bus_id": identity["pci_bus_id"],
+            "name": identity["gpu"],
+            "total_memory_mib": identity["nvidia_smi_total_memory_mib"],
+        }
+        observed = {
+            key: expected_identity.get(key)
+            for key in (
+                "index",
+                "uuid",
+                "pci_bus_id",
+                "name",
+                "total_memory_mib",
+            )
+        }
+        if observed != expected:
+            raise RuntimeError(
+                "worker CUDA identity differs from the frozen run inventory"
+            )
+    return identity
 
 
 def _reset_pipeline_ledgers(pipe: Any) -> None:
@@ -2506,6 +2925,9 @@ def _worker(
     abort_event: Any,
     publication_lock: Any,
     error_queue: Any,
+    ready_queue: Any,
+    completion_queue: Any,
+    release_event: Any,
 ) -> None:
     current_task = "worker-startup"
     pipe = None
@@ -2527,7 +2949,30 @@ def _worker(
             observed_environment = _generation_environment(run_config["devices"], torch)
             if observed_environment != run_config["generation_environment"]:
                 raise RuntimeError("worker generation environment differs from run contract")
-            identity = _cuda_device_identity(torch, device_index)
+            expected_identities = [
+                row
+                for row in run_config["generation_environment"]["gpu_inventory"]
+                if int(row["index"]) == int(device_index)
+            ]
+            if len(expected_identities) != 1:
+                raise RuntimeError(
+                    "worker assigned GPU is absent or duplicated in run inventory"
+                )
+            identity = _cuda_device_identity(
+                torch,
+                device_index,
+                expected_identity=expected_identities[0],
+            )
+            worker_pid = os.getpid()
+            worker_process_start_ticks = _process_start_ticks(worker_pid)
+            if worker_process_start_ticks is None:
+                raise RuntimeError("generation worker process start time is unavailable")
+            identity["worker_pid"] = worker_pid
+            identity["worker_process_start_ticks"] = worker_process_start_ticks
+            context_probe = torch.empty((1,), device=device)
+            torch.cuda.synchronize(device_index)
+            del context_probe
+            ready_queue.put(_worker_ready_record(device_index, identity))
             _validate_model_snapshot_record(run_config["model_snapshot"])
             try:
                 stage_record = model_snapshot.stage_model_snapshot(
@@ -2640,6 +3085,15 @@ def _worker(
                 "tree_sha256"
             ):
                 raise RuntimeError("worker staged-model tree changed during generation")
+            if not abort_event.is_set():
+                completion_queue.put(
+                    _worker_completion_record(
+                        device_index, identity, completed
+                    )
+                )
+                while not release_event.wait(0.25):
+                    if abort_event.is_set():
+                        break
         except BaseException as exc:
             worker_error = exc
 
@@ -2730,7 +3184,50 @@ def _run_workers(
     abort_event = context.Event()
     publication_lock = context.Lock()
     error_queue = context.Queue()
+    ready_queue = context.Queue()
+    completion_queue = context.Queue()
+    release_event = context.Event()
     processes = []
+    process_assignments = []
+    expected_workers: dict[int, dict[str, Any]] = {}
+    process_by_pid = {}
+    ready_pids: set[int] = set()
+    completed_pids: set[int] = set()
+    gpu_verified_pids: set[int] = set()
+
+    expected_worker_start_ticks: dict[int, int] = {}
+    expected_task_counts: dict[int, int] = {}
+
+    def drain_ready_queue() -> None:
+        while True:
+            try:
+                record = ready_queue.get_nowait()
+            except queue.Empty:
+                return
+            pid = _validate_worker_ready_record(
+                record, expected_workers, expected_worker_start_ticks
+            )
+            if pid in ready_pids:
+                raise ValueError("generation worker emitted readiness more than once")
+            ready_pids.add(pid)
+
+    def drain_completion_queue(*, require_live_process: bool = True) -> None:
+        while True:
+            try:
+                record = completion_queue.get_nowait()
+            except queue.Empty:
+                return
+            pid = _validate_worker_completion_record(
+                record,
+                expected_workers,
+                expected_worker_start_ticks,
+                expected_task_counts,
+                require_live_process=require_live_process,
+            )
+            if pid in completed_pids:
+                raise ValueError("generation worker emitted completion more than once")
+            completed_pids.add(pid)
+
     contract_payload = {
         "sampling": copy.deepcopy(contract["sampling"]),
         "output_dir": str(contract["output_dir"]),
@@ -2753,6 +3250,9 @@ def _run_workers(
                     abort_event,
                     publication_lock,
                     error_queue,
+                    ready_queue,
+                    completion_queue,
+                    release_event,
                 ),
                 name=f"hpsv2-gpu-{device}",
             )
@@ -2763,9 +3263,27 @@ def _run_workers(
                     processes.append(process)
                 raise
             processes.append(process)
-        allowed_worker_pids = [
-            int(process.pid) for process in processes if process.pid is not None
-        ]
+            process_assignments.append((process, int(device)))
+        frozen_by_device = {
+            int(row["index"]): dict(row)
+            for row in run_config["generation_environment"]["gpu_inventory"]
+        }
+        for process, device in process_assignments:
+            if process.pid is None or int(process.pid) <= 0:
+                raise RuntimeError("generation worker started without a valid PID")
+            pid = int(process.pid)
+            if pid in expected_workers or device not in frozen_by_device:
+                raise RuntimeError("generation worker PID or GPU assignment is invalid")
+            process_start_ticks = _process_start_ticks(pid)
+            if process_start_ticks is None:
+                raise RuntimeError("generation worker process exited before registration")
+            expected_workers[pid] = frozen_by_device[device]
+            expected_worker_start_ticks[pid] = process_start_ticks
+            expected_task_counts[pid] = sum(
+                len(block) for block in blocks[device]
+            )
+            process_by_pid[pid] = process
+
         next_gpu_monitor = 0.0
         while any(process.is_alive() for process in processes):
             try:
@@ -2773,6 +3291,19 @@ def _run_workers(
                 _request_generation_abort(abort_event)
             except queue.Empty:
                 pass
+            ready_count = len(ready_pids)
+            try:
+                drain_ready_queue()
+            except BaseException:
+                failures.append(("gpu-monitor", "worker-ready", traceback.format_exc()))
+                _request_generation_abort(abort_event)
+            if len(ready_pids) != ready_count:
+                next_gpu_monitor = 0.0
+            try:
+                drain_completion_queue()
+            except BaseException:
+                failures.append(("gpu-monitor", "worker-completion", traceback.format_exc()))
+                _request_generation_abort(abort_event)
             for process in processes:
                 if process.exitcode not in (0, None) and not failures:
                     failures.append(
@@ -2781,10 +3312,17 @@ def _run_workers(
                     _request_generation_abort(abort_event)
             now = time.monotonic()
             if now >= next_gpu_monitor and not failures:
+                required_worker_pids = [
+                    pid
+                    for pid in ready_pids | completed_pids
+                    if process_by_pid[pid].is_alive()
+                ]
                 try:
                     conflicts = _generation_compute_conflicts(
                         run_config["generation_environment"],
-                        allowed_pids=allowed_worker_pids,
+                        expected_workers=expected_workers,
+                        required_pids=required_worker_pids,
+                        expected_worker_start_ticks=expected_worker_start_ticks,
                     )
                 except BaseException:
                     failures.append(
@@ -2801,6 +3339,14 @@ def _run_workers(
                             )
                         )
                         _request_generation_abort(abort_event)
+                    else:
+                        gpu_verified_pids.update(required_worker_pids)
+                        if (
+                            expected_workers
+                            and set(expected_workers) <= completed_pids
+                            and set(expected_workers) <= gpu_verified_pids
+                        ):
+                            release_event.set()
                 next_gpu_monitor = now + 2.0
             if failures:
                 break
@@ -2812,6 +3358,7 @@ def _run_workers(
         _request_generation_abort(abort_event)
         lifecycle_error = exc
     finally:
+        release_event.set()
         join_deadline = time.monotonic() + 60.0
         for process in processes:
             try:
@@ -2872,6 +3419,22 @@ def _run_workers(
                 failures.append(error_queue.get_nowait())
             except queue.Empty:
                 break
+        try:
+            drain_ready_queue()
+        except BaseException:
+            failures.append(("gpu-monitor", "worker-ready", traceback.format_exc()))
+        try:
+            drain_completion_queue(require_live_process=False)
+        except BaseException:
+            failures.append(("gpu-monitor", "worker-completion", traceback.format_exc()))
+        failures.extend(
+            _worker_handshake_failures(
+                expected_workers,
+                ready_pids,
+                completed_pids,
+                gpu_verified_pids,
+            )
+        )
         for process in processes:
             if process.exitcode not in (0, None) and not failures:
                 failures.append(

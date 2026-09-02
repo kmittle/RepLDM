@@ -8,7 +8,14 @@ outputs/*
 outputs/archived_results/*
 !outputs/archived_results/README.md
 pretrained_ckpts/
-/_experiments_expansion/
+/_experiments_expansion/*
+!/_experiments_expansion/task-description.md
+!/_experiments_expansion/rethinking/
+/_experiments_expansion/rethinking/*
+!/_experiments_expansion/rethinking/*.md
+/DATA/*
+!/DATA/README.md
+
 ###################################################################
 
 # Byte-compiled / optimized / DLL files

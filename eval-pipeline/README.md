@@ -399,7 +399,7 @@ HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 \
   /home/bycao/miniforge3/envs/repldm_eval/bin/python eval-pipeline/prestage_weights.py
 ```
 
-ImageReward additionally uses the source checkout at `/mnt/miah204/bycao/ImageReward`. The pre-stage command caches its checkpoint, media config, and BERT tokenizer. Generation and formal scoring run offline after weights are staged.
+ImageReward additionally uses the source checkout at `/mnt/miah204/bycao/ImageReward`. The pre-stage command caches its checkpoint, media config, and the complete `bert-base-uncased` closure (`vocab.txt`, `tokenizer_config.json`, `tokenizer.json`, and `config.json`). It also stages TOPIQ-NR's `cfanet_nr_koniq_res50-9a73138b.pth` and the `timm/resnet50.a1_in1k` `model.safetensors` backbone. The command exits nonzero and reports the failed steps if any asset check fails; `PRESTAGE COMPLETE` is printed only after all steps pass. Generation and formal scoring run offline after weights are staged.
 
 ## Score
 

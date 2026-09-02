@@ -26,4 +26,5 @@ dependencies = [
 packages = [
     "AttentionGuidance",
     "InferencePipelines",
+    "latent_renderer_training",
 ]

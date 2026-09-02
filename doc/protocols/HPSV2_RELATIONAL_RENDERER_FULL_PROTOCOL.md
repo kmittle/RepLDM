@@ -45,7 +45,7 @@ after generation starts.
 ## Execution and Audit
 
 The complete matrix is `3,200 x 4 = 12,800` images. Assign whole prompt blocks
-to GPUs 2, 5, 6, and 7 so all four paired settings for one prompt stay on the
+to GPUs 4, 5, 6, and 7 so all four paired settings for one prompt stay on the
 same device. Each PNG must have an atomic JSON sidecar containing the prompt
 row, seed, setting, image hash, device identity, scheduler values, U-Net call
 count, renderer/provider diagnostics, and generation-attempt identity. Workers
@@ -78,14 +78,20 @@ it passes the memory/utilization limits and has no listed compute process for
 two consecutive polls. It checks again immediately before launch. During
 generation, the parent checks the compute-process list every two seconds and
 permits only its four worker PIDs. After generation, the queue independently
-waits for GPU 2 before starting the scorer, whose own watchdog permits only the
+waits for GPU 4 before starting the scorer, whose own watchdog permits only the
 scorer PID. This is not an atomic cluster reservation, so a late process can
 overlap briefly; once detected, the current stage fails instead of continuing
-silently on a shared GPU. Setting the shared abort event and publishing a
-PNG/sidecar pair use the same inter-process lock, so a worker cannot publish its
-in-flight result after the monitor has failed. Every system query has a
-ten-second timeout. A temporary query failure keeps the waiting queue alive,
-while a monitoring failure during generation or scoring fails closed.
+silently on a shared GPU. Abort signaling is lock-free, so an exited worker
+cannot leave the parent waiting on a publication lock. The parent poisons every
+private attempt as soon as monitoring or a worker fails. A late worker may finish
+its private write, but the parent will never accept or publish files from that
+attempt. Every system query has a ten-second timeout. A temporary query failure
+keeps the waiting queue alive, while a monitoring failure during generation or
+scoring fails closed.
+Each started worker must emit exactly one readiness record and exactly one
+completion record. The completion record is held until the parent has performed
+the final GPU identity/process audit; a missing or duplicate record fails the
+attempt even when all expected PNG/sidecar files exist.
 
 ## Scoring and Decision
 
@@ -115,21 +121,37 @@ cleanly, followed by an atomic `scoring_success.json` that binds the complete
 score-file hash and ordered task IDs. Analysis recomputes every binding; missing
 receipts and changed finite score values both fail.
 An already valid canonical score/receipt pair remains untouched during a rerun.
-If final publication is interrupted after replacing either file, the scorer
-restores the previous pair byte for byte; startup, model-loading, and watchdog
-failures therefore cannot erase an earlier completed evaluation.
+Before final publication, the scorer fsyncs content-addressed backups of the old
+pair and an atomic transaction journal. Startup reconciles this journal before
+loading any scorer: a fully written new pair is committed, otherwise the old
+pair is restored byte for byte. Backups and the journal are removed only after a
+directory fsync. This also covers `SIGKILL` and host failure between replacing
+the score file and replacing its receipt; ordinary startup, model-loading, and
+watchdog failures cannot erase an earlier completed evaluation.
 The scoring YAML itself enables the exclusive-GPU watchdog even if a caller
 omits the matching CLI flag. Every score row records the exact watchdog mode,
 physical CUDA device, polling interval, and canonical contract hash; analysis
-rejects absent, disabled, changed, or non-`cuda:2` monitoring provenance.
+rejects absent, disabled, changed, or non-`cuda:4` monitoring provenance.
 The queue also forces Hugging Face and Transformers offline during formal
-scoring, and the scorer blocks Python socket and URL access. Before model
-construction, all 29 required model, tokenizer, and ImageReward source files are
-copied into a private read-only directory. Models load only through its pinned
-directory descriptor; file identity and SHA-256 are checked after every model
-load and after scoring. The copied-file manifests are part of the registered
-scorer provenance, so both scoring and analysis reject changed implementations,
-packages, source files, preprocessing, or checkpoint bytes.
+scoring. Before any formal scorer plugin is imported, the process installs an
+irreversible process-wide Linux seccomp filter, synchronized to every existing
+thread, that denies socket and io_uring network syscalls. The process verifies
+every `/proc/self/task/*` seccomp mode and rescans open sockets after installation;
+cached Python functions, native code, new threads, and child processes inherit
+the same denial. The Python socket guard remains only as an early, readable error.
+Before model construction, all 31 required model, tokenizer, architecture, and
+ImageReward source files are copied into a private read-only directory. This
+inventory includes the OpenAI CLIP BPE vocabulary and HPS `ViT-H-14.json`; both
+tokenizers use their staged vocabularies explicitly, and `ftfy`/`regex` versions
+are bound. Models load only through the pinned directory descriptor; file
+identity and SHA-256 are checked after every model load and after scoring. Compact
+aggregate Python-source tree hashes bind `hpsv2`, OpenAI `clip`, `pyiqa`, and
+`timm`; the private scorer package initializer and provenance builder are bound
+as explicit implementation sources. These
+formal loaders live in `hpsv2_scorers/`, leaving the shared `scorers/` bytes used
+by older registered experiments unchanged. The copied-file manifests are part
+of the registered scorer provenance, so scoring and analysis reject changed
+implementations, packages, source files, preprocessing, or checkpoint bytes.
 The repository scorer stores raw HPS cosine values; multiply them by 100 only
 for the official table format and keep raw values in all paired calculations.
 

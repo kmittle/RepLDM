@@ -139,6 +139,67 @@ class HPSv2AnalysisTest(unittest.TestCase):
         self.assertAlmostEqual(low, 0.01)
         self.assertAlmostEqual(high, 0.01)
 
+    def test_cluster_bootstrap_gives_each_prompt_equal_weight(self) -> None:
+        labels = []
+        values = []
+        # 3,149 singleton prompts plus 18 duplicate pairs and 5 duplicate
+        # triples gives the frozen 3,172 clusters / 3,200 rows.
+        for index in range(3149):
+            labels.append(f"singleton-{index}")
+            values.append(0.0)
+        for index in range(18):
+            labels.extend([f"pair-{index}"] * 2)
+            values.extend([0.0, 0.0])
+        for index in range(5):
+            labels.extend([f"triple-{index}"] * 3)
+            values.extend([1.0, 1.0, 1.0] if index == 0 else [0.0, 0.0, 0.0])
+        captured = []
+
+        def capture_quantile(array, quantiles):
+            captured.append(array.copy())
+            return [0.0, 0.0]
+
+        with mock.patch.object(analyzer.np, "quantile", side_effect=capture_quantile):
+            analyzer.cluster_bootstrap_mean_interval(
+                values,
+                labels,
+                samples=10000,
+                confidence=0.95,
+                seed=analyzer.EXPECTED_BASE_SEED,
+            )
+        rng = analyzer.np.random.default_rng(analyzer.EXPECTED_BASE_SEED)
+        indices = rng.integers(0, 3172, size=(250, 3172))
+        cluster_values = analyzer.np.zeros(3172, dtype=analyzer.np.float64)
+        cluster_values[3149 + 18] = 1.0
+        expected_first = cluster_values[indices[0]].mean()
+        assert captured and captured[0][0] == expected_first
+
+    def test_execution_provenance_must_be_uniform_across_rows(self) -> None:
+        execution = {"device": "cuda:4", "target_identity": {"uuid": "a"}}
+        digest = "a" * 64
+        observation = {"scorer_pid": 12, "process_start_ticks": 34}
+        rows = [
+            {
+                "id": "task-0",
+                "scoring_execution_provenance": execution,
+                "scoring_execution_provenance_sha256": digest,
+                "scoring_execution_observation": observation,
+            },
+            {
+                "id": "task-1",
+                "scoring_execution_provenance": execution,
+                "scoring_execution_provenance_sha256": digest,
+                "scoring_execution_observation": observation,
+            },
+        ]
+        analyzer._validate_uniform_scoring_execution_rows(rows)
+        rows[1]["scoring_execution_observation"] = {
+            **observation,
+            "scorer_pid": 13,
+        }
+        with self.assertRaisesRegex(ValueError, "provenance drifted"):
+            analyzer._validate_uniform_scoring_execution_rows(rows)
+
 
 class QueueAnalysisContractTest(unittest.TestCase):
     def test_analysis_binds_the_registered_scorer_hash(self) -> None:
@@ -149,7 +210,7 @@ class QueueAnalysisContractTest(unittest.TestCase):
         self.assertIsNone(registered_contract)
         self.assertEqual(
             registered_hash,
-            "4ae13c86588d4d1c23cf99e04bc178130ceb160288ed30c6df93641409447926",
+            "f2734daafd1040ad95ceb1295d5bcee35ac3882e66bf5bb32a9576ae8311ed42",
         )
         with mock.patch.object(
             analyzer,
