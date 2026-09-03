@@ -16,6 +16,13 @@ benchmark:
     colors: 94
     position: 100
     color_attr: 100
+  # The numeric values are a registration choice, not an official GenEval
+  # requirement. Every method in one comparison must use this exact cohort.
+  seed_cohort:
+    schema: repldm.geneval_seed_cohort.v1
+    id: geneval_shared_v1
+    seeds: [2026090301, 2026090302, 2026090303, 2026090304]
+    sha256: d6250b326e44e2e11b97a77c1fd8d1c4867486735007fedb02fb8beaf18f947b
   sample_seeds: [2026090301, 2026090302, 2026090303, 2026090304]
   subset_evaluation_allowed: false
 

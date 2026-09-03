@@ -19,6 +19,12 @@ HASH = "a" * 64
 CHECKPOINT_HASH = "b" * 64
 CONTRACT_HASH = "c" * 64
 SEEDS = (2026090301, 2026090302, 2026090303, 2026090304)
+SEED_COHORT = {
+    "schema": geneval.SEED_COHORT_SCHEMA,
+    "id": "geneval_shared_v1",
+    "seeds": list(SEEDS),
+    "sha256": geneval.seed_cohort_sha256("geneval_shared_v1", SEEDS),
+}
 
 
 @pytest.fixture(scope="module")
@@ -62,6 +68,7 @@ def full_run(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
         method="opd",
         run_contract_sha256=CONTRACT_HASH,
         sample_seeds=SEEDS,
+        seed_cohort=SEED_COHORT,
     )
     input_path = run_dir / "geneval" / "input_manifest.jsonl"
     input_hash = geneval.write_input_manifest(input_path, rows)
@@ -72,6 +79,7 @@ def full_run(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
         run_dir=run_dir,
         layout_dir=layout_dir,
         input_manifest_sha256=input_hash,
+        expected_seed_cohort=SEED_COHORT,
     )
     raw_rows: list[dict[str, object]] = []
     for row in rows:
@@ -135,6 +143,14 @@ def test_config_cannot_rebind_official_metadata(field: str) -> None:
         "/tmp/lookalike-geneval.jsonl" if field == "metadata_path" else "a" * 64
     )
     with pytest.raises(ValueError, match="frozen official metadata"):
+        geneval._validate_config_contract(altered)
+
+
+def test_config_requires_a_self_consistent_shared_seed_cohort() -> None:
+    config, _config_hash = geneval._load_config(geneval.DEFAULT_CONFIG_PATH)
+    altered = copy.deepcopy(config)
+    altered["benchmark"]["seed_cohort"]["sha256"] = "a" * 64
+    with pytest.raises(ValueError, match="seed_cohort.sha256"):
         geneval._validate_config_contract(altered)
 
 
@@ -235,6 +251,7 @@ def test_aggregate_result_is_prompt_clustered_and_hash_sealed(full_run: dict[str
         scores_path=scores_path,
         bootstrap_seed=7,
         bootstrap_resamples=20,
+        expected_seed_cohort=SEED_COHORT,
     )
     assert summary["counts"]["images"] == 2212
     assert summary["bootstrap"]["unit"] == "prompt"
@@ -245,6 +262,96 @@ def test_aggregate_result_is_prompt_clustered_and_hash_sealed(full_run: dict[str
     tampered["counts"]["images"] = 1
     with pytest.raises(ValueError, match="counts"):
         geneval.validate_summary(tampered, require_sealed=True)
+
+    tampered_cohort = copy.deepcopy(summary)
+    tampered_cohort["seed_cohort"] = {
+        "schema": geneval.SEED_COHORT_SCHEMA,
+        "id": "geneval_shared_v2",
+        "seeds": [11, 29, 101, 303],
+        "sha256": geneval.seed_cohort_sha256("geneval_shared_v2", [11, 29, 101, 303]),
+    }
+    tampered_core = {
+        key: value for key, value in tampered_cohort.items() if key != "summary_sha256"
+    }
+    tampered_cohort["summary_sha256"] = geneval.sha256_bytes(
+        geneval.canonical_json(tampered_core)
+    )
+    with pytest.raises(ValueError, match="not registered"):
+        geneval.validate_summary(tampered_cohort, require_sealed=True)
+
+
+def test_seed_values_must_use_the_reviewed_shared_cohort_registration() -> None:
+    config, _config_hash = geneval._load_config(geneval.DEFAULT_CONFIG_PATH)
+    alternate_seeds = [11, 29, 101, 303]
+    alternate = copy.deepcopy(config)
+    alternate["benchmark"]["sample_seeds"] = alternate_seeds
+    alternate["benchmark"]["seed_cohort"] = {
+        "schema": geneval.SEED_COHORT_SCHEMA,
+        "id": "geneval_shared_v2",
+        "seeds": alternate_seeds,
+        "sha256": geneval.seed_cohort_sha256("geneval_shared_v2", alternate_seeds),
+    }
+    with pytest.raises(ValueError, match="not registered"):
+        geneval._validate_config_contract(alternate)
+
+
+def test_new_cohort_requires_a_new_registered_id_and_revision() -> None:
+    config, _config_hash = geneval._load_config(geneval.DEFAULT_CONFIG_PATH)
+    alternate = copy.deepcopy(config)
+    alternate["benchmark"]["seed_cohort"]["id"] = "geneval_shared_v2"
+    alternate["benchmark"]["sample_seeds"] = [11, 29, 101, 303]
+    alternate["benchmark"]["seed_cohort"]["seeds"] = [11, 29, 101, 303]
+    alternate["benchmark"]["seed_cohort"]["sha256"] = geneval.seed_cohort_sha256(
+        "geneval_shared_v2", [11, 29, 101, 303]
+    )
+    with pytest.raises(ValueError, match="not registered"):
+        geneval._validate_config_contract(alternate)
+
+
+def test_input_manifest_cannot_switch_or_drop_shared_seed_cohort(full_run: dict[str, object]) -> None:
+    rows = copy.deepcopy(full_run["rows"])
+    manifest = full_run["manifest"]
+    run_dir = full_run["run_dir"]
+    assert isinstance(rows, list)
+    assert isinstance(manifest, dict)
+    assert isinstance(run_dir, Path)
+
+    switched = copy.deepcopy(rows)
+    alternate_seeds = (11, 29, 101, 303)
+    alternate_cohort = {
+        "schema": geneval.SEED_COHORT_SCHEMA,
+        "id": "geneval_shared_v2",
+        "seeds": list(alternate_seeds),
+        "sha256": geneval.seed_cohort_sha256("geneval_shared_v2", alternate_seeds),
+    }
+    for row in switched:
+        row["seed"] = alternate_seeds[row["sample_index"]]
+        row["seed_cohort_id"] = alternate_cohort["id"]
+        row["seed_cohort_sha256"] = alternate_cohort["sha256"]
+    with pytest.raises(ValueError, match="seed cohort"):
+        geneval._validate_input_rows(
+            switched,
+            manifest,
+            run_dir=run_dir,
+            expected_seed_cohort=SEED_COHORT,
+        )
+    assert geneval._validate_input_rows(
+        switched,
+        manifest,
+        run_dir=run_dir,
+        expected_seed_cohort=alternate_cohort,
+    )
+
+    missing = copy.deepcopy(rows)
+    missing[0].pop("seed_cohort_id")
+    missing[0].pop("seed_cohort_sha256")
+    with pytest.raises(ValueError, match="seed cohort"):
+        geneval._validate_input_rows(
+            missing,
+            manifest,
+            run_dir=run_dir,
+            expected_seed_cohort=SEED_COHORT,
+        )
 
 
 def test_formal_evaluator_registry_rejects_path_replacement(monkeypatch: pytest.MonkeyPatch) -> None:

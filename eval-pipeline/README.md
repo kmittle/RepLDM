@@ -13,10 +13,16 @@ analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 
 Formal renderer checkpoints use the frozen Sana metadata at
 `/mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/test_metadata.jsonl`.
-It contains 553 unique prompts, repeated over four registered seeds, so one
-setting is exactly 2,212 images. The four metadata rows for a prompt are not
-four independent prompts; confidence intervals are clustered by prompt. A
-subset or a different seed list is rejected by the wrapper.
+It contains 553 prompts and four samples per prompt, so one setting is exactly
+2,212 images. The four rows for a prompt are not four independent prompts;
+confidence intervals are clustered by prompt. The numeric seeds are a
+registration choice, not a GenEval requirement. The config registers them as
+one ordered `seed_cohort` (`id` plus SHA-256), and every method in a comparison
+must use the same cohort. The formal CLI accepts only cohort IDs registered in
+the reviewed code revision. To change seeds, add a new versioned registration
+and rerun every method; changing only one method is rejected. A seed list that
+differs from the selected config, a missing cohort binding, or a mixed cohort
+is rejected by every CLI stage.
 
 The stages below are resumable and keep every file under one run directory.
 Run them from the repository root with the `repldm_eval` environment:
@@ -54,7 +60,8 @@ $PY eval-pipeline/geneval_full.py aggregate \
 ```
 
 The evaluator, model tree, input manifest, layout, raw JSONL, scores, config,
-checkpoint, and run contract are all hashed into `geneval/summary.json`.
+checkpoint, run contract, and shared seed cohort are all hashed into
+`geneval/summary.json`.
 `validate-summary --summary ...` must pass before a score is copied into an
 experiment table. The upstream evaluator is intentionally kept outside this
 repository; use a local, reviewed checkout with network access disabled.

@@ -37,8 +37,8 @@ ingredients is a novelty claim.
 ## Shared Renderer Contract
 
 All training methods use the same coefficient-only `StructuralLatentRenderer` with the same
-active bases, state encoder, parameter count, coefficient limits, prompt set, seeds, 50-step
-zero-churn Euler schedule, CFG, VAE, and SDXL checkpoint. The first round disables the D4
+active bases, state encoder, parameter count, coefficient limits, prompt set, **ordered seed
+cohort**, 50-step zero-churn Euler schedule, CFG, VAE, and SDXL checkpoint. The first round disables the D4
 spatial head. A probability objective that covers only coefficients while another trainable
 head changes the latent would be invalid.
 
@@ -624,9 +624,14 @@ before frame mixing.
 ## Evaluation and Stop Rules
 
 Every frozen checkpoint is evaluated on complete HPSv2 (3,200 images) and official GenEval
-(553 prompts times four images, 2,212 total). Training rewards cannot be the only primary
-metric. Report three independent training seeds separately, then paired prompt-level
-confidence intervals; do not multiply the apparent sample size by seeds or settings.
+(553 prompts times four images, 2,212 total). For GenEval, the numeric values of the four
+sample seeds are not intrinsically special; fairness requires that every compared method use
+the same pre-registered ordered `seed_cohort` (ID and SHA-256). A new cohort is allowed only
+as a new reviewed registration used by all methods; a method may not replace its seeds alone.
+The manifest, layout, score, and summary validators all check this binding. Training rewards
+cannot be the only primary metric. Report three independent training seeds separately, then
+paired prompt-level confidence intervals; do not multiply the apparent sample size by seeds
+or settings.
 
 A method handler may publish `status=training_complete` after its frozen checkpoint,
 per-update records, rollout manifests, and sealed query ledger are durable. It must also set

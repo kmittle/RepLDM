@@ -3,9 +3,9 @@
 The upstream GenEval evaluator writes one loose JSONL file and does not know
 anything about a RepLDM checkpoint, seed manifest, or paired experiment.  This
 module supplies that missing boundary.  It validates the frozen 553-prompt
-source, binds exactly four samples to every prompt, materializes the directory
-layout expected by the upstream evaluator, and aggregates only a complete
-2,212-image result.
+source, binds exactly four samples to every prompt, records one shared seed
+cohort for all methods, materializes the directory layout expected by the
+upstream evaluator, and aggregates only a complete 2,212-image result.
 
 The object detector itself is deliberately not copied into this repository.
 ``run_official_evaluator`` invokes the reviewed local Sana/GenEval checkout in
@@ -46,6 +46,24 @@ INPUT_ROW_SCHEMA = "repldm.geneval_input_row.v1"
 SCORE_ROW_SCHEMA = "repldm.geneval_score_row.v1"
 SUMMARY_SCHEMA = "repldm.geneval_summary.v1"
 LAYOUT_SCHEMA = "repldm.geneval_layout.v1"
+SEED_COHORT_SCHEMA = "repldm.geneval_seed_cohort.v1"
+DEFAULT_SEED_COHORT_ID = "geneval_shared_v1"
+DEFAULT_SAMPLE_SEEDS = (2026090301, 2026090302, 2026090303, 2026090304)
+DEFAULT_SEED_COHORT_SHA256 = (
+    "d6250b326e44e2e11b97a77c1fd8d1c4867486735007fedb02fb8beaf18f947b"
+)
+
+# A formal run may select only a cohort that has been registered in a reviewed
+# repository revision.  Registering a new cohort requires a new ID and commit;
+# a method cannot introduce a private seed list through its CLI invocation.
+REGISTERED_SEED_COHORTS = {
+    DEFAULT_SEED_COHORT_ID: {
+        "schema": SEED_COHORT_SCHEMA,
+        "id": DEFAULT_SEED_COHORT_ID,
+        "seeds": list(DEFAULT_SAMPLE_SEEDS),
+        "sha256": DEFAULT_SEED_COHORT_SHA256,
+    }
+}
 
 EXPECTED_PROMPT_COUNT = 553
 EXPECTED_SAMPLES_PER_PROMPT = 4
@@ -103,6 +121,92 @@ def canonical_json(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _validate_sample_seeds(value: Any, *, label: str = "sample_seeds") -> tuple[int, ...]:
+    """Validate the ordered four-seed sample axis used by formal GenEval."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{label} must contain exactly four distinct integers")
+    seeds = tuple(value)
+    if (
+        len(seeds) != EXPECTED_SAMPLES_PER_PROMPT
+        or any(type(seed) is not int or seed < 0 for seed in seeds)
+        or len(set(seeds)) != len(seeds)
+    ):
+        raise ValueError(f"{label} must contain exactly four distinct non-negative integers")
+    return seeds
+
+
+def seed_cohort_sha256(cohort_id: str, seeds: Sequence[int]) -> str:
+    """Return the stable digest for one shared, ordered seed cohort."""
+    if not isinstance(cohort_id, str) or not cohort_id.strip():
+        raise ValueError("seed cohort id must be non-empty")
+    normalized_id = cohort_id.strip()
+    normalized_seeds = _validate_sample_seeds(seeds, label="seed cohort seeds")
+    payload = {
+        "schema": SEED_COHORT_SCHEMA,
+        "cohort_id": normalized_id,
+        "seeds": list(normalized_seeds),
+    }
+    return sha256_bytes(canonical_json(payload))
+
+
+def _normalize_seed_cohort(
+    value: Mapping[str, Any], *, expected_seeds: Sequence[int] | None = None
+) -> dict[str, Any]:
+    """Validate and canonicalize a registered seed cohort descriptor."""
+    if not isinstance(value, Mapping):
+        raise ValueError("seed_cohort must be a mapping")
+    if set(value) != {"schema", "id", "seeds", "sha256"}:
+        raise ValueError("seed_cohort must contain exactly schema, id, seeds, and sha256")
+    if value.get("schema") != SEED_COHORT_SCHEMA:
+        raise ValueError("seed_cohort schema is invalid")
+    cohort_id = value.get("id")
+    if not isinstance(cohort_id, str) or not cohort_id.strip():
+        raise ValueError("seed_cohort.id must be a non-empty string")
+    cohort_id = cohort_id.strip()
+    seeds = _validate_sample_seeds(value.get("seeds"), label="seed_cohort.seeds")
+    if expected_seeds is not None and seeds != _validate_sample_seeds(
+        expected_seeds, label="expected seed cohort"
+    ):
+        raise ValueError("seed cohort seeds differ from the expected shared cohort")
+    digest = value.get("sha256")
+    _require_hash(digest, label="seed_cohort.sha256")
+    expected_digest = seed_cohort_sha256(cohort_id, seeds)
+    if digest != expected_digest:
+        raise ValueError("seed_cohort.sha256 does not match its id and seeds")
+    return {
+        "schema": SEED_COHORT_SCHEMA,
+        "id": cohort_id,
+        "seeds": list(seeds),
+        "sha256": digest,
+    }
+
+
+def validate_shared_seed_cohort(
+    cohorts: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Require every formal comparison arm to use one registered cohort."""
+    normalized = [_registered_seed_cohort(value) for value in cohorts]
+    if not normalized:
+        raise ValueError("at least one seed cohort is required")
+    first = normalized[0]
+    if any(canonical_json(value) != canonical_json(first) for value in normalized[1:]):
+        raise ValueError("compared GenEval methods use different seed cohorts")
+    return first
+
+
+def _registered_seed_cohort(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one cohort against the reviewed formal registry."""
+    normalized = _normalize_seed_cohort(value)
+    registered = REGISTERED_SEED_COHORTS.get(normalized["id"])
+    if registered is None:
+        raise ValueError(
+            "seed cohort is not registered for formal GenEval; add a reviewed cohort version"
+        )
+    if canonical_json(normalized) != canonical_json(registered):
+        raise ValueError("seed cohort differs from the reviewed registry bytes")
+    return normalized
 
 
 def sha256_file(path: Path) -> str:
@@ -434,6 +538,7 @@ def build_input_manifest(
     method: str,
     run_contract_sha256: str,
     sample_seeds: Sequence[int],
+    seed_cohort: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate generation records and return the canonical 2,212-row manifest."""
     if not isinstance(checkpoint_id, str) or not checkpoint_id:
@@ -442,11 +547,20 @@ def build_input_manifest(
     if not isinstance(method, str) or not method:
         raise ValueError("method must be a non-empty string")
     _require_hash(run_contract_sha256, label="run_contract_sha256")
-    seeds = tuple(sample_seeds)
-    if len(seeds) != EXPECTED_SAMPLES_PER_PROMPT or len(set(seeds)) != len(seeds):
-        raise ValueError("GenEval requires exactly four distinct registered sample seeds")
-    if any(type(seed) is not int for seed in seeds):
-        raise ValueError("GenEval sample seeds must be plain integers")
+    seeds = _validate_sample_seeds(sample_seeds)
+    if seed_cohort is None:
+        # Keep programmatic smoke callers usable, but label their cohort as
+        # unregistered so it cannot be mistaken for a formal shared cohort.
+        cohort = {
+            "schema": SEED_COHORT_SCHEMA,
+            "id": "unregistered",
+            "seeds": list(seeds),
+            "sha256": seed_cohort_sha256("unregistered", seeds),
+        }
+    else:
+        cohort = _registered_seed_cohort(
+            _normalize_seed_cohort(seed_cohort, expected_seeds=seeds)
+        )
     prompts = _prompt_by_index(prompt_manifest)
     if len(prompts) != EXPECTED_PROMPT_COUNT:
         raise ValueError("the formal GenEval input requires 553 prompts")
@@ -496,7 +610,7 @@ def build_input_manifest(
         if path_key in paths:
             raise ValueError("one image path is assigned to multiple GenEval cells")
         paths.add(path_key)
-        observed[key] = {
+        row = {
             "schema": INPUT_ROW_SCHEMA,
             "benchmark": "GenEval",
             "checkpoint_id": checkpoint_id,
@@ -513,6 +627,9 @@ def build_input_manifest(
             "source_record_id": source.get("id"),
             "optimization_seed": source.get("optimization_seed"),
         }
+        row["seed_cohort_id"] = cohort["id"]
+        row["seed_cohort_sha256"] = cohort["sha256"]
+        observed[key] = row
 
     expected_cells = {
         (prompt_index, sample_index)
@@ -539,9 +656,15 @@ def _validate_input_rows(
     prompt_manifest: Mapping[str, Any],
     *,
     run_dir: Path,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> dict[tuple[int, int], Mapping[str, Any]]:
     """Revalidate a persisted input manifest at every downstream boundary."""
     prompts = _prompt_by_index(prompt_manifest)
+    expected_cohort = (
+        _normalize_seed_cohort(expected_seed_cohort)
+        if expected_seed_cohort is not None
+        else None
+    )
     if len(rows) != EXPECTED_IMAGE_COUNT:
         raise ValueError("formal GenEval input manifest must contain exactly 2,212 rows")
     expected_cells = {
@@ -551,6 +674,9 @@ def _validate_input_rows(
     }
     observed: dict[tuple[int, int], Mapping[str, Any]] = {}
     seed_by_sample: dict[int, int] = {}
+    cohort_ids: set[str] = set()
+    cohort_hashes: set[str] = set()
+    cohort_presence: set[bool] = set()
     identity_fields = (
         "checkpoint_id",
         "checkpoint_sha256",
@@ -579,6 +705,28 @@ def _validate_input_rows(
         _require_hash(row.get("run_contract_sha256"), label="run_contract_sha256")
         if type(row.get("seed")) is not int:
             raise ValueError(f"GenEval input row {row_number} seed is invalid")
+        cohort_id = row.get("seed_cohort_id")
+        cohort_hash = row.get("seed_cohort_sha256")
+        cohort_presence.add(cohort_id is not None)
+        if (cohort_id is None) != (cohort_hash is None):
+            raise ValueError(
+                f"GenEval input row {row_number} has an incomplete seed cohort binding"
+            )
+        if cohort_id is not None:
+            if not isinstance(cohort_id, str) or not cohort_id.strip():
+                raise ValueError(
+                    f"GenEval input row {row_number} seed_cohort_id is invalid"
+                )
+            _require_hash(
+                cohort_hash,
+                label=f"seed_cohort_sha256 for input row {row_number}",
+            )
+            cohort_ids.add(cohort_id)
+            cohort_hashes.add(cohort_hash)
+        elif expected_cohort is not None:
+            raise ValueError(
+                f"GenEval input row {row_number} lacks the expected seed cohort binding"
+            )
         previous_seed = seed_by_sample.setdefault(sample_index, row["seed"])
         if previous_seed != row["seed"]:
             raise ValueError("GenEval input uses inconsistent seeds for one sample index")
@@ -594,6 +742,26 @@ def _validate_input_rows(
         raise ValueError(f"GenEval input is incomplete: {missing} missing, {extra} extra")
     if len(seed_by_sample) != EXPECTED_SAMPLES_PER_PROMPT or len(set(seed_by_sample.values())) != EXPECTED_SAMPLES_PER_PROMPT:
         raise ValueError("GenEval input must bind four distinct seeds to the sample indices")
+    observed_seeds = tuple(seed_by_sample[index] for index in range(EXPECTED_SAMPLES_PER_PROMPT))
+    _validate_sample_seeds(observed_seeds, label="GenEval input seeds")
+    if len(cohort_ids) > 1 or len(cohort_hashes) > 1:
+        raise ValueError("GenEval input contains mixed seed cohorts")
+    if len(cohort_presence) > 1:
+        raise ValueError("GenEval input contains incomplete seed cohort bindings")
+    observed_cohort: dict[str, Any] | None = None
+    if cohort_ids:
+        observed_cohort = _normalize_seed_cohort(
+            {
+                "schema": SEED_COHORT_SCHEMA,
+                "id": next(iter(cohort_ids)),
+                "seeds": list(observed_seeds),
+                "sha256": next(iter(cohort_hashes)),
+            },
+            expected_seeds=observed_seeds,
+        )
+    if expected_cohort is not None:
+        if observed_cohort is None or canonical_json(observed_cohort) != canonical_json(expected_cohort):
+            raise ValueError("GenEval input seed cohort differs from the registered shared cohort")
     first = observed[min(observed)]
     for field in identity_fields:
         if any(row.get(field) != first.get(field) for row in observed.values()):
@@ -659,6 +827,7 @@ def materialize_official_layout(
     run_dir: Path,
     layout_dir: Path,
     input_manifest_sha256: str,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the upstream ``00000/samples/0000.png`` layout by hardlinking."""
     _require_hash(input_manifest_sha256, label="input_manifest_sha256")
@@ -676,7 +845,12 @@ def materialize_official_layout(
         raise ValueError("GenEval layout cannot be a symlink")
     layout_dir.mkdir(parents=True, exist_ok=True)
     prompts = _prompt_by_index(prompt_manifest)
-    by_cell = _validate_input_rows(rows, prompt_manifest, run_dir=run_dir)
+    by_cell = _validate_input_rows(
+        rows,
+        prompt_manifest,
+        run_dir=run_dir,
+        expected_seed_cohort=expected_seed_cohort,
+    )
     unexpected_directories = [
         child.name
         for child in layout_dir.iterdir()
@@ -745,6 +919,29 @@ def materialize_official_layout(
         "image_count": EXPECTED_IMAGE_COUNT,
         "rows": layout_rows,
     }
+    layout_cohort = (
+        _normalize_seed_cohort(expected_seed_cohort)
+        if expected_seed_cohort is not None
+        else None
+    )
+    if layout_cohort is None:
+        first_row = by_cell[(0, 0)]
+        if "seed_cohort_id" in first_row and "seed_cohort_sha256" in first_row:
+            observed_seeds = tuple(
+                by_cell[(0, index)]["seed"]
+                for index in range(EXPECTED_SAMPLES_PER_PROMPT)
+            )
+            layout_cohort = _normalize_seed_cohort(
+                {
+                    "schema": SEED_COHORT_SCHEMA,
+                    "id": first_row["seed_cohort_id"],
+                    "seeds": list(observed_seeds),
+                    "sha256": first_row["seed_cohort_sha256"],
+                },
+                expected_seeds=observed_seeds,
+            )
+    if layout_cohort is not None:
+        descriptor["seed_cohort"] = layout_cohort
     descriptor["layout_sha256"] = sha256_bytes(canonical_json(descriptor))
     _write_new_or_verify(
         layout_dir / "layout.json",
@@ -785,6 +982,7 @@ def normalize_results(
     layout_dir: Path,
     evaluator: Mapping[str, Any],
     run_dir: Path | None = None,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Bind upstream result rows to the canonical input cells."""
     if len(input_rows) != EXPECTED_IMAGE_COUNT:
@@ -799,6 +997,7 @@ def normalize_results(
         input_rows,
         prompt_manifest,
         run_dir=input_root,
+        expected_seed_cohort=expected_seed_cohort,
     )
     output: dict[tuple[int, int], dict[str, Any]] = {}
     prompts = _prompt_by_index(prompt_manifest)
@@ -848,6 +1047,9 @@ def normalize_results(
             "details": raw.get("details", "{}"),
             "evaluator": dict(evaluator),
         }
+        if "seed_cohort_id" in source:
+            output[cell]["seed_cohort_id"] = source["seed_cohort_id"]
+            output[cell]["seed_cohort_sha256"] = source["seed_cohort_sha256"]
     if set(output) != set(expected):
         missing = len(set(expected) - set(output))
         raise ValueError(f"GenEval evaluator output is incomplete: {missing} rows missing")
@@ -925,6 +1127,7 @@ def aggregate_scores(
     config_sha256: str,
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute official task-mean and prompt-cluster statistics."""
     _require_hash(input_manifest_sha256, label="input_manifest_sha256")
@@ -935,6 +1138,9 @@ def aggregate_scores(
     prompts = _prompt_by_index(prompt_manifest)
     by_prompt: dict[int, list[Mapping[str, Any]]] = {}
     observed_cells: set[tuple[int, int]] = set()
+    cohort_ids: set[str] = set()
+    cohort_hashes: set[str] = set()
+    cohort_presence: set[bool] = set()
     for row in rows:
         if row.get("schema") != SCORE_ROW_SCHEMA or type(row.get("correct")) is not bool:
             raise ValueError("GenEval score row schema or correct field is invalid")
@@ -952,6 +1158,19 @@ def aggregate_scores(
         _require_nonempty_string(row.get("method"), label="score.method")
         _require_hash(row.get("run_contract_sha256"), label="score.run_contract_sha256")
         _require_plain_int(row.get("seed"), label="score.seed")
+        cohort_id = row.get("seed_cohort_id")
+        cohort_hash = row.get("seed_cohort_sha256")
+        cohort_presence.add(cohort_id is not None)
+        if (cohort_id is None) != (cohort_hash is None):
+            raise ValueError("GenEval score rows contain an incomplete seed cohort binding")
+        if cohort_id is not None:
+            if not isinstance(cohort_id, str) or not cohort_id.strip():
+                raise ValueError("GenEval score row seed_cohort_id is invalid")
+            _require_hash(cohort_hash, label="score.seed_cohort_sha256")
+            cohort_ids.add(cohort_id)
+            cohort_hashes.add(cohort_hash)
+        elif expected_seed_cohort is not None:
+            raise ValueError("GenEval score rows lack the expected seed cohort binding")
         _require_hash(row.get("image_sha256"), label=f"score.image_sha256 for {(p, s)}")
         by_prompt.setdefault(p, []).append(row)
     expected_cells = {
@@ -965,6 +1184,34 @@ def aggregate_scores(
         len(value) != EXPECTED_SAMPLES_PER_PROMPT for value in by_prompt.values()
     ):
         raise ValueError("GenEval scores do not contain exactly four samples per prompt")
+    seed_by_sample: dict[int, int] = {}
+    for row in rows:
+        sample_index = int(row["sample_index"])
+        seed = int(row["seed"])
+        previous = seed_by_sample.setdefault(sample_index, seed)
+        if previous != seed:
+            raise ValueError("GenEval score rows use inconsistent seeds for one sample index")
+    observed_seeds = tuple(seed_by_sample[index] for index in range(EXPECTED_SAMPLES_PER_PROMPT))
+    _validate_sample_seeds(observed_seeds, label="GenEval score seeds")
+    if len(cohort_ids) > 1 or len(cohort_hashes) > 1:
+        raise ValueError("GenEval score rows contain mixed seed cohorts")
+    if len(cohort_presence) > 1:
+        raise ValueError("GenEval score rows contain incomplete seed cohort bindings")
+    observed_cohort: dict[str, Any] | None = None
+    if cohort_ids:
+        observed_cohort = _normalize_seed_cohort(
+            {
+                "schema": SEED_COHORT_SCHEMA,
+                "id": next(iter(cohort_ids)),
+                "seeds": list(observed_seeds),
+                "sha256": next(iter(cohort_hashes)),
+            },
+            expected_seeds=observed_seeds,
+        )
+    if expected_seed_cohort is not None:
+        normalized_expected = _normalize_seed_cohort(expected_seed_cohort)
+        if observed_cohort is None or canonical_json(observed_cohort) != canonical_json(normalized_expected):
+            raise ValueError("GenEval scores use a different seed cohort from the registered one")
     prompt_scores = {
         p: sum(1.0 if row["correct"] else 0.0 for row in rows_for_prompt) / 4.0
         for p, rows_for_prompt in by_prompt.items()
@@ -1038,6 +1285,8 @@ def aggregate_scores(
             "confidence_intervals": bootstrap,
         },
     }
+    if observed_cohort is not None:
+        summary_core["seed_cohort"] = observed_cohort
     summary = {
         **summary_core,
         "summary_sha256": sha256_bytes(canonical_json(summary_core)),
@@ -1046,7 +1295,10 @@ def aggregate_scores(
 
 
 def validate_summary(
-    summary: Mapping[str, Any], *, require_sealed: bool = False
+    summary: Mapping[str, Any],
+    *,
+    require_sealed: bool = False,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate a previously published summary before treating it as complete."""
     if not isinstance(summary, Mapping) or summary.get("schema") != SUMMARY_SCHEMA:
@@ -1069,6 +1321,19 @@ def validate_summary(
         "summary_sha256",
     ):
         _require_hash(summary.get(field), label=f"summary.{field}")
+    summary_cohort_value = summary.get("seed_cohort")
+    if summary_cohort_value is None:
+        if require_sealed or expected_seed_cohort is not None:
+            raise ValueError("GenEval summary lacks its shared seed cohort binding")
+        summary_cohort = None
+    else:
+        summary_cohort = _normalize_seed_cohort(summary_cohort_value)
+        if require_sealed:
+            summary_cohort = _registered_seed_cohort(summary_cohort)
+    if expected_seed_cohort is not None:
+        expected_cohort = _normalize_seed_cohort(expected_seed_cohort)
+        if summary_cohort is None or canonical_json(summary_cohort) != canonical_json(expected_cohort):
+            raise ValueError("GenEval summary seed cohort differs from the registered shared cohort")
     counts = summary.get("counts")
     if not isinstance(counts, Mapping):
         raise ValueError("GenEval summary counts are incomplete")
@@ -1148,9 +1413,18 @@ def validate_summary(
     return dict(summary)
 
 
-def validate_summary_files(summary: Mapping[str, Any], *, run_dir: Path) -> dict[str, Any]:
+def validate_summary_files(
+    summary: Mapping[str, Any],
+    *,
+    run_dir: Path,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate a sealed summary and rehash the files it claims to bind."""
-    validated = validate_summary(summary, require_sealed=True)
+    validated = validate_summary(
+        summary,
+        require_sealed=True,
+        expected_seed_cohort=expected_seed_cohort,
+    )
     root = _run_dir(Path(run_dir))
     file_bindings = {
         "input_manifest_sha256": root / DEFAULT_INPUT_MANIFEST,
@@ -1160,8 +1434,18 @@ def validate_summary_files(summary: Mapping[str, Any], *, run_dir: Path) -> dict
     for field, path in file_bindings.items():
         if sha256_file(path) != validated[field]:
             raise ValueError(f"GenEval {field} does not match the published file")
+    _read_input_manifest(
+        root / DEFAULT_INPUT_MANIFEST,
+        prompt_manifest=load_prompt_manifest(),
+        run_dir=root,
+        expected_sha256=validated["input_manifest_sha256"],
+        expected_seed_cohort=validated["seed_cohort"],
+    )
     layout_path = root / DEFAULT_LAYOUT_DIR
-    if _layout_hash(layout_path) != validated["layout_sha256"]:
+    if _layout_hash(
+        layout_path,
+        expected_seed_cohort=validated["seed_cohort"],
+    ) != validated["layout_sha256"]:
         raise ValueError("GenEval layout hash does not match the published summary")
     evaluator = _validate_evaluator_descriptor(validated["evaluator"])
     registry_id = evaluator.get("registry_id")
@@ -1304,6 +1588,7 @@ def run_official_evaluator(
     timeout_seconds: float = 86_400.0,
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the reviewed upstream evaluator and publish normalized results."""
     layout = materialize_official_layout(
@@ -1312,6 +1597,7 @@ def run_official_evaluator(
         run_dir=run_dir,
         layout_dir=layout_dir,
         input_manifest_sha256=input_manifest_sha256,
+        expected_seed_cohort=expected_seed_cohort,
     )
     evaluator_python = Path(evaluator_python)
     evaluator_script = Path(evaluator_script)
@@ -1437,6 +1723,7 @@ def run_official_evaluator(
         evaluator=evaluator,
         bootstrap_seed=bootstrap_seed,
         bootstrap_resamples=bootstrap_resamples,
+        expected_seed_cohort=expected_seed_cohort,
     )
     if summary.get("layout_sha256") != layout["layout_sha256"]:
         raise RuntimeError("GenEval summary layout hash differs from materialized layout")
@@ -1464,6 +1751,7 @@ def aggregate_raw_results(
     scores_path: Path | None = None,
     bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize raw evaluator rows, write scores, and publish a sealed summary."""
     evaluator = _validate_evaluator_descriptor(evaluator)
@@ -1474,6 +1762,7 @@ def aggregate_raw_results(
         layout_dir=layout_dir,
         evaluator=evaluator,
         run_dir=run_dir,
+        expected_seed_cohort=expected_seed_cohort,
     )
     destination = scores_path or (Path(run_dir) / "geneval" / "scores.jsonl")
     scores_hash = write_jsonl(destination, normalized)
@@ -1485,6 +1774,7 @@ def aggregate_raw_results(
         config_sha256=config_sha256,
         bootstrap_seed=bootstrap_seed,
         bootstrap_resamples=bootstrap_resamples,
+        expected_seed_cohort=expected_seed_cohort,
     )
     summary_core = {
         key: value
@@ -1494,7 +1784,10 @@ def aggregate_raw_results(
     summary_core.update(
         {
             "scores_sha256": scores_hash,
-            "layout_sha256": _layout_hash(Path(layout_dir)),
+            "layout_sha256": _layout_hash(
+                Path(layout_dir),
+                expected_seed_cohort=expected_seed_cohort,
+            ),
             "evaluator": evaluator,
         }
     )
@@ -1504,7 +1797,11 @@ def aggregate_raw_results(
     }
 
 
-def _layout_hash(layout_dir: Path) -> str:
+def _layout_hash(
+    layout_dir: Path,
+    *,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
+) -> str:
     descriptor_path = Path(layout_dir) / "layout.json"
     if descriptor_path.is_symlink() or not descriptor_path.is_file():
         raise ValueError("GenEval layout descriptor is missing")
@@ -1521,6 +1818,16 @@ def _layout_hash(layout_dir: Path) -> str:
         or descriptor.get("image_count") != EXPECTED_IMAGE_COUNT
     ):
         raise ValueError("GenEval layout descriptor counts are invalid")
+    layout_cohort_value = descriptor.get("seed_cohort")
+    if layout_cohort_value is None:
+        if expected_seed_cohort is not None:
+            raise ValueError("GenEval layout lacks its shared seed cohort binding")
+    else:
+        layout_cohort = _normalize_seed_cohort(layout_cohort_value)
+        if expected_seed_cohort is not None:
+            expected_cohort = _normalize_seed_cohort(expected_seed_cohort)
+            if canonical_json(layout_cohort) != canonical_json(expected_cohort):
+                raise ValueError("GenEval layout seed cohort differs from the registered one")
     rows = descriptor.get("rows")
     if not isinstance(rows, list) or len(rows) != EXPECTED_IMAGE_COUNT:
         raise ValueError("GenEval layout descriptor rows are incomplete")
@@ -1576,6 +1883,18 @@ def _load_config(path: Path) -> tuple[dict[str, Any], str]:
     return value, sha256_bytes(raw)
 
 
+def _config_seed_cohort(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the one seed cohort shared by every formal GenEval arm."""
+    benchmark = config.get("benchmark")
+    if not isinstance(benchmark, Mapping):
+        raise ValueError("GenEval config lacks benchmark contract")
+    sample_seeds = _validate_sample_seeds(
+        benchmark.get("sample_seeds"), label="benchmark.sample_seeds"
+    )
+    cohort = _normalize_seed_cohort(benchmark.get("seed_cohort"), expected_seeds=sample_seeds)
+    return _registered_seed_cohort(cohort)
+
+
 def _validate_config_contract(config: Mapping[str, Any]) -> None:
     if config.get("status") != "frozen_official_benchmark":
         raise ValueError("GenEval config is not the frozen official benchmark")
@@ -1596,14 +1915,7 @@ def _validate_config_contract(config: Mapping[str, Any]) -> None:
         raise ValueError("GenEval config must bind the frozen official metadata path")
     if benchmark.get("metadata_sha256") != DEFAULT_METADATA_SHA256:
         raise ValueError("GenEval config must bind the frozen official metadata hash")
-    seeds = benchmark.get("sample_seeds")
-    if (
-        not isinstance(seeds, list)
-        or len(seeds) != EXPECTED_SAMPLES_PER_PROMPT
-        or any(type(seed) is not int for seed in seeds)
-        or len(set(seeds)) != len(seeds)
-    ):
-        raise ValueError("GenEval config sample_seeds must contain four distinct integers")
+    _config_seed_cohort(config)
     tags = benchmark.get("expected_tags")
     if tags != EXPECTED_TAG_COUNTS:
         raise ValueError("GenEval config task counts differ from the official contract")
@@ -1675,7 +1987,7 @@ def _run_child(run_dir: Path, value: Path | None, default: Path, *, label: str) 
 
 
 def _parse_seed_list(value: str | None, config: Mapping[str, Any]) -> tuple[int, ...]:
-    registered = tuple(config["benchmark"]["sample_seeds"])
+    registered = tuple(_config_seed_cohort(config)["seeds"])
     if value is None:
         seeds = registered
     else:
@@ -1683,16 +1995,10 @@ def _parse_seed_list(value: str | None, config: Mapping[str, Any]) -> tuple[int,
             seeds = [int(piece.strip()) for piece in value.split(",") if piece.strip()]
         except ValueError as exc:
             raise ValueError("--seeds must be a comma-separated list of integers") from exc
-    if (
-        not isinstance(seeds, (list, tuple))
-        or len(seeds) != EXPECTED_SAMPLES_PER_PROMPT
-        or any(type(seed) is not int for seed in seeds)
-        or len(set(seeds)) != len(seeds)
-    ):
-        raise ValueError("GenEval requires exactly four distinct sample seeds")
+    _validate_sample_seeds(seeds)
     if tuple(seeds) != registered:
         raise ValueError(
-            "--seeds must exactly match the four seeds registered in the frozen GenEval config"
+            "--seeds must exactly match the four seeds in the shared GenEval seed cohort"
         )
     return registered
 
@@ -1703,6 +2009,7 @@ def _read_input_manifest(
     prompt_manifest: Mapping[str, Any],
     run_dir: Path,
     expected_sha256: str | None = None,
+    expected_seed_cohort: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     rows = _read_jsonl(path, label="GenEval input manifest")
     actual_sha256 = _jsonl_file_sha256(path, label="GenEval input manifest")
@@ -1710,7 +2017,12 @@ def _read_input_manifest(
         expected_sha256, label="input_manifest_sha256"
     ):
         raise ValueError("GenEval input manifest hash differs from the registered value")
-    _validate_input_rows(rows, prompt_manifest, run_dir=run_dir)
+    _validate_input_rows(
+        rows,
+        prompt_manifest,
+        run_dir=run_dir,
+        expected_seed_cohort=expected_seed_cohort,
+    )
     return rows, actual_sha256
 
 
@@ -1818,6 +2130,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     config, config_hash, prompt_manifest = _load_cli_contract(args)
+    seed_cohort = _config_seed_cohort(config)
     if args.command is None:
         if args.print_manifest:
             print(json.dumps(prompt_manifest, sort_keys=True, ensure_ascii=True))
@@ -1830,6 +2143,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
                         "prompts": prompt_manifest["prompt_count"],
                         "images": prompt_manifest["prompt_count"] * prompt_manifest["samples_per_prompt"],
                         "tag_counts": prompt_manifest["tag_counts"],
+                        "seed_cohort": seed_cohort,
                     },
                     sort_keys=True,
                 )
@@ -1849,6 +2163,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             method=args.method,
             run_contract_sha256=args.run_contract_sha256,
             sample_seeds=_parse_seed_list(args.seeds, config),
+            seed_cohort=seed_cohort,
         )
         output = _run_child(run_dir, args.output, DEFAULT_INPUT_MANIFEST, label="input manifest")
         input_hash = write_input_manifest(output, rows)
@@ -1869,6 +2184,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             prompt_manifest=prompt_manifest,
             run_dir=run_dir,
             expected_sha256=args.input_manifest_sha256,
+            expected_seed_cohort=seed_cohort,
         )
         descriptor = materialize_official_layout(
             rows,
@@ -1876,6 +2192,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             run_dir=run_dir,
             layout_dir=layout_path,
             input_manifest_sha256=input_hash,
+            expected_seed_cohort=seed_cohort,
         )
         print(json.dumps({
             "layout_dir": str(layout_path),
@@ -1895,6 +2212,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             prompt_manifest=prompt_manifest,
             run_dir=run_dir,
             expected_sha256=args.input_manifest_sha256,
+            expected_seed_cohort=seed_cohort,
         )
         evaluator = _evaluator_from_args(args)
         raw_rows = _read_jsonl(raw_path, label="raw GenEval evaluator results")
@@ -1911,6 +2229,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             scores_path=_run_child(run_dir, args.scores, DEFAULT_SCORES, label="scores"),
             bootstrap_seed=int(config["aggregation"]["bootstrap_seed"]),
             bootstrap_resamples=int(config["aggregation"]["bootstrap_resamples"]),
+            expected_seed_cohort=seed_cohort,
         )
         summary_path = _run_child(run_dir, args.summary, DEFAULT_SUMMARY, label="summary")
         _write_summary(summary_path, summary)
@@ -1926,6 +2245,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             prompt_manifest=prompt_manifest,
             run_dir=run_dir,
             expected_sha256=args.input_manifest_sha256,
+            expected_seed_cohort=seed_cohort,
         )
         evaluator = _evaluator_from_args(args)
         summary = run_official_evaluator(
@@ -1943,6 +2263,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             bootstrap_seed=int(config["aggregation"]["bootstrap_seed"]),
             bootstrap_resamples=int(config["aggregation"]["bootstrap_resamples"]),
+            expected_seed_cohort=seed_cohort,
         )
         print(json.dumps(summary, sort_keys=True))
         return 0
@@ -1951,9 +2272,17 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     if args.run_dir is not None:
         if args.allow_unsealed:
             raise ValueError("--allow-unsealed cannot be combined with --run-dir")
-        validate_summary_files(summary, run_dir=args.run_dir)
+        validate_summary_files(
+            summary,
+            run_dir=args.run_dir,
+            expected_seed_cohort=seed_cohort,
+        )
     else:
-        validate_summary(summary, require_sealed=not args.allow_unsealed)
+        validate_summary(
+            summary,
+            require_sealed=not args.allow_unsealed,
+            expected_seed_cohort=seed_cohort,
+        )
     print(json.dumps({"summary": str(Path(args.summary).absolute()), "validated": True}, sort_keys=True))
     return 0
 
@@ -1966,6 +2295,8 @@ __all__ = [
     "DEFAULT_BOOTSTRAP_RESAMPLES",
     "DEFAULT_BOOTSTRAP_SEED",
     "DEFAULT_CONFIG_PATH",
+    "DEFAULT_SAMPLE_SEEDS",
+    "DEFAULT_SEED_COHORT_SHA256",
     "DEFAULT_METADATA_PATH",
     "DEFAULT_METADATA_SHA256",
     "DEFAULT_INPUT_MANIFEST",
@@ -1973,10 +2304,13 @@ __all__ = [
     "DEFAULT_RAW_RESULTS",
     "DEFAULT_SCORES",
     "DEFAULT_SUMMARY",
+    "DEFAULT_SEED_COHORT_ID",
     "EXPECTED_IMAGE_COUNT",
     "EXPECTED_PROMPT_COUNT",
     "EXPECTED_SAMPLES_PER_PROMPT",
     "GENEVAL_SCHEMA",
+    "SEED_COHORT_SCHEMA",
+    "REGISTERED_SEED_COHORTS",
     "aggregate_scores",
     "aggregate_raw_results",
     "build_input_manifest",
@@ -1987,6 +2321,8 @@ __all__ = [
     "rows_sha256",
     "run_official_evaluator",
     "sha256_file",
+    "seed_cohort_sha256",
+    "validate_shared_seed_cohort",
     "validate_summary",
     "validate_summary_files",
     "write_input_manifest",
