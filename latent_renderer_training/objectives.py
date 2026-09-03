@@ -74,17 +74,60 @@ def _valid_weight(values: Tensor, valid: Tensor, weight: Optional[Tensor] = None
     return result
 
 
+def _transition_valid_rows(
+    predicted: Tensor,
+    target: Tensor,
+    nominal_update: Tensor,
+    valid_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Return the fail-closed validity mask shared by transition objectives.
+
+    A transition with no measurable native scheduler update is not a valid
+    decision.  Keeping this predicate in one place prevents OPD/search
+    distillation from accidentally applying their reference anchor penalty to
+    a row that the normalized transition metric already rejected.
+    """
+    row_valid = (
+        torch.isfinite(predicted).flatten(1).all(dim=1)
+        & torch.isfinite(target).flatten(1).all(dim=1)
+        & torch.isfinite(nominal_update).flatten(1).all(dim=1)
+    )
+    native_norm = torch.linalg.vector_norm(nominal_update.float().flatten(1), dim=1)
+    row_valid = row_valid & (native_norm >= 1e-6)
+    if valid_mask is not None:
+        if (
+            not isinstance(valid_mask, Tensor)
+            or valid_mask.ndim != 1
+            or valid_mask.numel() != predicted.shape[0]
+        ):
+            raise ValueError("valid_mask must have one boolean value per transition row")
+        if valid_mask.dtype != torch.bool:
+            raise ValueError("valid_mask must be boolean")
+        row_valid = row_valid & valid_mask.to(device=predicted.device)
+    return row_valid
+
+
 def normalized_transition_loss(
-    predicted: Tensor, target: Tensor, nominal_update: Tensor, *, eps: float = 1e-12
+    predicted: Tensor,
+    target: Tensor,
+    nominal_update: Tensor,
+    *,
+    eps: float = 1e-12,
+    valid_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Native scheduler-transition MSE normalized by nominal update energy."""
     return normalized_transition_losses(
-        predicted, target, nominal_update, eps=eps
+        predicted, target, nominal_update, eps=eps, valid_mask=valid_mask
     ).mean()
 
 
 def normalized_transition_losses(
-    predicted: Tensor, target: Tensor, nominal_update: Tensor, *, eps: float = 1e-12
+    predicted: Tensor,
+    target: Tensor,
+    nominal_update: Tensor,
+    *,
+    eps: float = 1e-12,
+    valid_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Return one normalized transition loss per leading batch item."""
     if predicted.shape != target.shape or predicted.shape != nominal_update.shape:
@@ -96,10 +139,11 @@ def normalized_transition_losses(
     # A malformed rollout is charged but contributes zero loss.  Sanitize
     # before arithmetic so an invalid row cannot poison a whole batch through
     # NaN propagation or float64 overflow.
-    row_valid = (
-        torch.isfinite(predicted).flatten(1).all(dim=1)
-        & torch.isfinite(target).flatten(1).all(dim=1)
-        & torch.isfinite(nominal_update).flatten(1).all(dim=1)
+    # A near-zero native transition has no meaningful scheduler metric.  It
+    # must be rejected as a decision rather than converted into a zero
+    # denominator and allowed to contribute an anchor or policy loss.
+    row_valid = _transition_valid_rows(
+        predicted, target, nominal_update, valid_mask=valid_mask
     )
     pred = torch.nan_to_num(predicted.double(), nan=0.0, posinf=0.0, neginf=0.0)
     goal = torch.nan_to_num(target.double(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -155,6 +199,57 @@ def _resolve_pair_weight(
     return sample_weight.to(device=device)
 
 
+def _density(
+    mean: Tensor,
+    action: Tensor,
+    contract: ActionSpaceContract,
+    pre_squash: Optional[Tensor],
+    *,
+    require_pre_squash: bool,
+) -> tuple[Tensor, Tensor]:
+    """Evaluate a policy density, retaining the exact sampled coordinate.
+
+    A bounded action can lose information when converted back with ``atanh``.
+    Formal rollouts therefore pass the recorded pre-squash value.  The action
+    consistency check prevents a caller from pairing a valid density with a
+    different action tensor.
+    """
+    if pre_squash is None:
+        if require_pre_squash:
+            raise ValueError("formal density evaluation requires pre_squash samples")
+        return SquashedGaussian(mean, contract, strict=False).log_prob(
+            action, strict=False, return_valid=True
+        )
+    if not isinstance(pre_squash, Tensor) or pre_squash.shape != action.shape:
+        raise ValueError("pre_squash must have the same shape as action")
+    fixed_pre_squash = pre_squash.detach()
+    distribution = SquashedGaussian(mean, contract, strict=False)
+    density, valid = distribution.log_prob_from_pre_squash(
+        fixed_pre_squash, strict=False, return_valid=True
+    )
+    active = torch.as_tensor(contract.active_mask, device=action.device, dtype=torch.bool)
+    reconstructed = torch.zeros_like(action)
+    calculated = (
+        float(contract.coefficient_bound)
+        * torch.tanh(fixed_pre_squash[..., active])
+    ).to(dtype=action.dtype)
+    bound = torch.tensor(
+        contract.coefficient_bound, device=action.device, dtype=action.dtype
+    )
+    try:
+        interior = torch.nextafter(bound, torch.zeros_like(bound))
+    except RuntimeError:
+        interior = bound * (1 - 2 * torch.finfo(action.dtype).eps)
+    reconstructed[..., active] = calculated.clamp(-interior, interior)
+    # The sampler and this reconstruction use the same retained ``u`` bytes.
+    # A different bounded action is not a valid observation of this density.
+    consistent = torch.isfinite(action).all(dim=-1) & torch.isfinite(reconstructed).all(dim=-1)
+    consistent = consistent & torch.eq(action, reconstructed).all(dim=-1)
+    valid = valid & consistent
+    density = torch.where(valid, density, torch.zeros_like(density))
+    return density, valid
+
+
 def opd_loss(
     predicted: Tensor,
     teacher_target: Tensor,
@@ -164,6 +259,7 @@ def opd_loss(
     contract: ActionSpaceContract,
     *,
     anchor_weight: float = 0.10,
+    valid_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Detached native-transition OPD target plus a fixed reference anchor."""
     if not math.isfinite(float(anchor_weight)) or anchor_weight < 0:
@@ -177,14 +273,11 @@ def opd_loss(
         label="OPD",
     )
     losses = normalized_transition_losses(
-        predicted, teacher_target.detach(), nominal_update
+        predicted, teacher_target.detach(), nominal_update, valid_mask=valid_mask
     ).double()
-    transition_valid = (
-        _finite_rows(predicted)
-        & _finite_rows(teacher_target)
-        & _finite_rows(nominal_update)
-        & torch.isfinite(losses)
-    )
+    transition_valid = _transition_valid_rows(
+        predicted, teacher_target, nominal_update, valid_mask=valid_mask
+    ) & torch.isfinite(losses)
     anchor_values, anchor_valid = _anchor_losses(mean, reference_mean, contract)
     joint_valid = transition_valid & anchor_valid
     transition = _weighted_mean(
@@ -209,6 +302,7 @@ def search_distill_loss(
     contract: ActionSpaceContract,
     *,
     chosen_weight: Optional[Tensor] = None,
+    valid_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Winner-only branch distillation; ties have zero target weight."""
     _require_same_batch(
@@ -220,14 +314,11 @@ def search_distill_loss(
         label="search distillation",
     )
     losses = normalized_transition_losses(
-        predicted, chosen_target.detach(), nominal_update
+        predicted, chosen_target.detach(), nominal_update, valid_mask=valid_mask
     ).double()
-    transition_valid = (
-        _finite_rows(predicted)
-        & _finite_rows(chosen_target)
-        & _finite_rows(nominal_update)
-        & torch.isfinite(losses)
-    )
+    transition_valid = _transition_valid_rows(
+        predicted, chosen_target, nominal_update, valid_mask=valid_mask
+    ) & torch.isfinite(losses)
     weights = None if chosen_weight is None else chosen_weight.detach().float()
     anchor_values, anchor_valid = _anchor_losses(mean, reference_mean, contract)
     joint_valid = transition_valid & anchor_valid
@@ -256,6 +347,9 @@ def dpo_loss(
     beta: float = 0.10,
     sample_weight: Optional[Tensor] = None,
     tie_mask: Optional[Tensor] = None,
+    chosen_pre_squash: Optional[Tensor] = None,
+    rejected_pre_squash: Optional[Tensor] = None,
+    require_pre_squash: bool = False,
 ) -> Tensor:
     """Reference-relative preference loss over matched branch trajectories."""
     if not torch.isfinite(torch.tensor(beta)) or beta <= 0:
@@ -282,22 +376,24 @@ def dpo_loss(
     # must not carry a pathwise gradient into either policy's density.
     fixed_chosen = chosen_action.detach()
     fixed_rejected = rejected_action.detach()
-    chosen_dist = SquashedGaussian(chosen_mean, contract, strict=False)
-    rejected_dist = SquashedGaussian(rejected_mean, contract, strict=False)
-    chosen_logp, chosen_valid = chosen_dist.log_prob(
-        fixed_chosen, strict=False, return_valid=True
+    chosen_logp, chosen_valid = _density(
+        chosen_mean, fixed_chosen, contract, chosen_pre_squash,
+        require_pre_squash=require_pre_squash,
     )
-    rejected_logp, rejected_valid = rejected_dist.log_prob(
-        fixed_rejected, strict=False, return_valid=True
+    rejected_logp, rejected_valid = _density(
+        rejected_mean, fixed_rejected, contract, rejected_pre_squash,
+        require_pre_squash=require_pre_squash,
     )
     # The reference is frozen, and trajectory preferences are one margin per
     # trajectory rather than one independent sigmoid per decision.
-    ref_chosen, ref_chosen_valid = SquashedGaussian(
-        reference_chosen_mean.detach(), contract, strict=False
-    ).log_prob(fixed_chosen, strict=False, return_valid=True)
-    ref_rejected, ref_rejected_valid = SquashedGaussian(
-        reference_rejected_mean.detach(), contract, strict=False
-    ).log_prob(fixed_rejected, strict=False, return_valid=True)
+    ref_chosen, ref_chosen_valid = _density(
+        reference_chosen_mean.detach(), fixed_chosen, contract, chosen_pre_squash,
+        require_pre_squash=require_pre_squash,
+    )
+    ref_rejected, ref_rejected_valid = _density(
+        reference_rejected_mean.detach(), fixed_rejected, contract, rejected_pre_squash,
+        require_pre_squash=require_pre_squash,
+    )
     policy_delta = chosen_logp - rejected_logp
     reference_delta = ref_chosen - ref_rejected
     if policy_delta.ndim > 1:
@@ -334,6 +430,8 @@ def per_decision_rl_loss(
     clip_low: float = 0.8,
     clip_high: float = 1.2,
     kl_weight: float = 0.01,
+    pre_squash: Optional[Tensor] = None,
+    require_pre_squash: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """DDPO-style per-decision clipped ratios and reference KL."""
     if advantages.ndim == 0:
@@ -358,12 +456,14 @@ def per_decision_rl_loss(
     # prevents a reparameterized rollout from adding an unintended pathwise
     # gradient to the likelihood-ratio objective.
     fixed_actions = actions.detach()
-    behavior_logp, behavior_valid = SquashedGaussian(
-        behavior_mean.detach(), contract, strict=False
-    ).log_prob(fixed_actions, strict=False, return_valid=True)
-    policy_logp, policy_valid = SquashedGaussian(
-        policy_mean, contract, strict=False
-    ).log_prob(fixed_actions, strict=False, return_valid=True)
+    behavior_logp, behavior_valid = _density(
+        behavior_mean.detach(), fixed_actions, contract, pre_squash,
+        require_pre_squash=require_pre_squash,
+    )
+    policy_logp, policy_valid = _density(
+        policy_mean, fixed_actions, contract, pre_squash,
+        require_pre_squash=require_pre_squash,
+    )
     log_ratio = policy_logp - behavior_logp
     valid = behavior_valid & policy_valid & torch.isfinite(log_ratio)
     log_ratio = torch.nan_to_num(log_ratio, nan=0.0, posinf=0.0, neginf=0.0)

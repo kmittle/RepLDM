@@ -14,6 +14,10 @@ dependencies = [
     "omegaconf~=2.3.0",
     "accelerate>=1.2,<2",
     "transformers>=4.47.1,<4.48",
+    "Pillow>=11,<12",
+    "PyYAML>=6,<7",
+    "torchvision>=0.20.1,<0.21",
+    "safetensors>=0.4.5,<0.5",
     "tqdm",
     "einops",
     "entmax",
@@ -26,5 +30,8 @@ dependencies = [
 packages = [
     "AttentionGuidance",
     "InferencePipelines",
+    "InferencePipelines.RepLDM",
+    "InferencePipelines.FreeScale",
     "latent_renderer_training",
+    "latent_renderer_training.methods",
 ]

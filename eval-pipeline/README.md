@@ -9,6 +9,56 @@ compare_actions.py[repldm_eval]  manifest + scores       -> action_comparisons.c
 analyze_adaptivity.py[repldm_eval] scores + held-out seed -> adaptivity CSVs
 ```
 
+## Full GenEval
+
+Formal renderer checkpoints use the frozen Sana metadata at
+`/mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/test_metadata.jsonl`.
+It contains 553 unique prompts, repeated over four registered seeds, so one
+setting is exactly 2,212 images. The four metadata rows for a prompt are not
+four independent prompts; confidence intervals are clustered by prompt. A
+subset or a different seed list is rejected by the wrapper.
+
+The stages below are resumable and keep every file under one run directory.
+Run them from the repository root with the `repldm_eval` environment:
+
+```bash
+PY=/home/bycao/miniforge3/envs/repldm_eval/bin/python
+
+# 1. Validate generator records and publish geneval/input_manifest.jsonl.
+$PY eval-pipeline/geneval_full.py validate-input \
+  --run-dir outputs/renderer/opd_c0 \
+  --records outputs/renderer/opd_c0/manifest.jsonl \
+  --checkpoint-id opd-c0 \
+  --checkpoint-sha256 <64-hex-checkpoint-hash> \
+  --method opd \
+  --run-contract-sha256 <64-hex-contract-hash>
+
+# 2. Create the official 00000/samples/0000.png layout.
+$PY eval-pipeline/geneval_full.py prepare-layout \
+  --run-dir outputs/renderer/opd_c0
+
+# 3. Run the reviewed local Sana evaluator and seal the result.
+$PY eval-pipeline/geneval_full.py run \
+  --run-dir outputs/renderer/opd_c0 \
+  --evaluator-python /opt/geneval/bin/python \
+  --evaluator-script /mnt/miah204/bycao/Sana/tools/metrics/geneval/evaluation/evaluate_images.py \
+  --model-path /mnt/miah204/bycao/Sana/output/pretrained_models/geneval
+
+# Existing raw output can be normalized without rerunning the detector.
+$PY eval-pipeline/geneval_full.py aggregate \
+  --run-dir outputs/renderer/opd_c0 \
+  --raw-results outputs/renderer/opd_c0/geneval/raw_results.jsonl \
+  --evaluator-python /opt/geneval/bin/python \
+  --evaluator-script /mnt/miah204/bycao/Sana/tools/metrics/geneval/evaluation/evaluate_images.py \
+  --model-path /mnt/miah204/bycao/Sana/output/pretrained_models/geneval
+```
+
+The evaluator, model tree, input manifest, layout, raw JSONL, scores, config,
+checkpoint, and run contract are all hashed into `geneval/summary.json`.
+`validate-summary --summary ...` must pass before a score is copied into an
+experiment table. The upstream evaluator is intentionally kept outside this
+repository; use a local, reviewed checkout with network access disabled.
+
 ## Generate
 
 Stage 1 at up to 1024² is the default. A resolution above 1024 requires the explicit `--stage2` opt-in, which enables the repository's high-resolution resampling path and records all phase settings. `--scales` retains the legacy constant-scale sweep; `--actions` accepts no-AG, conference-expert, scalar, low/mid/high-frequency, standalone `trajectory_correction`, and scheduler-reference actions from YAML. Scalar actions may set `residual_mode` to `raw`, `mean_centered`, `moment_tangent`, `moment_tangent_rescaled`, `trajectory_cone_tangent`, or `trajectory_cone_tangent_rescaled`; omitted mode means byte-compatible `raw`. Trajectory-cone modes project against the scheduler update already passed to the controller. Fixed-moment modes cannot use frequency gains or the additive `max_update_ratio` cap because either operation would invalidate their geometry. A trajectory correction interpolates an Euler step toward its analytical ancestral transition, supports `mix` in `[0,1]`, and records per-step norm diagnostics; only `mix=0` and the uncapped `mix=1,sqrt` endpoint have exact scheduler semantics, while intermediate values are ablation controls. Strict paired RNG parity requires a single `torch.Generator`; generator lists are rejected for this intervention. The hook is Stage-1-only and cannot be combined with another intervention. Scheduler references replace only the sampler, record the base scheduler config hash, and are marked `selection_eligible: false` when they are controls rather than proposed methods.

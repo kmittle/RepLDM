@@ -6,6 +6,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .contracts import ActionSpaceContract
@@ -39,6 +40,8 @@ class SquashedGaussian:
         else:
             if not isinstance(noise, Tensor) or noise.shape != self.mean.shape:
                 raise ValueError("noise shape must match mean")
+            if noise.device != self.mean.device:
+                raise ValueError("noise and mean must share one device")
             if not noise.is_floating_point() or not torch.isfinite(noise).all():
                 raise ValueError("noise must be finite and floating-point")
             active_noise = noise[..., active_bool]
@@ -59,9 +62,16 @@ class SquashedGaussian:
         except RuntimeError:
             interior = bound * (1 - 2 * torch.finfo(self.mean.dtype).eps)
         action_active = action_active.clamp(-interior, interior)
-        u = torch.zeros_like(self.mean)
+        # Keep the sampled coordinate in the calculation dtype.  Returning a
+        # rounded fp16 ``u`` would defeat the exact-density path even though the
+        # bounded action itself must retain the policy/model dtype.
+        u = torch.zeros(
+            self.mean.shape,
+            device=self.mean.device,
+            dtype=calc_dtype,
+        )
         action = torch.zeros_like(self.mean)
-        u[..., active_bool] = u_active.to(dtype=self.mean.dtype)
+        u[..., active_bool] = u_active
         action[..., active_bool] = action_active
         return action, u
 
@@ -80,6 +90,8 @@ class SquashedGaussian:
             or not action.is_floating_point()
         ):
             raise ValueError("action must have the same shape as mean")
+        if action.device != self.mean.device:
+            raise ValueError("action and mean must share one device")
         if not torch.isfinite(torch.tensor(eps)) or eps <= 0 or eps >= 1:
             raise ValueError("eps must be finite and lie in (0, 1)")
         valid = self.contract.action_valid_mask(action)
@@ -130,12 +142,30 @@ class SquashedGaussian:
         return output
 
     def log_prob_u(self, pre_squash: Tensor) -> Tensor:
+        """Return the base Normal log density in pre-squash coordinates.
+
+        This method intentionally excludes the tanh Jacobian for compatibility
+        with older audit records.  Training code that evaluates a density for
+        a sampled action must call :meth:`log_prob_from_pre_squash` instead.
+        """
+        value, valid = self._normal_log_prob_u(pre_squash)
+        output = value.to(dtype=self.mean.dtype)
+        valid = valid & torch.isfinite(output)
+        if not bool(valid.all()):
+            raise ValueError("log probability is non-finite")
+        return output
+
+    def _normal_log_prob_u(self, pre_squash: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute the Normal term and a row validity mask."""
         if (
-            pre_squash.ndim < 1
+            not isinstance(pre_squash, Tensor)
+            or pre_squash.ndim < 1
             or pre_squash.shape[-1] != self.contract.num_slots
             or not pre_squash.is_floating_point()
         ):
             raise ValueError("pre_squash has the wrong number of slots")
+        if pre_squash.shape != self.mean.shape or pre_squash.device != self.mean.device:
+            raise ValueError("pre_squash must share the mean shape and device")
         active = torch.as_tensor(self.contract.active_mask, device=pre_squash.device, dtype=torch.bool)
         if not torch.isfinite(pre_squash).all():
             raise ValueError("pre_squash contains non-finite values")
@@ -150,12 +180,70 @@ class SquashedGaussian:
             - math.log(sigma)
             - 0.5 * math.log(2 * math.pi)
         ).sum(dim=-1)
-        if not torch.isfinite(result).all():
-            raise ValueError("log probability is non-finite")
-        output = result.to(dtype=self.mean.dtype)
-        if not torch.isfinite(output).all():
-            raise ValueError("log probability is outside the mean dtype range")
-        return output
+        valid = torch.isfinite(result)
+        result = torch.where(valid, result, torch.zeros_like(result))
+        return result, valid
+
+    def log_prob_from_pre_squash(
+        self,
+        pre_squash: Tensor,
+        *,
+        strict: Optional[bool] = None,
+        return_valid: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Evaluate the exact transformed density at a recorded ``u``.
+
+        A rollout records ``u`` before the coefficient ``bound * tanh(u)``
+        transform.  Reconstructing ``u`` from a rounded coefficient is lossy,
+        especially near the open boundary.  This path keeps the exact sample
+        and includes the absolute tanh Jacobian for the registered active
+        coordinates only.
+        """
+        strict = self.strict if strict is None else bool(strict)
+        if (
+            not isinstance(pre_squash, Tensor)
+            or pre_squash.shape != self.mean.shape
+            or not pre_squash.is_floating_point()
+        ):
+            raise ValueError("pre_squash must have the same shape as mean")
+        if pre_squash.device != self.mean.device:
+            raise ValueError("pre_squash and mean must share one device")
+        active = torch.as_tensor(
+            self.contract.active_mask, device=pre_squash.device, dtype=torch.bool
+        )
+        if not torch.isfinite(pre_squash).all():
+            if strict:
+                raise ValueError("pre_squash contains non-finite values")
+            valid = torch.zeros(pre_squash.shape[:-1], device=pre_squash.device, dtype=torch.bool)
+            return (torch.zeros_like(pre_squash[..., 0]), valid) if return_valid else torch.zeros_like(pre_squash[..., 0])
+        inactive = pre_squash[..., ~active] if (~active).any() else pre_squash[..., :0]
+        if inactive.numel() and not torch.all(inactive == 0):
+            if strict:
+                raise ValueError("inactive pre_squash coordinates must be exact zero")
+            valid = torch.zeros(pre_squash.shape[:-1], device=pre_squash.device, dtype=torch.bool)
+            return (torch.zeros_like(pre_squash[..., 0]), valid) if return_valid else torch.zeros_like(pre_squash[..., 0])
+        normal, valid = self._normal_log_prob_u(pre_squash)
+        u = pre_squash[..., active].double()
+        # log(sech(u)^2) computed without subtracting two saturated tanhs.
+        log_sech2 = -2.0 * (
+            u.abs() + F.softplus(-2.0 * u.abs()) - math.log(2.0)
+        )
+        log_det = math.log(self.contract.coefficient_bound) + log_sech2
+        value = normal - log_det.sum(dim=-1)
+        valid = valid & torch.isfinite(value)
+        value = torch.where(valid, value, torch.zeros_like(value))
+        if strict:
+            output = value.to(dtype=self.mean.dtype)
+            valid = valid & torch.isfinite(output)
+            output = torch.where(valid, output, torch.zeros_like(output))
+            if not bool(valid.all()):
+                raise ValueError("log probability is non-finite")
+        else:
+            output = value
+        return (output, valid) if return_valid else output
+
+    # Descriptive alias used by callers that prefer the transform name.
+    transformed_log_prob_u = log_prob_from_pre_squash
 
 
 def transformed_gaussian_kl(

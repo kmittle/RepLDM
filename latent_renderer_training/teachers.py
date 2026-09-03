@@ -69,15 +69,18 @@ def construct_reward_targets(
     clean_from_u: Callable[[Tensor], Tensor],
     reward: Callable[[Tensor], Tensor],
     *,
+    reward_gradient: Callable[[Tensor, Tensor], Tensor],
     config: TargetStepConfig = TargetStepConfig(),
     contract: ActionSpaceContract | None = None,
     candidate_validator: Callable[[Tensor], Tensor | bool] | None = None,
 ) -> RewardTargetPair:
-    """Construct detached positive/negative targets from a clean-latent reward.
+    """Construct detached positive/negative targets from one anchor gradient.
 
-    The reward graph is used only while differentiating the detached anchor;
-    returned targets and gradients are detached, so fitting a student cannot
-    backpropagate through the reward model or decoder.
+    ``reward_gradient`` is an injected, budgeted operation. Formal runs bind it
+    to ``SdxlTrainingAdapter.reward_gradient``; isolated tests may inject local
+    autograd. The reward and its gradient are evaluated exactly once at the
+    detached anchor. Both signs and all deterministic projection substeps reuse
+    that direction, so one logical state consumes one reward backward.
     """
     if (
         anchor_u.ndim < 2
@@ -85,7 +88,15 @@ def construct_reward_targets(
         or not torch.isfinite(anchor_u).all()
     ):
         raise ValueError("anchor_u must be finite and have batch and slot dimensions")
+    if not callable(clean_from_u) or not callable(reward) or not callable(reward_gradient):
+        raise TypeError("clean_from_u, reward, and reward_gradient must be callable")
+    if candidate_validator is not None and not callable(candidate_validator):
+        raise TypeError("candidate_validator must be callable or None")
     if contract is not None:
+        if candidate_validator is None:
+            raise ValueError(
+                "an action contract requires an explicit candidate validator"
+            )
         if anchor_u.shape[-1] != contract.num_slots:
             raise ValueError("anchor_u does not match the action contract")
         inactive = anchor_u[..., ~torch.as_tensor(
@@ -103,75 +114,54 @@ def construct_reward_targets(
     calc_dtype = torch.float64 if anchor.dtype == torch.float64 else torch.float32
     active_calc = None if active is None else active.to(dtype=calc_dtype)
 
-    def walk(sign: float) -> tuple[Tensor, Tensor, Tensor]:
+    variable = anchor.detach().clone().requires_grad_(True)
+    value = reward(clean_from_u(variable))
+    if not isinstance(value, Tensor):
+        raise TypeError("reward must return a Tensor")
+    if value.ndim == 0:
+        if anchor.shape[0] != 1:
+            raise ValueError("reward must return one value per batch item")
+        value_rows = value.reshape(1)
+    elif value.ndim == 1:
+        if value.shape[0] != anchor.shape[0]:
+            raise ValueError("reward must return one value per batch item")
+        # Preserve the exact tensor object returned by the ledgered reward
+        # adapter. Its in-process receipt capability is consumed by the one
+        # authorized backward call below.
+        value_rows = value
+    else:
+        if value.shape[0] != anchor.shape[0]:
+            raise ValueError("reward must return one value per batch item")
+        value_rows = value.reshape(anchor.shape[0], -1).mean(dim=1)
+    finite_value = torch.isfinite(value_rows)
+    gradient = reward_gradient(value_rows, variable)
+    if not isinstance(gradient, Tensor):
+        raise TypeError("reward_gradient must return a Tensor")
+    if gradient.shape != variable.shape:
+        raise ValueError("reward gradient shape does not match the action batch")
+    if not gradient.is_floating_point():
+        raise ValueError("reward gradient must use floating point")
+    if gradient.device != variable.device or gradient.dtype != variable.dtype:
+        raise ValueError("reward gradient must match the action device and dtype")
+    gradient = gradient.detach().to(dtype=calc_dtype)
+    finite_gradient = torch.isfinite(gradient).flatten(1).all(dim=1)
+    safe_gradient = torch.nan_to_num(gradient, nan=0.0, posinf=0.0, neginf=0.0)
+    if active_calc is not None:
+        safe_gradient = safe_gradient * active_calc
+    norm = torch.linalg.vector_norm(safe_gradient.flatten(1), dim=-1, keepdim=True)
+    gradient_valid = finite_value & finite_gradient & (norm[:, 0] > config.epsilon_grad)
+    shape = (norm.shape[0],) + (1,) * (safe_gradient.ndim - 1)
+    direction = safe_gradient / norm.clamp_min(config.epsilon_grad).reshape(shape)
+    exported_gradient = safe_gradient.to(dtype=anchor.dtype).detach()
+
+    def walk(sign: float) -> tuple[Tensor, Tensor]:
         current = anchor.clone()
-        first_gradient = torch.zeros_like(anchor, dtype=calc_dtype)
-        valid_rows = torch.ones(anchor.shape[0], device=anchor.device, dtype=torch.bool)
+        valid_rows = gradient_valid.clone()
         for _ in range(config.target_steps):
-            variable = current.detach().clone().requires_grad_(True)
-            value = reward(clean_from_u(variable))
-            if value.ndim == 0:
-                if anchor.shape[0] != 1:
-                    raise ValueError("reward must return one value per batch item")
-                value_rows = value.reshape(1)
-            else:
-                if value.shape[0] != anchor.shape[0]:
-                    raise ValueError("reward must return one value per batch item")
-                value_rows = value.reshape(anchor.shape[0], -1).mean(dim=1)
-            finite_value = torch.isfinite(value_rows)
-            safe_rows = torch.nan_to_num(value_rows, nan=0.0, posinf=0.0, neginf=0.0)
-            gradient = torch.zeros_like(variable, dtype=calc_dtype)
-            gradient_valid = torch.zeros(anchor.shape[0], device=anchor.device, dtype=torch.bool)
-            for row in range(anchor.shape[0]):
-                if not bool(finite_value[row]) or not safe_rows[row].requires_grad:
-                    continue
-                row_gradient = torch.autograd.grad(
-                    safe_rows[row],
-                    variable,
-                    create_graph=False,
-                    retain_graph=True,
-                    allow_unused=True,
-                )[0]
-                if row_gradient is None:
-                    continue
-                row_gradient = row_gradient.to(dtype=calc_dtype)
-                if row_gradient.shape != variable.shape:
-                    raise ValueError("reward gradient shape does not match the action batch")
-                # A reward that differentiates one sample through another makes
-                # teacher labels depend on batch composition; reject it.
-                cross = row_gradient.detach().clone()
-                cross[row] = 0
-                if not torch.isfinite(cross).all() or torch.any(cross.abs() > 1e-12):
-                    raise ValueError("reward must be batch-independent")
-                if not torch.isfinite(row_gradient[row]).all():
-                    continue
-                gradient[row] = row_gradient[row]
-                gradient_valid[row] = True
-            finite_gradient = torch.isfinite(gradient).flatten(1).all(dim=1)
-            safe_gradient = torch.nan_to_num(gradient, nan=0.0, posinf=0.0, neginf=0.0)
-            if active_calc is not None:
-                safe_gradient = safe_gradient * active_calc
-            if _ == 0:
-                # The exported teacher direction is part of the action
-                # contract too; inactive Dirac coordinates must stay exact
-                # zero, not merely be masked during target construction.
-                first_gradient = safe_gradient.detach()
-            norm = torch.linalg.vector_norm(
-                safe_gradient.flatten(1), dim=-1, keepdim=True
-            )
-            step_valid = (
-                valid_rows
-                & finite_value
-                & gradient_valid
-                & finite_gradient
-                & (norm[:, 0] > config.epsilon_grad)
-            )
-            shape = (norm.shape[0],) + (1,) * (safe_gradient.ndim - 1)
-            direction = safe_gradient / norm.clamp_min(config.epsilon_grad).reshape(shape)
             anchor_calc = anchor.to(dtype=calc_dtype)
             current_calc = current.to(dtype=calc_dtype)
             chosen = current_calc.clone()
-            chosen_valid = torch.zeros_like(step_valid)
+            chosen_valid = torch.zeros_like(valid_rows)
             for scale in config.backtracking:
                 candidate = _project_ball(
                     current_calc
@@ -188,20 +178,32 @@ def construct_reward_targets(
                     if isinstance(external, bool):
                         candidate_ok = candidate_ok & external
                     else:
+                        if not isinstance(external, Tensor) or external.dtype != torch.bool:
+                            raise TypeError(
+                                "candidate validator must return bool flags"
+                            )
                         if external.shape != candidate_ok.shape:
                             raise ValueError("candidate validator must return one flag per batch item")
                         candidate_ok = candidate_ok & external.to(device=anchor.device, dtype=torch.bool)
-                take = candidate_ok & step_valid & ~chosen_valid
+                take = candidate_ok & valid_rows & ~chosen_valid
                 take_shape = (take.shape[0],) + (1,) * (candidate.ndim - 1)
                 chosen = torch.where(take.reshape(take_shape), candidate, chosen)
                 chosen_valid = chosen_valid | take
             current = chosen.to(dtype=anchor.dtype).detach()
             if active is not None:
                 current = current * active
-            valid_rows = step_valid & chosen_valid & torch.isfinite(current).flatten(1).all(dim=1)
-        return current, first_gradient.to(dtype=anchor.dtype), valid_rows
+            valid_rows = (
+                valid_rows & chosen_valid & torch.isfinite(current).flatten(1).all(dim=1)
+            )
+        return current, valid_rows
 
-    plus, gradient, plus_valid = walk(+1.0)
-    minus, _, minus_valid = walk(-1.0)
+    plus, plus_valid = walk(+1.0)
+    minus, minus_valid = walk(-1.0)
     valid = plus_valid & minus_valid
-    return RewardTargetPair(anchor, plus, minus, gradient, valid)
+    valid_shape = (valid.shape[0],) + (1,) * (anchor.ndim - 1)
+    plus = torch.where(valid.reshape(valid_shape), plus, anchor)
+    minus = torch.where(valid.reshape(valid_shape), minus, anchor)
+    exported_gradient = torch.where(
+        valid.reshape(valid_shape), exported_gradient, torch.zeros_like(exported_gradient)
+    )
+    return RewardTargetPair(anchor, plus, minus, exported_gradient, valid)

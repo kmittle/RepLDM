@@ -1063,8 +1063,11 @@ class RepLDMSDXLPipeline(
                 feature extraction and parameter counts remain auditable.
             latent_renderer_scheduler_mapping (`str`, *optional*, defaults to
                 `"legacy_unit"`): Selects the registered LR-1 post-step
-                translation or the Euler-only `"euler_clean_endpoint"`
-                pre-step model-output conversion. Other values fail closed.
+                translation, the historical Euler-only
+                `"euler_clean_endpoint"` conversion, or the learned
+                `"euler_native_frame_v1"` adapter. New Euler-native renderers
+                must declare and explicitly select their mapping; the legacy
+                default fails closed for them.
             freeu_schedule (`FreeUSchedule`, *optional*):
                 A validated, Stage-1-only schedule for FreeU backbone/skip
                 reweighting. It is disabled before Stage 2 or return.
@@ -1111,6 +1114,7 @@ class RepLDMSDXLPipeline(
         # Clear renderer state on every invocation so paired non-renderer
         # actions cannot inherit a previous action's scheduler/provenance.
         self._last_latent_renderer_scheduler_mapping = None
+        self._last_latent_renderer_frame_contract_hash = None
         self._last_latent_renderer_diagnostics = None
         self._last_latent_renderer_provider_diagnostics = None
         self._last_latent_renderer_step_diagnostics = []
@@ -1370,14 +1374,92 @@ class RepLDMSDXLPipeline(
             if latent_renderer_scheduler_mapping not in {
                 "legacy_unit",
                 "euler_clean_endpoint",
+                "euler_native_frame_v1",
             }:
                 raise ValueError("unsupported latent_renderer_scheduler_mapping")
+            renderer_mapping = getattr(latent_renderer, "scheduler_mapping", None)
+            requires_native_adapter = getattr(
+                latent_renderer, "requires_euler_native_adapter", False
+            )
+            if not isinstance(requires_native_adapter, bool):
+                raise TypeError("requires_euler_native_adapter must be boolean")
+            if requires_native_adapter:
+                if renderer_mapping != "euler_native_frame_v1":
+                    raise ValueError(
+                        "Euler-native renderer declares an invalid scheduler mapping"
+                    )
+                if latent_renderer_scheduler_mapping != renderer_mapping:
+                    raise ValueError(
+                        "EulerNativeFrameV1 requires explicit "
+                        "latent_renderer_scheduler_mapping='euler_native_frame_v1'"
+                    )
+                if not callable(getattr(latent_renderer, "forward_euler_mapped", None)):
+                    raise TypeError(
+                        "Euler-native renderer must implement forward_euler_mapped"
+                    )
+                renderer_cap = getattr(latent_renderer, "max_update_ratio", None)
+                if (
+                    isinstance(renderer_cap, bool)
+                    or not isinstance(renderer_cap, (int, float))
+                    or not math.isfinite(float(renderer_cap))
+                    or float(renderer_cap) != 0.05
+                ):
+                    raise ValueError(
+                        "Euler-native renderer must use the registered 0.05 update cap"
+                    )
+                calibration = getattr(latent_renderer, "calibration", None)
+                if calibration is None:
+                    raise ValueError(
+                        "Euler-native renderer must carry a validated calibration"
+                    )
+                if getattr(calibration, "schema", None) != (
+                    "repldm.euler_native_frame.v1.mask.v2"
+                ):
+                    raise ValueError("Euler-native calibration schema is not registered")
+                if getattr(calibration, "state_count", None) != 576:
+                    raise ValueError(
+                        "Euler-native calibration must contain exactly 576 states"
+                    )
+                calibration_hash = getattr(calibration, "calibration_hash", None)
+                renderer_calibration_hash = getattr(
+                    latent_renderer, "calibration_hash", None
+                )
+                if (
+                    not isinstance(calibration_hash, str)
+                    or len(calibration_hash) != 64
+                    or renderer_calibration_hash != calibration_hash
+                ):
+                    raise ValueError(
+                        "Euler-native renderer calibration hash is missing or inconsistent"
+                    )
+                frame_contract_hash = getattr(latent_renderer, "frame_contract_hash", None)
+                if not isinstance(frame_contract_hash, str) or len(frame_contract_hash) != 64:
+                    raise ValueError("Euler-native renderer frame contract hash is missing")
+                action_contract = getattr(latent_renderer, "contract", None)
+                if action_contract is None:
+                    raise ValueError("Euler-native renderer action contract is missing")
+                if (
+                    getattr(action_contract, "num_slots", None) != 6
+                    or tuple(getattr(action_contract, "active_mask", ()))
+                    != tuple(getattr(calibration, "active_mask", ()))
+                    or getattr(action_contract, "coefficient_bound", None) != 1.0
+                    or getattr(action_contract, "pre_squash_sigma", None) != 0.25
+                ):
+                    raise ValueError(
+                        "Euler-native renderer action contract differs from the registered frame"
+                    )
+                self._last_latent_renderer_frame_contract_hash = frame_contract_hash
+            elif latent_renderer_scheduler_mapping == "euler_native_frame_v1":
+                raise ValueError(
+                    "euler_native_frame_v1 requires an explicitly compatible renderer"
+                )
             if (
-                latent_renderer_scheduler_mapping == "euler_clean_endpoint"
+                latent_renderer_scheduler_mapping
+                in {"euler_clean_endpoint", "euler_native_frame_v1"}
                 and type(self.scheduler).__name__ != "EulerDiscreteScheduler"
             ):
                 raise ValueError(
-                    "euler_clean_endpoint requires EulerDiscreteScheduler"
+                    "Euler clean-endpoint mappings require EulerDiscreteScheduler"
                 )
             latent_renderer.to(device)
             latent_renderer.eval()
@@ -1390,6 +1472,7 @@ class RepLDMSDXLPipeline(
             )
         if latent_renderer is None:
             self._last_latent_renderer_scheduler_mapping = None
+            self._last_latent_renderer_frame_contract_hash = None
         self._last_latent_renderer_diagnostics = None
         self._last_latent_renderer_provider_diagnostics = None
         self._last_latent_renderer_step_diagnostics = []
@@ -1522,7 +1605,7 @@ class RepLDMSDXLPipeline(
                     if (
                         latent_renderer is not None
                         and latent_renderer_scheduler_mapping
-                        == "euler_clean_endpoint"
+                        in {"euler_clean_endpoint", "euler_native_frame_v1"}
                     ):
                         sigmas = getattr(self.scheduler, "sigmas", None)
                         step_index = int(scheduler_step_index)
@@ -1556,7 +1639,65 @@ class RepLDMSDXLPipeline(
                             raise TypeError(
                                 "latent_renderer_basis_provider must return RendererCondition"
                             )
-                        if getattr(
+                        if (
+                            latent_renderer_scheduler_mapping
+                            == "euler_native_frame_v1"
+                        ):
+                            mapped_output = latent_renderer.forward_euler_mapped(
+                                native_renderer_endpoint.pred_original_sample,
+                                condition.bases,
+                                sample=latents_before_step,
+                                native_model_output=noise_pred,
+                                sigma_from=native_renderer_endpoint.sigma_from,
+                                sigma_to=native_renderer_endpoint.sigma_to,
+                                prediction_type=prediction_type,
+                                scheduler_update=(
+                                    native_renderer_endpoint.nominal_update
+                                ),
+                                clean_update_gain=(
+                                    native_renderer_endpoint.clean_update_gain
+                                ),
+                                timestep=observation.normalized_timestep,
+                                prompt_embedding=condition.prompt_embedding,
+                                state_features=condition.state_features,
+                            )
+                            rendered = mapped_output.rendered
+                            step_model_output = mapped_output.model_output
+                            mapped_expected_prev_sample = (
+                                mapped_output.predicted_prev_sample
+                            )
+                            measured = mapped_output.mapped_intervention
+                            renderer_cap = float(latent_renderer.max_update_ratio)
+                            ratio_tolerance = 5e-4
+                            if not torch.isfinite(measured.ratio).all():
+                                raise RuntimeError(
+                                    "Euler-native mapped ratio is non-finite"
+                                )
+                            if torch.any(
+                                measured.ratio > renderer_cap + ratio_tolerance
+                            ):
+                                raise RuntimeError(
+                                    "Euler-native mapped ratio exceeds its registered cap"
+                                )
+                            scheduler_mapped_intervention = {
+                                "nominal_update_norm": (
+                                    measured.nominal_update_norm.detach().cpu().tolist()
+                                ),
+                                "applied_update_norm": (
+                                    measured.intervention_norm.detach().cpu().tolist()
+                                ),
+                                "applied_update_ratio": (
+                                    measured.ratio.detach().cpu().tolist()
+                                ),
+                                "registered_update_cap": [renderer_cap],
+                                "cap_tolerance": [ratio_tolerance],
+                                "cap_hit": (
+                                    measured.ratio > renderer_cap + ratio_tolerance
+                                ).detach().cpu().tolist(),
+                                "solver_target_update_ratio": None,
+                                "solver_evaluations": 0,
+                            }
+                        elif getattr(
                             latent_renderer,
                             "requires_strict_scheduler_mapped_ratio",
                             False,
@@ -1687,12 +1828,42 @@ class RepLDMSDXLPipeline(
                         expected_prev_sample = latents_before_step.float() + gain * (
                             rendered.guided_x0.float() - latents_before_step.float()
                         )
-                        if mapped_expected_prev_sample is not None and not torch.equal(
-                            step_output.prev_sample, mapped_expected_prev_sample
-                        ):
-                            raise RuntimeError(
-                                "Euler scheduler output differs from the calibrated prediction"
+                        if mapped_expected_prev_sample is not None:
+                            # The pinned diffusers Euler scheduler performs its
+                            # sigma/model-output multiply in the model dtype
+                            # before upcasting the sample.  The renderer's
+                            # analytic mirror deliberately computes in float32,
+                            # so byte equality is not a valid parity criterion
+                            # for the native frame.  Keep exact no-op parity,
+                            # while accepting only the renderer's registered
+                            # relative-L2 tolerance for nonzero native actions.
+                            mapped_prev_error = _relative_l2_error(
+                                step_output.prev_sample,
+                                mapped_expected_prev_sample,
                             )
+                            if latent_renderer_scheduler_mapping == "euler_native_frame_v1":
+                                mapped_prev_tolerance = float(
+                                    getattr(
+                                        latent_renderer,
+                                        "scheduler_prev_sample_relative_l2_tolerance",
+                                        float("nan"),
+                                    )
+                                )
+                                if (
+                                    not math.isfinite(mapped_prev_tolerance)
+                                    or mapped_prev_tolerance <= 0
+                                    or not torch.isfinite(mapped_prev_error).all()
+                                    or torch.any(mapped_prev_error > mapped_prev_tolerance)
+                                ):
+                                    raise RuntimeError(
+                                        "Euler scheduler output differs from the calibrated prediction"
+                                    )
+                            elif not torch.equal(
+                                step_output.prev_sample, mapped_expected_prev_sample
+                            ):
+                                raise RuntimeError(
+                                    "Euler scheduler output differs from the calibrated prediction"
+                                )
                         pred_original_error = _relative_l2_error(
                             step_output.pred_original_sample,
                             rendered.guided_x0,

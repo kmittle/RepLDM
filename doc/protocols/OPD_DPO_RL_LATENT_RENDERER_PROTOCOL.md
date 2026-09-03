@@ -239,11 +239,15 @@ threshold, and model hash. These classifier and semantic/image threshold artifac
 yet frozen; until they are locally available and hashed, the builder must emit
 `training_ready=false` and must not fall back to exact matching alone.
 
-## Feasibility Experiment F0
+## Engineering Feasibility Screen F0
 
 F0 asks one question: does the bounded structure space contain an outcome-improving action
 that the small renderer can realize? It is not a benchmark shortcut and not yet an OPD,
-DPO, or RL result.
+DPO, or RL result. The 64+32 prompts make F0 an engineering teacher-construction screen,
+not a powered inferential study. Its bootstrap intervals are conservative stability filters,
+not paper evidence or confidence-coverage claims. Every frozen `T_OPSD` that survives this
+screen must still receive the complete HPSv2 and official GenEval evaluation before it can
+support any performance claim.
 
 Use 64 training-only prompts, generation seeds `{2026090101, 2026090102}`, and zero-based
 decision indices `{8, 24, 40}`: 384 logical teacher states. At decision index `i`, the U-Net
@@ -255,16 +259,21 @@ constants are frozen before the first decode:
 ```text
 eta_target=0.25, target_steps=2, trust_radius_u=0.50
 backtracking=(1.0, 0.5, 0.25, 0.125), epsilon_grad=1e-12
-branch_coefficient=1.0, fit_steps_per_fold=1
+branch_coefficient=1.0, fit_steps_per_fold=200
+fit_batch_size=8, fit_order=sha256_epoch_order_v1
+deployment_weights=final_ema, ema_decay=0.995
 vae_scaling_factor=0.13025
 decoder_output=(decode(z / 0.13025)[0] / 2 + 0.5).clamp(0, 1)
 ```
 
 The configured `vae_scaling_factor` must equal the pinned SDXL VAE config; a mismatch fails
-before any reward query. At each target step, recompute the reward gradient at the detached
-current target, normalize it by `max(||g||_2, epsilon_grad)`, take a step of length
-`eta_target / target_steps`, and project `u-u_bar` to the trust ball of radius
-`trust_radius_u`. Backtracking may choose only the first finite candidate satisfying the
+before any reward query. At each logical state, evaluate the reward and its gradient exactly
+once at the detached anchor `u_bar`, normalize it by `max(||g||_2, epsilon_grad)`, and reuse
+that frozen direction for both signs and both deterministic projection substeps. Each
+substep has length `eta_target / target_steps` and projects `u-u_bar` to the trust ball of
+radius `trust_radius_u`. Formal code obtains this gradient only through the budgeted
+`SdxlTrainingAdapter.reward_gradient` operation; direct autograd is limited to isolated CPU
+tests. Backtracking may choose only the first finite candidate satisfying the
 fixed action, moment, scheduler, angle, and cap checks. It may not inspect a reward, ranking,
 or image-quality outcome. If all four candidates fail, reject the state and charge its query.
 At each student state, take the gradient in the renderer's active pre-squash action coordinates:
@@ -297,9 +306,12 @@ L_F0 = w * mse_tensor(P_phi+, stopgrad(T_plus)) / max(mse_tensor(N, 0), 1e-12)
      + 0.10 * mean_active((mu_phi-u_ref)^2)
 ```
 
-`w=clip(0.5 + 0.5*(r_endpoint-r_prompt_mean)/reward_scale, 0, 1)` is computed only from
-the frozen round-0 anchor distribution. Fitting retains no decoder or reward graph and uses
-one optimizer update per fold; action-coordinate regression is not substituted for the
+`w=clip(0.5 + 0.5*(r_terminal_anchor-r_prompt_mean)/reward_scale, 0, 1)` uses the
+same prompt-seed's terminal strict-C0 reward and is computed only from the frozen round-0
+anchor distribution. It never uses the intermediate clean-endpoint reward queried for the
+target gradient. Fitting retains no decoder or reward graph. Each
+fold performs exactly one registered fit of 200 optimizer updates; it is never retried or
+selected from multiple fits. Action-coordinate regression is not substituted for the
 native-transition loss.
 
 Split the 64 prompts into four deterministic folds of 16, stratified by source and prompt
@@ -307,6 +319,15 @@ stratum before any output. For each fold, fit on the other 48 prompts and genera
 out fold's renderer action. Concatenate these out-of-fold actions for the realization test.
 After that test passes, fit one final teacher on all 64 prompts with the same optimizer
 settings; do not use its in-sample reward as evidence.
+
+Every fit uses batches of eight logical states. At epoch `e`, order the eligible rows by
+SHA-256 of `(fit_order, optimizer_seed, e, stable_id)`, take contiguous batches, and continue
+at the next epoch until exactly 200 updates have completed. Thus a cross-fit epoch has 36
+batches over 288 rows and the final fit has 48 batches over 384 rows. No row is dropped,
+sampled with replacement, or selected by an observed loss. Each fit starts from an
+independent copy of `C0` and an empty AdamW state. Its final EMA weights, not its raw final
+weights or a best intermediate checkpoint, produce held-out actions. The final all-prompt
+fit's EMA is the frozen deployable `T_OPSD` checkpoint.
 
 Define the frozen quantities for every logical state:
 
@@ -339,7 +360,7 @@ all safety guards against strict no-op and `conference_settings`. No main arm re
 private teacher, gradient, target, or branch. Each arm's round data contain the same fields
 when they are physically queried; the ledger records which fields each objective actually uses.
 
-F0 passes only when all conditions hold:
+The pre-registered F0 screen advances `T_OPSD` only when all conditions hold:
 
 - no-op parity, scheduler parity, finite-value, moment, and hard-cap violations are zero;
 - valid nonzero-gradient coverage is at least 0.80 in every decision stratum;
@@ -352,8 +373,12 @@ F0 passes only when all conditions hold:
 - out-of-fold mean `G_realized` has a positive 95% lower bound and
   `mean(G_realized) / mean(G_target) >= 0.25`.
 
-Power for the minimum effects must be frozen before any F0 output is viewed. A failed F0
-closes that basis family; DPO or RL cannot rescue it.
+Before any F0 output is viewed, freeze an immutable screen-registration artifact. It binds
+the sample counts, prompt-cluster aggregation, bootstrap implementation, all thresholds,
+the fact that inferential claims are forbidden, and the obligation to run complete HPSv2
+and GenEval on `T_OPSD`. The obsolete `repldm.renderer_f0_power.v1` artifact is invalid:
+caller-supplied `planned_power` is never accepted as evidence. A failed F0 closes that basis
+family; DPO or RL cannot rescue it.
 
 After the train gate passes, run one confirmation on all 32 validation prompts with seeds
 `{2026090191, 2026090192}` and the same three decision indices. This confirmation has 192
@@ -368,7 +393,8 @@ realization, witness, cap, and pixel gates apply at prompt level; failure reject
 
 Run exactly two online rounds and one hyperparameter setting. In round 1, all arms start from
 the same strict no-op checkpoint. In round 2, each arm starts from its own round-1 EMA
-checkpoint; policies are expected to differ, so each arm recollects its own states with the
+checkpoint and a newly initialized AdamW optimizer; carrying raw-policy Adam moments across
+the EMA weight swap is forbidden. Policies are expected to differ, so each arm recollects its own states with the
 same prompt/seed manifest. A round has 32 optimizer updates, each with a fresh batch of four
 prompt-seed blocks. The 128 blocks are assigned by one frozen permutation, so every block is
 used exactly once per round. The behavior checkpoint is frozen for collection and is updated
@@ -514,8 +540,10 @@ L_RL = mean_b,t[-min(ratio_b,t * A_b,t,
 KL_ref = mean_b,t,active 0.5 * ((mu_phi(s_b,t) - mu_ref(s_b,t)) / 0.25)^2
 ```
 
-The behavior policy is the frozen round-start checkpoint and the reference is the frozen
-initial no-op policy. `mean(r_{-b})` is the other antithetic branch for the two-branch group;
+The behavior policy is the immutable EMA checkpoint that collected the current four-block
+update. It is refreshed only after that optimizer update and is never changed while a batch
+is being scored or fitted. The reference is the frozen initial no-op policy.
+`mean(r_{-b})` is the other antithetic branch for the two-branch group;
 for the optional four-branch sensitivity audit it is the mean of the other three branches.
 Advantages are zero for ties. Ratios are clipped only as shown; there is no reward shaping or
 hidden entropy bonus. Both policies have fixed `sigma=0.25` and the same bijective `tanh`
@@ -539,15 +567,16 @@ Compute the training-reward location and scale once from the 128 round-0 determi
 images, before reading any branch outcome: median and `max(IQR / 1.349, 1e-6)`. Reuse these
 numbers for every arm, round, and seed. No per-arm or post-outcome normalization is allowed.
 
-The statistical unit is the prompt. Average generation seeds and decision indices within a
+The aggregation unit is the prompt. Average generation seeds and decision indices within a
 prompt, then run 10,000 prompt-cluster bootstrap resamples with seed `20260901`. Report the
-paired mean and percentile 95% interval. Direction accuracy is also aggregated to one value
-per prompt. The independent witness is TOPIQ-NR with minimum mean delta `+0.005` and a 95%
-lower bound above zero. The clipped-fraction interval upper delta must be at most `+0.001`,
-mean-saturation interval upper delta at most `+0.005`, and contrast geometric-ratio interval
-inside `[0.95, 1.05]`. HPSv2 and CLIP lower bounds must exceed `-0.005` where those metrics
-are used. A power artifact for 64 train and 32 validation prompts is frozen before output;
-insufficient power is a no-go, not permission to add prompts after seeing results.
+paired mean and percentile interval. Direction accuracy is also aggregated to one value per
+prompt. Because 64 train and 32 validation prompts are underpowered for the frozen minimum
+effects, these intervals are descriptive selection filters only. The independent witness is
+TOPIQ-NR with minimum mean delta `+0.005` and a lower interval endpoint above zero. The
+clipped-fraction interval upper delta must be at most `+0.001`, mean-saturation interval upper
+delta at most `+0.005`, and contrast geometric-ratio interval inside `[0.95, 1.05]`. HPSv2 and
+CLIP lower endpoints must exceed `-0.005` where those metrics are used. No F0 screen output
+may be reported as a formal significance, power, benchmark, OPD, DPO, or RL result.
 
 For a terminal ImageReward difference within `1e-6`, search-distill uses the deterministic
 anchor target, DPO retains the record with zero loss weight, and RL uses zero advantages.
@@ -598,6 +627,11 @@ Every frozen checkpoint is evaluated on complete HPSv2 (3,200 images) and offici
 (553 prompts times four images, 2,212 total). Training rewards cannot be the only primary
 metric. Report three independent training seeds separately, then paired prompt-level
 confidence intervals; do not multiply the apparent sample size by seeds or settings.
+
+A method handler may publish `status=training_complete` after its frozen checkpoint,
+per-update records, rollout manifests, and sealed query ledger are durable. It must also set
+`benchmark_status=pending`. Only the later cohort-level result, after all three optimization
+seeds and every required complete benchmark pass validation, may use `status=completed`.
 
 A round-2 method is compared pairwise with both `strict_no_op` and the frozen
 `conference_settings` baseline, using the same prompt, generation seed, sampler, and initial

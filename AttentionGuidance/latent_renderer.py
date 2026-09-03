@@ -194,7 +194,7 @@ LATENT_STRUCTURE_PROVIDER_IMPLEMENTATION_ALIASES = {
     "StructuralUNetBasisProvider": "structural_unet_basis_v1",
 }
 LATENT_RENDERER_SCHEDULER_MAPPINGS = frozenset(
-    {"legacy_unit", "euler_clean_endpoint"}
+    {"legacy_unit", "euler_clean_endpoint", "euler_native_frame_v1"}
 )
 LATENT_RENDERER_BASIS_NORMALIZATIONS = frozenset(
     {"legacy_l2_to_rms", "match_rms"}

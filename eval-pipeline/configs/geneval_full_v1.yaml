@@ -1,0 +1,33 @@
+schema: repldm.geneval_full_evaluation.v1
+status: frozen_official_benchmark
+
+benchmark:
+  name: GenEval
+  protocol: official_complete_prompt_set
+  metadata_path: /mnt/miah204/bycao/Sana/diffusion/post_training/dataset/geneval/test_metadata.jsonl
+  metadata_sha256: eb9d9f624e76c2efb1bf8495494121d30e86d73358022502b071bebcfc8a2ad7
+  prompt_count: 553
+  samples_per_prompt: 4
+  image_count: 2212
+  expected_tags:
+    single_object: 80
+    two_object: 99
+    counting: 80
+    colors: 94
+    position: 100
+    color_attr: 100
+  sample_seeds: [2026090301, 2026090302, 2026090303, 2026090304]
+  subset_evaluation_allowed: false
+
+aggregation:
+  unit: prompt
+  score_definition: unweighted_mean_of_six_task_image_accuracies
+  bootstrap_method: prompt_cluster_percentile_type7_v1
+  bootstrap_seed: 20260901
+  bootstrap_resamples: 10000
+  confidence_interval: [0.025, 0.975]
+
+evaluator:
+  upstream_project: Sana/tools/metrics/geneval
+  expected_result_rows: 2212
+  network_required: false

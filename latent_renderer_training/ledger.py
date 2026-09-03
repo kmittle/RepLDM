@@ -85,11 +85,13 @@ class QueryLedger:
         path: str | Path,
         budget: Mapping[str, int],
         *,
-        run_contract: str,
+        run_contract: Any,
         strict_provenance: bool = True,
+        authorization_binding: Any = None,
+        authorization: Any = None,
+        require_authorization: bool = False,
     ) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.seal_path = self.path.with_name(self.path.name + ".seal")
         self.transaction_path = self.path.with_name(self.path.name + ".txn")
         self.budget = {}
@@ -99,12 +101,87 @@ class QueryLedger:
             self.budget[str(key)] = value
         if not self.budget:
             raise ValueError("ledger budget must contain at least one query kind")
-        self.run_contract = str(run_contract)
-        if not self.run_contract:
-            raise ValueError("run_contract must be a non-empty string")
         if not isinstance(strict_provenance, bool):
             raise TypeError("strict_provenance must be boolean")
         self.strict_provenance = strict_provenance
+
+        if authorization is not None:
+            raise TypeError(
+                "QueryLedger requires authorization_binding; authorization is not accepted"
+            )
+        binding = authorization_binding
+        if binding is not None:
+            from .authorization import require_authorization_binding
+            from .run_contract import TrainingRunContract
+
+            binding = require_authorization_binding(binding)
+            if not strict_provenance:
+                raise ValueError(
+                    "authorization-bound ledgers require strict provenance"
+                )
+            if isinstance(run_contract, TrainingRunContract):
+                supplied_hash = run_contract.sha256
+            elif isinstance(run_contract, Mapping):
+                supplied_hash = TrainingRunContract.from_mapping(run_contract).sha256
+            else:
+                supplied_hash = str(run_contract)
+            if supplied_hash != binding.contract_hash:
+                raise ValueError("ledger run contract differs from authorization binding")
+            binding.validate_current()
+            payload = binding.contract
+            declared_budget = payload.get("query_budget")
+            if dict(declared_budget) != dict(self.budget):
+                raise ValueError("ledger query budget differs from the run contract")
+            self.authorization_binding = binding
+            self._contract_payload = payload
+            self.run_contract = binding.contract_hash
+        else:
+            from .run_contract import RUN_CONTRACT_SCHEMA, TrainingRunContract
+
+            if isinstance(run_contract, TrainingRunContract) or (
+                isinstance(run_contract, Mapping)
+                and run_contract.get("schema") == RUN_CONTRACT_SCHEMA
+            ):
+                raise RuntimeError(
+                    "formal query ledgers require a validated authorization binding"
+                )
+            self.authorization_binding = None
+            self._contract_payload = None
+            self.run_contract = str(run_contract)
+            if not self.run_contract:
+                raise ValueError("run_contract must be a non-empty string")
+        self.require_authorization = bool(require_authorization or binding is not None)
+        if self.require_authorization and self.authorization_binding is None:
+            raise RuntimeError(
+                "formal query-ledger operations require a validated authorization binding"
+            )
+
+    def _preflight(self) -> None:
+        """Run the authorization gate before any callback or ledger I/O."""
+        if self.authorization_binding is None:
+            if self.require_authorization:
+                raise RuntimeError(
+                    "query-ledger operation requires a validated authorization binding"
+                )
+            return
+        self.authorization_binding.validate_current()
+
+    def _validate_bound_fields(self, value: Mapping[str, Any], *, result: bool = False) -> None:
+        """Require provenance fields that identify the complete training run."""
+        if self.authorization_binding is None:
+            return
+        payload = self._contract_payload or {}
+        required = {
+            "run_contract_hash": self.run_contract,
+            "renderer_frame_contract_hash": payload["renderer_frame_contract_hash"],
+            "calibration_hash": payload["calibration_hash"],
+            "data_manifest_sha256": payload["data_manifest_sha256"],
+            "reward_config_sha256": payload["reward_config_sha256"],
+        }
+        for field, expected in required.items():
+            if value.get(field) != expected:
+                kind = "receipt" if result else "reservation"
+                raise ValueError(f"{kind} provenance field {field} differs from the run contract")
 
     @staticmethod
     def _validate_hash(value: Any, field: str) -> None:
@@ -120,6 +197,7 @@ class QueryLedger:
         if not self.strict_provenance:
             # Even relaxed provenance must remain canonical JSON so a record
             # cannot hide NaN/Inf values from the hash chain.
+            self._validate_bound_fields(value)
             return value
         missing = [field for field in _RESERVATION_PROVENANCE_FIELDS if field not in value]
         if missing:
@@ -140,6 +218,7 @@ class QueryLedger:
         if not isinstance(value["action"], (list, tuple, Mapping)):
             raise ValueError("action must be a JSON array or object")
         # Validate JSON serializability and reject NaN/Inf hidden in nested data.
+        self._validate_bound_fields(value)
         return value
 
     def _validate_receipt_result(
@@ -159,6 +238,7 @@ class QueryLedger:
             parent = value["cached_parent"]
             if parent is not None:
                 self._validate_hash(parent, "cached_parent")
+        self._validate_bound_fields(value, result=True)
         supplied_hash = value.pop("result_hash", None)
         computed_hash = hashlib.sha256(_canonical(value)).hexdigest()
         if supplied_hash is not None and supplied_hash != computed_hash:
@@ -233,6 +313,7 @@ class QueryLedger:
             os.close(fd)
 
     def _write_transaction(self, payload: Mapping[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.transaction_path.with_name(
             self.transaction_path.name + f".{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
@@ -414,6 +495,7 @@ class QueryLedger:
 
     def _append_record_bytes(self, record: Mapping[str, Any]) -> None:
         """Publish a complete ledger file atomically, avoiding torn JSON lines."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists() and (self.path.is_symlink() or not self.path.is_file()):
             raise RuntimeError("query ledger is not a regular file")
         temporary = self.path.with_name(
@@ -437,6 +519,7 @@ class QueryLedger:
             temporary.unlink(missing_ok=True)
 
     def _publish_seal(self, seal: Mapping[str, Any]) -> None:
+        self.seal_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_seal = self.seal_path.with_name(
             self.seal_path.name + f".{os.getpid()}.{uuid.uuid4().hex}.tmp"
         )
@@ -482,6 +565,7 @@ class QueryLedger:
     def _exclusive_lock(self):
         import fcntl
 
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_name(self.path.name + ".lock")
         with lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -499,18 +583,21 @@ class QueryLedger:
         return total
 
     def used(self, kind: str) -> int:
+        self._preflight()
         if kind not in self.budget:
             raise KeyError(kind)
         with self._exclusive_lock():
             return self._used_from_records(self._records(), kind)
 
     def remaining(self, kind: str) -> int:
+        self._preflight()
         if kind not in self.budget:
             raise KeyError(kind)
         with self._exclusive_lock():
             return self.budget[kind] - self._used_from_records(self._records(), kind)
 
     def reserve(self, kind: str, amount: int, *, metadata: Optional[Mapping[str, Any]] = None) -> QueryReservation:
+        self._preflight()
         if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
             raise ValueError("reservation amount must be positive")
         if kind not in self.budget:
@@ -536,6 +623,7 @@ class QueryLedger:
         return reservation
 
     def receipt(self, reservation: QueryReservation, *, result: Mapping[str, Any], success: bool) -> None:
+        self._preflight()
         if not isinstance(reservation, QueryReservation):
             raise TypeError("receipt requires a QueryReservation")
         if not isinstance(success, bool):
@@ -570,12 +658,14 @@ class QueryLedger:
             })
 
     def summary(self) -> dict[str, Any]:
+        self._preflight()
         with self._exclusive_lock():
             records = self._records()
             reserved = {
                 kind: self._used_from_records(records, kind) for kind in self.budget
             }
-            completed = sum(1 for row in records if row.get("type") == "receipt")
+            receipt_rows = [row for row in records if row.get("type") == "receipt"]
+            completed = len(receipt_rows)
             receipt_ids = {
                 item.get("reservation_id")
                 for item in records
@@ -586,6 +676,30 @@ class QueryLedger:
                 if row.get("type") == "reservation"
                 and row.get("reservation_id") not in receipt_ids
             )
+            successes = {
+                kind: sum(
+                    int(row["amount"])
+                    for row in receipt_rows
+                    if row["kind"] == kind and row["success"]
+                )
+                for kind in self.budget
+            }
+            failures = {
+                kind: sum(
+                    int(row["amount"])
+                    for row in receipt_rows
+                    if row["kind"] == kind and not row["success"]
+                )
+                for kind in self.budget
+            }
+            wall_seconds = {
+                kind: sum(
+                    float(row["result"].get("wall_seconds", 0.0))
+                    for row in receipt_rows
+                    if row["kind"] == kind
+                )
+                for kind in self.budget
+            }
             return {
                 "budget": dict(self.budget),
                 "reserved": reserved,
@@ -593,5 +707,61 @@ class QueryLedger:
                     k: self.budget[k] - reserved[k] for k in self.budget
                 },
                 "completed_receipts": completed,
+                "successful_amount": successes,
+                "failed_amount": failures,
+                "wall_seconds": wall_seconds,
                 "unfinished_reservations": unfinished,
+                "record_count": len(records),
+                "root_record_hash": records[0]["record_hash"] if records else None,
+                "tip_record_hash": records[-1]["record_hash"] if records else None,
             }
+
+    def verified_records(self) -> tuple[dict[str, Any], ...]:
+        """Return a defensive snapshot after verifying the complete sealed chain."""
+        self._preflight()
+        with self._exclusive_lock():
+            records = self._records()
+            return tuple(_json_value(record) for record in records)
+
+    def successful_receipt_pairs(
+        self, kind: Optional[str] = None
+    ) -> tuple[tuple[dict[str, Any], dict[str, Any]], ...]:
+        """Return successful reservation/receipt pairs in durable receipt order."""
+        if kind is not None and kind not in self.budget:
+            raise KeyError(kind)
+        records = self.verified_records()
+        reservations = {
+            row["reservation_id"]: row
+            for row in records
+            if row["type"] == "reservation"
+        }
+        return tuple(
+            (
+                _json_value(reservations[row["reservation_id"]]),
+                _json_value(row),
+            )
+            for row in records
+            if row["type"] == "receipt"
+            and row["success"] is True
+            and (kind is None or row["kind"] == kind)
+        )
+
+    def successful_output_hashes(self, kind: str) -> tuple[str, ...]:
+        """Return successful output hashes in durable receipt order."""
+        self._preflight()
+        if kind not in self.budget:
+            raise KeyError(kind)
+        with self._exclusive_lock():
+            records = self._records()
+            values = []
+            for row in records:
+                if (
+                    row.get("type") != "receipt"
+                    or row.get("kind") != kind
+                    or row.get("success") is not True
+                ):
+                    continue
+                output_hash = row["result"].get("output_hash")
+                self._validate_hash(output_hash, "output_hash")
+                values.append(output_hash)
+            return tuple(values)

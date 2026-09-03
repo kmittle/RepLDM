@@ -59,6 +59,12 @@ The editable install supports development. Formal 1024px experiments use the
 exact runtime in `eval-pipeline/configs/generation_environment_diff_attn_20260825.yaml`;
 validate it with `eval-pipeline/generation_environment.py` before generation.
 
+Formal latent-renderer training is checkout-only: run the launcher from this
+repository after the selected-view release, Git commit, and local model snapshot
+have been validated. A wheel can expose the Python modules for library use, but it
+does not contain `DATA/`, `eval-pipeline/`, or the model assets and therefore cannot
+authorize a formal run.
+
 ## Research Documentation
 
 Research plans, experiment reports, protocols, literature reviews, and audits

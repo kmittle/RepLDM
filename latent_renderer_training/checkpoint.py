@@ -8,9 +8,107 @@ import copy
 import os
 import random
 from pathlib import Path
+import stat
 from typing import Any, Mapping
+import uuid
 
 import torch
+
+from .run_contract import RUN_CONTRACT_SCHEMA
+
+
+_AUTHORIZATION_PROVENANCE_FIELD = "authorization_binding"
+
+
+def _open_parent_directory(
+    path: str | Path, *, create: bool
+) -> tuple[Path, int, str]:
+    """Open every parent component without following symbolic links."""
+    destination = Path(os.path.abspath(os.fspath(path)))
+    if destination.name in {"", ".", ".."}:
+        raise ValueError("checkpoint path must name a file")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(destination.anchor, flags)
+    try:
+        for component in destination.parts[1:-1]:
+            if component in {"", ".", ".."}:
+                raise ValueError("checkpoint path contains an invalid component")
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return destination, descriptor, destination.name
+
+
+def _sha256_regular_file_at(directory_fd: int, name: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    digest = hashlib.sha256()
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size <= 0:
+            raise ValueError("checkpoint must be a non-empty ordinary file")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _is_formal_contract(value: Any) -> bool:
+    """Return whether a mapping claims the formal training-run schema."""
+    return isinstance(value, Mapping) and value.get("schema") == RUN_CONTRACT_SCHEMA
+
+
+def _resolve_binding(
+    *,
+    authorization_binding: Any,
+    authorization: Any,
+    contract: Mapping[str, Any] | None,
+    require_authorization: bool,
+) -> Any:
+    """Normalize the optional formal-training capability before file I/O."""
+    if authorization_binding is not None and authorization is not None:
+        raise TypeError("provide authorization_binding or authorization, not both")
+    binding = authorization_binding if authorization_binding is not None else authorization
+    if binding is not None:
+        from .authorization import (
+            TrainingAuthorization,
+            require_authorization_binding,
+        )
+        if type(binding) is TrainingAuthorization:
+            if not isinstance(contract, Mapping):
+                raise TypeError(
+                    "a complete run-contract mapping is required with TrainingAuthorization"
+                )
+            binding = binding.bind_run_contract(contract)
+        binding = require_authorization_binding(binding)
+        binding.validate_current()
+        if contract is not None:
+            if not isinstance(contract, Mapping):
+                raise ValueError("checkpoint contract must be a mapping")
+            if _canonical(dict(contract)) != _canonical(binding.contract):
+                raise ValueError("checkpoint contract differs from authorization binding")
+    elif require_authorization or _is_formal_contract(contract):
+        raise RuntimeError(
+            "formal checkpoint I/O requires a validated authorization binding"
+        )
+    return binding
 
 
 def _canonical(value: Any) -> bytes:
@@ -230,13 +328,26 @@ def save_checkpoint(
     contract: Mapping[str, Any],
     extra: Mapping[str, Any] | None = None,
     rng_state: Mapping[str, Any] | None = None,
+    authorization_binding: Any = None,
+    authorization: Any = None,
+    require_authorization: bool = False,
 ) -> dict[str, Any]:
-    """Write a checkpoint through a fsync-and-replace transaction."""
+    """Publish a checkpoint once through a symlink-safe transaction."""
     if isinstance(step, bool) or not isinstance(step, int) or step < 0:
         raise ValueError("checkpoint step must be a non-negative integer")
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not isinstance(contract, Mapping):
+        raise ValueError("checkpoint contract must be a mapping")
+    binding = _resolve_binding(
+        authorization_binding=authorization_binding,
+        authorization=authorization,
+        contract=contract,
+        require_authorization=require_authorization,
+    )
     extra_payload = dict(extra or {})
+    if _AUTHORIZATION_PROVENANCE_FIELD in extra_payload:
+        raise ValueError(
+            "checkpoint authorization provenance is reserved and cannot be supplied"
+        )
     if scheduler is not None:
         extra_payload["scheduler_state"] = scheduler.state_dict()
     if optimizer is not None:
@@ -247,6 +358,8 @@ def save_checkpoint(
     rng_payload = dict(supplied_rng)
     _validate_rng_state(rng_payload)
     extra_payload["rng_state"] = rng_payload
+    if binding is not None:
+        extra_payload[_AUTHORIZATION_PROVENANCE_FIELD] = binding.provenance()
     payload: dict[str, Any] = {
         "schema": "repldm.latent_renderer_checkpoint.v1",
         "step": int(step), "contract": dict(contract),
@@ -255,18 +368,62 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "extra": extra_payload,
     }
-    temporary = destination.with_name(destination.name + ".tmp")
-    with temporary.open("wb") as handle:
-        torch.save(payload, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(destination)
-    directory_fd = os.open(str(destination.parent), os.O_RDONLY)
     try:
+        destination, directory_fd, destination_name = _open_parent_directory(
+            path, create=True
+        )
+    except OSError as exc:
+        raise ValueError("checkpoint parent must contain no symbolic links") from exc
+    temporary_name = f".{destination_name}.{uuid.uuid4().hex}.tmp"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                torch.save(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        try:
+            # A hard-link publication is atomic and, unlike replace(), cannot
+            # overwrite an existing checkpoint or follow a destination link.
+            os.link(
+                temporary_name,
+                destination_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to replace existing checkpoint: {destination}"
+            ) from exc
         os.fsync(directory_fd)
+        digest = _sha256_regular_file_at(directory_fd, destination_name)
     finally:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except FileNotFoundError:
+            pass
         os.close(directory_fd)
-    return {"path": str(destination), "step": int(step), "contract_hash": payload["contract_hash"], "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()}
+    return {
+        "path": str(destination),
+        "step": int(step),
+        "contract_hash": payload["contract_hash"],
+        "sha256": digest,
+    }
 
 
 def load_checkpoint(
@@ -279,6 +436,9 @@ def load_checkpoint(
     expected_contract: Mapping[str, Any] | None = None,
     map_location: str | torch.device = "cpu",
     restore_rng: bool = True,
+    authorization_binding: Any = None,
+    authorization: Any = None,
+    require_authorization: bool = False,
 ) -> dict[str, Any]:
     """Load a checkpoint and restore the complete trainer state.
 
@@ -286,11 +446,50 @@ def load_checkpoint(
     its step counter and EMA state; passing ``scheduler`` restores its state.
     Older/incomplete checkpoints are rejected when either state is requested.
     """
-    payload = torch.load(Path(path), map_location=map_location, weights_only=False)
+    # A formal caller supplies its expected run contract.  If it is omitted,
+    # the binding itself is the source of truth and is checked before the
+    # potentially untrusted pickle is opened.
+    binding = _resolve_binding(
+        authorization_binding=authorization_binding,
+        authorization=authorization,
+        contract=expected_contract,
+        require_authorization=require_authorization,
+    )
+    try:
+        checkpoint_path, directory_fd, checkpoint_name = _open_parent_directory(
+            path, create=False
+        )
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(checkpoint_name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ValueError("checkpoint path must be an ordinary non-symlinked file") from exc
+    finally:
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_size <= 0:
+            raise ValueError("checkpoint path must be an ordinary non-empty file")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            payload = torch.load(handle, map_location=map_location, weights_only=False)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
     if not isinstance(payload, dict) or payload.get("schema") != "repldm.latent_renderer_checkpoint.v1":
         raise ValueError("unsupported latent renderer checkpoint schema")
     if not isinstance(payload.get("contract"), Mapping):
         raise ValueError("checkpoint contract is invalid")
+    if binding is None and _is_formal_contract(payload["contract"]):
+        raise RuntimeError(
+            "formal checkpoint I/O requires a validated authorization binding"
+        )
     actual_hash = hashlib.sha256(_canonical(payload.get("contract", {}))).hexdigest()
     if actual_hash != payload.get("contract_hash"):
         raise ValueError("checkpoint contract hash is invalid")
@@ -308,6 +507,9 @@ def load_checkpoint(
         effective_expected_contract = trainer_contract
     else:
         effective_expected_contract = expected_contract
+    if binding is not None:
+        if _canonical(dict(payload.get("contract", {}))) != _canonical(binding.contract):
+            raise ValueError("checkpoint contract does not match authorization binding")
     if effective_expected_contract is not None and not isinstance(effective_expected_contract, Mapping):
         raise ValueError("expected contract must be a mapping")
     if effective_expected_contract is not None and hashlib.sha256(_canonical(effective_expected_contract)).hexdigest() != actual_hash:
@@ -317,6 +519,14 @@ def load_checkpoint(
     extra = payload.get("extra")
     if not isinstance(extra, dict):
         raise ValueError("checkpoint extra state is invalid")
+    if binding is None and _AUTHORIZATION_PROVENANCE_FIELD in extra:
+        raise RuntimeError(
+            "checkpoint records authorization provenance; a validated binding is required"
+        )
+    if binding is not None:
+        recorded_binding = extra.get(_AUTHORIZATION_PROVENANCE_FIELD)
+        if recorded_binding != binding.provenance():
+            raise ValueError("checkpoint authorization binding is missing or mismatched")
     current_model_state = model.state_dict()
     _validate_model_state(payload.get("model"), current_model_state, label="model")
     if trainer is not None and getattr(trainer, "model", None) is not model:
