@@ -4,9 +4,9 @@ This directory contains generated JSONL indexes for OPD, DPO, and RL latent-rend
 research. Images, model weights, feature caches, and run logs remain in the five source
 directories; records reference payloads by absolute path.
 
-The checked-in configuration is intentionally a development candidate inventory, not a
-formal training release. The plain command below is the final command only after every
-artifact hash has been populated and a selected payload view has been bound:
+The checked-in configuration is a formal, path-verified candidate inventory, not a
+training release. The plain command rebuilds its content-addressed parent catalog; a
+selected payload view is still required before training:
 
 ```bash
 python eval-pipeline/build_data_catalog.py
@@ -21,9 +21,8 @@ python eval-pipeline/build_data_catalog.py --allow-dirty --no-verify-paths \
   --output-dir DATA/dev-catalog-YYYYMMDD
 ```
 
-The formal command fails closed while `expected_artifact_hashes` is empty; this is
-intentional. After selected payload SHA-256 manifests and the frozen configuration are
-committed, rebuild from the clean pushed commit and run `--validate-only` before use.
+The configuration pins the byte count and SHA-256 of every parent artifact. Rebuild from
+the clean pushed commit and run `--validate-only` before using the resulting parent.
 
 Development builds may use `--allow-dirty --no-verify-paths`, but they never update
 `DATA/current` and must not feed an experiment. `DATA/current` changes only after the new
@@ -56,8 +55,8 @@ selected view and hash every selected payload with SHA-256. The
 The frozen candidate total is 313,094 rows: 275,217 contain prompts and 263,094 reference
 images. Source counts, splits, modalities, protected-source hashes, and candidate statistics
 are pinned by the versioned config. Artifact byte counts and hashes are recorded in each
-release manifest; `expected_artifact_hashes` is intentionally empty for this development-only
-catalog, so those values are not yet a formal acceptance contract. Rows marked `review_required`,
+release manifest and in the versioned config, so the parent artifact set is a formal
+acceptance contract. Rows marked `review_required`,
 `noncommercial_research`, or `benchmark_only` are excluded by a fail-closed allowlist.
 
 The historical expanded development release under

@@ -579,9 +579,24 @@ expected_artifact_order:
   - training_views.jsonl
   - source_inventory.jsonl
 
-# Frozen from a development derivation after adding the complete local 4KLSDB holdouts.
+# Frozen from the reproducible, path-verified derivation used for the catalog parent.
 # A formal clean build must reproduce every byte count and SHA-256 below.
-expected_artifact_hashes: {}
+expected_artifact_hashes:
+  benchmark_holdouts.jsonl: {bytes: 59321729, sha256: 9703fedd5c60bae55e6ba3095bb17d005f3f8dfdd843efa92a2306cfa0262cfd}
+  four_k_lsdb.jsonl: {bytes: 170054881, sha256: e227aad228a325b1347f5d4e43ed781b51f960e9ea4fed622ef027b9d6d32d47}
+  pixverve_95k.jsonl: {bytes: 456328397, sha256: 650eb8394984e4a72802052db5e02422c1b108e6959d1c93cb610c1e5a341e8e}
+  sana_pickscore_prompts.jsonl: {bytes: 22323659, sha256: f0a222f7f402279da7b623a751f6744aaa9104d27f6a8d6943a6ed425724284a}
+  sana_ocr_prompts.jsonl: {bytes: 19038620, sha256: f4c2c00a95d819730390094aae28d652747b385cd492debe1fddbb0cfcd45e1a}
+  sana_geneval_prompts.jsonl: {bytes: 43790634, sha256: 294afe69b530efca2b76b58ff2db41e0322e67547500b92c8c78485cb08ee06c}
+  sana_drawbench_prompts.jsonl: {bytes: 723894, sha256: 3f23e590aed55272d7f3e8dddc9cf853e85b71fb8eb58de34e9ec506087eb8fa}
+  aesthetic_4k.jsonl: {bytes: 10470495, sha256: 3f37dc8aa3b235a76240c8e560dd51d1029dd729e56365c2c9db91c20cfa248b}
+  style30k.jsonl: {bytes: 20226240, sha256: d7c1d6b591a36e69ae348e75a024b0974c31447c9416440d465239a9fab9cfbc}
+  omnistyle_available.jsonl: {bytes: 2504599, sha256: 9fcb24e633f9af85523aa5e1cdf9924df6dc14d8af8a11f8408afbdb42f33c39}
+  pixel_render_image_only.jsonl: {bytes: 4583817316, sha256: ec73147858faf7d66622066095633960d6931081710d0621bb1fd1ad4b1e8078}
+  sana_4klsdb_text_features.jsonl: {bytes: 9008, sha256: fa6469a15fe1f21f8110d838f17b6be5411f315da4c985bc023e0be32a2edf73}
+  training_candidates.jsonl: {bytes: 696026144, sha256: a47892e0c8f7d6c4a70a2ad1cc379e4916edbec743fafdd3584daa360a2d0d4b}
+  training_views.jsonl: {bytes: 1291, sha256: f912c9dc237b61de1a54a2c0980a1ffbcf87c2a59c6da6a17b0fa9d018c60b58}
+  source_inventory.jsonl: {bytes: 1658, sha256: 300a1f09c9c7ebbed6fc495de5cd23a49a818117ee78116b5849c139b50d7b88}
 
 cross_checks:
   four_k_lsdb_manifest: /mnt/miah204/bycao/Sana/data/4klsdb/index.jsonl
