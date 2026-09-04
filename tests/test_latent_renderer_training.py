@@ -2078,6 +2078,17 @@ def test_training_authorization_rejects_v1_receipt(tmp_path: Path):
         )
 
 
+def test_training_authorization_accepts_selected_view_config_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The formal loader must accept the current selected-view config schema."""
+    authorized = _training_authorization(tmp_path, monkeypatch)
+    config = json.loads(authorized.selected_config_path.read_text(encoding="utf-8"))
+
+    assert config["schema"] == authorization_module.SELECTED_CONFIG_SCHEMA
+    assert config["schema"] == "repldm.selected_view_config.v2"
+
+
 def test_training_authorization_runs_canonical_child_validator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

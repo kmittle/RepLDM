@@ -16,6 +16,8 @@ import math
 import os
 import re
 import stat
+import threading
+import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -35,10 +37,12 @@ from .io import canonical_json_bytes, iter_jsonl, sha256_file
 from .schema import normalize_prompt
 
 SELECTED_VIEW_SCHEMA = "repldm.selected_view_release.v1"
-SELECTED_CONFIG_SCHEMA = "repldm.selected_view_config.v1"
+SELECTED_CONFIG_SCHEMA = "repldm.selected_view_config.v2"
 SELECTED_ROW_SCHEMA = "repldm.selected_data_record.v1"
 SELECTED_GATE_REPORT_SCHEMA = "repldm.selected_view_gate_report.v1"
 THRESHOLD_CALIBRATION_SCHEMA = "repldm.threshold_calibration.v1"
+SELECTED_IMAGE_MAX_PIXELS = 400_000_000
+_IMAGE_DECODE_LIMIT_LOCK = threading.Lock()
 
 STRATA = (
     "nature",
@@ -124,34 +128,64 @@ def decode_image_payload(path: Path, decoder: Mapping[str, Any]) -> DecodedImage
         decoder.get("library") != "Pillow"
         or decoder.get("version") != pillow_version
         or decoder.get("littlecms_version") != features.version("littlecms2")
+        or decoder.get("max_image_pixels") != SELECTED_IMAGE_MAX_PIXELS
     ):
         raise ValueError("installed Pillow/LittleCMS stack differs from the selected-view config")
-    try:
-        with Image.open(image_path) as opened:
-            image = ImageOps.exif_transpose(opened)
-            icc_payload = image.info.get("icc_profile")
-            if icc_payload:
-                source_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_payload))
-                target_profile = ImageCms.createProfile("sRGB")
-                # LittleCMS cannot build an RGB-profile transform directly for
-                # L/LA/P inputs.  Some datasets contain grayscale pixels with
-                # an RGB profile, so expand only those inputs before conversion.
-                profile_color_space = getattr(source_profile.profile, "xcolor_space", "").strip()
-                if image.mode in {"L", "LA", "P"} and profile_color_space == "RGB":
-                    image = image.convert("RGB")
-                image = ImageCms.profileToProfile(
-                    image,
-                    source_profile,
-                    target_profile,
-                    outputMode="RGB",
-                )
-            else:
-                image = image.convert("RGB")
-            image.load()
-            width, height = image.size
-            pixels = image.tobytes()
-    except (OSError, ValueError, ImageCms.PyCMSError) as exc:
-        raise ValueError(f"cannot decode selected image: {image_path}") from exc
+    # Pillow stores this guard as a process-global value.  Serialize the
+    # temporary override so concurrent public API calls restore one another's
+    # settings correctly.
+    with _IMAGE_DECODE_LIMIT_LOCK:
+        previous_max_image_pixels = Image.MAX_IMAGE_PIXELS
+        try:
+            # The protected catalog contains high-resolution source images.
+            # Pillow's process-global default is lower than this frozen bound,
+            # so override it only for this decode and restore it below.
+            Image.MAX_IMAGE_PIXELS = SELECTED_IMAGE_MAX_PIXELS
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(image_path) as opened:
+                    opened_width, opened_height = opened.size
+                    if opened_width * opened_height > SELECTED_IMAGE_MAX_PIXELS:
+                        raise ValueError(
+                            f"decoded image exceeds the frozen pixel limit: {image_path}"
+                        )
+                    image = ImageOps.exif_transpose(opened)
+                    width, height = image.size
+                    if width * height > SELECTED_IMAGE_MAX_PIXELS:
+                        raise ValueError(
+                            f"decoded image exceeds the frozen pixel limit: {image_path}"
+                        )
+                    icc_payload = image.info.get("icc_profile")
+                    if icc_payload:
+                        source_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_payload))
+                        target_profile = ImageCms.createProfile("sRGB")
+                        # LittleCMS cannot build an RGB-profile transform
+                        # directly for L/LA/P inputs.  Expand only those first.
+                        profile_color_space = getattr(
+                            source_profile.profile, "xcolor_space", ""
+                        ).strip()
+                        if image.mode in {"L", "LA", "P"} and profile_color_space == "RGB":
+                            image = image.convert("RGB")
+                        image = ImageCms.profileToProfile(
+                            image,
+                            source_profile,
+                            target_profile,
+                            outputMode="RGB",
+                        )
+                    else:
+                        image = image.convert("RGB")
+                    image.load()
+                    width, height = image.size
+                    pixels = image.tobytes()
+        except (
+            OSError,
+            ValueError,
+            ImageCms.PyCMSError,
+            Image.DecompressionBombError,
+        ) as exc:
+            raise ValueError(f"cannot decode selected image: {image_path}") from exc
+        finally:
+            Image.MAX_IMAGE_PIXELS = previous_max_image_pixels
     if width <= 0 or height <= 0 or len(pixels) != width * height * 3:
         raise ValueError(f"decoded image has an invalid RGB payload: {image_path}")
     digest = hashlib.sha256(
@@ -869,6 +903,7 @@ def _validate_config(
         "library",
         "version",
         "littlecms_version",
+        "max_image_pixels",
         "exif_transpose",
         "icc_to_srgb",
         "output_mode",
@@ -881,6 +916,7 @@ def _validate_config(
         or not decoder["version"]
         or not isinstance(decoder.get("littlecms_version"), str)
         or not decoder["littlecms_version"]
+        or decoder.get("max_image_pixels") != SELECTED_IMAGE_MAX_PIXELS
         or decoder.get("exif_transpose") is not True
         or decoder.get("icc_to_srgb") is not True
         or decoder.get("output_mode") != "RGB"
@@ -1854,6 +1890,7 @@ __all__ = [
     "PARENT_ARTIFACT_ORDER",
     "SELECTED_CONFIG_SCHEMA",
     "SELECTED_GATE_REPORT_SCHEMA",
+    "SELECTED_IMAGE_MAX_PIXELS",
     "SELECTED_ROW_SCHEMA",
     "SELECTED_VIEW_SCHEMA",
     "STRATA",

@@ -239,6 +239,13 @@ threshold, and model hash. These classifier and semantic/image threshold artifac
 yet frozen; until they are locally available and hashed, the builder must emit
 `training_ready=false` and must not fall back to exact matching alone.
 
+The selected-view configuration is `repldm.selected_view_config.v2`. This version bump records
+the decoder contract change instead of silently changing v1 semantics. It freezes a
+`max_image_pixels` bound of 400,000,000. Pillow's lower process default is overridden only
+during a bound, local decode and restored afterward; images over the bound fail closed. This
+accommodates the largest protected source image (384,000,000 pixels) without silently accepting
+unbounded inputs.
+
 ## Engineering Feasibility Screen F0
 
 F0 asks one question: does the bounded structure space contain an outcome-improving action

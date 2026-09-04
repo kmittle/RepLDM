@@ -282,6 +282,7 @@ class SelectedReleaseFixture:
                 "library": "Pillow",
                 "version": "11.0.0",
                 "littlecms_version": "2.12",
+                "max_image_pixels": 400_000_000,
                 "exif_transpose": True,
                 "icc_to_srgb": True,
                 "output_mode": "RGB",

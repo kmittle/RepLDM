@@ -24,7 +24,7 @@ from typing import Any
 
 AUTHORIZATION_SCHEMA = "repldm.training_authorization.v2"
 SELECTED_VIEW_SCHEMA = "repldm.selected_view_release.v1"
-SELECTED_CONFIG_SCHEMA = "repldm.selected_view_config.v1"
+SELECTED_CONFIG_SCHEMA = "repldm.selected_view_config.v2"
 SELECTED_ROW_SCHEMA = "repldm.selected_data_record.v1"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

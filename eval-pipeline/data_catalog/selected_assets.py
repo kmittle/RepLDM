@@ -22,7 +22,13 @@ import numpy as np
 
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
 from .schema import normalize_prompt
-from .selected import _field, dct_phash_v1, decode_image_payload
+from .selected import (
+    SELECTED_CONFIG_SCHEMA,
+    SELECTED_IMAGE_MAX_PIXELS,
+    _field,
+    dct_phash_v1,
+    decode_image_payload,
+)
 
 ASSET_SCHEMA = "repldm.selected_view_assets.v1"
 CALIBRATION_SCHEMA = "repldm.threshold_calibration.v1"
@@ -940,6 +946,7 @@ def build_selected_assets(
         "library": "Pillow",
         "version": pillow_version,
         "littlecms_version": features.version("littlecms2"),
+        "max_image_pixels": SELECTED_IMAGE_MAX_PIXELS,
         "exif_transpose": True,
         "icc_to_srgb": True,
         "output_mode": "RGB",
@@ -1156,7 +1163,7 @@ def build_selected_assets(
     )
 
     config = {
-        "schema": "repldm.selected_view_config.v1",
+        "schema": SELECTED_CONFIG_SCHEMA,
         "view_id": "opd_dpo_rl_selected_view_v1",
         "parent_catalog": {"release_id": parent_manifest["release_id"], "manifest_sha256": parent_hash},
         "sources": {

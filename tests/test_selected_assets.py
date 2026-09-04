@@ -16,6 +16,7 @@ if str(EVAL_ROOT) not in sys.path:
 
 from data_catalog import selected_assets
 from data_catalog.selected import (
+    SELECTED_IMAGE_MAX_PIXELS,
     _validate_calibration,
     _validate_protected_index_binding,
 )
@@ -42,6 +43,7 @@ def _fixture_decoder() -> dict[str, object]:
         "library": "Pillow",
         "version": pillow_version,
         "littlecms_version": features.version("littlecms2"),
+        "max_image_pixels": SELECTED_IMAGE_MAX_PIXELS,
         "exif_transpose": True,
         "icc_to_srgb": True,
         "output_mode": "RGB",
@@ -62,6 +64,48 @@ def test_decode_image_payload_expands_grayscale_with_rgb_icc_profile(
 
     assert (decoded.width, decoded.height) == (2, 1)
     assert decoded.rgb_bytes == bytes((96, 96, 96, 96, 96, 96))
+
+
+def test_decode_image_payload_temporarily_overrides_pillow_pixel_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "small-image.png"
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(image_path)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+
+    decoded = selected_assets.decode_image_payload(image_path, _fixture_decoder())
+
+    assert (decoded.width, decoded.height) == (2, 2)
+    assert Image.MAX_IMAGE_PIXELS == 1
+
+
+def test_decode_image_payload_rejects_oversized_header_before_exif_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PIL import ImageOps
+
+    image_path = tmp_path / "oversized-header.bin"
+    image_path.write_bytes(b"fixture")
+
+    class _Opened:
+        size = (SELECTED_IMAGE_MAX_PIXELS + 1, 1)
+
+        def __enter__(self) -> "_Opened":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(Image, "open", lambda _path: _Opened())
+
+    def unexpected_exif(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("EXIF transpose must not load an oversized image")
+
+    monkeypatch.setattr(ImageOps, "exif_transpose", unexpected_exif)
+    with pytest.raises(ValueError, match="cannot decode selected image"):
+        selected_assets.decode_image_payload(image_path, _fixture_decoder())
 
 
 def test_decode_image_payload_rejects_incompatible_cmyk_rgb_profile(
