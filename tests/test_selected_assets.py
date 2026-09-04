@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+EVAL_ROOT = ROOT / "eval-pipeline"
+if str(EVAL_ROOT) not in sys.path:
+    sys.path.insert(0, str(EVAL_ROOT))
+
+from data_catalog import selected_assets
+from data_catalog.selected import (
+    _validate_calibration,
+    _validate_protected_index_binding,
+)
+from data_catalog.selected_assets import (
+    SOURCE_PROMPT_FIELDS,
+    TOKENIZER_FILE_SHA256,
+    _calibration_artifact,
+    _cyclic_hamming_distances,
+    _protected_sample_ids,
+    _source_evidence_from_parent,
+    _validate_source_prompt_fields,
+    derive_protected_index_manifest,
+    protected_ids_sha256,
+    unique_protected_images,
+    unique_protected_prompts,
+)
+
+
+def _fixture_decoder() -> dict[str, object]:
+    from PIL import __version__ as pillow_version
+    from PIL import features
+
+    return {
+        "library": "Pillow",
+        "version": pillow_version,
+        "littlecms_version": features.version("littlecms2"),
+        "exif_transpose": True,
+        "icc_to_srgb": True,
+        "output_mode": "RGB",
+        "pixel_hash": "sha256_rgb_u64be_width_height_bytes_v1",
+    }
+
+
+def _file_binding(path: Path) -> dict[str, object]:
+    payload = path.read_bytes()
+    return {
+        "path": str(path.absolute()),
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _small_protected_fixture(tmp_path: Path) -> tuple[dict[str, object], Path, dict[str, object]]:
+    parent = tmp_path / "catalog-test"
+    parent.mkdir()
+    image_paths = []
+    for index, color in enumerate(((20, 30, 40), (80, 90, 100))):
+        image = parent / f"image-{index}.png"
+        Image.new("RGB", (2, 2), color=color).save(image)
+        image_paths.append(image)
+    holdout = parent / "benchmark_holdouts.jsonl"
+    rows = [
+        {"id": "prompt-0", "prompt": "first protected prompt", "image_path": str(image_paths[0])},
+        {"id": "prompt-1", "prompt": "second protected prompt", "image_path": str(image_paths[1])},
+    ]
+    # The formal contract has a fixed 49,393-row parent.  Repeating two
+    # stable rows keeps this adversarial unit test small in semantic content
+    # while exercising the same count gate.
+    holdout.write_bytes(
+        b"".join((json.dumps(rows[index % 2], sort_keys=True) + "\n").encode() for index in range(49393))
+    )
+    parent_manifest_sha = "a" * 64
+    parent_manifest = {
+        "release_id": parent.name,
+        "protected_normalized_unique_prompts": 2,
+        "protected_unique_images": 2,
+    }
+    decoder = _fixture_decoder()
+    manifest = derive_protected_index_manifest(
+        parent,
+        parent_release_id=parent.name,
+        parent_manifest_sha256=parent_manifest_sha,
+        decoder=decoder,
+    )
+    manifest_path = parent / "protected-index-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+    semantic = parent / "semantic.npz"
+    image = parent / "image.npz"
+    ids = np.asarray(["prompt-0", "prompt-1"])
+    embeddings = np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (2, 1))
+    np.savez(semantic, ids=ids, embeddings=embeddings)
+    np.savez(image, ids=ids, embeddings=embeddings)
+    phash = parent / "phash.jsonl"
+    phash.write_text(
+        "".join(
+            json.dumps({"id": value, "phash": f"{index + 1:016x}"}) + "\n"
+            for index, value in enumerate(ids.tolist())
+        ),
+        encoding="utf-8",
+    )
+    index_bindings = {
+        "semantic_text": {
+            "manifest_sha256": manifest["manifest_sha256"],
+            "ids_sha256": protected_ids_sha256(ids.tolist()),
+        },
+        "phash": {
+            "manifest_sha256": manifest["manifest_sha256"],
+            "ids_sha256": protected_ids_sha256(ids.tolist()),
+        },
+        "image_embedding": {
+            "manifest_sha256": manifest["manifest_sha256"],
+            "ids_sha256": protected_ids_sha256(ids.tolist()),
+        },
+    }
+    protected = {
+        "holdout_rows": 49393,
+        "normalized_unique_prompts": 2,
+        "unique_images": 2,
+        "manifest": _file_binding(manifest_path),
+        "manifest_sha256": manifest["manifest_sha256"],
+        "semantic_text": _file_binding(semantic),
+        "phash": _file_binding(phash),
+        "image_embedding": _file_binding(image),
+        "index_bindings": index_bindings,
+    }
+    return parent_manifest, parent, {"decoder": decoder, "protected": protected, "manifest": manifest}
+
+
+def test_unique_protected_prompts_is_stable_and_deduplicates_normalized_text() -> None:
+    rows = [
+        {"id": "prompt-z", "prompt": "  A shared prompt  "},
+        {"id": "prompt-a", "prompt": "a   shared prompt"},
+        {"id": "prompt-b", "prompt": "A different prompt"},
+        {"id": "ignored", "prompt": ""},
+        {"id": "ignored-none", "prompt": None},
+    ]
+
+    expected = [
+        {
+            "id": "prompt-b",
+            "prompt": "A different prompt",
+            "normalized": "a different prompt",
+        },
+        {
+            "id": "prompt-a",
+            "prompt": "a   shared prompt",
+            "normalized": "a shared prompt",
+        },
+    ]
+    assert unique_protected_prompts(rows) == expected
+    assert unique_protected_prompts(list(reversed(rows))) == expected
+
+
+def test_unique_protected_prompts_rejects_a_relevant_row_without_id() -> None:
+    with pytest.raises(ValueError, match="stable id"):
+        unique_protected_prompts([{"prompt": "usable prompt"}])
+
+
+def test_unique_protected_images_is_stable_and_deduplicates_resolved_paths(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    rows = [
+        {"id": "image-z", "image_path": str(first)},
+        {"id": "image-a", "image_path": str(tmp_path / "." / "first.bin")},
+        {"id": "image-b", "image_path": str(second)},
+        {"id": "ignored", "image_path": ""},
+    ]
+
+    expected = [
+        {"id": "image-a", "image_path": str(first.resolve())},
+        {"id": "image-b", "image_path": str(second.resolve())},
+    ]
+    assert unique_protected_images(rows) == expected
+    assert unique_protected_images(list(reversed(rows))) == expected
+
+
+def test_unique_protected_images_rejects_missing_relevant_assets(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.jpg"
+    with pytest.raises(FileNotFoundError, match="protected image is missing"):
+        unique_protected_images([{"id": "image-1", "image_path": str(missing)}])
+
+
+def test_unique_protected_images_rejects_symlink_paths(tmp_path: Path) -> None:
+    target = tmp_path / "target.jpg"
+    target.write_bytes(b"image")
+    link = tmp_path / "link.jpg"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        unique_protected_images([{"id": "image-1", "image_path": str(link)}])
+
+
+def test_source_prompt_fields_match_normalized_catalog_contract() -> None:
+    assert SOURCE_PROMPT_FIELDS == {
+        "four_k_lsdb": {
+            "model_prompt_field": "prompt",
+            "raw_prompt_field": "prompt",
+        },
+        "pixverve_95k": {
+            "model_prompt_field": "source_record.model_prompt",
+            "raw_prompt_field": "source_record.raw_prompt",
+        },
+    }
+
+
+def test_cyclic_hamming_distances_keep_64_bit_hashes_as_integers() -> None:
+    assert _cyclic_hamming_distances([0xFFFFFFFFFFFFFFFF, 0, 1]) == [64, 1, 63]
+
+
+def test_source_prompt_paths_are_checked_against_real_candidate_rows(tmp_path: Path) -> None:
+    candidates = tmp_path / "training_candidates.jsonl"
+    rows = [
+        {
+            "id": "four-k-1",
+            "source": "four_k_lsdb",
+            "prompt": "a four k prompt",
+            "training_eligible": True,
+            "benchmark_exact_match": [],
+        },
+        {
+            "id": "pix-1",
+            "source": "pixverve_95k",
+            "prompt": "a short prompt",
+            "source_record": {
+                "model_prompt": "a short prompt",
+                "raw_prompt": "a long prompt",
+            },
+            "training_eligible": True,
+            "benchmark_exact_match": [],
+        },
+    ]
+    candidates.write_bytes(
+        b"".join(
+            (json.dumps(row, sort_keys=True) + "\n").encode("utf-8") for row in rows
+        )
+    )
+    _validate_source_prompt_fields(tmp_path)
+
+    rows[1]["source_record"].pop("raw_prompt")
+    candidates.write_bytes(
+        b"".join(
+            (json.dumps(row, sort_keys=True) + "\n").encode("utf-8") for row in rows
+        )
+    )
+    with pytest.raises(ValueError, match="prompt field mapping"):
+        _validate_source_prompt_fields(tmp_path)
+
+
+def test_source_evidence_must_match_parent_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    four_k = tmp_path / "four_k.jsonl"
+    pixverve = tmp_path / "pixverve.jsonl"
+    four_k.write_bytes(b"four k source")
+    pixverve.write_bytes(b"pixverve source")
+    paths = {"four_k_lsdb": four_k, "pixverve_95k": pixverve}
+    monkeypatch.setattr(selected_assets, "SOURCE_EVIDENCE_PATHS", paths)
+    provenance = [
+        {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": selected_assets.file_binding(path)["sha256"],
+        }
+        for path in paths.values()
+    ]
+    assert set(_source_evidence_from_parent({"source_provenance": provenance})) == set(paths)
+    pixverve.write_bytes(b"changed source")
+    with pytest.raises(ValueError, match="differs from the parent manifest"):
+        _source_evidence_from_parent({"source_provenance": provenance})
+
+
+def test_checkpoint_hash_is_checked_before_clip_loader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint = tmp_path / "wrong.pt"
+    checkpoint.write_bytes(b"not-the-pinned-checkpoint")
+    called = False
+
+    def unexpected_loader(*args: object, **kwargs: object) -> tuple[object, object]:
+        nonlocal called
+        called = True
+        raise AssertionError("the CLIP loader must not see an unbound checkpoint")
+
+    monkeypatch.setattr(selected_assets, "_load_clip", unexpected_loader)
+    with pytest.raises(ValueError, match="pinned selected-view revision"):
+        selected_assets._load_bound_clip(checkpoint, "cpu")
+    assert called is False
+
+
+def test_tokenizer_registration_rejects_unbound_file_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "tokenizer"
+    root.mkdir()
+    for name in TOKENIZER_FILE_SHA256["sdxl_tokenizer_1"]:
+        (root / name).write_bytes(b"fixture tokenizer file")
+    with pytest.raises(ValueError, match="frozen registration"):
+        selected_assets._tokenizer_descriptor(root, "sdxl_tokenizer_1")
+
+
+def test_same_count_but_wrong_protected_index_ids_are_rejected(tmp_path: Path) -> None:
+    parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    protected = fixture["protected"]
+    selected_path = Path(protected["semantic_text"]["path"])
+    np.savez(
+        selected_path,
+        ids=np.asarray(["prompt-1", "prompt-0"]),
+        embeddings=np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (2, 1)),
+    )
+    protected["semantic_text"] = _file_binding(selected_path)
+    with pytest.raises(ValueError, match="IDs differ from the parent manifest"):
+        _validate_protected_index_binding(
+            protected,
+            parent=parent_manifest,
+            parent_dir=parent,
+            parent_manifest_sha256="a" * 64,
+            decoder=fixture["decoder"],
+        )
+
+
+@pytest.mark.parametrize("override", ["holdout_rows", "prompt_rows", "image_rows"])
+def test_manifest_derivation_rejects_rows_not_from_current_holdout(
+    tmp_path: Path, override: str
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    values: dict[str, object] = {
+        "holdout_rows": [{"id": "forged", "prompt": "forged"}],
+        "prompt_rows": [
+            {"id": "forged", "prompt": "forged", "normalized": "forged"}
+        ],
+        "image_rows": [{"id": "forged", "image_path": "/tmp/forged.png"}],
+    }
+    with pytest.raises(ValueError, match="current (holdout|holdout cohort)"):
+        derive_protected_index_manifest(
+            parent,
+            parent_release_id=parent.name,
+            parent_manifest_sha256="a" * 64,
+            decoder=fixture["decoder"],
+            **{override: values[override]},
+        )
+
+
+def test_metadata_only_manifest_validation_uses_frozen_image_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+
+    def unexpected_decode(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("metadata-only validation must not decode images")
+
+    monkeypatch.setattr(selected_assets, "decode_image_payload", unexpected_decode)
+    observed = derive_protected_index_manifest(
+        parent,
+        parent_release_id=parent.name,
+        parent_manifest_sha256="a" * 64,
+        decoder=fixture["decoder"],
+        image_evidence=fixture["manifest"]["images"],
+        verify_image_evidence=False,
+    )
+    assert observed == fixture["manifest"]
+
+
+def test_metadata_only_manifest_still_binds_holdout_bytes(
+    tmp_path: Path,
+) -> None:
+    parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    holdout = parent / "benchmark_holdouts.jsonl"
+    with holdout.open("ab") as handle:
+        handle.write(b"{\"id\":\"changed\",\"prompt\":\"changed\"}\n")
+    with pytest.raises(ValueError, match="protected index manifest differs"):
+        _validate_protected_index_binding(
+            fixture["protected"],
+            parent=parent_manifest,
+            parent_dir=parent,
+            parent_manifest_sha256="a" * 64,
+            decoder=fixture["decoder"],
+        )
+
+
+def test_formal_manifest_validation_rechecks_current_protected_image_bytes(
+    tmp_path: Path,
+) -> None:
+    parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    image_path = Path(fixture["manifest"]["images"][0]["image_path"])
+    image_path.write_bytes(b"replaced-after-index-build")
+
+    with pytest.raises(ValueError, match="cannot derive the protected index manifest"):
+        _validate_protected_index_binding(
+            fixture["protected"],
+            parent=parent_manifest,
+            parent_dir=parent,
+            parent_manifest_sha256="a" * 64,
+            decoder=fixture["decoder"],
+        )
+
+
+def test_protected_calibration_rejects_misbinding_to_another_index(
+    tmp_path: Path,
+) -> None:
+    _parent_manifest, _parent, fixture = _small_protected_fixture(tmp_path)
+    source = tmp_path / "calibration.jsonl"
+    sample_ids = _protected_sample_ids(["prompt-0", "prompt-1"])
+    source.write_text(
+        "".join(
+            json.dumps(
+                {"pair": index, "label": "positive", "protected_ids": ids}
+            )
+            + "\n"
+            for index, ids in enumerate(sample_ids)
+        ),
+        encoding="utf-8",
+    )
+    artifact = tmp_path / "calibration.json"
+    _calibration_artifact(
+        artifact,
+        metric="cosine_similarity",
+        selected_value=0.8,
+        comparison="reject_at_or_above",
+        source_path=source,
+        positive_count=2,
+        negative_count=2,
+        model_hash="b" * 64,
+        protected_manifest_sha256=fixture["manifest"]["manifest_sha256"],
+        protected_index_sha256="c" * 64,
+        protected_sample_ids=sample_ids,
+    )
+    binding = _file_binding(artifact)
+    with pytest.raises(ValueError, match="protected binding differs from the index"):
+        _validate_calibration(
+            binding,
+            label="semantic text",
+            metric="cosine_similarity",
+            selected_value=0.8,
+            comparison="reject_at_or_above",
+            model_hash="b" * 64,
+            protected_sample_binding={
+                "manifest_sha256": fixture["manifest"]["manifest_sha256"],
+                "index_sha256": "d" * 64,
+                "sample_ids": sample_ids,
+            },
+        )

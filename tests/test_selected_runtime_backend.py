@@ -240,6 +240,37 @@ def test_backend_loads_bound_assets_and_implements_all_gates(
     runtime.close()
 
 
+def test_formal_parent_requires_protected_manifest_before_model_loading(
+    tmp_path: Path, fake_dependencies
+) -> None:
+    config, _checkpoint, _ = _config(tmp_path)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "repldm.data_catalog.v1",
+                "release_id": "catalog-" + "1" * 20,
+                "candidate_catalog_complete": True,
+                "development_build": False,
+                "verify_paths": True,
+                "training_ready": False,
+                "complete": False,
+                "protected_normalized_unique_prompts": 46619,
+                "protected_unique_images": 37160,
+                "artifacts": [
+                    {"path": "benchmark_holdouts.jsonl", "rows": 49393}
+                ],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="requires a protected index manifest"):
+        build_runtime_v1(config, tmp_path, tmp_path)
+    assert fake_dependencies == []
+
+
 def test_backend_uses_the_declared_clip_tokenizer_after_list_reordering(
     tmp_path: Path, fake_dependencies
 ):

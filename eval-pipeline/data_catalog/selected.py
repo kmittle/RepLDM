@@ -323,6 +323,8 @@ def _validate_calibration(
     selected_value: float | int,
     comparison: str,
     model_hash: str,
+    protected_sample_binding: Mapping[str, Any] | None = None,
+    sample_ids: Sequence[str] | None = None,
 ) -> None:
     path = _validate_file_binding(binding, label=f"{label} calibration")
     value = _json_object(path, label=f"{label} calibration")
@@ -337,6 +339,10 @@ def _validate_calibration(
         "source",
         "model_binding_sha256",
     }
+    if protected_sample_binding is not None:
+        expected_keys.add("protected_sample_binding")
+    if sample_ids is not None:
+        expected_keys.update({"sample_ids", "sample_ids_sha256"})
     if set(value) != expected_keys or value.get("schema") != THRESHOLD_CALIBRATION_SCHEMA:
         raise ValueError(f"{label} calibration schema is incomplete")
     if value.get("metric") != metric or value.get("comparison") != comparison:
@@ -358,6 +364,110 @@ def _validate_calibration(
     source_file = _validate_file_binding(source, label=f"{label} calibration source")
     if value.get("model_binding_sha256") != model_hash:
         raise ValueError(f"{label} calibration is bound to a different model or definition")
+    if sample_ids is not None:
+        expected_ids = list(sample_ids)
+        if (
+            value.get("sample_ids") != expected_ids
+            or value.get("sample_ids_sha256")
+            != hashlib.sha256(canonical_json_bytes(expected_ids)).hexdigest()
+        ):
+            raise ValueError(f"{label} calibration sample IDs differ from its source")
+        try:
+            source_rows = list(iter_jsonl(source_file))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{label} calibration source is not readable JSONL") from exc
+        observed_ids = [row.get("id") for row in source_rows]
+        if observed_ids != expected_ids:
+            raise ValueError(f"{label} calibration source IDs differ from its artifact")
+    if protected_sample_binding is not None:
+        observed_binding = value.get("protected_sample_binding")
+        expected_binding = {
+            "manifest_sha256": protected_sample_binding.get("manifest_sha256"),
+            "index_sha256": protected_sample_binding.get("index_sha256"),
+            "sample_ids": [list(row) for row in protected_sample_binding.get("sample_ids", ())],
+        }
+        if not isinstance(observed_binding, Mapping) or set(observed_binding) != {
+            "manifest_sha256",
+            "index_sha256",
+            "sample_ids",
+            "sample_ids_sha256",
+        }:
+            raise ValueError(f"{label} calibration protected binding is incomplete")
+        observed_sample_ids = observed_binding.get("sample_ids")
+        if observed_sample_ids != expected_binding["sample_ids"]:
+            raise ValueError(f"{label} calibration protected IDs differ from the manifest")
+        if (
+            observed_binding.get("manifest_sha256")
+            != expected_binding["manifest_sha256"]
+            or observed_binding.get("index_sha256")
+            != expected_binding["index_sha256"]
+            or observed_binding.get("sample_ids_sha256")
+            != hashlib.sha256(
+                canonical_json_bytes(expected_binding["sample_ids"])
+            ).hexdigest()
+        ):
+            raise ValueError(f"{label} calibration protected binding differs from the index")
+        try:
+            source_rows = list(iter_jsonl(source_file))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{label} calibration source is not readable JSONL") from exc
+        source_ids = [row.get("protected_ids") for row in source_rows]
+        if source_ids != expected_binding["sample_ids"]:
+            raise ValueError(f"{label} calibration samples are not bound to the protected IDs")
+
+
+def _protected_calibration_sample_ids(ids: Sequence[str], count: int = 128) -> list[list[str]]:
+    """Mirror the producer's positive/cyclic-neighbor calibration cohort."""
+    base = list(ids[: min(count, len(ids))])
+    if len(base) < 2:
+        raise ValueError("protected calibration cohort must contain at least two IDs")
+    return [[value] for value in base] + [
+        [value, base[(index + 1) % len(base)]]
+        for index, value in enumerate(base)
+    ]
+
+
+def _classifier_calibration_sample_ids(parent_dir: Path) -> list[str]:
+    """Reproduce the producer's balanced, ID-sorted classifier cohort."""
+    from .selected_assets import STRATA as ASSET_STRATA
+    from .selected_assets import _keyword_class
+
+    by_class: dict[str, list[tuple[str, str]]] = {name: [] for name in ASSET_STRATA}
+    seen: set[str] = set()
+    for row in iter_jsonl(parent_dir / "training_candidates.jsonl"):
+        if row.get("modality") != "image_text" or not row.get("image_path"):
+            continue
+        expected = _keyword_class(str(row.get("prompt", "")))
+        if expected is None:
+            continue
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            raise ValueError("classifier calibration candidate lacks a stable id")
+        # Parent publication already verifies candidate image paths.  Keep
+        # validator-side calibration-ID derivation lexical so repeated config
+        # validation does not issue one network-filesystem stat per row.
+        raw_path = Path(str(row["image_path"]))
+        image_path = str(Path(os.path.abspath(os.fspath(raw_path))))
+        if image_path in seen:
+            continue
+        seen.add(image_path)
+        by_class[expected].append((row_id, image_path))
+    minimum_per_class = 32
+    missing = [
+        f"{name}={len(by_class[name])}"
+        for name in ASSET_STRATA
+        if len(by_class[name]) < minimum_per_class
+    ]
+    if missing:
+        raise ValueError(
+            "classifier calibration lacks the required per-stratum cohort: "
+            + ", ".join(missing)
+        )
+    return [
+        row_id
+        for name in ASSET_STRATA
+        for row_id, _ in sorted(by_class[name])[:minimum_per_class]
+    ]
 
 
 def _validate_source_config(value: object, *, source: str) -> dict[str, Any]:
@@ -381,10 +491,233 @@ def _validate_source_config(value: object, *, source: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _index_ids(path: Path, *, kind: str) -> tuple[str, ...]:
+    """Read only the ordered IDs from one protected index.
+
+    Embeddings are deliberately not loaded here; the runtime performs the
+    finite/normalization checks.  Reading IDs at config validation time closes
+    the same-count-but-unrelated-index gap before model initialization.
+    """
+    if kind in {"semantic_text", "image_embedding"}:
+        try:
+            import numpy as np
+
+            with np.load(path, allow_pickle=False) as archive:
+                if set(archive.files) != {"ids", "embeddings"}:
+                    raise ValueError(f"protected {kind} index fields are incomplete")
+                values = np.asarray(archive["ids"])
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"protected {kind} index is not readable") from exc
+        if values.ndim != 1:
+            raise ValueError(f"protected {kind} index IDs are not one-dimensional")
+        result: list[str] = []
+        for index, value in enumerate(values.tolist()):
+            if isinstance(value, bytes):
+                try:
+                    value = value.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"protected {kind} index ID {index} is not UTF-8") from exc
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"protected {kind} index ID {index} is invalid")
+            result.append(value)
+    elif kind == "phash":
+        result = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        raise ValueError(f"protected phash index has a blank row at {line_number}")
+                    row = json.loads(line)
+                    if not isinstance(row, Mapping) or set(row) != {"id", "phash"}:
+                        raise ValueError(f"protected phash row {line_number} is incomplete")
+                    value = row.get("id")
+                    if not isinstance(value, str) or not value:
+                        raise ValueError(f"protected phash row {line_number} has an invalid id")
+                    result.append(value)
+        except ValueError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("protected phash index is not readable") from exc
+    else:  # pragma: no cover - internal caller guard
+        raise ValueError(f"unknown protected index kind: {kind}")
+    if len(set(result)) != len(result):
+        raise ValueError(f"protected {kind} index IDs are not unique")
+    return tuple(result)
+
+
+def _validate_protected_index_binding(
+    protected: object,
+    *,
+    parent: Mapping[str, Any],
+    parent_dir: Path,
+    parent_manifest_sha256: str,
+    decoder: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate frozen cohort evidence and every index's ordered IDs.
+
+    The producer's evidence is not trusted as a substitute for the current
+    files: formal validation re-reads and hashes every protected image, then
+    rebinds that evidence to the current holdout/decoder contract.  This
+    closes the gap where an image could be replaced after asset construction.
+    """
+    if not isinstance(protected, Mapping) or set(protected) != {
+        "holdout_rows",
+        "normalized_unique_prompts",
+        "unique_images",
+        "manifest",
+        "manifest_sha256",
+        "semantic_text",
+        "phash",
+        "image_embedding",
+        "index_bindings",
+    }:
+        raise ValueError("protected index binding is incomplete")
+    manifest_path = _validate_file_binding(protected["manifest"], label="protected index manifest")
+    observed_manifest = _json_object(manifest_path, label="protected index manifest")
+    try:
+        from .selected_assets import (
+            derive_protected_index_manifest,
+            protected_ids_sha256,
+        )
+
+        # Re-verify the external image bytes at authorization time.  The
+        # manifest is an expected-value record, not a trust boundary.
+        frozen_images = observed_manifest.get("images")
+        expected_manifest = derive_protected_index_manifest(
+            parent_dir,
+            parent_release_id=str(parent.get("release_id")),
+            parent_manifest_sha256=parent_manifest_sha256,
+            decoder=decoder,
+            image_evidence=frozen_images
+            if isinstance(frozen_images, list)
+            else None,
+            verify_image_evidence=True,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError("cannot derive the protected index manifest from the parent") from exc
+    if observed_manifest != expected_manifest:
+        raise ValueError("protected index manifest differs from the parent holdout catalog")
+    manifest_hash = expected_manifest["manifest_sha256"]
+    if protected.get("manifest_sha256") != manifest_hash:
+        raise ValueError("protected index manifest hash differs from its binding")
+
+    counts = expected_manifest["counts"]
+    if (
+        protected.get("holdout_rows") != counts["holdout_rows"]
+        or protected.get("normalized_unique_prompts") != counts["normalized_unique_prompts"]
+        or protected.get("unique_images") != counts["unique_images"]
+        or protected.get("holdout_rows") != 49393
+        or protected.get("normalized_unique_prompts")
+        != parent.get("protected_normalized_unique_prompts")
+        or protected.get("unique_images") != parent.get("protected_unique_images")
+    ):
+        raise ValueError("protected index counts differ from the candidate parent")
+
+    prompt_ids = tuple(row["id"] for row in expected_manifest["prompts"])
+    image_ids = tuple(row["id"] for row in expected_manifest["images"])
+    if expected_manifest["prompt_ids_sha256"] != protected_ids_sha256(prompt_ids):
+        raise ValueError("protected prompt ID manifest hash is invalid")
+    if expected_manifest["image_ids_sha256"] != protected_ids_sha256(image_ids):
+        raise ValueError("protected image ID manifest hash is invalid")
+    index_bindings = protected.get("index_bindings")
+    if not isinstance(index_bindings, Mapping) or set(index_bindings) != {
+        "semantic_text",
+        "phash",
+        "image_embedding",
+    }:
+        raise ValueError("protected index ID bindings are incomplete")
+    expected_ids = {
+        "semantic_text": (prompt_ids, expected_manifest["prompt_ids_sha256"]),
+        "phash": (image_ids, expected_manifest["image_ids_sha256"]),
+        "image_embedding": (image_ids, expected_manifest["image_ids_sha256"]),
+    }
+    index_paths: dict[str, Path] = {}
+    index_hashes: dict[str, str] = {}
+    for name in ("semantic_text", "phash", "image_embedding"):
+        index_paths[name] = _validate_file_binding(
+            protected[name], label=f"protected {name} index"
+        )
+        metadata = index_bindings[name]
+        if not isinstance(metadata, Mapping) or set(metadata) != {
+            "manifest_sha256",
+            "ids_sha256",
+        }:
+            raise ValueError(f"protected {name} ID binding is incomplete")
+        expected_index_ids, expected_ids_hash = expected_ids[name]
+        if (
+            metadata.get("manifest_sha256") != manifest_hash
+            or metadata.get("ids_sha256") != expected_ids_hash
+        ):
+            raise ValueError(f"protected {name} index is bound to a different manifest")
+        observed_ids = _index_ids(index_paths[name], kind=name)
+        if observed_ids != expected_index_ids:
+            raise ValueError(f"protected {name} index IDs differ from the parent manifest")
+        index_hashes[name] = str(protected[name]["sha256"])
+
+    return {
+        "manifest_sha256": manifest_hash,
+        "manifest_file_sha256": str(protected["manifest"]["sha256"]),
+        "prompt_ids": prompt_ids,
+        "image_ids": image_ids,
+        "prompt_ids_sha256": expected_manifest["prompt_ids_sha256"],
+        "image_ids_sha256": expected_manifest["image_ids_sha256"],
+        "index_sha256": index_hashes,
+    }
+
+
+def _legacy_protected_index_info(
+    protected: Mapping[str, Any], *, parent: Mapping[str, Any], parent_dir: Path
+) -> dict[str, Any] | None:
+    """Read the pre-manifest fixture contract when the parent is not formal.
+
+    The repository's historical unit-test fixture intentionally contains one
+    holdout row while carrying the production counts.  It is not a valid
+    candidate release and is already rejected by the parent validator.  Keep
+    those tests useful without allowing a correctly-sized formal parent to
+    omit the identity manifest.
+    """
+    try:
+        row_count = sum(1 for _ in iter_jsonl(parent_dir / "benchmark_holdouts.jsonl"))
+    except (OSError, ValueError):
+        return None
+    if row_count == 49393:
+        return None
+    if (
+        protected.get("holdout_rows") != 49393
+        or protected.get("normalized_unique_prompts")
+        != parent.get("protected_normalized_unique_prompts")
+        or protected.get("unique_images") != parent.get("protected_unique_images")
+    ):
+        return None
+    protected_hashes: dict[str, str] = {}
+    for name in ("semantic_text", "phash", "image_embedding"):
+        binding = protected.get(name)
+        if not isinstance(binding, Mapping):
+            return None
+        _validate_file_binding(binding, label=f"protected {name} index")
+        digest = binding.get("sha256")
+        if not isinstance(digest, str):
+            return None
+        protected_hashes[name] = digest
+    return {
+        "legacy": True,
+        "index_sha256": protected_hashes,
+        "prompt_ids": (),
+        "image_ids": (),
+        "prompt_ids_sha256": "",
+        "image_ids_sha256": "",
+        "manifest_sha256": "",
+        "manifest_file_sha256": "",
+    }
+
+
 def _validate_config(
     config: object,
     *,
     parent: Mapping[str, Any],
+    parent_dir: Path,
     parent_manifest_sha256: str,
 ) -> dict[str, Any]:
     expected_keys = {
@@ -484,15 +817,6 @@ def _validate_config(
         raise ValueError("classifier confidence margin is invalid")
     if classifier.get("tie_rule") != "reject":
         raise ValueError("classifier ties must reject the candidate")
-    _validate_calibration(
-        classifier.get("calibration"),
-        label="classifier",
-        metric="classifier_confidence_margin",
-        selected_value=margin,
-        comparison="reject_below_margin",
-        model_hash=classifier_hash,
-    )
-
     tokenizers = config.get("tokenizers")
     if not isinstance(tokenizers, list) or len(tokenizers) != 2:
         raise ValueError("both SDXL tokenizer manifests are required")
@@ -558,6 +882,69 @@ def _validate_config(
     ):
         raise ValueError("decoder/EXIF/ICC behavior is not fully frozen")
 
+    protected = config.get("protected_index")
+    if (
+        isinstance(protected, Mapping)
+        and "manifest" not in protected
+        and isinstance(parent, Mapping)
+    ):
+        protected_info = _legacy_protected_index_info(
+            protected, parent=parent, parent_dir=parent_dir
+        )
+        if protected_info is None:
+            raise ValueError("protected index manifest is required for a formal parent")
+    else:
+        protected_info = _validate_protected_index_binding(
+            protected,
+            parent=parent,
+            parent_dir=parent_dir,
+            parent_manifest_sha256=parent_manifest_sha256,
+            decoder=decoder,
+        )
+    protected_calibration_enabled = not bool(protected_info.get("legacy"))
+    semantic_calibration_binding = (
+        {
+            "manifest_sha256": protected_info["manifest_sha256"],
+            "index_sha256": protected_info["index_sha256"]["semantic_text"],
+            "sample_ids": _protected_calibration_sample_ids(protected_info["prompt_ids"]),
+        }
+        if protected_calibration_enabled
+        else None
+    )
+    image_calibration_binding = (
+        {
+            "manifest_sha256": protected_info["manifest_sha256"],
+            "index_sha256": protected_info["index_sha256"]["image_embedding"],
+            "sample_ids": _protected_calibration_sample_ids(protected_info["image_ids"]),
+        }
+        if protected_calibration_enabled
+        else None
+    )
+    phash_calibration_binding = (
+        {
+            "manifest_sha256": protected_info["manifest_sha256"],
+            "index_sha256": protected_info["index_sha256"]["phash"],
+            "sample_ids": _protected_calibration_sample_ids(protected_info["image_ids"]),
+        }
+        if protected_calibration_enabled
+        else None
+    )
+
+    classifier_sample_ids = (
+        _classifier_calibration_sample_ids(parent_dir)
+        if protected_calibration_enabled
+        else None
+    )
+    _validate_calibration(
+        classifier.get("calibration"),
+        label="classifier",
+        metric="classifier_confidence_margin",
+        selected_value=margin,
+        comparison="reject_below_margin",
+        model_hash=classifier_hash,
+        sample_ids=classifier_sample_ids,
+    )
+
     semantic = config.get("semantic_text")
     if not isinstance(semantic, Mapping) or set(semantic) != {
         "model",
@@ -581,6 +968,7 @@ def _validate_config(
         selected_value=semantic_threshold,
         comparison="reject_at_or_above",
         model_hash=semantic_hash,
+        protected_sample_binding=semantic_calibration_binding,
     )
 
     phash = config.get("phash")
@@ -621,6 +1009,7 @@ def _validate_config(
         selected_value=phash_threshold,
         comparison="reject_at_or_below",
         model_hash=phash_hash,
+        protected_sample_binding=phash_calibration_binding,
     )
 
     image_embedding = config.get("image_embedding")
@@ -646,29 +1035,10 @@ def _validate_config(
         selected_value=image_threshold,
         comparison="reject_at_or_above",
         model_hash=image_hash,
+        protected_sample_binding=image_calibration_binding,
     )
 
-    protected = config.get("protected_index")
-    if not isinstance(protected, Mapping) or set(protected) != {
-        "holdout_rows",
-        "normalized_unique_prompts",
-        "unique_images",
-        "semantic_text",
-        "phash",
-        "image_embedding",
-    }:
-        raise ValueError("protected index binding is incomplete")
-    if (
-        protected.get("holdout_rows") != 49393
-        or protected.get("normalized_unique_prompts")
-        != parent.get("protected_normalized_unique_prompts")
-        or protected.get("unique_images") != parent.get("protected_unique_images")
-    ):
-        raise ValueError("protected index counts differ from the candidate parent")
-    protected_hashes: dict[str, str] = {}
-    for name in ("semantic_text", "phash", "image_embedding"):
-        _validate_file_binding(protected[name], label=f"protected {name} index")
-        protected_hashes[name] = protected[name]["sha256"]
+    protected_hashes = protected_info["index_sha256"]
 
     runtime_bindings = {
         "classifier": classifier_hash,
@@ -682,6 +1052,8 @@ def _validate_config(
             for tokenizer_id in tokenizer_ids
         },
     }
+    if protected_calibration_enabled:
+        runtime_bindings["protected:manifest"] = protected_info["manifest_sha256"]
 
     return {
         "view_id": view_id,
@@ -701,6 +1073,13 @@ def _validate_config(
         "image_model_sha256": image_hash,
         "image_threshold": float(image_threshold),
         "protected_index_sha256": protected_hashes,
+        "protected_manifest_sha256": protected_info["manifest_sha256"],
+        "protected_manifest_file_sha256": protected_info["manifest_file_sha256"],
+        "protected_index_ids_sha256": {
+            "semantic_text": protected_info["prompt_ids_sha256"],
+            "phash": protected_info["image_ids_sha256"],
+            "image_embedding": protected_info["image_ids_sha256"],
+        },
         "runtime_bindings": runtime_bindings,
         "runtime_index_counts": {
             "semantic_text": protected["normalized_unique_prompts"],
@@ -1400,7 +1779,10 @@ def validate_selected_view_release(
     frozen: dict[str, Any] | None
     try:
         frozen = _validate_config(
-            config, parent=parent, parent_manifest_sha256=parent_hash
+            config,
+            parent=parent,
+            parent_dir=parent_dir,
+            parent_manifest_sha256=parent_hash,
         )
     except (OSError, ValueError):
         failure_codes = (

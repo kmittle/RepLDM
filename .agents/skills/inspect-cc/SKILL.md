@@ -3,9 +3,9 @@ name: inspect-cc
 description: >-
   Audit a RepLDM branch with two blind reviewers in parallel, one fresh Codex subagent and one
   external Claude CLI process, then verify findings, minimally fix, smoke-test, and commit until
-  both engines are clean for five consecutive passes. Use only when the user explicitly invokes
-  $inspect-cc; invocation authorizes this loop's fix commits but never a push. Accept a clean-streak
-  number, --max-iters=N, --base=REF, or --all.
+  both engines are clean for the requested number of consecutive passes. Use only when the user
+  explicitly invokes $inspect-cc; invocation authorizes this loop's fix commits but never a push.
+  Accept a clean-streak number, --max-iters=N, --base=REF, or --all.
 ---
 
 # Inspect RepLDM with Codex and Claude
@@ -16,6 +16,13 @@ verifies findings, edits, tests, stages, and commits.
 
 Treat explicit invocation as authorization only for commits containing fixes produced by this
 loop. Never push, rewrite history, switch branches, or sweep unrelated dirty work into a commit.
+
+## Invocation Parameters
+
+The default `n` is `2`. A positive integer after `$inspect-cc` sets `n`: `$inspect-cc 1` passes
+after one complete dual-review pass in which both engines succeed and no confirmed error remains.
+It does not reduce either engine's review, adversarial verification, or smoke tests.
+`--max-iters=N` changes only the safety cap; `--base=REF` and `--all` select the audit surface.
 
 ## Check preconditions
 
@@ -34,7 +41,7 @@ model version or credentials.
 
 ## Parse options and freeze scope
 
-Set `STREAK_TARGET=5` and `MAX_ITERS=50`. Let a bare positive integer override the streak,
+Set `STREAK_TARGET=2` and `MAX_ITERS=50`. Let a bare positive integer override the clean-pass target,
 `--max-iters=N` override the cap, `--base=REF` select the comparison base, and `--all` select the
 whole repository audit surface.
 
@@ -222,7 +229,7 @@ push.
 
 ## Terminate and report
 
-Stop successfully at five consecutive dual-clean passes or the requested target. Also stop at
+Stop successfully at `STREAK_TARGET` consecutive dual-clean passes. Also stop at
 `MAX_ITERS`, after three degraded passes, on repeated findings, reviewer mutation, unsafe scope, or
 a genuine user decision. Remove only the exact run directory and temporary artifacts created by
 this skill.

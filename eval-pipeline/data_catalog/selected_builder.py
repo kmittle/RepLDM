@@ -649,7 +649,10 @@ def build_selected_view_release(
     runtime: SelectedViewGateRuntime | None = None
     try:
         frozen = _validate_config(
-            config, parent=parent, parent_manifest_sha256=parent_hash
+            config,
+            parent=parent,
+            parent_dir=parent_dir,
+            parent_manifest_sha256=parent_hash,
         )
         config_valid = True
     except (OSError, ValueError) as exc:
@@ -847,7 +850,10 @@ def verify_selected_view_runtime(
     config_path = Path(release_dir) / manifest["config"]["path"]
     config = _json_object(config_path, label="selected-view config")
     frozen = _validate_config(
-        config, parent=parent, parent_manifest_sha256=parent_hash
+        config,
+        parent=parent,
+        parent_dir=parent_dir,
+        parent_manifest_sha256=parent_hash,
     )
     _runtime_bindings(runtime, frozen["runtime_bindings"])
     _runtime_index_counts(runtime, frozen["runtime_index_counts"])

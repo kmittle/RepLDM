@@ -2,10 +2,10 @@
 name: check
 description: >-
   Verify only RepLDM's invocation-time pending Git change-set through independent Codex review,
-  minimal fixes, project-specific smoke tests, and safe checkpoint commits until three fresh rounds
-  are clean. Use only when the user invokes $check or explicitly asks for this exact pending-change
-  hardening and commit loop. Freeze the starting baseline and staged, unstaged, deleted, and
-  non-ignored untracked scope for the entire run.
+  minimal fixes, project-specific smoke tests, and safe checkpoint commits until the requested
+  number of fresh rounds are clean. Use only when the user invokes $check or explicitly asks for
+  this exact pending-change hardening and commit loop. Freeze the starting baseline and staged,
+  unstaged, deleted, and non-ignored untracked scope for the entire run.
 ---
 
 # Check Pending RepLDM Changes
@@ -19,6 +19,13 @@ authorizes commits only for the frozen RepLDM change-set and verified fixes dire
 Never push, rewrite history, switch to an existing unrelated branch, or include unrelated work. If
 the current branch is the local or remote default/protected branch, create and switch to one new
 working branch before the first loop commit; otherwise stay on the current branch.
+
+## Invocation Parameters
+
+The default `n` is `2`. A positive integer after `$check` sets `n`: `$check 1` passes after one
+complete independent review round with no confirmed errors. It does not mean one reviewer, one
+test, or a weaker audit; every round still runs all applicable lenses, verification, and smoke
+tests. The safety cap remains 12 rounds, and the current pending change-set is always the scope.
 
 ## Freeze the baseline and scope
 
@@ -83,8 +90,9 @@ defects, and failures caused only by unavailable CUDA, weights, datasets, or opt
 
 ## Run the loop
 
-Initialize `round = 1`, `consecutive_clean = 0`, and `checkpoint_created = false`. Require three
-consecutive clean rounds and stop at round 12 if convergence is not reached.
+Initialize `round = 1`, `consecutive_clean = 0`, `checkpoint_created = false`, and `STREAK_TARGET = 2`
+(or the positive integer supplied after `$check`). Require `STREAK_TARGET` consecutive clean rounds
+and stop at round 12 if convergence is not reached.
 
 For each round:
 
@@ -105,6 +113,7 @@ For each round:
    `checkpoint_created` is false, set `checkpoint_created = true`, then increment the clean streak.
    When verified defects remain, reset the streak, minimally fix them within the frozen set,
    validate, create one fixing-round commit, and set `checkpoint_created = true`.
+   Stop when the clean streak reaches `STREAK_TARGET`.
 
 Stop and ask if the same finding returns after two attempted fixes or correct behavior is ambiguous.
 
@@ -157,6 +166,6 @@ Do not add a vendor-specific co-author trailer unless requested. Never push.
 ## Report the result
 
 List the branch, `BASE`, frozen paths, rounds and final streak, verified findings and fixes, checks
-run or skipped, and commit hashes/subjects. Confirm the final three independent rounds were clean,
+run or skipped, and commit hashes/subjects. Confirm the final `STREAK_TARGET` independent rounds were clean,
 or explain the round cap, oscillation, reviewer mutation, out-of-scope blocker, unsafe artifact, or
 unresolved user decision.

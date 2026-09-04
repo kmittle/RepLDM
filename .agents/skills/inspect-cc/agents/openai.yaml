@@ -1,6 +1,6 @@
 interface:
   display_name: "Inspect RepLDM Dual Review"
-  short_description: "Audit RepLDM with Codex and Claude"
-  default_prompt: "Use $inspect-cc to audit RepLDM with independent Codex and Claude reviewers."
+  short_description: "Audit with two engines and a target"
+  default_prompt: "Use $inspect-cc [n] to audit RepLDM with Codex and Claude; n is the consecutive clean-pass count (default 2)."
 policy:
   allow_implicit_invocation: false

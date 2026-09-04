@@ -3,9 +3,10 @@ name: check-cc
 description: >-
   Audit only RepLDM's invocation-time pending Git changes with two blind reviewers in parallel, one
   fresh Codex subagent and one external Claude CLI process, then verify findings, minimally fix,
-  project-smoke-test, and commit fix-touched files until both engines are clean for five consecutive
-  passes. Use only when the user explicitly invokes $check-cc; invocation authorizes this loop's
-  fix commits but never a push. Accept a clean-streak number or --max-iters=N.
+  project-smoke-test, and commit fix-touched files until both engines are clean for the requested
+  number of consecutive passes. Use only when the user explicitly invokes $check-cc;
+  invocation authorizes this loop's fix commits but never a push. Accept a clean-streak number or
+  --max-iters=N.
 ---
 
 # Check Pending RepLDM Changes with Codex and Claude
@@ -17,6 +18,13 @@ findings, edits, tests, stages, and commits.
 Explicit invocation authorizes commits only for frozen files the main agent actually edits while
 applying verified fixes. Frozen files untouched by a fixing pass remain uncommitted. Never push,
 rewrite history, switch branches, or include an unrelated path.
+
+## Invocation Parameters
+
+The default `n` is `2`. A positive integer after `$check-cc` sets `n`: `$check-cc 1` passes after
+one complete dual-review pass in which both engines succeed and no confirmed error remains. It
+does not reduce either reviewer's checks, adversarial verification, or smoke tests. `--max-iters=N`
+changes only the safety cap.
 
 ## Check preconditions and freeze scope
 
@@ -48,7 +56,7 @@ At startup:
    reference.
 5. Stop with "nothing to check" if the frozen set is empty.
 
-Set `STREAK_TARGET=5` and `MAX_ITERS=50`. Let a bare positive integer override the streak and
+Set `STREAK_TARGET=2` and `MAX_ITERS=50`. Let a bare positive integer override the clean-pass target and
 `--max-iters=N` override the cap.
 
 Every pass reviews separate artifacts for:
@@ -208,7 +216,7 @@ trailer without a request, commit generated artifacts, or push. Keep `SNAPSHOT_B
 
 ## Terminate and report
 
-Stop successfully at five consecutive dual-clean passes or the requested target. Also stop at
+Stop successfully at `STREAK_TARGET` consecutive dual-clean passes. Also stop at
 `MAX_ITERS`, after three degraded passes, on repeated findings, reviewer mutation, unsafe scope, or
 a user decision. Remove only the exact run directory and temporary artifacts created by this skill.
 

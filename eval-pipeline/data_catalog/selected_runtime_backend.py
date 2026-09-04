@@ -38,7 +38,11 @@ from typing import Any
 
 import numpy as np
 
-from .selected import DecodedImage, model_binding_sha256
+from .selected import (
+    DecodedImage,
+    _validate_protected_index_binding,
+    model_binding_sha256,
+)
 from .selected_builder import (
     ClassifierGateResult,
     DistanceGateResult,
@@ -342,6 +346,101 @@ class OpenAIClipSelectedViewRuntime:
             Path(parent_dir), label="parent directory"
         )
 
+        # A formal candidate parent must carry the immutable protected cohort
+        # manifest.  Historical unit-test fixtures have no parent manifest at
+        # all, so they retain the minimal runtime contract below.
+        parent_manifest: Mapping[str, Any] | None = None
+        parent_manifest_file: Path | None = None
+        parent_manifest_path = self._parent_dir / "manifest.json"
+        try:
+            parent_manifest_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            parent_manifest_file = _ordinary_file(
+                parent_manifest_path, label="parent manifest"
+            )
+            try:
+                loaded_parent = json.loads(
+                    parent_manifest_file.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("parent manifest is not readable JSON") from exc
+            if not isinstance(loaded_parent, Mapping):
+                raise RuntimeError("parent manifest is not an object")
+            parent_manifest = loaded_parent
+
+        formal_parent = False
+        if parent_manifest is not None:
+            artifacts = parent_manifest.get("artifacts")
+            holdout: Mapping[str, Any] | None = None
+            if isinstance(artifacts, list):
+                holdout = next(
+                    (
+                        row
+                        for row in artifacts
+                        if isinstance(row, Mapping)
+                        and row.get("path") == "benchmark_holdouts.jsonl"
+                    ),
+                    None,
+                )
+            holdout_rows = parent_manifest.get("holdout_rows")
+            if holdout_rows is None and isinstance(holdout, Mapping):
+                holdout_rows = holdout.get("rows")
+            formal_parent = (
+                parent_manifest.get("candidate_catalog_complete") is True
+                and parent_manifest.get("development_build") is False
+                and parent_manifest.get("verify_paths") is True
+                and parent_manifest.get("training_ready") is False
+                and parent_manifest.get("complete") is False
+                and parent_manifest.get("protected_normalized_unique_prompts")
+                == 46619
+                and parent_manifest.get("protected_unique_images") == 37160
+                and holdout_rows == 49393
+            )
+        if "manifest" not in protected and formal_parent:
+            raise RuntimeError(
+                "formal candidate parent requires a protected index manifest"
+            )
+
+        # Validate the logical protected cohort before loading any model.  A
+        # same-sized replacement index must not be able to weaken leakage
+        # checks merely by preserving its row count and file binding.
+        protected_manifest_info: dict[str, Any] | None = None
+        if "manifest" in protected:
+            try:
+                if parent_manifest is None or parent_manifest_file is None:
+                    raise ValueError("protected index manifest requires a parent manifest")
+                parent_ref = config.get("parent_catalog")
+                if not isinstance(parent_ref, Mapping):
+                    raise ValueError("selected config lacks parent catalog binding")
+                observed_parent_hash = _sha256(parent_manifest_file)
+                if (
+                    parent_ref.get("release_id") != parent_manifest.get("release_id")
+                    or parent_ref.get("manifest_sha256") != observed_parent_hash
+                ):
+                    raise ValueError("selected config binds a different parent manifest")
+                protected_manifest_info = _validate_protected_index_binding(
+                    protected,
+                    parent=parent_manifest,
+                    parent_dir=self._parent_dir,
+                    parent_manifest_sha256=observed_parent_hash,
+                    decoder=config.get("decoder")
+                    if isinstance(config.get("decoder"), Mapping)
+                    else {},
+                )
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as exc:
+                raise RuntimeError(
+                    f"protected index manifest validation failed: {exc}"
+                ) from exc
+
         # Load one bundle per distinct pinned model.  The three gate roles may
         # share an OpenAI checkpoint, but their config bindings remain separate.
         model_descriptors = {
@@ -430,22 +529,42 @@ class OpenAIClipSelectedViewRuntime:
                     path, count
                 )
 
-        self._bindings = MappingProxyType(
-            {
-                "classifier": self._classifier_hash,
-                "image_embedding": self._image_hash,
-                "protected:image_embedding": str(
-                    protected["image_embedding"]["sha256"]
-                ),
-                "protected:phash": str(protected["phash"]["sha256"]),
-                "protected:semantic_text": str(protected["semantic_text"]["sha256"]),
-                "semantic_text": self._semantic_hash,
-                **{
-                    f"tokenizer:{key}": value
-                    for key, value in self._tokenizer_hashes.items()
-                },
+        if protected_manifest_info is not None:
+            expected_ids = {
+                "semantic_text": tuple(protected_manifest_info["prompt_ids"]),
+                "phash": tuple(protected_manifest_info["image_ids"]),
+                "image_embedding": tuple(protected_manifest_info["image_ids"]),
             }
-        )
+            observed_ids = {
+                "semantic_text": self._text_index[0] if self._text_index else (),
+                "phash": self._phash_ids,
+                "image_embedding": self._image_index[0]
+                if self._image_index
+                else (),
+            }
+            for name in expected_ids:
+                if observed_ids[name] != expected_ids[name]:
+                    raise RuntimeError(
+                        f"protected {name} index IDs differ from the parent manifest"
+                    )
+
+        binding_values: dict[str, str] = {
+            "classifier": self._classifier_hash,
+            "image_embedding": self._image_hash,
+            "protected:image_embedding": str(protected["image_embedding"]["sha256"]),
+            "protected:phash": str(protected["phash"]["sha256"]),
+            "protected:semantic_text": str(protected["semantic_text"]["sha256"]),
+            "semantic_text": self._semantic_hash,
+            **{
+                f"tokenizer:{key}": value
+                for key, value in self._tokenizer_hashes.items()
+            },
+        }
+        if protected_manifest_info is not None:
+            binding_values["protected:manifest"] = str(
+                protected_manifest_info["manifest_sha256"]
+            )
+        self._bindings = MappingProxyType(binding_values)
         self._index_counts = MappingProxyType(
             {
                 "semantic_text": len(self._text_index[0]) if self._text_index else 0,

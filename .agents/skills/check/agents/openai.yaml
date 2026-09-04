@@ -1,6 +1,6 @@
 interface:
   display_name: "Check RepLDM Changes"
-  short_description: "Verify and harden pending RepLDM changes"
-  default_prompt: "Use $check to verify, harden, and commit the current RepLDM changes."
+  short_description: "Verify pending changes with a clean-round target"
+  default_prompt: "Use $check [n] to verify and harden pending RepLDM changes; n is the consecutive clean-round count (default 2)."
 policy:
   allow_implicit_invocation: false

@@ -2,10 +2,11 @@
 name: inspect
 description: >-
   Audit RepLDM code, documentation, configuration, and experiment interfaces for objective
-  defects, then minimally fix, validate, and commit until three fresh independent Codex review
-  rounds are clean. Use only when the user invokes $inspect or explicitly requests this exact
-  audit-fix-commit loop and authorizes its commits. Accept an optional path/glob scope or the
-  selectors code, docs, pipelines, attention, or eval; default to the whole repository.
+  defects, then minimally fix, validate, and commit until the requested number of fresh independent
+  Codex review rounds are clean. Use only when the user invokes $inspect or explicitly requests this
+  exact audit-fix-commit loop and authorizes its commits. Accept a clean-round number, an optional
+  path/glob scope, or the selectors code, docs, pipelines, attention, or eval; default to the whole
+  repository.
 ---
 
 # Inspect RepLDM
@@ -18,6 +19,14 @@ Treat invocation as authorization only for commits containing fixes produced by 
 push, rewrite history, switch to an existing unrelated branch, or include unrelated user work. If
 the current branch is the local or remote default/protected branch, create and switch to one new
 working branch immediately before the first loop commit; otherwise remain on the current branch.
+
+## Invocation Parameters
+
+The default `n` is `2`. A positive integer after `$inspect` sets `n`: `$inspect 1` passes after one
+complete independent inspection round with no confirmed errors. It does not mean one file, one
+reviewer, or a weaker audit; all applicable lenses and validation still run. A non-numeric
+positional argument remains a path/glob scope, and the named selectors remain valid. The safety cap
+remains 12 rounds.
 
 ## Prepare the repository
 
@@ -98,8 +107,9 @@ or paper-versus-current differences that the repository explicitly documents.
 
 ## Run independent rounds
 
-Initialize `round = 1` and `consecutive_clean = 0`. Require three consecutive clean rounds and stop
-at round 12 if the loop has not converged.
+Initialize `round = 1`, `consecutive_clean = 0`, and `STREAK_TARGET = 2` (or the positive integer
+supplied after `$inspect`). Require `STREAK_TARGET` consecutive clean rounds and stop at round 12
+if the loop has not converged.
 
 For each round:
 
@@ -176,6 +186,6 @@ commit generated outputs, cached weights, datasets, or smoke artifacts. Never pu
 ## Report the result
 
 Report the resolved scope, branch and starting `HEAD`, rounds run, verified findings fixed, checks
-run or skipped with infrastructure reasons, and each commit hash/subject. Confirm the final three
-fresh rounds were clean, or state the round cap, oscillation, mutation, out-of-scope blocker, or
-user decision that stopped convergence.
+run or skipped with infrastructure reasons, and each commit hash/subject. Confirm the final
+`STREAK_TARGET` fresh rounds were clean, or state the round cap, oscillation, mutation,
+out-of-scope blocker, or user decision that stopped convergence.

@@ -1,6 +1,6 @@
 interface:
   display_name: "Inspect RepLDM"
-  short_description: "Audit and fix RepLDM until independently clean"
-  default_prompt: "Use $inspect to audit and fix RepLDM until three independent review rounds are clean."
+  short_description: "Audit RepLDM with a clean-round target"
+  default_prompt: "Use $inspect [n] to audit and fix RepLDM; n is the consecutive clean-round count (default 2)."
 policy:
   allow_implicit_invocation: false
