@@ -133,6 +133,12 @@ def decode_image_payload(path: Path, decoder: Mapping[str, Any]) -> DecodedImage
             if icc_payload:
                 source_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_payload))
                 target_profile = ImageCms.createProfile("sRGB")
+                # LittleCMS cannot build an RGB-profile transform directly for
+                # L/LA/P inputs.  Some datasets contain grayscale pixels with
+                # an RGB profile, so expand only those inputs before conversion.
+                profile_color_space = getattr(source_profile.profile, "xcolor_space", "").strip()
+                if image.mode in {"L", "LA", "P"} and profile_color_space == "RGB":
+                    image = image.convert("RGB")
                 image = ImageCms.profileToProfile(
                     image,
                     source_profile,
@@ -144,7 +150,7 @@ def decode_image_payload(path: Path, decoder: Mapping[str, Any]) -> DecodedImage
             image.load()
             width, height = image.size
             pixels = image.tobytes()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, ImageCms.PyCMSError) as exc:
         raise ValueError(f"cannot decode selected image: {image_path}") from exc
     if width <= 0 or height <= 0 or len(pixels) != width * height * 3:
         raise ValueError(f"decoded image has an invalid RGB payload: {image_path}")
@@ -374,7 +380,7 @@ def _validate_calibration(
             raise ValueError(f"{label} calibration sample IDs differ from its source")
         try:
             source_rows = list(iter_jsonl(source_file))
-        except (OSError, ValueError) as exc:
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(f"{label} calibration source is not readable JSONL") from exc
         observed_ids = [row.get("id") for row in source_rows]
         if observed_ids != expected_ids:
@@ -409,7 +415,7 @@ def _validate_calibration(
             raise ValueError(f"{label} calibration protected binding differs from the index")
         try:
             source_rows = list(iter_jsonl(source_file))
-        except (OSError, ValueError) as exc:
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(f"{label} calibration source is not readable JSONL") from exc
         source_ids = [row.get("protected_ids") for row in source_rows]
         if source_ids != expected_binding["sample_ids"]:

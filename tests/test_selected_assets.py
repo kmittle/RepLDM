@@ -49,6 +49,65 @@ def _fixture_decoder() -> dict[str, object]:
     }
 
 
+def test_decode_image_payload_expands_grayscale_with_rgb_icc_profile(
+    tmp_path: Path,
+) -> None:
+    from PIL import ImageCms
+
+    image_path = tmp_path / "gray-rgb-profile.png"
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    Image.new("L", (2, 1), color=96).save(image_path, icc_profile=profile)
+
+    decoded = selected_assets.decode_image_payload(image_path, _fixture_decoder())
+
+    assert (decoded.width, decoded.height) == (2, 1)
+    assert decoded.rgb_bytes == bytes((96, 96, 96, 96, 96, 96))
+
+
+def test_decode_image_payload_rejects_incompatible_cmyk_rgb_profile(
+    tmp_path: Path,
+) -> None:
+    from PIL import ImageCms
+
+    image_path = tmp_path / "cmyk-rgb-profile.jpg"
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    Image.new("CMYK", (1, 1), color=(0, 128, 255, 0)).save(
+        image_path, format="JPEG", icc_profile=profile
+    )
+
+    with pytest.raises(ValueError, match="cannot decode selected image"):
+        selected_assets.decode_image_payload(image_path, _fixture_decoder())
+
+
+def test_calibration_validation_rejects_non_utf8_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "invalid-calibration.jsonl"
+    source.write_bytes(b'{"id":"ok"}\n\xff\n')
+    artifact = tmp_path / "calibration.json"
+    _calibration_artifact(
+        artifact,
+        metric="cosine_similarity",
+        selected_value=0.8,
+        comparison="reject_at_or_above",
+        source_path=source,
+        positive_count=1,
+        negative_count=1,
+        model_hash="a" * 64,
+        sample_ids=["ok"],
+    )
+    with pytest.raises(ValueError, match="calibration source is not readable JSONL"):
+        _validate_calibration(
+            _file_binding(artifact),
+            label="semantic text",
+            metric="cosine_similarity",
+            selected_value=0.8,
+            comparison="reject_at_or_above",
+            model_hash="a" * 64,
+            sample_ids=["ok"],
+        )
+
+
 def _file_binding(path: Path) -> dict[str, object]:
     payload = path.read_bytes()
     return {
