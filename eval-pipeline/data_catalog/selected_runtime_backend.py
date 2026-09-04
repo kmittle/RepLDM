@@ -707,7 +707,11 @@ class OpenAIClipSelectedViewRuntime:
                 add_special_tokens=True,
                 padding="max_length",
                 max_length=77,
-                truncation=False,
+                # Protected benchmark captions can exceed CLIP's fixed
+                # context window.  Match the OpenAI CLIP tokenizer's
+                # deterministic 77-token truncation for index/query text.
+                # Candidate rows use ``tokenize`` above with truncation off.
+                truncation=True,
                 return_tensors="pt",
             )
         except Exception as exc:

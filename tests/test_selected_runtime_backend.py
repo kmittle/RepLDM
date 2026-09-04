@@ -59,6 +59,16 @@ class _FakeTokenizer:
         }
 
 
+class _TruncationCheckingTokenizer(_FakeTokenizer):
+    """Ensure protected-text encoding requests the fixed CLIP context policy."""
+
+    def __call__(self, texts, **kwargs):
+        if kwargs.get("return_tensors") == "pt":
+            assert kwargs.get("truncation") is True
+            assert kwargs.get("max_length") == 77
+        return super().__call__(texts, **kwargs)
+
+
 class _FakeModel:
     def eval(self):
         return self
@@ -247,6 +257,19 @@ def test_backend_uses_the_declared_clip_tokenizer_after_list_reordering(
 
     assert _FakeTokenizer.used_roots
     assert all(path.name == "tokenizer-2" for path in _FakeTokenizer.used_roots)
+    runtime.close()
+
+
+def test_protected_text_encoding_uses_fixed_context_truncation(
+    tmp_path: Path, fake_dependencies, monkeypatch: pytest.MonkeyPatch
+):
+    config, _, _ = _config(tmp_path)
+    transformers = ModuleType("transformers")
+    transformers.CLIPTokenizer = _TruncationCheckingTokenizer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    runtime = build_runtime_v1(config, tmp_path, tmp_path)
+    assert runtime.nearest_protected_text("a long protected caption").nearest_id == "protected-0"
     runtime.close()
 
 

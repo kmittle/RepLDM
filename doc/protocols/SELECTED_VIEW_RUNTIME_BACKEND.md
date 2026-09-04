@@ -20,6 +20,13 @@ tokenizer is used for OpenAI CLIP text features because the current config
 schema has no separate CLIP-tokenizer field; SDXL's two tokenizers share the
 OpenAI BPE vocabulary.
 
+Protected prompt indexes and semantic-gate queries use the OpenAI CLIP context
+contract: the selected tokenizer is called with `max_length=77`, padded to 77,
+and deterministic truncation enabled. This is required because some held-out
+captions exceed 77 tokens. Candidate training rows are checked separately with
+the SDXL tokenizers and truncation disabled; a candidate that would be
+truncated is rejected.
+
 ## Protected indexes
 
 Semantic-text and image indexes are `.npz` files with exactly `ids` and

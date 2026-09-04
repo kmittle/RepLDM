@@ -24,6 +24,18 @@ python eval-pipeline/build_data_catalog.py --allow-dirty --no-verify-paths \
 The configuration pins the byte count and SHA-256 of every parent artifact. Rebuild from
 the clean pushed commit and run `--validate-only` before using the resulting parent.
 
+If a previously built candidate already has the frozen 15 artifact hashes, bind those
+unchanged bytes to the current clean, pushed commit without rescanning source manifests:
+
+```bash
+python eval-pipeline/promote_data_catalog.py \
+  --source-release DATA/catalogs/catalog-<candidate-id>
+```
+
+The command copies artifacts into a new content-addressed release, fsyncs the publication,
+and runs formal validation. It leaves `training_ready=false`; a selected payload view and
+its per-image checksums are still required before training.
+
 Development builds may use `--allow-dirty --no-verify-paths`, but they never update
 `DATA/current` and must not feed an experiment. `DATA/current` changes only after the new
 content-addressed release passes full validation.
