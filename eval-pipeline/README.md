@@ -24,6 +24,11 @@ and rerun every method; changing only one method is rejected. A seed list that
 differs from the selected config, a missing cohort binding, or a mixed cohort
 is rejected by every CLI stage.
 
+This means "use the same seed" at comparison time: use the same four seeds for
+the corresponding four samples of every prompt. Supplying only one seed would
+produce 553 images, not a complete 2,212-image GenEval result, and supplying a
+different four-seed list cannot be labeled as this formal run.
+
 The stages below are resumable and keep every file under one run directory.
 Run them from the repository root with the `repldm_eval` environment:
 

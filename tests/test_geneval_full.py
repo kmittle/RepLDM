@@ -154,6 +154,20 @@ def test_config_requires_a_self_consistent_shared_seed_cohort() -> None:
         geneval._validate_config_contract(altered)
 
 
+def test_cli_seed_override_must_match_the_single_shared_cohort() -> None:
+    config, _config_hash = geneval._load_config(geneval.DEFAULT_CONFIG_PATH)
+
+    assert geneval._parse_seed_list(None, config) == SEEDS
+    assert geneval._parse_seed_list(",".join(str(seed) for seed in SEEDS), config) == SEEDS
+
+    with pytest.raises(ValueError, match="exactly match the four seeds"):
+        geneval._parse_seed_list("11,29,101,303", config)
+    with pytest.raises(ValueError, match="exactly four distinct"):
+        geneval._parse_seed_list(str(SEEDS[0]), config)
+    with pytest.raises(ValueError, match="exactly match the four seeds"):
+        geneval._parse_seed_list(",".join(str(seed) for seed in reversed(SEEDS)), config)
+
+
 def test_cli_metadata_cannot_bypass_official_source(tmp_path: Path) -> None:
     alternate = tmp_path / "same-shape-metadata.jsonl"
     alternate.write_text("{}\n", encoding="utf-8")
