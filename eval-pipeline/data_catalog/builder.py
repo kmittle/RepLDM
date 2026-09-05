@@ -976,16 +976,21 @@ def _validate_source_derivations(
     return protected_counts, unique_count, unique_image_count
 
 
-def _validate_artifact(
-    path: Path, expected: Mapping[str, Any], *, verify_paths: bool
-) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"catalog artifact is missing: {path}")
+def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> None:
+    """Validate an immutable artifact's file binding without parsing its rows."""
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"catalog artifact is missing or not a regular file: {path}")
     if path.stat().st_size != expected["bytes"]:
         raise ValueError(f"artifact byte count mismatch: {path}")
     actual_sha256 = sha256_file(path)
     if actual_sha256 != expected["sha256"]:
         raise ValueError(f"artifact hash mismatch: {path}")
+
+
+def _validate_artifact(
+    path: Path, expected: Mapping[str, Any], *, verify_paths: bool
+) -> dict[str, Any]:
+    _validate_artifact_file(path, expected)
     count = 0
     eligible = 0
     with_prompt = 0
@@ -1059,7 +1064,16 @@ def validate_release(
     verify_paths: bool,
     require_formal_catalog: bool = False,
     require_training_ready: bool = False,
+    validate_records: bool = True,
 ) -> dict[str, Any]:
+    if type(validate_records) is not bool:
+        raise TypeError("validate_records must be a boolean")
+    if not validate_records and (
+        not require_formal_catalog or verify_paths is not True
+    ):
+        raise ValueError(
+            "record-skipping validation requires a path-verified formal catalog"
+        )
     if require_training_ready and not require_formal_catalog:
         raise ValueError(
             "training-ready validation requires a formal catalog from a clean pushed commit"
@@ -1087,6 +1101,7 @@ def validate_release(
     ) != CONFIG_SNAPSHOT_SCHEMA:
         raise ValueError("catalog config snapshot metadata is invalid")
     snapshot_path = release_dir / CONFIG_SNAPSHOT_NAME
+    _validate_artifact_file(snapshot_path, snapshot)
     snapshot_bytes = snapshot_path.read_bytes()
     if len(snapshot_bytes) != snapshot.get("bytes") or hashlib.sha256(
         snapshot_bytes
@@ -1166,9 +1181,11 @@ def validate_release(
     if artifact_names != config["expected_artifact_order"]:
         raise ValueError("release artifact inventory differs from the frozen config")
     for artifact in artifacts:
-        _validate_artifact(
-            release_dir / artifact["path"], artifact, verify_paths=verify_paths
-        )
+        path = release_dir / artifact["path"]
+        if validate_records:
+            _validate_artifact(path, artifact, verify_paths=verify_paths)
+        else:
+            _validate_artifact_file(path, artifact)
     _assert_artifact_contract(artifacts, config)
     training = artifacts[artifact_names.index("training_candidates.jsonl")]
     if (
@@ -1176,6 +1193,31 @@ def validate_release(
         or training.get("benchmark_exact_match_rows") != 0
     ):
         raise ValueError("training_candidates contains an ineligible or protected row")
+
+    if not validate_records:
+        expected_protected_counts = {
+            row["id"]: row["expected_prompts"]
+            for row in config["protected_prompt_sources"]
+        }
+        if manifest.get("protected_prompt_source_counts") != expected_protected_counts:
+            raise ValueError("manifest protected-source counts differ from the frozen config")
+        if manifest.get("protected_normalized_unique_prompts") != config[
+            "expected_protected_normalized_unique_prompts"
+        ]:
+            raise ValueError("manifest protected unique-prompt count differs from the frozen config")
+        if (
+            config.get("expected_protected_unique_images") is not None
+            and manifest.get("protected_unique_images")
+            != config["expected_protected_unique_images"]
+        ):
+            raise ValueError("manifest protected unique-image count differs from the frozen config")
+        cross_checks = manifest.get("cross_checks")
+        if (
+            not isinstance(cross_checks, Mapping)
+            or cross_checks.get("sana_cache_matches_four_k_lsdb") is not True
+        ):
+            raise ValueError("formal catalog cross-checks are incomplete")
+        return manifest
 
     current_source_provenance = _source_provenance(config, REPOSITORY_ROOT)
     if manifest.get("source_provenance") != current_source_provenance:
@@ -1216,6 +1258,28 @@ def validate_release(
     if manifest.get("cross_checks") != expected_cross_checks:
         raise ValueError("manifest cross-checks differ from current source derivation")
     return manifest
+
+
+def validate_release_artifact_closure(
+    release_dir: Path,
+    *,
+    require_training_ready: bool = False,
+) -> dict[str, Any]:
+    """Validate a published catalog's immutable closure for downstream consumers.
+
+    Catalog publication performs the expensive row-by-row derivation and path
+    checks.  Consumers still verify the formal Git provenance, manifest
+    identity, artifact statistics, and every artifact hash, then validate the
+    rows they actually consume.  This avoids repeating millions of unrelated
+    image-path checks in every parallel selected-view worker.
+    """
+    return validate_release(
+        release_dir,
+        verify_paths=True,
+        require_formal_catalog=True,
+        require_training_ready=require_training_ready,
+        validate_records=False,
+    )
 
 
 def _assert_build_inputs_unchanged(

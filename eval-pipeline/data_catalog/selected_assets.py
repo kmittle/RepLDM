@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
+from .builder import validate_release_artifact_closure
 from .schema import normalize_prompt
 from .selected import (
     SELECTED_CONFIG_SCHEMA,
@@ -168,6 +169,16 @@ def _validate_parent_release(path: Path) -> Path:
     path = _validate_directory(path, label="parent release")
     manifest = _ordinary_file(path / "manifest.json", label="parent manifest")
     _validate_parent_release_cached(str(path), sha256_file(manifest))
+    return path
+
+
+def _validate_parent_release_fast(path: Path) -> Path:
+    """Require a formal parent whose published artifact bytes remain unchanged."""
+    path = _validate_directory(path, label="parent release")
+    _ordinary_file(path / "manifest.json", label="parent manifest")
+    # Do not cache this closure: downstream workers must detect an artifact
+    # replacement even when the manifest bytes are unchanged.
+    validate_release_artifact_closure(path, require_training_ready=False)
     return path
 
 
@@ -1177,7 +1188,7 @@ def _build_selected_assets_in_directory(
         Path(published_config_output or config_output)
     )
     parent_release = _validate_directory(Path(parent_release), label="parent release")
-    _validate_parent_release(parent_release)
+    _validate_parent_release_fast(parent_release)
     output_dir = _validate_directory(
         Path(output_dir), label="selected-view output directory"
     )

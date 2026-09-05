@@ -32,6 +32,7 @@ from .selected_assets import (
     _preflight_selected_asset_destinations,
     _reject_directory_overlap,
     _validate_parent_release,
+    _validate_parent_release_fast,
     _validate_directory,
     file_binding,
     unique_protected_prompts,
@@ -172,9 +173,10 @@ def _read_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _parent_rows(
-    parent_release: Path, *, validate_files: bool
+    parent_release: Path, *, validate_files: bool, validate_records: bool = True
 ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
-    parent_release = _validate_parent_release(parent_release)
+    validator = _validate_parent_release if validate_records else _validate_parent_release_fast
+    parent_release = validator(parent_release)
     manifest_path = _ordinary_file(parent_release / "manifest.json", label="parent manifest")
     manifest = _read_json(manifest_path, label="parent manifest")
     if manifest.get("release_id") != parent_release.name:
@@ -238,7 +240,7 @@ def _build_image_index_shard_in_directory(
     # opened and decoded below, so repeating 37,160 network ``stat`` calls in
     # every worker only creates avoidable I/O contention.
     parent_manifest, parent_hash, image_rows = _parent_rows(
-        parent_release, validate_files=False
+        parent_release, validate_files=False, validate_records=False
     )
     if type(shard_count) is not int or shard_count <= 0:
         raise ValueError("shard_count must be a positive integer")
@@ -634,7 +636,7 @@ def _merge_image_index_shards_in_directory(
         label="merged image output directory",
     )
     parent_manifest, parent_hash, image_rows = _parent_rows(
-        parent_release, validate_files=False
+        parent_release, validate_files=False, validate_records=False
     )
     expected_checkpoint = _checkpoint_descriptor(Path(clip_checkpoint))
     expected_decoder = decoder_contract()
@@ -898,7 +900,7 @@ def load_image_index_bundle(
     if set(bundle) != _BUNDLE_FIELDS or bundle.get("schema") != IMAGE_BUNDLE_SCHEMA:
         raise ValueError("unsupported image index bundle schema")
     parent_manifest, parent_hash, image_rows = _parent_rows(
-        parent_release, validate_files=False
+        parent_release, validate_files=False, validate_records=False
     )
     expected_checkpoint = _checkpoint_descriptor(Path(clip_checkpoint))
     if (

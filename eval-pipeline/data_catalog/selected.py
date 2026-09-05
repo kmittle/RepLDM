@@ -31,7 +31,7 @@ from .builder import (
     _run_git_bytes,
     _validate_formal_git_record,
     _validate_recorded_upstream_ancestry,
-    validate_release,
+    validate_release_artifact_closure,
 )
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
 from .schema import normalize_prompt
@@ -1509,11 +1509,9 @@ def _artifact_projection(artifact: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_candidate_parent(parent_dir: Path, repository_root: Path) -> dict[str, Any]:
-    """Run the existing canonical validator without asking v1 to be training-ready."""
-    return validate_release(
+    """Validate the published parent closure without replaying its derivations."""
+    return validate_release_artifact_closure(
         parent_dir,
-        verify_paths=True,
-        require_formal_catalog=True,
         require_training_ready=False,
     )
 
