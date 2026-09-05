@@ -29,6 +29,7 @@ from .selected_assets import (
     _manifest_artifact_path,
     _model_descriptor,
     _ordinary_file,
+    _image_parent_directories,
     _preflight_selected_asset_destinations,
     _reject_directory_overlap,
     _validate_parent_release,
@@ -265,9 +266,12 @@ def _build_image_index_shard_in_directory(
             parent_release / "manifest.json",
             parent_release / "benchmark_holdouts.jsonl",
             checkpoint,
-            *(Path(str(row["image_path"])) for row in image_rows),
         ],
-        input_dirs=[parent_release, checkpoint.parent],
+        input_dirs=[
+            parent_release,
+            checkpoint.parent,
+            *_image_parent_directories(image_rows),
+        ],
     )
     descriptor, model, preprocess = _load_bound_clip(checkpoint, device)
     if descriptor != _checkpoint_descriptor(checkpoint):
@@ -772,7 +776,6 @@ def _merge_image_index_shards_in_directory(
         parent_release / "manifest.json",
         parent_release / "benchmark_holdouts.jsonl",
         Path(clip_checkpoint),
-        *(Path(str(row["image_path"])) for row in image_rows),
         *(path for binding in shard_bindings for path in (
             Path(str(binding["manifest"]["path"])),
             Path(str(binding["arrays"]["path"])),
@@ -785,7 +788,12 @@ def _merge_image_index_shards_in_directory(
     _preflight_selected_asset_destinations(
         (("arrays", arrays_path), ("records", records_path), ("bundle", bundle_path)),
         input_paths,
-        input_dirs=[parent_release, shard_dir, Path(clip_checkpoint).absolute().parent],
+        input_dirs=[
+            parent_release,
+            shard_dir,
+            Path(clip_checkpoint).absolute().parent,
+            *_image_parent_directories(image_rows),
+        ],
     )
 
     def published_path(path: Path) -> Path:

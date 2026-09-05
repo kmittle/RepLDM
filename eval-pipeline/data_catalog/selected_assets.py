@@ -433,6 +433,33 @@ def _candidate_image_paths(parent: Path) -> list[Path]:
     return paths
 
 
+def _image_parent_directories(rows: Iterable[Mapping[str, Any]]) -> tuple[Path, ...]:
+    """Return unique lexical parent directories for image references.
+
+    Output/input alias checks only need to know whether an output tree is
+    inside an image tree.  Resolving every individual image with
+    ``realpath`` is both redundant and very expensive on network storage;
+    the image decoder performs the strict per-file validation later, before
+    any generated artifact is published.
+    """
+    directories: list[Path] = []
+    seen: set[Path] = set()
+    for row in rows:
+        raw = row.get("image_path")
+        if not isinstance(raw, str) or not raw:
+            continue
+        directory = _absolute_path(Path(raw)).parent
+        if directory not in seen:
+            seen.add(directory)
+            directories.append(directory)
+    return tuple(directories)
+
+
+def _candidate_image_parent_directories(parent: Path) -> tuple[Path, ...]:
+    """Collect candidate image directories without materializing every path."""
+    return _image_parent_directories(iter_jsonl(parent / "training_candidates.jsonl"))
+
+
 def _source_evidence_from_parent(parent_manifest: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Bind source metadata only when it matches the frozen parent manifest."""
     provenance = parent_manifest.get("source_provenance")
@@ -1295,12 +1322,16 @@ def _build_selected_assets_in_directory(
         checkpoint,
         *source_input_paths,
         *tokenizer_input_paths,
-        *(Path(str(row["image_path"])) for row in image_rows),
-        *_candidate_image_paths(parent_release),
         *bundle_paths,
     ]
     source_input_dirs = [path.parent for path in source_input_paths]
     bundle_input_dirs = [image_index_bundle_path.parent] if image_index_bundle_path else []
+    image_input_dirs = list(_image_parent_directories(image_rows))
+    seen_image_dirs = set(image_input_dirs)
+    for directory in _candidate_image_parent_directories(parent_release):
+        if directory not in seen_image_dirs:
+            seen_image_dirs.add(directory)
+            image_input_dirs.append(directory)
     _preflight_selected_asset_destinations(
         _selected_asset_destinations(published_output_dir, published_config_output),
         input_paths,
@@ -1311,6 +1342,7 @@ def _build_selected_assets_in_directory(
             checkpoint.parent,
             *source_input_dirs,
             *bundle_input_dirs,
+            *image_input_dirs,
         ],
     )
 

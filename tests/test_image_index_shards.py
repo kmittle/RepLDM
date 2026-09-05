@@ -21,12 +21,43 @@ from data_catalog.image_index_shards import (
     bound_image_index_paths,
     shard_positions,
 )
+from data_catalog.selected_assets import (
+    _candidate_image_parent_directories,
+    _image_parent_directories,
+)
 
 
 def test_shard_positions_partition_global_order() -> None:
     shards = [shard_positions(11, index, 4) for index in range(4)]
     assert shards == [(0, 4, 8), (1, 5, 9), (2, 6, 10), (3, 7)]
     assert sorted(position for shard in shards for position in shard) == list(range(11))
+
+
+def test_image_parent_directories_are_lexical_and_deduplicated(tmp_path: Path) -> None:
+    first = tmp_path / "images" / "a.jpg"
+    second = tmp_path / "images" / "sub" / "b.jpg"
+    directories = _image_parent_directories(
+        [
+            {"image_path": str(first)},
+            {"image_path": str(tmp_path / "images" / "." / "a.jpg")},
+            {"image_path": str(second)},
+            {"image_path": ""},
+        ]
+    )
+    assert directories == (tmp_path / "images", tmp_path / "images" / "sub")
+
+
+def test_candidate_image_parent_directories_stream_catalog(tmp_path: Path) -> None:
+    catalog = tmp_path / "training_candidates.jsonl"
+    catalog.write_text(
+        "\n".join(
+            json.dumps({"id": str(index), "image_path": str(tmp_path / "images" / f"{index}.jpg")})
+            for index in range(3)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _candidate_image_parent_directories(tmp_path) == (tmp_path / "images",)
 
 
 @pytest.mark.parametrize(
