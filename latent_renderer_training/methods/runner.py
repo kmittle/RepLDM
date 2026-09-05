@@ -18,6 +18,12 @@ from torch import Tensor
 from ..artifacts import module_state_sha256
 from ..authorization import require_authorization_binding
 from ..checkpoint import save_checkpoint
+from ..f0_teacher import (
+    _decode_target_with_receipt,
+    _reward_target_with_receipt,
+    _validate_decode_image,
+    _validate_reward_scores,
+)
 from ..gates import (
     validate_f0_gate,
     validate_opsd_teacher_state,
@@ -482,6 +488,34 @@ def _make_optimizer(
     )
 
 
+def _score_terminal(
+    runtime: Any,
+    state: Any,
+) -> tuple[Tensor, Tensor]:
+    """Decode and score one terminal state with an authenticated parent chain."""
+    adapter = runtime.adapter
+    if getattr(adapter, "operation_executor", None) is None:
+        image = adapter.decode(state)
+        _validate_decode_image(image, state, label="terminal image")
+        reward = adapter.reward(state, image)
+    else:
+        image, decode_receipt = _decode_target_with_receipt(
+            adapter,
+            state,
+            action_metadata=None,
+        )
+        reward, _reward_receipt = _reward_target_with_receipt(
+            adapter,
+            state,
+            image,
+            parent_receipt=decode_receipt,
+            action_metadata=None,
+        )
+    _validate_decode_image(image, state, label="terminal image")
+    _validate_reward_scores(reward, state, label="terminal reward")
+    return image, reward
+
+
 def _save_renderer_checkpoint(
     runtime: Any,
     renderer: torch.nn.Module,
@@ -518,8 +552,7 @@ def _score_collection(
     for branch in ("plus", "minus", "anchor"):
         state = collection.terminal_states[branch]
         with torch.no_grad():
-            image = runtime.adapter.decode(state)
-            reward = runtime.adapter.reward(state, image)
+            image, reward = _score_terminal(runtime, state)
         image_hashes[branch] = tensor_sha256(image)
         rewards[branch] = reward.detach()
         collection.branches[branch].terminal_reward = reward.detach()
@@ -781,8 +814,7 @@ def _score_teacher_rollout(runtime: Any, teacher_rollout: Any) -> Mapping[str, A
     if terminal_state is None:
         raise RuntimeError("OPD collector omitted the independent teacher terminal state")
     with torch.no_grad():
-        image = runtime.adapter.decode(terminal_state)
-        reward = runtime.adapter.reward(terminal_state, image)
+        image, reward = _score_terminal(runtime, terminal_state)
     if not isinstance(reward, Tensor) or reward.numel() != 1 or not torch.isfinite(reward).all():
         raise RuntimeError("OPD teacher terminal reward is invalid")
     if not isinstance(image, Tensor) or not torch.isfinite(image).all():

@@ -181,6 +181,320 @@ class _FakeOpdRuntime(_FakeRuntime):
         self.teacher_checkpoint_provenance = checkpoint
 
 
+def test_runner_terminal_scoring_validates_overridden_receipt_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Overridden adapters cannot return values different from their receipts."""
+    import latent_renderer_training.methods.runner as runner_module
+    from latent_renderer_training.f0_teacher import (
+        _decode_target_with_receipt,
+        _reward_target_with_receipt,
+    )
+    from latent_renderer_training.operations import (
+        OperationContext,
+        OperationReceipt,
+        operation_output_sha256,
+    )
+    from latent_renderer_training.renderer import tensor_sha256
+    from latent_renderer_training.sdxl_adapter import SdxlEulerTrainingAdapter
+
+    image = torch.full((1, 3, 2, 2), 0.5)
+    reward = torch.tensor([0.75])
+    decode_context = OperationContext(
+        "train", "prompt", 1, 50, 0, "plus", [], "f" * 64
+    )
+    reward_context = OperationContext(
+        "train",
+        "prompt",
+        1,
+        50,
+        0,
+        "plus",
+        [],
+        "f" * 64,
+        image_hash=tensor_sha256(image),
+        cached_parent=operation_output_sha256(image),
+    )
+
+    class State:
+        conditioning = SimpleNamespace(batch_size=1)
+
+        def operation_context(self, **kwargs):
+            return reward_context if "image_hash" in kwargs else decode_context
+
+    state = State()
+
+    def receipt(*, kind, output_hash, context, reservation_id):
+        return OperationReceipt(
+            reservation_id=reservation_id,
+            kind=kind,
+            output_hash=output_hash,
+            image_hash=context.image_hash or output_hash,
+            model="ImageReward-v1.0" if kind == "reward_forward" else "repldm-runtime",
+            role="training_reward" if kind == "reward_forward" else "vae_decode",
+            preprocess_hash="a" * 64,
+            model_config_sha256="b" * 64,
+            model_asset_manifest_sha256="c" * 64,
+            context=context,
+            _executor_seal=object(),
+        )
+
+    # Use an actual executor instance for the type guard, then replace only
+    # its verifier with a minimal contract checker for this model-free test.
+    from latent_renderer_training.operations import LedgeredOperationExecutor
+
+    executor = object.__new__(LedgeredOperationExecutor)
+    expected_parent = "decode-reservation"
+    executor.verify_receipt = lambda supplied_receipt: supplied_receipt
+
+    def validate(
+        supplied_receipt,
+        *,
+        kind,
+        output_hash,
+        context,
+        scalar_or_gradient,
+        parent_reservation_id=None,
+        **_kwargs,
+    ):
+        assert supplied_receipt.kind == kind
+        assert supplied_receipt.context == context
+        assert supplied_receipt.output_hash == output_hash
+        assert scalar_or_gradient in {"tensor", "scalar"}
+        if kind == "reward_forward":
+            assert parent_reservation_id == expected_parent
+
+    executor.validate_receipt = validate
+
+    class MutatingAdapter(SdxlEulerTrainingAdapter):
+        def __init__(self, *, mutate_decode=False, mutate_reward=False):
+            # The helper only needs the transient receipt fields and the
+            # operation executor; no SDXL modules are used in this test.
+            self.operation_executor = executor
+            self._last_decode_receipt = None
+            self._last_reward_receipt = None
+            self._pending_decode_action_metadata = None
+            self._pending_reward_parent = None
+            self._pending_reward_action_metadata = None
+            self.mutate_decode = mutate_decode
+            self.mutate_reward = mutate_reward
+            self.reward_invocations = 0
+
+        def decode(self, supplied_state):
+            self._last_decode_receipt = decode_receipt
+            return image + 0.25 if self.mutate_decode else image
+
+        def reward(self, supplied_state, supplied_image):
+            self.reward_invocations += 1
+            self._last_reward_receipt = reward_receipt
+            return reward + 1.0 if self.mutate_reward else reward
+
+    decode_receipt = receipt(
+        kind="vae_decode",
+        output_hash=operation_output_sha256(image),
+        context=decode_context,
+        reservation_id=expected_parent,
+    )
+    reward_receipt = receipt(
+        kind="reward_forward",
+        output_hash=operation_output_sha256(reward),
+        context=reward_context,
+        reservation_id="reward-reservation",
+    )
+
+    with pytest.raises(AssertionError):
+        _decode_target_with_receipt(
+            MutatingAdapter(mutate_decode=True), state
+        )
+
+    adapter = MutatingAdapter(mutate_reward=True)
+    decoded, parent = _decode_target_with_receipt(adapter, state)
+    assert decoded is image and parent is decode_receipt
+    with pytest.raises(AssertionError):
+        _reward_target_with_receipt(
+            adapter,
+            state,
+            decoded,
+            parent_receipt=parent,
+        )
+
+    # An instance-level replacement must not be mistaken for the native
+    # receipt wrapper merely because the class itself is unchanged.
+    class InheritedAdapter(SdxlEulerTrainingAdapter):
+        def __init__(self):
+            self.operation_executor = executor
+            self._last_decode_receipt = None
+            self._last_reward_receipt = None
+            self._pending_decode_action_metadata = None
+            self._pending_reward_parent = None
+            self._pending_reward_action_metadata = None
+
+    inherited = InheritedAdapter()
+
+    def instance_decode(_supplied_state):
+        inherited._last_decode_receipt = decode_receipt
+        return image
+
+    def forged_native_decode(*_args, **_kwargs):
+        raise AssertionError("instance-forged native wrapper was called")
+
+    inherited.decode = instance_decode
+    inherited.decode_with_receipt = forged_native_decode
+    decoded, inherited_parent = _decode_target_with_receipt(inherited, state)
+    assert decoded is image and inherited_parent is decode_receipt
+
+    # A receipt from another branch must not be accepted just because it
+    # authenticates and refers to the same image bytes.  Before the parent
+    # validation in the legacy path, this cross-state child was accepted.
+    source_decode_context = OperationContext(
+        "train", "prompt", 1, 50, 0, "anchor", [], "f" * 64
+    )
+    target_decode_context = OperationContext(
+        "train", "prompt", 1, 50, 0, "plus", [], "f" * 64
+    )
+    target_reward_context = OperationContext(
+        "train",
+        "prompt",
+        1,
+        50,
+        0,
+        "plus",
+        [],
+        "f" * 64,
+        image_hash=tensor_sha256(image),
+        cached_parent=operation_output_sha256(image),
+    )
+
+    class CrossState:
+        conditioning = SimpleNamespace(batch_size=1)
+
+        def operation_context(self, **kwargs):
+            return (
+                target_reward_context
+                if "image_hash" in kwargs
+                else target_decode_context
+            )
+
+    cross_parent = receipt(
+        kind="vae_decode",
+        output_hash=operation_output_sha256(image),
+        context=source_decode_context,
+        reservation_id="cross-state-decode",
+    )
+
+    class CrossStateAdapter(MutatingAdapter):
+        def reward(self, supplied_state, supplied_image):
+            self.reward_invocations += 1
+            self._last_reward_receipt = receipt(
+                kind="reward_forward",
+                output_hash=operation_output_sha256(reward),
+                context=target_reward_context,
+                reservation_id="cross-state-reward",
+            )
+            return reward
+
+    cross_state_adapter = CrossStateAdapter()
+    with pytest.raises(AssertionError):
+        _reward_target_with_receipt(
+            cross_state_adapter,
+            CrossState(),
+            image,
+            parent_receipt=cross_parent,
+        )
+    assert cross_state_adapter.reward_invocations == 0
+
+    # Instrument the symbols imported by the runner.  This makes the
+    # integration assertion fail if the runner regresses to calling the
+    # legacy adapter methods directly, and checks that the reward operation
+    # receives the exact decode capability as its parent.
+    decode_calls = []
+    reward_calls = []
+    original_decode = runner_module._decode_target_with_receipt
+    original_reward = runner_module._reward_target_with_receipt
+
+    def decode_spy(*args, **kwargs):
+        result = original_decode(*args, **kwargs)
+        decode_calls.append(result)
+        return result
+
+    def reward_spy(*args, **kwargs):
+        reward_calls.append(kwargs.get("parent_receipt"))
+        return original_reward(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runner_module, "_decode_target_with_receipt", decode_spy
+    )
+    monkeypatch.setattr(
+        runner_module, "_reward_target_with_receipt", reward_spy
+    )
+
+    # The runner itself uses the receipt-aware helpers, and forwards the
+    # decode capability into the reward operation as its parent.
+    valid = MutatingAdapter()
+    runtime = SimpleNamespace(adapter=valid)
+    scored_image, scored_reward = runner_module._score_terminal(runtime, state)
+    assert scored_image is image
+    assert scored_reward is reward
+    assert len(decode_calls) == 1
+    assert len(reward_calls) == 1
+    assert reward_calls[0] is decode_calls[0][1]
+
+    class MalformedDecodeAdapter(MutatingAdapter):
+        def decode(self, supplied_state):
+            return super().decode(supplied_state).reshape(-1)
+
+    with pytest.raises(RuntimeError, match="floating-point RGB NCHW"):
+        _decode_target_with_receipt(MalformedDecodeAdapter(), state)
+
+    class MalformedChannelAdapter(MutatingAdapter):
+        def decode(self, supplied_state):
+            return super().decode(supplied_state)[:, :2]
+
+    with pytest.raises(RuntimeError, match="RGB NCHW"):
+        _decode_target_with_receipt(MalformedChannelAdapter(), state)
+
+    class OutOfRangeAdapter(MutatingAdapter):
+        def decode(self, supplied_state):
+            return super().decode(supplied_state) + 0.6
+
+    with pytest.raises(RuntimeError, match=r"\[0, 1\]"):
+        _decode_target_with_receipt(OutOfRangeAdapter(), state)
+
+    class MalformedRewardAdapter(MutatingAdapter):
+        def reward(self, supplied_state, supplied_image):
+            return super().reward(supplied_state, supplied_image).reshape(1, 1)
+
+    malformed_reward_adapter = MalformedRewardAdapter()
+    decoded, parent = _decode_target_with_receipt(malformed_reward_adapter, state)
+    with pytest.raises(RuntimeError, match="one finite floating-point score"):
+        _reward_target_with_receipt(
+            malformed_reward_adapter,
+            state,
+            decoded,
+            parent_receipt=parent,
+        )
+
+    class InformalMalformedAdapter:
+        operation_executor = None
+
+        def __init__(self):
+            self.reward_invocations = 0
+
+        def decode(self, supplied_state):
+            return image.reshape(-1)
+
+        def reward(self, supplied_state, supplied_image):
+            self.reward_invocations += 1
+            return reward
+
+    informal_malformed = InformalMalformedAdapter()
+    with pytest.raises(RuntimeError, match="floating-point RGB NCHW"):
+        runner_module._score_terminal(
+            SimpleNamespace(adapter=informal_malformed), state
+        )
+    assert informal_malformed.reward_invocations == 0
+
+
 def test_pair_runner_executes_and_persists_the_complete_frozen_schedule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

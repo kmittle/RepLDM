@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 import inspect
 import math
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 import torch
 from torch import Tensor
@@ -53,6 +53,53 @@ F0_TARGET_STEP_CONFIG = TargetStepConfig(
 _MOMENT_RTOL = 2e-4
 _MOMENT_ATOL = 2e-5
 _CAP_ATOL = 1e-5
+
+
+def _validate_decode_image(image: Any, state: SdxlEulerState, *, label: str) -> None:
+    """Apply the same RGB ``[0, 1]`` contract as the native reward adapter."""
+    if (
+        not isinstance(image, Tensor)
+        or not image.is_floating_point()
+        or image.ndim != 4
+        or image.shape[0] != state.conditioning.batch_size
+        or image.shape[1] != 3
+        or image.shape[2] <= 0
+        or image.shape[3] <= 0
+        or not torch.isfinite(image).all()
+        or torch.any(image.detach() < 0.0)
+        or torch.any(image.detach() > 1.0)
+    ):
+        raise RuntimeError(
+            f"{label} must be a finite floating-point RGB NCHW batch in [0, 1]"
+        )
+
+
+def _validate_reward_scores(reward: Any, state: SdxlEulerState, *, label: str) -> None:
+    """Require exactly one finite floating-point reward for each prompt."""
+    if (
+        not isinstance(reward, Tensor)
+        or not reward.is_floating_point()
+        or reward.ndim != 1
+        or reward.shape[0] != state.conditioning.batch_size
+        or not torch.isfinite(reward).all()
+    ):
+        raise RuntimeError(f"{label} must be one finite floating-point score per image")
+
+
+def _is_unmodified_bound_method(
+    adapter: Any, name: str, implementation: Any
+) -> bool:
+    """Only dispatch the native path for the exact bound implementation.
+
+    An instance attribute can shadow a class method without changing
+    ``type(adapter).__dict__``.  Inspecting the bound method prevents such an
+    override from bypassing the legacy receipt validation path.
+    """
+    method = getattr(adapter, name, None)
+    return (
+        getattr(method, "__self__", None) is adapter
+        and getattr(method, "__func__", None) is implementation
+    )
 
 
 @dataclass(frozen=True)
@@ -399,7 +446,7 @@ def _decode_target_with_receipt(
     adapter: SdxlEulerTrainingAdapter,
     state: SdxlEulerState,
     *,
-    action_metadata: Mapping[str, Any],
+    action_metadata: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Tensor, OperationReceipt]:
     """Decode one target through the formal receipt API.
 
@@ -408,24 +455,46 @@ def _decode_target_with_receipt(
     overridden adapters receive the same durable receipt through the guarded
     private handoff populated by the base method.
     """
-    if type(adapter).decode is SdxlEulerTrainingAdapter.decode:
-        return adapter.decode_with_receipt(
+    native = _is_unmodified_bound_method(
+        adapter, "decode", SdxlEulerTrainingAdapter.decode
+    ) and _is_unmodified_bound_method(
+        adapter, "decode_with_receipt", SdxlEulerTrainingAdapter.decode_with_receipt
+    )
+    if native:
+        image, receipt = adapter.decode_with_receipt(
             state, action_metadata=action_metadata
         )
-    previous_metadata = getattr(adapter, "_pending_decode_action_metadata", None)
-    previous_receipt = getattr(adapter, "_last_decode_receipt", None)
-    adapter._pending_decode_action_metadata = action_metadata
-    adapter._last_decode_receipt = None
-    try:
-        image = adapter.decode(state)
-    finally:
-        adapter._pending_decode_action_metadata = previous_metadata
-    receipt = getattr(adapter, "_last_decode_receipt", None)
-    adapter._last_decode_receipt = previous_receipt
+    else:
+        previous_metadata = getattr(adapter, "_pending_decode_action_metadata", None)
+        previous_receipt = getattr(adapter, "_last_decode_receipt", None)
+        adapter._pending_decode_action_metadata = action_metadata
+        adapter._last_decode_receipt = None
+        try:
+            image = adapter.decode(state)
+        finally:
+            adapter._pending_decode_action_metadata = previous_metadata
+        receipt = getattr(adapter, "_last_decode_receipt", None)
+        adapter._last_decode_receipt = previous_receipt
     if type(receipt) is not OperationReceipt:
-        raise RuntimeError(
-            "overridden F0 decode did not return a durable VAE receipt"
-        )
+        raise RuntimeError("F0 decode did not return a durable VAE receipt")
+    executor = getattr(adapter, "operation_executor", None)
+    if not isinstance(executor, LedgeredOperationExecutor):
+        raise RuntimeError("F0 decode receipt validation requires the formal executor")
+    _validate_decode_image(
+        image, state, label="overridden F0 decode output"
+    )
+    expected_output_hash = operation_output_sha256(image)
+    expected_context = state.operation_context(action_metadata=action_metadata)
+    # Authenticate the durable ledger pair for both dispatch paths.  Native
+    # wrappers already validate internally; repeating this check also binds
+    # the returned value to the expected model, context, and operation kind.
+    executor.validate_receipt(
+        receipt,
+        kind="vae_decode",
+        output_hash=expected_output_hash,
+        context=expected_context,
+        scalar_or_gradient="tensor",
+    )
     return image, receipt
 
 
@@ -435,33 +504,76 @@ def _reward_target_with_receipt(
     image: Tensor,
     *,
     parent_receipt: OperationReceipt,
-    action_metadata: Mapping[str, Any],
+    action_metadata: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Tensor, OperationReceipt]:
     """Score one target while preserving the VAE parent capability."""
-    if type(adapter).reward is SdxlEulerTrainingAdapter.reward:
-        return adapter.reward_with_receipt(
+    executor = getattr(adapter, "operation_executor", None)
+    if not isinstance(executor, LedgeredOperationExecutor):
+        raise RuntimeError("F0 reward receipt validation requires the formal executor")
+
+    # Authenticate the parent and validate the exact image before dispatching
+    # to an adapter override.  Legacy adapters can perform arbitrary work in
+    # ``reward``; an invalid parent or image must not consume that operation.
+    _validate_decode_image(image, state, label="F0 reward input image")
+    image_hash = tensor_sha256(image)
+    image_output_hash = operation_output_sha256(image)
+    decode_context = state.operation_context(action_metadata=action_metadata)
+    executor.validate_receipt(
+        parent_receipt,
+        kind="vae_decode",
+        output_hash=image_output_hash,
+        context=decode_context,
+        scalar_or_gradient="tensor",
+    )
+
+    native = _is_unmodified_bound_method(
+        adapter, "reward", SdxlEulerTrainingAdapter.reward
+    ) and _is_unmodified_bound_method(
+        adapter, "reward_with_receipt", SdxlEulerTrainingAdapter.reward_with_receipt
+    )
+    if native:
+        reward, receipt = adapter.reward_with_receipt(
             state,
             image,
             parent_receipt=parent_receipt,
             action_metadata=action_metadata,
         )
-    previous_parent = getattr(adapter, "_pending_reward_parent", None)
-    previous_metadata = getattr(adapter, "_pending_reward_action_metadata", None)
-    previous_receipt = getattr(adapter, "_last_reward_receipt", None)
-    adapter._pending_reward_parent = parent_receipt
-    adapter._pending_reward_action_metadata = action_metadata
-    adapter._last_reward_receipt = None
-    try:
-        reward = adapter.reward(state, image)
-    finally:
-        adapter._pending_reward_parent = previous_parent
-        adapter._pending_reward_action_metadata = previous_metadata
-    receipt = getattr(adapter, "_last_reward_receipt", None)
-    adapter._last_reward_receipt = previous_receipt
+    else:
+        previous_parent = getattr(adapter, "_pending_reward_parent", None)
+        previous_metadata = getattr(adapter, "_pending_reward_action_metadata", None)
+        previous_receipt = getattr(adapter, "_last_reward_receipt", None)
+        adapter._pending_reward_parent = parent_receipt
+        adapter._pending_reward_action_metadata = action_metadata
+        adapter._last_reward_receipt = None
+        try:
+            reward = adapter.reward(state, image)
+        finally:
+            adapter._pending_reward_parent = previous_parent
+            adapter._pending_reward_action_metadata = previous_metadata
+        receipt = getattr(adapter, "_last_reward_receipt", None)
+        adapter._last_reward_receipt = previous_receipt
     if type(receipt) is not OperationReceipt:
         raise RuntimeError(
             "overridden F0 reward did not return a durable reward receipt"
         )
+    _validate_reward_scores(
+        reward, state, label="overridden F0 reward output"
+    )
+    reward_context = state.operation_context(
+        action_metadata=action_metadata,
+        image_hash=image_hash,
+        cached_parent=image_output_hash,
+    )
+    # Authenticate the child after the callback and bind it to the exact
+    # returned reward tensor and the already-authenticated decode parent.
+    executor.validate_receipt(
+        receipt,
+        kind="reward_forward",
+        output_hash=operation_output_sha256(reward),
+        context=reward_context,
+        scalar_or_gradient="scalar",
+        parent_reservation_id=parent_receipt.reservation_id,
+    )
     return reward, receipt
 
 

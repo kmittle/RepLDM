@@ -188,7 +188,10 @@ class _Vae(nn.Module):
 
     def decode(self, latent, return_dict=False):
         assert return_dict is False
-        return (latent,)
+        # The production VAE maps SDXL's latent channels to an RGB image.
+        # Keep the fixture's small latent width while honoring that public
+        # decode contract.
+        return (latent[:, :1].expand(-1, 3, -1, -1),)
 
 
 class _TerminalReward(nn.Module):
@@ -902,7 +905,12 @@ def test_decode_and_reward_legacy_interfaces_remain_tensor_only(formal_case):
     image = adapter.decode(terminal)
     reward = adapter.reward(terminal, image)
 
-    assert isinstance(image, torch.Tensor) and image.shape == terminal.latents.shape
+    assert isinstance(image, torch.Tensor) and image.shape == (
+        terminal.latents.shape[0],
+        3,
+        terminal.latents.shape[2],
+        terminal.latents.shape[3],
+    )
     assert isinstance(reward, torch.Tensor) and reward.shape == (1,)
     assert (adapter.decode_calls, adapter.reward_calls, adapter.gradient_calls) == (1, 1, 0)
     summary = adapter.operation_executor.ledger.summary()
