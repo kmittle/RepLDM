@@ -13,8 +13,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +28,12 @@ from .schema import normalize_prompt
 from .selected import (
     SELECTED_CONFIG_SCHEMA,
     SELECTED_IMAGE_MAX_PIXELS,
-    _field,
     dct_phash_v1,
+    _field,
     decode_image_payload,
 )
 
-ASSET_SCHEMA = "repldm.selected_view_assets.v1"
+ASSET_SCHEMA = "repldm.selected_view_assets.v2"
 CALIBRATION_SCHEMA = "repldm.threshold_calibration.v1"
 PROTECTED_INDEX_MANIFEST_SCHEMA = "repldm.protected_index_manifest.v1"
 CLIP_MODEL_ID = "openai/ViT-L-14"
@@ -129,10 +132,198 @@ def _ordinary_file(path: Path, *, label: str) -> Path:
     return path
 
 
-def file_binding(path: Path) -> dict[str, Any]:
-    """Return the absolute, byte-bound descriptor used by the config schema."""
+def _absolute_path(path: Path) -> Path:
+    """Normalize a path lexically without dereferencing symlinks."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _validate_directory(path: Path, *, label: str) -> Path:
+    """Validate a directory path without following symlink components."""
+    path = _absolute_path(Path(path))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{label} cannot contain a symlink: {current}")
+        if current.exists() and not current.is_dir():
+            raise ValueError(f"{label} path component is not a directory: {current}")
+    return path
+
+
+@lru_cache(maxsize=8)
+def _validate_parent_release_cached(path: str, manifest_sha256: str) -> None:
+    """Run the canonical catalog validator once for one immutable parent."""
+    from .builder import validate_release
+
+    validate_release(
+        Path(path),
+        verify_paths=True,
+        require_formal_catalog=True,
+        require_training_ready=False,
+    )
+
+
+def _validate_parent_release(path: Path) -> Path:
+    """Require a complete, formal, path-verified parent catalog."""
+    path = _validate_directory(path, label="parent release")
+    manifest = _ordinary_file(path / "manifest.json", label="parent manifest")
+    _validate_parent_release_cached(str(path), sha256_file(manifest))
+    return path
+
+
+def _validate_destination(path: Path, *, label: str) -> Path:
+    """Validate one future output path and every existing parent component."""
+    path = _absolute_path(Path(path))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{label} cannot contain a symlink: {current}")
+        if current == path:
+            break
+        if current.exists() and not current.is_dir():
+            raise ValueError(f"{label} parent is not a directory: {current}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"{label} is not an ordinary output file: {path}")
+    return path
+
+
+def _reject_directory_overlap(
+    output_dir: Path, input_dirs: Sequence[Path], *, label: str
+) -> None:
+    """Reject an output directory that is an input tree or contains one."""
+    output_dir = _absolute_path(output_dir)
+    for input_dir in input_dirs:
+        input_dir = _absolute_path(input_dir)
+        if (
+            output_dir == input_dir
+            or output_dir in input_dir.parents
+            or input_dir in output_dir.parents
+        ):
+            raise ValueError(f"{label} overlaps an input directory: {output_dir}")
+
+
+def _collision_key(path: Path) -> Path:
+    """Compare paths by their current filesystem target and lexical spelling."""
+    return Path(os.path.realpath(os.fspath(path)))
+
+
+def _selected_asset_destinations(
+    output_dir: Path, config_output: Path
+) -> tuple[tuple[str, Path], ...]:
+    """Enumerate every path written by :func:`build_selected_assets`."""
+    calibration_dir = output_dir / "calibration"
+    return (
+        ("semantic_text", output_dir / "protected_semantic_text.npz"),
+        ("image_embedding", output_dir / "protected_image_embedding.npz"),
+        ("phash", output_dir / "protected_phash.jsonl"),
+        ("protected_index_manifest", output_dir / "protected_index_manifest.json"),
+        ("semantic_calibration_source", calibration_dir / "semantic_text.jsonl"),
+        (
+            "semantic_calibration",
+            calibration_dir / "semantic_text_calibration.json",
+        ),
+        ("phash_calibration_source", calibration_dir / "phash.jsonl"),
+        ("phash_calibration", calibration_dir / "phash_calibration.json"),
+        ("image_calibration_source", calibration_dir / "image_embedding.jsonl"),
+        (
+            "image_calibration",
+            calibration_dir / "image_embedding_calibration.json",
+        ),
+        ("classifier_calibration_source", calibration_dir / "classifier.jsonl"),
+        (
+            "classifier_calibration",
+            calibration_dir / "classifier_calibration.json",
+        ),
+        ("config", config_output),
+        ("asset_manifest", output_dir / "asset_manifest.json"),
+    )
+
+
+def _preflight_selected_asset_destinations(
+    destinations: Sequence[tuple[str, Path]],
+    input_paths: Sequence[Path],
+    input_dirs: Sequence[Path] = (),
+) -> None:
+    """Reject output/input aliasing before the builder creates any file."""
+    destination_keys: dict[Path, str] = {}
+    for label, raw_path in destinations:
+        path = _validate_destination(raw_path, label=f"selected-view output {label}")
+        destination_parent = path.parent
+        for raw_dir in input_dirs:
+            input_dir = _absolute_path(Path(raw_dir))
+            if (
+                destination_parent == input_dir
+                or destination_parent in input_dir.parents
+                or input_dir in destination_parent.parents
+            ):
+                raise ValueError(
+                    f"selected-view output {label} is inside or contains an input directory: {path}"
+                )
+        key = _collision_key(path)
+        previous = destination_keys.get(key)
+        if previous is not None:
+            raise ValueError(
+                f"selected-view output paths collide: {previous} and {label} ({path})"
+            )
+        destination_keys[key] = label
+    input_keys: dict[Path, str] = {}
+    for index, raw_path in enumerate(input_paths):
+        path = _absolute_path(raw_path)
+        key = _collision_key(path)
+        input_keys.setdefault(key, f"input[{index}]")
+    collisions = sorted(
+        (destination_keys[key], input_keys[key], key)
+        for key in destination_keys.keys() & input_keys.keys()
+    )
+    if collisions:
+        label, input_label, path = collisions[0]
+        raise ValueError(
+            f"selected-view output {label} collides with {input_label}: {path}"
+        )
+
+
+def _manifest_artifact_path(
+    parent_release: Path,
+    manifest: Mapping[str, Any],
+    name: str,
+    *,
+    label: str,
+) -> Path:
+    """Return a manifest-bound artifact after checking bytes and its path."""
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("parent manifest artifacts are missing")
+    matches = [
+        value
+        for value in artifacts
+        if isinstance(value, Mapping) and value.get("path") == name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"parent manifest has no unique {name} artifact")
+    binding = matches[0]
+    if set(binding) < {"path", "bytes", "sha256"}:
+        raise ValueError(f"parent {name} artifact binding is incomplete")
+    path = _ordinary_file(Path(parent_release) / name, label=label)
+    if type(binding.get("bytes")) is not int or binding["bytes"] != path.stat().st_size:
+        raise ValueError(f"parent {name} artifact byte count differs")
+    digest = binding.get("sha256")
+    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+        raise ValueError(f"parent {name} artifact hash is invalid")
+    if sha256_file(path) != digest:
+        raise ValueError(f"parent {name} artifact bytes differ from its manifest")
+    return path
+
+
+def file_binding(path: Path, *, published_path: Path | None = None) -> dict[str, Any]:
+    """Return a byte-bound descriptor, optionally naming its final published path."""
     path = _ordinary_file(Path(path), label="asset")
-    return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+    logical_path = _absolute_path(Path(published_path)) if published_path is not None else path
+    return {
+        "path": str(logical_path),
+        "bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> None:
@@ -219,6 +410,16 @@ def _validate_source_prompt_fields(parent: Path) -> None:
             return
     missing = sorted(set(SOURCE_PROMPT_FIELDS) - observed)
     raise ValueError("parent has no eligible rows for configured sources: " + ", ".join(missing))
+
+
+def _candidate_image_paths(parent: Path) -> list[Path]:
+    """Collect every image path referenced by the training candidate catalog."""
+    paths: list[Path] = []
+    for row in iter_jsonl(parent / "training_candidates.jsonl"):
+        raw = row.get("image_path")
+        if isinstance(raw, str) and raw:
+            paths.append(_absolute_path(Path(raw)))
+    return paths
 
 
 def _source_evidence_from_parent(parent_manifest: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -378,7 +579,7 @@ def derive_protected_index_manifest(
     """
     if not isinstance(verify_image_evidence, bool):
         raise TypeError("verify_image_evidence must be a boolean")
-    parent_release = Path(parent_release).resolve()
+    parent_release = _validate_directory(parent_release, label="parent release")
     holdout_path = _ordinary_file(
         parent_release / "benchmark_holdouts.jsonl", label="protected holdout catalog"
     )
@@ -551,7 +752,7 @@ def _load_tokenizer(root: Path):
     from transformers import CLIPTokenizer
 
     return CLIPTokenizer.from_pretrained(
-        str(Path(root).resolve()), local_files_only=True
+        str(_validate_directory(root, label="tokenizer root")), local_files_only=True
     )
 
 
@@ -585,6 +786,24 @@ def _decode_clip_tensor(path: Path, preprocess: Any, decoder: Mapping[str, Any])
     return decoded, preprocess(image)
 
 
+def _validate_embedding_matrix(
+    values: np.ndarray, *, label: str, expected_dim: int | None = None
+) -> int:
+    """Validate the finite, nonzero, row-normalized embedding contract."""
+    if values.ndim != 2 or values.shape[1] <= 0:
+        raise ValueError(f"{label} embeddings have an invalid shape")
+    if not np.issubdtype(values.dtype, np.floating):
+        raise ValueError(f"{label} embeddings must be floating point")
+    if expected_dim is not None and values.shape[1] != expected_dim:
+        raise ValueError(f"{label} embedding dimension differs from its manifest")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{label} embeddings are not finite floats")
+    norms = np.linalg.norm(values.astype(np.float64, copy=False), axis=1)
+    if np.any(norms <= 1e-12) or not np.allclose(norms, 1.0, rtol=0.0, atol=5e-3):
+        raise ValueError(f"{label} embeddings must be row-normalized")
+    return int(values.shape[1])
+
+
 def _encode_images(
     model: Any,
     preprocess: Any,
@@ -594,40 +813,55 @@ def _encode_images(
     device: str,
     batch_size: int,
     with_hashes: bool = False,
+    decode_workers: int = 8,
 ) -> tuple[np.ndarray, list[str], list[dict[str, Any]]]:
     import torch
 
+    if type(decode_workers) is not int or decode_workers <= 0:
+        raise ValueError("decode_workers must be a positive integer")
+    if not rows:
+        raise ValueError("rows must be non-empty")
     outputs: list[np.ndarray] = []
     phashes: list[str] = []
     evidence: list[dict[str, Any]] = []
-    tensors: list[Any] = []
-    for index, row in enumerate(rows):
-        decoded, tensor = _decode_clip_tensor(Path(str(row["image_path"])), preprocess, decoder)
-        tensors.append(tensor)
-        if with_hashes:
-            image_path = _ordinary_file(
-                Path(str(row["image_path"])), label="protected image"
-            )
-            phashes.append(dct_phash_v1(decoded))
-            evidence.append(
-                {
-                    "id": str(row["id"]),
-                    "image_path": str(image_path),
-                    "raw_file_sha256": sha256_file(image_path),
-                    "decoded_pixel_sha256": decoded.pixel_sha256,
-                    "decoded_width": decoded.width,
-                    "decoded_height": decoded.height,
-                }
-            )
-        if len(tensors) == batch_size or index == len(rows) - 1:
+    worker_count = min(decode_workers, max(1, batch_size))
+
+    def prepare(row: Mapping[str, Any]) -> tuple[Any, str | None, dict[str, Any] | None]:
+        image_path = Path(str(row["image_path"]))
+        decoded, tensor = _decode_clip_tensor(image_path, preprocess, decoder)
+        if not with_hashes:
+            return tensor, None, None
+        checked_path = _ordinary_file(image_path, label="protected image")
+        return (
+            tensor,
+            dct_phash_v1(decoded),
+            {
+                "id": str(row["id"]),
+                "image_path": str(checked_path),
+                "raw_file_sha256": sha256_file(checked_path),
+                "decoded_pixel_sha256": decoded.pixel_sha256,
+                "decoded_width": decoded.width,
+                "decoded_height": decoded.height,
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for start in range(0, len(rows), batch_size):
+            prepared = list(executor.map(prepare, rows[start : start + batch_size]))
+            tensors = [item[0] for item in prepared]
+            for _tensor, phash, item in prepared:
+                if with_hashes:
+                    assert phash is not None and item is not None
+                    phashes.append(phash)
+                    evidence.append(item)
             batch = torch.stack(tensors).to(device)
             with torch.inference_mode():
                 features = model.encode_image(batch).float()
                 features = features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             outputs.append(features.cpu().numpy().astype(np.float32, copy=False))
-            tensors.clear()
-        if (index + 1) % 256 == 0:
-            print(f"encoded protected images: {index + 1:,}/{len(rows):,}", flush=True)
+            completed = min(start + batch_size, len(rows))
+            if completed % 256 == 0 or completed == len(rows):
+                print(f"encoded protected images: {completed:,}/{len(rows):,}", flush=True)
     return np.concatenate(outputs, axis=0), phashes, evidence
 
 
@@ -649,6 +883,7 @@ def _model_descriptor(checkpoint: Path) -> dict[str, Any]:
 
 
 def _tokenizer_descriptor(root: Path, tokenizer_id: str) -> dict[str, Any]:
+    root = _validate_directory(root, label=f"{tokenizer_id} tokenizer root")
     expected_hashes = TOKENIZER_FILE_SHA256.get(tokenizer_id)
     if expected_hashes is None:
         raise ValueError(f"no frozen tokenizer registration exists for {tokenizer_id}")
@@ -728,6 +963,7 @@ def _calibration_artifact(
     protected_index_sha256: str | None = None,
     protected_sample_ids: Sequence[Sequence[str]] | None = None,
     sample_ids: Sequence[str] | None = None,
+    published_source_path: Path | None = None,
 ) -> None:
     total = positive_count + negative_count
     payload: dict[str, Any] = {
@@ -738,7 +974,7 @@ def _calibration_artifact(
         "sample_count": total,
         "positive_count": positive_count,
         "negative_count": negative_count,
-        "source": file_binding(source_path),
+        "source": file_binding(source_path, published_path=published_source_path),
         "model_binding_sha256": model_hash,
     }
     if (
@@ -806,6 +1042,8 @@ def _build_classifier_calibration(
     source_path: Path,
     artifact_path: Path,
     model_hash: str,
+    decode_workers: int = 8,
+    published_source_path: Path | None = None,
 ) -> float:
     by_class: dict[str, list[dict[str, Any]]] = {name: [] for name in STRATA}
     seen: set[str] = set()
@@ -818,7 +1056,11 @@ def _build_classifier_calibration(
         row_id = row.get("id")
         if not isinstance(row_id, str) or not row_id:
             raise RuntimeError("classifier calibration candidate lacks a stable id")
-        path = str(Path(str(row["image_path"])).resolve())
+        path = str(
+            _ordinary_file(
+                Path(str(row["image_path"])), label="classifier calibration image"
+            )
+        )
         if path in seen:
             continue
         seen.add(path)
@@ -853,6 +1095,7 @@ def _build_classifier_calibration(
         decoder=decoder,
         device=device,
         batch_size=batch_size,
+        decode_workers=decode_workers,
     )
     text_rows = [template for name in STRATA for template in CLASS_TEMPLATES[name]]
     text_features = _encode_texts(model, tokenizer, text_rows, device=device, batch_size=64)
@@ -902,11 +1145,12 @@ def _build_classifier_calibration(
         negative_count=negative_count,
         model_hash=model_hash,
         sample_ids=[str(row["id"]) for row in candidates],
+        published_source_path=published_source_path,
     )
     return threshold
 
 
-def build_selected_assets(
+def _build_selected_assets_in_directory(
     *,
     parent_release: Path,
     output_dir: Path,
@@ -914,24 +1158,65 @@ def build_selected_assets(
     clip_checkpoint: Path,
     tokenizer_root: Path,
     tokenizer_root_2: Path,
+    image_index_bundle: Path | None = None,
     device: str = "cuda",
     batch_size: int = 32,
+    decode_workers: int = 8,
+    published_output_dir: Path | None = None,
+    published_config_output: Path | None = None,
 ) -> dict[str, Any]:
     """Build all local selected-view dependencies and the frozen config."""
     from PIL import __version__ as pillow_version
     from PIL import features
 
-    parent_release = Path(parent_release).resolve()
-    output_dir = Path(output_dir).resolve()
-    config_output = Path(config_output).resolve()
+    published_output_dir = _validate_directory(
+        Path(published_output_dir or output_dir),
+        label="selected-view published output directory",
+    )
+    published_config_output = _absolute_path(
+        Path(published_config_output or config_output)
+    )
+    parent_release = _validate_directory(Path(parent_release), label="parent release")
+    _validate_parent_release(parent_release)
+    output_dir = _validate_directory(
+        Path(output_dir), label="selected-view output directory"
+    )
+    config_output = _absolute_path(Path(config_output))
+
+    def published_path(path: Path) -> Path:
+        """Map a staging artifact to the path exposed after directory install."""
+        return published_output_dir / path.relative_to(output_dir)
+
+    image_index_bundle_path = (
+        _absolute_path(Path(image_index_bundle))
+        if image_index_bundle is not None
+        else None
+    )
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if type(decode_workers) is not int or decode_workers <= 0:
+        raise ValueError("decode_workers must be a positive integer")
+
     manifest_path = _ordinary_file(parent_release / "manifest.json", label="parent manifest")
     parent_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     parent_hash = sha256_file(manifest_path)
     if parent_manifest.get("release_id") != parent_release.name:
         raise ValueError("parent manifest directory and release_id differ")
-    holdout_rows = _load_rows(parent_release / "benchmark_holdouts.jsonl")
+    holdout_path = _manifest_artifact_path(
+        parent_release,
+        parent_manifest,
+        "benchmark_holdouts.jsonl",
+        label="protected holdout catalog",
+    )
+    candidate_path = _manifest_artifact_path(
+        parent_release,
+        parent_manifest,
+        "training_candidates.jsonl",
+        label="training candidate catalog",
+    )
+    holdout_rows = _load_rows(holdout_path)
+    if len(holdout_rows) != 49_393:
+        raise ValueError("protected holdout catalog must contain 49,393 rows")
     prompt_rows = unique_protected_prompts(holdout_rows)
     image_rows = unique_protected_images(holdout_rows)
     if len(prompt_rows) != int(parent_manifest["protected_normalized_unique_prompts"]):
@@ -941,7 +1226,6 @@ def build_selected_assets(
     _validate_source_prompt_fields(parent_release)
     source_evidence = _source_evidence_from_parent(parent_manifest)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     decoder = {
         "library": "Pillow",
         "version": pillow_version,
@@ -953,12 +1237,76 @@ def build_selected_assets(
         "pixel_hash": "sha256_rgb_u64be_width_height_bytes_v1",
     }
     checkpoint = _ordinary_file(Path(clip_checkpoint), label="CLIP checkpoint")
-    tokenizer_root = Path(os.path.abspath(os.fspath(tokenizer_root)))
-    tokenizer_root_2 = Path(os.path.abspath(os.fspath(tokenizer_root_2)))
-    model_descriptor, model, preprocess = _load_bound_clip(checkpoint, device)
-    model_hash = hashlib.sha256(canonical_json_bytes(model_descriptor)).hexdigest()
+    model_descriptor = _model_descriptor(checkpoint)
+    tokenizer_root = _validate_directory(tokenizer_root, label="sdxl_tokenizer_1 root")
+    tokenizer_root_2 = _validate_directory(tokenizer_root_2, label="sdxl_tokenizer_2 root")
+    _reject_directory_overlap(
+        published_output_dir,
+        [parent_release, tokenizer_root, tokenizer_root_2, checkpoint.parent],
+        label="selected-view output directory",
+    )
     tokenizer_descriptor = _tokenizer_descriptor(tokenizer_root, "sdxl_tokenizer_1")
     tokenizer_descriptor_2 = _tokenizer_descriptor(tokenizer_root_2, "sdxl_tokenizer_2")
+
+    bundle_paths: tuple[Path, ...] = ()
+    bundled_image_data: tuple[np.ndarray, list[str], list[dict[str, Any]]] | None = None
+    if image_index_bundle_path is not None:
+        from .image_index_shards import bound_image_index_paths, load_image_index_bundle
+
+        bundle_paths = bound_image_index_paths(image_index_bundle_path)
+        if image_index_bundle_path.parent == published_output_dir:
+            raise ValueError(
+                "image_index_bundle must be published in a different directory from selected assets"
+            )
+        # Complete bundle validation must happen before the first output is
+        # created.  The lightweight binding check above is not sufficient.
+        bundled_image_data = load_image_index_bundle(
+            image_index_bundle_path,
+            parent_release=parent_release,
+            clip_checkpoint=checkpoint,
+            decoder=decoder,
+        )
+
+    source_input_paths = [
+        Path(str(binding["path"]))
+        for values in source_evidence.values()
+        for binding in values
+    ]
+    tokenizer_input_paths = [
+        Path(str(binding["path"]))
+        for descriptor in (tokenizer_descriptor, tokenizer_descriptor_2)
+        for binding in descriptor["model"]["files"]
+    ]
+    input_paths = [
+        manifest_path,
+        holdout_path,
+        candidate_path,
+        checkpoint,
+        *source_input_paths,
+        *tokenizer_input_paths,
+        *(Path(str(row["image_path"])) for row in image_rows),
+        *_candidate_image_paths(parent_release),
+        *bundle_paths,
+    ]
+    source_input_dirs = [path.parent for path in source_input_paths]
+    bundle_input_dirs = [image_index_bundle_path.parent] if image_index_bundle_path else []
+    _preflight_selected_asset_destinations(
+        _selected_asset_destinations(published_output_dir, published_config_output),
+        input_paths,
+        input_dirs=[
+            parent_release,
+            tokenizer_root,
+            tokenizer_root_2,
+            checkpoint.parent,
+            *source_input_dirs,
+            *bundle_input_dirs,
+        ],
+    )
+
+    model_descriptor_loaded, model, preprocess = _load_bound_clip(checkpoint, device)
+    if model_descriptor_loaded != model_descriptor:
+        raise RuntimeError("CLIP descriptor changed while loading selected assets")
+    model_hash = hashlib.sha256(canonical_json_bytes(model_descriptor)).hexdigest()
     tokenizer = _load_tokenizer(tokenizer_root)
     _load_tokenizer(tokenizer_root_2)
 
@@ -969,26 +1317,22 @@ def build_selected_assets(
         device=device,
         batch_size=max(1, batch_size * 4),
     )
-    text_index = output_dir / "protected_semantic_text.npz"
-    _atomic_npz(text_index, ids=[row["id"] for row in prompt_rows], embeddings=text_embeddings)
-
-    image_embeddings, phashes, image_evidence = _encode_images(
-        model,
-        preprocess,
-        image_rows,
-        decoder=decoder,
-        device=device,
-        batch_size=batch_size,
-        with_hashes=True,
-    )
-    image_index = output_dir / "protected_image_embedding.npz"
-    _atomic_npz(image_index, ids=[row["id"] for row in image_rows], embeddings=image_embeddings)
-    phash_index = output_dir / "protected_phash.jsonl"
-    _atomic_jsonl(
-        phash_index,
-        ({"id": row["id"], "phash": value} for row, value in zip(image_rows, phashes)),
-    )
-
+    if bundled_image_data is None:
+        image_embeddings, phashes, image_evidence = _encode_images(
+            model,
+            preprocess,
+            image_rows,
+            decoder=decoder,
+            device=device,
+            batch_size=batch_size,
+            with_hashes=True,
+            decode_workers=decode_workers,
+        )
+    else:
+        image_embeddings, phashes, image_evidence = bundled_image_data
+    if len(image_embeddings) != len(image_rows):
+        raise ValueError("selected image embeddings differ from the protected image count")
+    _validate_embedding_matrix(image_embeddings, label="selected image")
     protected_manifest = derive_protected_index_manifest(
         parent_release,
         parent_release_id=str(parent_manifest["release_id"]),
@@ -999,13 +1343,31 @@ def build_selected_assets(
         image_rows=image_rows,
         image_evidence=image_evidence,
     )
+
+    # No producer output is created until all parent, bundle, decoder, and
+    # image evidence checks above have completed successfully.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    text_index = output_dir / "protected_semantic_text.npz"
+    _atomic_npz(text_index, ids=[row["id"] for row in prompt_rows], embeddings=text_embeddings)
+    image_index = output_dir / "protected_image_embedding.npz"
+    _atomic_npz(image_index, ids=[row["id"] for row in image_rows], embeddings=image_embeddings)
+    phash_index = output_dir / "protected_phash.jsonl"
+    _atomic_jsonl(
+        phash_index,
+        ({"id": row["id"], "phash": value} for row, value in zip(image_rows, phashes)),
+    )
+
     protected_manifest_path = output_dir / "protected_index_manifest.json"
     _atomic_json(protected_manifest_path, protected_manifest)
     protected_manifest_hash = str(protected_manifest["manifest_sha256"])
-    protected_manifest_file = file_binding(protected_manifest_path)
-    semantic_index_file = file_binding(text_index)
-    phash_index_file = file_binding(phash_index)
-    image_index_file = file_binding(image_index)
+    protected_manifest_file = file_binding(
+        protected_manifest_path, published_path=published_path(protected_manifest_path)
+    )
+    semantic_index_file = file_binding(text_index, published_path=published_path(text_index))
+    phash_index_file = file_binding(phash_index, published_path=published_path(phash_index))
+    image_index_file = file_binding(
+        image_index, published_path=published_path(image_index)
+    )
     protected_prompt_ids = [str(row["id"]) for row in prompt_rows]
     protected_image_ids = [str(row["id"]) for row in image_rows]
     protected_prompt_samples = _protected_sample_ids(protected_prompt_ids)
@@ -1054,6 +1416,7 @@ def build_selected_assets(
         protected_manifest_sha256=protected_manifest_hash,
         protected_index_sha256=semantic_index_file["sha256"],
         protected_sample_ids=protected_prompt_samples,
+        published_source_path=published_path(semantic_source),
     )
 
     phash_values = [int(value, 16) for value in phashes[:128]]
@@ -1107,6 +1470,7 @@ def build_selected_assets(
         protected_manifest_sha256=protected_manifest_hash,
         protected_index_sha256=phash_index_file["sha256"],
         protected_sample_ids=protected_image_samples,
+        published_source_path=published_path(phash_source),
     )
 
     # Exact-image positives are a conservative lower bound for the embedding
@@ -1145,6 +1509,7 @@ def build_selected_assets(
         protected_manifest_sha256=protected_manifest_hash,
         protected_index_sha256=image_index_file["sha256"],
         protected_sample_ids=protected_image_samples,
+        published_source_path=published_path(image_source),
     )
 
     classifier_source = calibration_dir / "classifier.jsonl"
@@ -1157,9 +1522,11 @@ def build_selected_assets(
         decoder=decoder,
         device=device,
         batch_size=batch_size,
+        decode_workers=decode_workers,
         source_path=classifier_source,
         artifact_path=classifier_artifact,
         model_hash=model_hash,
+        published_source_path=published_path(classifier_source),
     )
 
     config = {
@@ -1197,7 +1564,9 @@ def build_selected_assets(
             "class_templates": CLASS_TEMPLATES,
             "confidence_margin": classifier_threshold,
             "tie_rule": "reject",
-            "calibration": file_binding(classifier_artifact),
+            "calibration": file_binding(
+                classifier_artifact, published_path=published_path(classifier_artifact)
+            ),
         },
         "tokenizers": [tokenizer_descriptor, tokenizer_descriptor_2],
         "clip_tokenizer_id": "sdxl_tokenizer_1",
@@ -1206,19 +1575,25 @@ def build_selected_assets(
             "model": model_descriptor,
             "threshold": semantic_threshold,
             "comparison": "reject_at_or_above",
-            "calibration": file_binding(semantic_artifact),
+            "calibration": file_binding(
+                semantic_artifact, published_path=published_path(semantic_artifact)
+            ),
         },
         "phash": {
             **phash_definition,
             "threshold": phash_threshold,
             "comparison": "reject_at_or_below",
-            "calibration": file_binding(phash_artifact),
+            "calibration": file_binding(
+                phash_artifact, published_path=published_path(phash_artifact)
+            ),
         },
         "image_embedding": {
             "model": model_descriptor,
             "threshold": image_threshold,
             "comparison": "reject_at_or_above",
-            "calibration": file_binding(image_artifact),
+            "calibration": file_binding(
+                image_artifact, published_path=published_path(image_artifact)
+            ),
         },
         "protected_index": {
             "holdout_rows": len(holdout_rows),
@@ -1254,10 +1629,11 @@ def build_selected_assets(
         "tokenizer_roots": [str(tokenizer_root), str(tokenizer_root_2)],
         "device": device,
         "batch_size": batch_size,
+        "decode_workers": decode_workers,
         "protected_prompt_count": len(prompt_rows),
         "protected_image_count": len(image_rows),
         "artifacts": {
-            name: file_binding(path)
+            name: file_binding(path, published_path=published_path(path))
             for name, path in {
                 "semantic_text": text_index,
                 "phash": phash_index,
@@ -1271,8 +1647,127 @@ def build_selected_assets(
             }.items()
         },
     }
+    if image_index_bundle is not None:
+        assert image_index_bundle_path is not None
+        asset_manifest["image_index_bundle"] = file_binding(image_index_bundle_path)
     _atomic_json(output_dir / "asset_manifest.json", asset_manifest)
     return config
+
+
+def _fsync_tree(root: Path) -> None:
+    """Flush a completed staging tree before its parent directory is published."""
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_file():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+        elif path.is_dir():
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    descriptor = os.open(root, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def build_selected_assets(
+    *,
+    parent_release: Path,
+    output_dir: Path,
+    config_output: Path,
+    clip_checkpoint: Path,
+    tokenizer_root: Path,
+    tokenizer_root_2: Path,
+    image_index_bundle: Path | None = None,
+    device: str = "cuda",
+    batch_size: int = 32,
+    decode_workers: int = 8,
+) -> dict[str, Any]:
+    """Build a complete selected-view asset tree and publish it atomically."""
+    final_output_dir = _validate_directory(
+        Path(output_dir), label="selected-view output directory"
+    )
+    final_config_output = _validate_destination(
+        Path(config_output), label="selected-view config output"
+    )
+    if final_output_dir.exists():
+        raise ValueError(
+            "selected-view output directory must be a new, absent directory"
+        )
+    try:
+        config_relative = final_config_output.relative_to(final_output_dir)
+    except ValueError as exc:
+        raise ValueError(
+            "selected-view config output must be inside the output directory"
+        ) from exc
+    if not config_relative.parts:
+        raise ValueError("selected-view config output must name a file")
+    parent_candidate = _absolute_path(Path(parent_release))
+    checkpoint_candidate = _absolute_path(Path(clip_checkpoint))
+    tokenizer_candidate = _absolute_path(Path(tokenizer_root))
+    tokenizer_candidate_2 = _absolute_path(Path(tokenizer_root_2))
+    bundle_candidate = (
+        _absolute_path(Path(image_index_bundle))
+        if image_index_bundle is not None
+        else None
+    )
+    protected_input_dirs = [
+        parent_candidate,
+        checkpoint_candidate.parent,
+        tokenizer_candidate,
+        tokenizer_candidate_2,
+        *[Path(path).parent for path in SOURCE_EVIDENCE_PATHS.values()],
+    ]
+    if bundle_candidate is not None:
+        protected_input_dirs.append(bundle_candidate.parent)
+    _reject_directory_overlap(
+        final_output_dir,
+        protected_input_dirs,
+        label="selected-view output directory",
+    )
+    _reject_directory_overlap(
+        final_config_output.parent,
+        protected_input_dirs,
+        label="selected-view config output",
+    )
+    final_output_dir.parent.mkdir(parents=True, exist_ok=True)
+    _validate_directory(final_output_dir.parent, label="selected-view output parent")
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{final_output_dir.name}.staging-",
+            dir=str(final_output_dir.parent),
+        )
+    )
+    staging_config = staging / config_relative
+    try:
+        config = _build_selected_assets_in_directory(
+            parent_release=parent_release,
+            output_dir=staging,
+            config_output=staging_config,
+            clip_checkpoint=clip_checkpoint,
+            tokenizer_root=tokenizer_root,
+            tokenizer_root_2=tokenizer_root_2,
+            image_index_bundle=image_index_bundle,
+            device=device,
+            batch_size=batch_size,
+            decode_workers=decode_workers,
+            published_output_dir=final_output_dir,
+            published_config_output=final_config_output,
+        )
+        _fsync_tree(staging)
+        os.replace(staging, final_output_dir)
+        descriptor = os.open(final_output_dir.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return config
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 __all__ = [

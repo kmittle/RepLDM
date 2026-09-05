@@ -131,15 +131,12 @@ def decode_image_payload(path: Path, decoder: Mapping[str, Any]) -> DecodedImage
         or decoder.get("max_image_pixels") != SELECTED_IMAGE_MAX_PIXELS
     ):
         raise ValueError("installed Pillow/LittleCMS stack differs from the selected-view config")
-    # Pillow stores this guard as a process-global value.  Serialize the
-    # temporary override so concurrent public API calls restore one another's
-    # settings correctly.
+    # Pillow stores this guard and warning filters as process-global values.
+    # Hold the lock until every lazy decode, EXIF transform, and ICC conversion
+    # has completed; several plugins re-check the pixel limit during ``load``.
     with _IMAGE_DECODE_LIMIT_LOCK:
         previous_max_image_pixels = Image.MAX_IMAGE_PIXELS
         try:
-            # The protected catalog contains high-resolution source images.
-            # Pillow's process-global default is lower than this frozen bound,
-            # so override it only for this decode and restore it below.
             Image.MAX_IMAGE_PIXELS = SELECTED_IMAGE_MAX_PIXELS
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
@@ -159,8 +156,8 @@ def decode_image_payload(path: Path, decoder: Mapping[str, Any]) -> DecodedImage
                     if icc_payload:
                         source_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc_payload))
                         target_profile = ImageCms.createProfile("sRGB")
-                        # LittleCMS cannot build an RGB-profile transform
-                        # directly for L/LA/P inputs.  Expand only those first.
+                        # LittleCMS cannot build an RGB-profile transform directly
+                        # for L/LA/P inputs.  Expand only those first.
                         profile_color_space = getattr(
                             source_profile.profile, "xcolor_space", ""
                         ).strip()

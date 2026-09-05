@@ -25,6 +25,8 @@ from data_catalog.selected_assets import (
     TOKENIZER_FILE_SHA256,
     _calibration_artifact,
     _cyclic_hamming_distances,
+    _preflight_selected_asset_destinations,
+    _selected_asset_destinations,
     _protected_sample_ids,
     _source_evidence_from_parent,
     _validate_source_prompt_fields,
@@ -305,6 +307,29 @@ def test_unique_protected_images_rejects_symlink_paths(tmp_path: Path) -> None:
         unique_protected_images([{"id": "image-1", "image_path": str(link)}])
 
 
+def test_selected_asset_preflight_rejects_input_output_collision(tmp_path: Path) -> None:
+    output_dir = tmp_path / "selected"
+    config_output = tmp_path / "config.json"
+    destinations = _selected_asset_destinations(output_dir, config_output)
+
+    with pytest.raises(ValueError, match="output .*collides"):
+        _preflight_selected_asset_destinations(
+            destinations, [output_dir / "protected_image_embedding.npz"]
+        )
+
+    assert not output_dir.exists()
+
+
+def test_selected_asset_preflight_rejects_duplicate_destinations(tmp_path: Path) -> None:
+    output_dir = tmp_path / "selected"
+    duplicate = output_dir / "asset_manifest.json"
+
+    with pytest.raises(ValueError, match="output paths collide"):
+        _preflight_selected_asset_destinations(
+            (("config", duplicate), ("asset_manifest", duplicate)), []
+        )
+
+
 def test_source_prompt_fields_match_normalized_catalog_contract() -> None:
     assert SOURCE_PROMPT_FIELDS == {
         "four_k_lsdb": {
@@ -316,6 +341,63 @@ def test_source_prompt_fields_match_normalized_catalog_contract() -> None:
             "raw_prompt_field": "source_record.raw_prompt",
         },
     }
+
+
+def test_classifier_calibration_forwards_decode_worker_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidates_path = tmp_path / "training_candidates.jsonl"
+    rows = []
+    for class_index, name in enumerate(selected_assets.STRATA):
+        for item_index in range(32):
+            image_path = tmp_path / f"{class_index:02d}-{item_index:02d}.bin"
+            image_path.write_bytes(b"fixture")
+            prompt = f"a {name} scene"
+            if name == "nature":
+                prompt = "a landscape scene"
+            rows.append(
+                {
+                    "id": f"candidate-{class_index:02d}-{item_index:02d}",
+                    "modality": "image_text",
+                    "prompt": prompt,
+                    "image_path": str(image_path),
+                }
+            )
+    candidates_path.write_bytes(
+        b"".join((json.dumps(row, sort_keys=True) + "\n").encode() for row in rows)
+    )
+    observed_workers: list[int] = []
+
+    def fake_encode_images(*_args: object, **kwargs: object) -> tuple[np.ndarray, list[str], list[dict[str, object]]]:
+        observed_workers.append(int(kwargs["decode_workers"]))
+        embeddings = np.zeros((len(rows), len(selected_assets.STRATA) * 3), dtype=np.float32)
+        for index in range(len(rows)):
+            embeddings[index, 0] = 1.0
+            embeddings[index, 3] = 0.1 + index / (len(rows) * 2.0)
+        return embeddings, [], []
+
+    monkeypatch.setattr(selected_assets, "_encode_images", fake_encode_images)
+    monkeypatch.setattr(
+        selected_assets,
+        "_encode_texts",
+        lambda *_args, **_kwargs: np.eye(len(selected_assets.STRATA) * 3, dtype=np.float32),
+    )
+
+    selected_assets._build_classifier_calibration(
+        tmp_path,
+        object(),
+        object(),
+        object(),
+        decoder=_fixture_decoder(),
+        device="cpu",
+        batch_size=8,
+        decode_workers=3,
+        source_path=tmp_path / "classifier.jsonl",
+        artifact_path=tmp_path / "classifier.json",
+        model_hash="a" * 64,
+    )
+
+    assert observed_workers == [3]
 
 
 def test_cyclic_hamming_distances_keep_64_bit_hashes_as_integers() -> None:

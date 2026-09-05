@@ -27,8 +27,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--clip-checkpoint", type=Path, required=True)
     parser.add_argument("--tokenizer-root", type=Path, required=True)
     parser.add_argument("--tokenizer-root-2", type=Path, required=True)
+    parser.add_argument(
+        "--image-index-bundle",
+        type=Path,
+        default=None,
+        help="validated output of merge_selected_image_shards.py",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--decode-workers", type=int, default=8)
     args = parser.parse_args(argv)
     config = build_selected_assets(
         parent_release=args.parent_release,
@@ -37,8 +44,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         clip_checkpoint=args.clip_checkpoint,
         tokenizer_root=args.tokenizer_root,
         tokenizer_root_2=args.tokenizer_root_2,
+        image_index_bundle=args.image_index_bundle,
         device=args.device,
         batch_size=args.batch_size,
+        decode_workers=args.decode_workers,
     )
     print(
         json.dumps(
