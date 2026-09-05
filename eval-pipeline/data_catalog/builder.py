@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections import Counter
@@ -976,22 +977,236 @@ def _validate_source_derivations(
     return protected_counts, unique_count, unique_image_count
 
 
-def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> str:
-    """Validate an immutable artifact's file binding without parsing its rows."""
+def _artifact_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Return the filesystem identity used to pin one artifact read."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    """Hash bytes from a pinned descriptor without changing its file offset."""
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 8 * 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_path_snapshot(path: Path) -> tuple[str, os.stat_result]:
+    """Hash the bytes currently reachable through a fresh, pinned pathname."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"catalog artifact changed while it was read: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        path_before = _artifact_path_stat(path)
+        if _artifact_identity(path_before) != _artifact_identity(before):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        actual_sha256 = _sha256_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        path_after = _artifact_path_stat(path)
+        if (
+            _artifact_identity(after) != _artifact_identity(before)
+            or _artifact_identity(path_after) != _artifact_identity(before)
+        ):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        return actual_sha256, after
+    finally:
+        os.close(descriptor)
+
+
+def _artifact_path_stat(path: Path) -> os.stat_result:
+    """Read the pathname identity without following a final symlink."""
+    try:
+        value = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"catalog artifact changed while it was read: {path}") from exc
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError(f"catalog artifact changed while it was read: {path}")
+    return value
+
+
+def _open_artifact_snapshot(
+    path: Path, expected: Mapping[str, Any]
+) -> tuple[int, os.stat_result, str]:
+    """Open, hash, and pin one artifact before any row parsing begins."""
+    # Reject a non-regular pathname before ``open`` so a FIFO cannot block the
+    # validator.  The descriptor and pathname identities are checked again
+    # below because this preflight is inherently racy.
     if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"catalog artifact is missing or not a regular file: {path}")
-    if path.stat().st_size != expected["bytes"]:
-        raise ValueError(f"artifact byte count mismatch: {path}")
-    actual_sha256 = sha256_file(path)
+        raise FileNotFoundError(
+            f"catalog artifact is missing or not a regular file: {path}"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"catalog artifact is missing or not a regular file: {path}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise FileNotFoundError(
+                f"catalog artifact is missing or not a regular file: {path}"
+            )
+        if before.st_size != expected["bytes"]:
+            raise ValueError(f"artifact byte count mismatch: {path}")
+        current = _artifact_path_stat(path)
+        if _artifact_identity(current) != _artifact_identity(before):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        actual_sha256 = _sha256_descriptor(descriptor)
+        if actual_sha256 != expected["sha256"]:
+            raise ValueError(f"artifact hash mismatch: {path}")
+        after = os.fstat(descriptor)
+        current = _artifact_path_stat(path)
+        if (
+            _artifact_identity(after) != _artifact_identity(before)
+            or _artifact_identity(current) != _artifact_identity(before)
+        ):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor, before, actual_sha256
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_artifact_snapshot_unchanged(
+    path: Path,
+    descriptor: int,
+    snapshot: os.stat_result,
+    expected: Mapping[str, Any],
+) -> tuple[str, int]:
+    """Hash the pinned bytes and reject replacement during or after parsing."""
+    before_hash = os.fstat(descriptor)
+    path_stat = _artifact_path_stat(path)
+    if (
+        _artifact_identity(before_hash) != _artifact_identity(snapshot)
+        or _artifact_identity(path_stat) != _artifact_identity(snapshot)
+    ):
+        raise ValueError(f"catalog artifact changed while it was read: {path}")
+    actual_sha256 = _sha256_descriptor(descriptor)
     if actual_sha256 != expected["sha256"]:
         raise ValueError(f"artifact hash mismatch: {path}")
-    return actual_sha256
+    after_hash = os.fstat(descriptor)
+    after_path = _artifact_path_stat(path)
+    if (
+        _artifact_identity(after_hash) != _artifact_identity(snapshot)
+        or _artifact_identity(after_path) != _artifact_identity(snapshot)
+    ):
+        raise ValueError(f"catalog artifact changed while it was read: {path}")
+    path_sha256, _path_snapshot = _sha256_path_snapshot(path)
+    if path_sha256 != actual_sha256 or path_sha256 != expected["sha256"]:
+        raise ValueError(f"catalog artifact changed while it was read: {path}")
+    return actual_sha256, after_hash.st_size
+
+
+def _read_artifact_snapshot(path: Path, expected: Mapping[str, Any]) -> bytes:
+    """Read one small artifact from its pinned descriptor and verify its bytes."""
+    descriptor, snapshot, _initial_sha256 = _open_artifact_snapshot(path, expected)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        actual_sha256, actual_bytes = _assert_artifact_snapshot_unchanged(
+            path, descriptor, snapshot, expected
+        )
+        if len(payload) != actual_bytes or hashlib.sha256(payload).hexdigest() != actual_sha256:
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _iter_jsonl_descriptor(
+    descriptor: int,
+    path: Path,
+    *,
+    digest: hashlib._Hash | None = None,
+) -> Iterable[dict[str, Any]]:
+    """Yield JSONL rows while optionally hashing the exact bytes parsed."""
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    duplicate = os.dup(descriptor)
+    try:
+        handle = os.fdopen(duplicate, "rb")
+    except BaseException:
+        # ``fdopen`` does not take ownership when construction fails.
+        os.close(duplicate)
+        raise
+    with handle:
+        for line_number, raw_line in enumerate(handle, 1):
+            if digest is not None:
+                digest.update(raw_line)
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"invalid UTF-8 at {path}:{line_number}: {exc}"
+                ) from exc
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid JSON at {path}:{line_number}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"expected object at {path}:{line_number}")
+            yield row
+
+
+def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> str:
+    """Validate an immutable artifact's file binding without parsing its rows."""
+    descriptor, snapshot, initial_sha256 = _open_artifact_snapshot(path, expected)
+    try:
+        # Rehash the pinned descriptor after the initial check.  This is
+        # intentional even though no rows are parsed here: NFS attribute
+        # caching can leave size and timestamps unchanged after an in-place
+        # rewrite, so metadata alone cannot close the read window.
+        actual_sha256, actual_bytes = _assert_artifact_snapshot_unchanged(
+            path, descriptor, snapshot, expected
+        )
+        if actual_sha256 != initial_sha256 or actual_bytes != expected["bytes"]:
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        return actual_sha256
+    finally:
+        os.close(descriptor)
 
 
 def _validate_artifact(
     path: Path, expected: Mapping[str, Any], *, verify_paths: bool
 ) -> dict[str, Any]:
-    actual_sha256 = _validate_artifact_file(path, expected)
+    descriptor, snapshot, _initial_sha256 = _open_artifact_snapshot(path, expected)
     count = 0
     eligible = 0
     with_prompt = 0
@@ -1002,44 +1217,55 @@ def _validate_artifact(
     splits: Counter[str] = Counter()
     id_fingerprints: set[bytes] = set()
     path_check_batch: list[Mapping[str, Any]] = []
-    executor = ThreadPoolExecutor(max_workers=32) if verify_paths else None
+    parsed_digest = hashlib.sha256()
+    executor: ThreadPoolExecutor | None = None
     try:
-        for row in iter_jsonl(path):
-            row_id = row.get("id")
-            if not isinstance(row_id, str) or not row_id:
-                raise ValueError(f"artifact row lacks a non-empty id: {path}")
-            fingerprint = hashlib.blake2b(row_id.encode("utf-8"), digest_size=16).digest()
-            if fingerprint in id_fingerprints:
-                raise ValueError(f"duplicate record id in {path}: {row_id}")
-            id_fingerprints.add(fingerprint)
-            if expected.get("schema") == DATA_RECORD_SCHEMA:
-                validate_record(row)
-                eligible += int(row["training_eligible"])
-                with_prompt += int(bool(row["prompt"]))
-                with_image += int(bool(row["image_path"]))
-                leakage_matches += int(bool(row["benchmark_exact_match"]))
-                missing_images += int(row["source_record"].get("image_exists") is False)
-                modalities[row["modality"]] += 1
-                splits[row["split"]] += 1
-                if verify_paths and row["image_path"]:
-                    path_check_batch.append(row)
-                    if len(path_check_batch) == 4096:
-                        verify_image_paths(path_check_batch, executor=executor)
-                        path_check_batch.clear()
-            elif row.get("schema") != expected.get("schema"):
-                raise ValueError(f"unexpected row schema in {path}")
-            count += 1
-            if count % 500_000 == 0:
-                print(f"[{path.name}] validated {count:,} rows", flush=True)
-        if path_check_batch:
-            verify_image_paths(path_check_batch, executor=executor)
+        executor = ThreadPoolExecutor(max_workers=32) if verify_paths else None
+        try:
+            for row in _iter_jsonl_descriptor(
+                descriptor, path, digest=parsed_digest
+            ):
+                row_id = row.get("id")
+                if not isinstance(row_id, str) or not row_id:
+                    raise ValueError(f"artifact row lacks a non-empty id: {path}")
+                fingerprint = hashlib.blake2b(row_id.encode("utf-8"), digest_size=16).digest()
+                if fingerprint in id_fingerprints:
+                    raise ValueError(f"duplicate record id in {path}: {row_id}")
+                id_fingerprints.add(fingerprint)
+                if expected.get("schema") == DATA_RECORD_SCHEMA:
+                    validate_record(row)
+                    eligible += int(row["training_eligible"])
+                    with_prompt += int(bool(row["prompt"]))
+                    with_image += int(bool(row["image_path"]))
+                    leakage_matches += int(bool(row["benchmark_exact_match"]))
+                    missing_images += int(row["source_record"].get("image_exists") is False)
+                    modalities[row["modality"]] += 1
+                    splits[row["split"]] += 1
+                    if verify_paths and row["image_path"]:
+                        path_check_batch.append(row)
+                        if len(path_check_batch) == 4096:
+                            verify_image_paths(path_check_batch, executor=executor)
+                            path_check_batch.clear()
+                elif row.get("schema") != expected.get("schema"):
+                    raise ValueError(f"unexpected row schema in {path}")
+                count += 1
+                if count % 500_000 == 0:
+                    print(f"[{path.name}] validated {count:,} rows", flush=True)
+            if path_check_batch:
+                verify_image_paths(path_check_batch, executor=executor)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+        # The artifact may be replaced while rows are being parsed.  Revalidate
+        # the pinned descriptor and pathname so the returned statistics and
+        # hash describe the same published bytes.
+        actual_sha256, actual_bytes = _assert_artifact_snapshot_unchanged(
+            path, descriptor, snapshot, expected
+        )
+        if parsed_digest.hexdigest() != expected["sha256"]:
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
     finally:
-        if executor is not None:
-            executor.shutdown(wait=True)
-    # The artifact may be replaced while rows are being parsed.  Revalidate
-    # the binding after the read so the returned statistics and hash describe
-    # the same published bytes.
-    actual_sha256 = _validate_artifact_file(path, expected)
+        os.close(descriptor)
     observed: dict[str, Any] = {
         "path": path.name,
         "schema": expected["schema"],
@@ -1057,7 +1283,7 @@ def _validate_artifact(
                 "splits": dict(sorted(splits.items())),
             }
         )
-    observed.update({"bytes": path.stat().st_size, "sha256": actual_sha256})
+    observed.update({"bytes": actual_bytes, "sha256": actual_sha256})
     if dict(expected) != observed:
         raise ValueError(f"manifest artifact metadata does not match observed content: {path}")
     return observed
@@ -1106,12 +1332,7 @@ def validate_release(
     ) != CONFIG_SNAPSHOT_SCHEMA:
         raise ValueError("catalog config snapshot metadata is invalid")
     snapshot_path = release_dir / CONFIG_SNAPSHOT_NAME
-    _validate_artifact_file(snapshot_path, snapshot)
-    snapshot_bytes = snapshot_path.read_bytes()
-    if len(snapshot_bytes) != snapshot.get("bytes") or hashlib.sha256(
-        snapshot_bytes
-    ).hexdigest() != snapshot.get("sha256"):
-        raise ValueError("catalog config snapshot content does not match the manifest")
+    snapshot_bytes = _read_artifact_snapshot(snapshot_path, snapshot)
     config = _load_config_bytes(snapshot_bytes, source=str(snapshot_path))
     if manifest.get("physical_source_count") != len(config["physical_sources"]):
         raise ValueError("release does not inventory exactly the configured five sources")

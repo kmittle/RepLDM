@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -606,10 +607,48 @@ class ArtifactTest(unittest.TestCase):
                 "bytes": len(original),
                 "sha256": hashlib.sha256(original).hexdigest(),
             }
-            real_hash = catalog_builder.sha256_file
+            real_hash = catalog_builder._sha256_descriptor
             calls = 0
 
             def rewrite_after_first_hash(value):
+                nonlocal calls
+                digest = real_hash(value)
+                calls += 1
+                if calls == 2:
+                    path.write_bytes(replacement)
+                return digest
+
+            with mock.patch.object(
+                catalog_builder,
+                "_sha256_descriptor",
+                side_effect=rewrite_after_first_hash,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "catalog artifact changed while it was read"
+                ):
+                    catalog_builder._validate_artifact(
+                        path, expected, verify_paths=False
+                    )
+
+        self.assertEqual(calls, 2)
+
+    def test_artifact_file_rechecks_pinned_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            original = b'{"id":"one","schema":"fixture.schema.v1"}\n'
+            replacement = b'{"id":"two","schema":"fixture.schema.v1"}\n'
+            path.write_bytes(original)
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "rows": 1,
+                "bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+            real_hash = catalog_builder._sha256_descriptor
+            calls = 0
+
+            def rewrite_after_snapshot_hash(value):
                 nonlocal calls
                 digest = real_hash(value)
                 calls += 1
@@ -618,14 +657,172 @@ class ArtifactTest(unittest.TestCase):
                 return digest
 
             with mock.patch.object(
-                catalog_builder, "sha256_file", side_effect=rewrite_after_first_hash
+                catalog_builder,
+                "_sha256_descriptor",
+                side_effect=rewrite_after_snapshot_hash,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "catalog artifact changed while it was read"
+                ):
+                    catalog_builder._validate_artifact_file(path, expected)
+
+        self.assertEqual(calls, 1)
+
+    def test_artifact_file_rehash_rejects_same_metadata_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            original = b'{"id":"one","schema":"fixture.schema.v1"}\n'
+            replacement = b'{"id":"two","schema":"fixture.schema.v1"}\n'
+            path.write_bytes(original)
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "rows": 1,
+                "bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+            real_hash = catalog_builder._sha256_descriptor
+            calls = 0
+
+            def rewrite_after_initial_hash(value):
+                nonlocal calls
+                digest = real_hash(value)
+                calls += 1
+                if calls == 1:
+                    path.write_bytes(replacement)
+                return digest
+
+            with mock.patch.object(
+                catalog_builder,
+                "_sha256_descriptor",
+                side_effect=rewrite_after_initial_hash,
+            ), mock.patch.object(
+                catalog_builder, "_artifact_identity", return_value=(1, 2, 3, 4, 5)
             ):
                 with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+                    catalog_builder._validate_artifact_file(path, expected)
+
+        self.assertEqual(calls, 2)
+
+    def test_artifact_file_rejects_path_replacement_with_stale_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            replacement_path = Path(directory) / "replacement.jsonl"
+            original = b'{"id":"one","schema":"fixture.schema.v1"}\n'
+            replacement = b'{"id":"two","schema":"fixture.schema.v1"}\n'
+            path.write_bytes(original)
+            replacement_path.write_bytes(replacement)
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "rows": 1,
+                "bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+            real_hash = catalog_builder._sha256_descriptor
+            calls = 0
+
+            def replace_after_initial_hash(value):
+                nonlocal calls
+                digest = real_hash(value)
+                calls += 1
+                if calls == 1:
+                    os.replace(replacement_path, path)
+                return digest
+
+            with mock.patch.object(
+                catalog_builder,
+                "_sha256_descriptor",
+                side_effect=replace_after_initial_hash,
+            ), mock.patch.object(
+                catalog_builder, "_artifact_identity", return_value=(1, 2, 3, 4, 5)
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "catalog artifact changed while it was read"
+                ):
+                    catalog_builder._validate_artifact_file(path, expected)
+
+        self.assertEqual(calls, 3)
+
+    def test_validator_hashes_bytes_seen_during_transient_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            original = b'{"id":"one","schema":"fixture.schema.v1"}\n'
+            replacement = b'{"id":"two","schema":"fixture.schema.v1"}\n'
+            path.write_bytes(original)
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "rows": 1,
+                "bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+            real_iter = catalog_builder._iter_jsonl_descriptor
+
+            def rewrite_then_restore(descriptor, value, **kwargs):
+                path.write_bytes(replacement)
+                iterator = real_iter(descriptor, value, **kwargs)
+                try:
+                    row = next(iterator)
+                finally:
+                    path.write_bytes(original)
+                yield row
+                yield from iterator
+
+            with mock.patch.object(
+                catalog_builder,
+                "_iter_jsonl_descriptor",
+                side_effect=rewrite_then_restore,
+            ), mock.patch.object(
+                catalog_builder, "_artifact_identity", return_value=(1, 2, 3, 4, 5)
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "catalog artifact changed while it was read"
+                ):
                     catalog_builder._validate_artifact(
                         path, expected, verify_paths=False
                     )
 
-        self.assertEqual(calls, 2)
+    def test_read_artifact_snapshot_returns_pinned_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            payload = b"schema: fixture.schema.v1\n"
+            path.write_bytes(payload)
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            self.assertEqual(
+                catalog_builder._read_artifact_snapshot(path, expected), payload
+            )
+
+    def test_jsonl_iterator_closes_duplicate_when_fdopen_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            path.write_bytes(b'{"id":"one"}\n')
+            descriptor = path.open("rb")
+            duplicate = descriptor.fileno()
+            leaked = os.dup(duplicate)
+            try:
+                with mock.patch.object(
+                    catalog_builder.os, "dup", return_value=leaked
+                ), mock.patch.object(
+                    catalog_builder.os,
+                    "fdopen",
+                    side_effect=OSError("fdopen fixture failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "fdopen fixture failure"):
+                        list(catalog_builder._iter_jsonl_descriptor(duplicate, path))
+                with self.assertRaises(OSError):
+                    os.fstat(leaked)
+            finally:
+                try:
+                    os.close(leaked)
+                except OSError:
+                    pass
+                descriptor.close()
 
 
 class ConfigTest(unittest.TestCase):
