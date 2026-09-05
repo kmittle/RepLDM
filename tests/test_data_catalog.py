@@ -575,6 +575,58 @@ class ArtifactTest(unittest.TestCase):
                 write_records(path, [record], verify_paths=True)
             self.assertFalse(path.exists())
 
+    def test_validator_reuses_verified_artifact_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            path.write_bytes(b'{"id":"one","schema":"fixture.schema.v1"}\n')
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "rows": 1,
+                "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+
+            observed = catalog_builder._validate_artifact(
+                path, expected, verify_paths=False
+            )
+
+        self.assertEqual(observed, expected)
+
+    def test_validator_rechecks_hash_after_row_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifact.jsonl"
+            original = b'{"id":"one","schema":"fixture.schema.v1"}\n'
+            replacement = b'{"id":"two","schema":"fixture.schema.v1"}\n'
+            path.write_bytes(original)
+            expected = {
+                "path": path.name,
+                "schema": "fixture.schema.v1",
+                "rows": 1,
+                "bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+            real_hash = catalog_builder.sha256_file
+            calls = 0
+
+            def rewrite_after_first_hash(value):
+                nonlocal calls
+                digest = real_hash(value)
+                calls += 1
+                if calls == 1:
+                    path.write_bytes(replacement)
+                return digest
+
+            with mock.patch.object(
+                catalog_builder, "sha256_file", side_effect=rewrite_after_first_hash
+            ):
+                with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+                    catalog_builder._validate_artifact(
+                        path, expected, verify_paths=False
+                    )
+
+        self.assertEqual(calls, 2)
+
 
 class ConfigTest(unittest.TestCase):
     def test_config_rejects_boolean_counts_in_frozen_contract(self):

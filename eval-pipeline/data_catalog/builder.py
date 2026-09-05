@@ -976,7 +976,7 @@ def _validate_source_derivations(
     return protected_counts, unique_count, unique_image_count
 
 
-def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> None:
+def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> str:
     """Validate an immutable artifact's file binding without parsing its rows."""
     if path.is_symlink() or not path.is_file():
         raise FileNotFoundError(f"catalog artifact is missing or not a regular file: {path}")
@@ -985,12 +985,13 @@ def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> None:
     actual_sha256 = sha256_file(path)
     if actual_sha256 != expected["sha256"]:
         raise ValueError(f"artifact hash mismatch: {path}")
+    return actual_sha256
 
 
 def _validate_artifact(
     path: Path, expected: Mapping[str, Any], *, verify_paths: bool
 ) -> dict[str, Any]:
-    _validate_artifact_file(path, expected)
+    actual_sha256 = _validate_artifact_file(path, expected)
     count = 0
     eligible = 0
     with_prompt = 0
@@ -1035,6 +1036,10 @@ def _validate_artifact(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+    # The artifact may be replaced while rows are being parsed.  Revalidate
+    # the binding after the read so the returned statistics and hash describe
+    # the same published bytes.
+    actual_sha256 = _validate_artifact_file(path, expected)
     observed: dict[str, Any] = {
         "path": path.name,
         "schema": expected["schema"],
