@@ -1045,28 +1045,43 @@ def _artifact_path_stat(path: Path) -> os.stat_result:
 
 
 def _open_artifact_snapshot(
-    path: Path, expected: Mapping[str, Any]
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    pinned_descriptor: int | None = None,
 ) -> tuple[int, os.stat_result, str]:
     """Open, hash, and pin one artifact before any row parsing begins."""
-    # Reject a non-regular pathname before ``open`` so a FIFO cannot block the
-    # validator.  The descriptor and pathname identities are checked again
-    # below because this preflight is inherently racy.
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(
-            f"catalog artifact is missing or not a regular file: {path}"
+    # A selected-view parent may already have been opened through a directory
+    # descriptor.  Duplicate that descriptor so this validator never follows a
+    # pathname after the parent directory is replaced.  The unpinned path
+    # branch remains for ordinary catalog validation and publication.
+    if pinned_descriptor is not None:
+        try:
+            descriptor = os.dup(pinned_descriptor)
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"catalog artifact pinned descriptor is unavailable: {path}"
+            ) from exc
+    else:
+        # Reject a non-regular pathname before ``open`` so a FIFO cannot block
+        # the validator.  The descriptor and pathname identities are checked
+        # again below because this preflight is inherently racy.
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(
+                f"catalog artifact is missing or not a regular file: {path}"
+            )
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise FileNotFoundError(
-            f"catalog artifact is missing or not a regular file: {path}"
-        ) from exc
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"catalog artifact is missing or not a regular file: {path}"
+            ) from exc
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -1125,9 +1140,16 @@ def _assert_artifact_snapshot_unchanged(
     return actual_sha256, after_hash.st_size
 
 
-def _read_artifact_snapshot(path: Path, expected: Mapping[str, Any]) -> bytes:
+def _read_artifact_snapshot(
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    pinned_descriptor: int | None = None,
+) -> bytes:
     """Read one small artifact from its pinned descriptor and verify its bytes."""
-    descriptor, snapshot, _initial_sha256 = _open_artifact_snapshot(path, expected)
+    descriptor, snapshot, _initial_sha256 = _open_artifact_snapshot(
+        path, expected, pinned_descriptor=pinned_descriptor
+    )
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
         chunks: list[bytes] = []
@@ -1185,9 +1207,64 @@ def _iter_jsonl_descriptor(
             yield row
 
 
-def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> str:
+def _read_pinned_descriptor(
+    path: Path,
+    descriptor: int,
+    *,
+    expected_bytes: int | None = None,
+) -> bytes:
+    """Read bytes from a caller-owned descriptor without following ``path``.
+
+    The descriptor is duplicated so the caller retains ownership and file
+    position.  When a pathname is supplied, its identity is checked at both
+    boundaries; a directory swap therefore either fails closed or leaves the
+    read pinned to the original inode.
+    """
+    try:
+        duplicate = os.dup(descriptor)
+    except OSError as exc:
+        raise ValueError(f"catalog artifact descriptor is unavailable: {path}") from exc
+    try:
+        before = os.fstat(duplicate)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"catalog artifact is not a regular file: {path}")
+        path_before = _artifact_path_stat(path)
+        if _artifact_identity(path_before) != _artifact_identity(before):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        if expected_bytes is not None and before.st_size != expected_bytes:
+            raise ValueError(f"catalog artifact byte count mismatch: {path}")
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(duplicate, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(duplicate)
+        path_after = _artifact_path_stat(path)
+        if (
+            _artifact_identity(after) != _artifact_identity(before)
+            or _artifact_identity(path_after) != _artifact_identity(before)
+        ):
+            raise ValueError(f"catalog artifact changed while it was read: {path}")
+        if expected_bytes is not None and len(payload) != expected_bytes:
+            raise ValueError(f"catalog artifact byte count mismatch: {path}")
+        return payload
+    finally:
+        os.close(duplicate)
+
+
+def _validate_artifact_file(
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    pinned_descriptor: int | None = None,
+) -> str:
     """Validate an immutable artifact's file binding without parsing its rows."""
-    descriptor, snapshot, initial_sha256 = _open_artifact_snapshot(path, expected)
+    descriptor, snapshot, initial_sha256 = _open_artifact_snapshot(
+        path, expected, pinned_descriptor=pinned_descriptor
+    )
     try:
         # Rehash the pinned descriptor after the initial check.  This is
         # intentional even though no rows are parsed here: NFS attribute
@@ -1204,9 +1281,15 @@ def _validate_artifact_file(path: Path, expected: Mapping[str, Any]) -> str:
 
 
 def _validate_artifact(
-    path: Path, expected: Mapping[str, Any], *, verify_paths: bool
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    verify_paths: bool,
+    pinned_descriptor: int | None = None,
 ) -> dict[str, Any]:
-    descriptor, snapshot, _initial_sha256 = _open_artifact_snapshot(path, expected)
+    descriptor, snapshot, _initial_sha256 = _open_artifact_snapshot(
+        path, expected, pinned_descriptor=pinned_descriptor
+    )
     count = 0
     eligible = 0
     with_prompt = 0
@@ -1296,6 +1379,7 @@ def validate_release(
     require_formal_catalog: bool = False,
     require_training_ready: bool = False,
     validate_records: bool = True,
+    pinned_descriptors: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     if type(validate_records) is not bool:
         raise TypeError("validate_records must be a boolean")
@@ -1310,7 +1394,20 @@ def validate_release(
             "training-ready validation requires a formal catalog from a clean pushed commit"
         )
     manifest_path = release_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pinned = dict(pinned_descriptors or {})
+    if pinned_descriptors is not None and "manifest.json" not in pinned:
+        raise ValueError("pinned catalog validation requires a manifest descriptor")
+    manifest_descriptor = pinned.get("manifest.json")
+    if manifest_descriptor is None:
+        manifest_bytes = manifest_path.read_bytes()
+    else:
+        manifest_bytes = _read_pinned_descriptor(manifest_path, manifest_descriptor)
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"release manifest is not readable JSON: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"release manifest must contain one JSON object: {manifest_path}")
     if manifest.get("schema") != CATALOG_SCHEMA:
         raise ValueError(f"unexpected release schema in {manifest_path}")
     release_id = manifest.get("release_id")
@@ -1332,7 +1429,13 @@ def validate_release(
     ) != CONFIG_SNAPSHOT_SCHEMA:
         raise ValueError("catalog config snapshot metadata is invalid")
     snapshot_path = release_dir / CONFIG_SNAPSHOT_NAME
-    snapshot_bytes = _read_artifact_snapshot(snapshot_path, snapshot)
+    if pinned_descriptors is not None and CONFIG_SNAPSHOT_NAME not in pinned:
+        raise ValueError("pinned catalog validation requires a config descriptor")
+    snapshot_bytes = _read_artifact_snapshot(
+        snapshot_path,
+        snapshot,
+        pinned_descriptor=pinned.get(CONFIG_SNAPSHOT_NAME),
+    )
     config = _load_config_bytes(snapshot_bytes, source=str(snapshot_path))
     if manifest.get("physical_source_count") != len(config["physical_sources"]):
         raise ValueError("release does not inventory exactly the configured five sources")
@@ -1406,12 +1509,32 @@ def validate_release(
         raise ValueError("artifact paths must be unique basenames")
     if artifact_names != config["expected_artifact_order"]:
         raise ValueError("release artifact inventory differs from the frozen config")
+    if pinned_descriptors is not None:
+        expected_pinned = {"manifest.json", CONFIG_SNAPSHOT_NAME, *artifact_names}
+        if set(pinned) != expected_pinned:
+            missing = sorted(expected_pinned - set(pinned))
+            extra = sorted(set(pinned) - expected_pinned)
+            raise ValueError(
+                "pinned catalog descriptor set is incomplete"
+                + (f"; missing={missing}" if missing else "")
+                + (f"; extra={extra}" if extra else "")
+            )
     for artifact in artifacts:
         path = release_dir / artifact["path"]
+        pinned_descriptor = pinned.get(str(artifact["path"]))
         if validate_records:
-            _validate_artifact(path, artifact, verify_paths=verify_paths)
+            _validate_artifact(
+                path,
+                artifact,
+                verify_paths=verify_paths,
+                pinned_descriptor=pinned_descriptor,
+            )
         else:
-            _validate_artifact_file(path, artifact)
+            _validate_artifact_file(
+                path,
+                artifact,
+                pinned_descriptor=pinned_descriptor,
+            )
     _assert_artifact_contract(artifacts, config)
     training = artifacts[artifact_names.index("training_candidates.jsonl")]
     if (
@@ -1490,6 +1613,7 @@ def validate_release_artifact_closure(
     release_dir: Path,
     *,
     require_training_ready: bool = False,
+    pinned_descriptors: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Validate a published catalog's immutable closure for downstream consumers.
 
@@ -1505,6 +1629,7 @@ def validate_release_artifact_closure(
         require_formal_catalog=True,
         require_training_ready=require_training_ready,
         validate_records=False,
+        pinned_descriptors=pinned_descriptors,
     )
 
 

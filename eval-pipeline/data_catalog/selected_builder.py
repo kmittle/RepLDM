@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -17,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .builder import REPOSITORY_ROOT, _tracked_config_path, enforce_git_gate
+from .builder import (
+    REPOSITORY_ROOT,
+    _sha256_path_snapshot,
+    _tracked_config_path,
+    enforce_git_gate,
+)
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
 from .selected import (
     SELECTED_CONFIG_SCHEMA,
@@ -27,7 +33,11 @@ from .selected import (
     SOURCES,
     STRATA,
     DecodedImage,
+    ParentArtifactSnapshot,
     _artifact_projection,
+    _assert_parent_artifact_snapshot,
+    _capture_parent_artifact_snapshot,
+    _iter_parent_jsonl,
     _field,
     _json_object,
     _load_protected_exact_index,
@@ -36,6 +46,7 @@ from .selected import (
     dct_phash_v1,
     decode_image_payload,
     selected_release_id,
+    parent_snapshot_scope,
     validate_selected_view_release,
 )
 from .schema import normalize_prompt
@@ -103,9 +114,7 @@ class SelectedViewGateRuntime(Protocol):
     ) -> SimilarityGateResult: ...
 
 
-RuntimeFactory = Callable[
-    [Mapping[str, Any], Path, Path], SelectedViewGateRuntime
-]
+RuntimeFactory = Callable[..., SelectedViewGateRuntime]
 
 
 class _CandidateRejected(Exception):
@@ -204,9 +213,26 @@ def create_selected_view_runtime(
     config: Mapping[str, Any],
     parent_dir: Path,
     repository_root: Path,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> SelectedViewGateRuntime:
     """Instantiate a runtime with network access disabled."""
     with _offline_runtime():
+        if parent_snapshot is not None:
+            try:
+                parameters = inspect.signature(factory).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            accepts_snapshot = "parent_snapshot" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if accepts_snapshot:
+                return factory(
+                    config,
+                    parent_dir,
+                    repository_root,
+                    parent_snapshot=parent_snapshot,
+                )
         return factory(config, parent_dir, repository_root)
 
 
@@ -401,13 +427,18 @@ def _select_rows(
     config: Mapping[str, Any],
     frozen: Mapping[str, Any],
     runtime: SelectedViewGateRuntime,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    protected_exact = _load_protected_exact_index(parent_dir)
+    protected_exact = _load_protected_exact_index(
+        parent_dir, parent_snapshot=parent_snapshot
+    )
     candidates: list[tuple[str, str, dict[str, Any]]] = []
     ids: set[str] = set()
     digests: set[str] = set()
     seed = frozen["selection_seed"]
-    for candidate in iter_jsonl(parent_dir / "training_candidates.jsonl"):
+    for candidate in _iter_parent_jsonl(
+        parent_dir, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+    ):
         if candidate.get("source") not in SOURCES:
             continue
         record_id = candidate.get("id")
@@ -560,22 +591,35 @@ def _parent_manifest_binding(
     parent_release: Path,
     *,
     repository_root: Path,
-) -> tuple[dict[str, Any], Path, str, dict[str, Any]]:
+) -> tuple[
+    dict[str, Any],
+    Path,
+    str,
+    dict[str, Any],
+    ParentArtifactSnapshot,
+]:
     manifest_path = parent_release / "manifest.json"
-    parent_manifest = _json_object(manifest_path, label="candidate parent manifest")
-    artifacts = parent_manifest.get("artifacts")
-    if not isinstance(artifacts, list):
-        raise ValueError("candidate parent lacks an artifact inventory")
-    binding = {
-        "path": str(manifest_path.absolute()),
-        "release_id": parent_manifest.get("release_id"),
-        "manifest_sha256": sha256_file(manifest_path),
-        "artifacts": [_artifact_projection(row) for row in artifacts],
-    }
-    parent, parent_dir, parent_hash = _validate_parent_binding(
-        binding, repository_root=repository_root
-    )
-    return parent, parent_dir, parent_hash, binding
+    parent_snapshot = _capture_parent_artifact_snapshot(parent_release)
+    try:
+        parent_manifest = parent_snapshot.manifest
+        artifacts = parent_manifest.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ValueError("candidate parent lacks an artifact inventory")
+        binding = {
+            "path": str(manifest_path.absolute()),
+            "release_id": parent_manifest.get("release_id"),
+            "manifest_sha256": parent_snapshot.manifest_sha256,
+            "artifacts": [_artifact_projection(row) for row in artifacts],
+        }
+        parent, parent_dir, parent_hash, parent_snapshot = _validate_parent_binding(
+            binding,
+            repository_root=repository_root,
+            parent_snapshot=parent_snapshot,
+        )
+        return parent, parent_dir, parent_hash, binding, parent_snapshot
+    except BaseException:
+        parent_snapshot.close()
+        raise
 
 
 def _install_release(staging: Path, destination: Path) -> bool:
@@ -599,6 +643,7 @@ def _install_release(staging: Path, destination: Path) -> bool:
     return True
 
 
+@parent_snapshot_scope
 def build_selected_view_release(
     *,
     config_path: Path,
@@ -622,7 +667,7 @@ def build_selected_view_release(
         commit=git["commit"],
         required=not allow_dirty,
     )
-    parent, parent_dir, parent_hash, parent_binding = _parent_manifest_binding(
+    parent, parent_dir, parent_hash, parent_binding, parent_snapshot = _parent_manifest_binding(
         parent_release, repository_root=repository_root
     )
     config_bytes = config_path.read_bytes()
@@ -653,6 +698,7 @@ def build_selected_view_release(
             parent=parent,
             parent_dir=parent_dir,
             parent_manifest_sha256=parent_hash,
+            parent_snapshot=parent_snapshot,
         )
         config_valid = True
     except (OSError, ValueError) as exc:
@@ -673,6 +719,7 @@ def build_selected_view_release(
                     config=config,
                     parent_dir=parent_dir,
                     repository_root=repository_root,
+                    parent_snapshot=parent_snapshot,
                 )
                 runtime_bindings = _runtime_bindings(
                     runtime, frozen["runtime_bindings"]
@@ -699,7 +746,11 @@ def build_selected_view_release(
                     config=config,
                     frozen=frozen,
                     runtime=runtime,
+                    parent_snapshot=parent_snapshot,
                 )
+            # The parent was fully validated before row parsing.  Compare
+            # pinned identities here rather than rescanning every artifact.
+            _assert_parent_artifact_snapshot(parent_snapshot, verify_content=False)
             selection_complete = len(selected_rows) == 96
             if not selection_complete:
                 insufficient = [
@@ -753,8 +804,10 @@ def build_selected_view_release(
         raise RuntimeError("repository state changed during selected-view construction")
     if config_path.read_bytes() != config_bytes:
         raise RuntimeError("selected-view config changed during construction")
-    if sha256_file(parent_dir / "manifest.json") != parent_hash:
-        raise RuntimeError("candidate parent changed during selected-view construction")
+    try:
+        _assert_parent_artifact_snapshot(parent_snapshot)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise RuntimeError("candidate parent changed during selected-view construction") from exc
 
     output_root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".selected-view-build-", dir=output_root))
@@ -812,6 +865,7 @@ def build_selected_view_release(
             repository_root=repository_root,
             require_formal=not allow_dirty,
             require_training_ready=False,
+            parent_snapshot=parent_snapshot,
         )
         if selection_complete and runtime is not None:
             verify_selected_view_runtime(
@@ -819,6 +873,7 @@ def build_selected_view_release(
                 runtime=runtime,
                 repository_root=repository_root,
                 require_formal=not allow_dirty,
+                parent_snapshot=parent_snapshot,
             )
     except BaseException:
         if installed:
@@ -828,12 +883,14 @@ def build_selected_view_release(
     return release_dir
 
 
+@parent_snapshot_scope
 def verify_selected_view_runtime(
     release_dir: Path,
     *,
     runtime: SelectedViewGateRuntime,
     repository_root: Path = REPOSITORY_ROOT,
     require_formal: bool = True,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Re-run every learned/indexed gate for an installed 96-row payload."""
     manifest = validate_selected_view_release(
@@ -841,11 +898,14 @@ def verify_selected_view_runtime(
         repository_root=repository_root,
         require_formal=require_formal,
         require_training_ready=False,
+        parent_snapshot=parent_snapshot,
     )
     if "selected_payload" not in manifest:
         raise ValueError("selected-view release has no payload to reverify")
-    parent, parent_dir, parent_hash = _validate_parent_binding(
-        manifest["parent_catalog"], repository_root=Path(repository_root).absolute()
+    parent, parent_dir, parent_hash, parent_snapshot = _validate_parent_binding(
+        manifest["parent_catalog"],
+        repository_root=Path(repository_root).absolute(),
+        parent_snapshot=parent_snapshot,
     )
     config_path = Path(release_dir) / manifest["config"]["path"]
     config = _json_object(config_path, label="selected-view config")
@@ -854,6 +914,7 @@ def verify_selected_view_runtime(
         parent=parent,
         parent_dir=parent_dir,
         parent_manifest_sha256=parent_hash,
+        parent_snapshot=parent_snapshot,
     )
     _runtime_bindings(runtime, frozen["runtime_bindings"])
     _runtime_index_counts(runtime, frozen["runtime_index_counts"])
@@ -863,12 +924,18 @@ def verify_selected_view_runtime(
     ids = {row["id"] for row in selected}
     candidates = {
         row["id"]: row
-        for row in iter_jsonl(parent_dir / "training_candidates.jsonl")
+        for row in _iter_parent_jsonl(
+            parent_dir,
+            "training_candidates.jsonl",
+            parent_snapshot=parent_snapshot,
+        )
         if row.get("id") in ids
     }
     if set(candidates) != ids:
         raise ValueError("selected payload cannot be derived from its candidate parent")
-    protected_exact = _load_protected_exact_index(parent_dir)
+    protected_exact = _load_protected_exact_index(
+        parent_dir, parent_snapshot=parent_snapshot
+    )
     evidence_keys = {
         "model_prompt",
         "raw_prompt",
@@ -898,6 +965,8 @@ def verify_selected_view_runtime(
                 raise ValueError(
                     f"selected row gate evidence does not reproduce: {row['id']}"
                 )
+    # The parent was fully validated before the runtime re-read its rows.
+    _assert_parent_artifact_snapshot(parent_snapshot)
     return manifest
 
 

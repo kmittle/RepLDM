@@ -93,6 +93,11 @@ def test_build_rejects_more_shards_than_images(
         "_parent_rows",
         lambda *args, **kwargs: ({"release_id": "parent"}, "hash", [{"id": "image"}]),
     )
+    class _Snapshot:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(image_index_shards, "_capture_parent_artifact_snapshot", lambda _path: _Snapshot())
     clip = tmp_path / "clip.pt"
     clip.write_bytes(b"fixture checkpoint")
     with pytest.raises(ValueError, match="shard_count cannot exceed"):
@@ -270,3 +275,134 @@ def test_parent_rows_rejects_incomplete_holdout_count(
 
     with pytest.raises(ValueError, match="49,393"):
         _parent_rows(parent, validate_files=False)
+
+
+def test_parent_rows_validates_parent_closure_with_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+
+    class _Snapshot:
+        def assert_for(self, path: Path) -> None:
+            assert path == parent
+
+    seen: dict[str, object] = {}
+
+    def reject_incomplete_parent(
+        path: Path, *, parent_snapshot: object
+    ) -> Path:
+        seen["path"] = path
+        seen["snapshot"] = parent_snapshot
+        raise ValueError("parent closure rejected")
+
+    monkeypatch.setattr(
+        image_index_shards,
+        "_validate_parent_release_fast",
+        reject_incomplete_parent,
+    )
+    snapshot = _Snapshot()
+    with pytest.raises(ValueError, match="parent closure rejected"):
+        _parent_rows(
+            parent,
+            validate_files=False,
+            validate_records=False,
+            parent_snapshot=snapshot,
+        )
+
+    assert seen == {"path": parent, "snapshot": snapshot}
+
+
+def test_build_shard_removes_publication_when_parent_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Snapshot:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    snapshot = _Snapshot()
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    output_root = tmp_path / "outputs"
+    checkpoint = input_root / "clip.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(
+        image_index_shards,
+        "_capture_parent_artifact_snapshot",
+        lambda _path: snapshot,
+    )
+    monkeypatch.setattr(
+        image_index_shards,
+        "_build_image_index_shard_in_directory",
+        lambda **_kwargs: {"stub": True},
+    )
+    monkeypatch.setattr(image_index_shards, "_fsync_tree", lambda _path: None)
+
+    def parent_changed(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("parent changed after publication")
+
+    monkeypatch.setattr(
+        image_index_shards, "_assert_parent_artifact_snapshot", parent_changed
+    )
+    with pytest.raises(RuntimeError, match="parent changed after publication"):
+        image_index_shards.build_image_index_shard(
+            parent_release=input_root / "parent",
+            output_dir=output_root,
+            clip_checkpoint=checkpoint,
+            shard_index=0,
+            shard_count=1,
+        )
+
+    assert not (output_root / "shard-0000").exists()
+    assert snapshot.closed is True
+
+
+def test_merge_removes_publication_when_parent_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Snapshot:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    snapshot = _Snapshot()
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    shard_dir = input_root / "shards"
+    shard_dir.mkdir()
+    checkpoint = input_root / "clip.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    output_dir = tmp_path / "outputs" / "bundle"
+    monkeypatch.setattr(
+        image_index_shards,
+        "_capture_parent_artifact_snapshot",
+        lambda _path: snapshot,
+    )
+    monkeypatch.setattr(
+        image_index_shards,
+        "_merge_image_index_shards_in_directory",
+        lambda **_kwargs: {"stub": True},
+    )
+    monkeypatch.setattr(image_index_shards, "_fsync_tree", lambda _path: None)
+
+    def parent_changed(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("parent changed after publication")
+
+    monkeypatch.setattr(
+        image_index_shards, "_assert_parent_artifact_snapshot", parent_changed
+    )
+    with pytest.raises(RuntimeError, match="parent changed after publication"):
+        image_index_shards.merge_image_index_shards(
+            parent_release=input_root / "parent",
+            shard_dir=shard_dir,
+            output_dir=output_dir,
+            clip_checkpoint=checkpoint,
+        )
+
+    assert not output_dir.exists()
+    assert snapshot.closed is True

@@ -24,14 +24,19 @@ from typing import Any
 import numpy as np
 
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
-from .builder import validate_release_artifact_closure
+from .builder import _sha256_path_snapshot, validate_release_artifact_closure
 from .schema import normalize_prompt
 from .selected import (
+    ParentArtifactSnapshot,
     SELECTED_CONFIG_SCHEMA,
     SELECTED_IMAGE_MAX_PIXELS,
+    _assert_parent_artifact_snapshot,
+    _capture_parent_artifact_snapshot,
+    _iter_parent_jsonl,
     dct_phash_v1,
     _field,
     decode_image_payload,
+    parent_snapshot_scope,
 )
 
 ASSET_SCHEMA = "repldm.selected_view_assets.v2"
@@ -172,14 +177,43 @@ def _validate_parent_release(path: Path) -> Path:
     return path
 
 
-def _validate_parent_release_fast(path: Path) -> Path:
+def _validate_parent_release_fast(
+    path: Path, *, parent_snapshot: ParentArtifactSnapshot | None = None
+) -> Path:
     """Require a formal parent whose published artifact bytes remain unchanged."""
     path = _validate_directory(path, label="parent release")
+    if parent_snapshot is not None:
+        parent_snapshot.assert_for(path)
     _ordinary_file(path / "manifest.json", label="parent manifest")
     # Do not cache this closure: downstream workers must detect an artifact
     # replacement even when the manifest bytes are unchanged.
-    validate_release_artifact_closure(path, require_training_ready=False)
+    validate_release_artifact_closure(
+        path,
+        require_training_ready=False,
+        pinned_descriptors=(
+            parent_snapshot.descriptors if parent_snapshot is not None else None
+        ),
+    )
     return path
+
+
+def _revalidate_parent_release_after_reads(
+    path: Path,
+    *,
+    expected_manifest_sha256: str,
+    snapshot: ParentArtifactSnapshot | None = None,
+) -> None:
+    """Close the parent-catalog read window before publishing derived assets."""
+    if snapshot is not None:
+        _assert_parent_artifact_snapshot(snapshot)
+    else:
+        _validate_parent_release_fast(path)
+    if snapshot is not None and snapshot.manifest_sha256 != expected_manifest_sha256:
+        raise RuntimeError("parent catalog changed while selected assets were built")
+    if snapshot is None:
+        observed_hash, _ = _sha256_path_snapshot(path / "manifest.json")
+        if observed_hash != expected_manifest_sha256:
+            raise RuntimeError("parent catalog changed while selected assets were built")
 
 
 def _validate_destination(path: Path, *, label: str) -> Path:
@@ -400,10 +434,14 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _validate_source_prompt_fields(parent: Path) -> None:
+def _validate_source_prompt_fields(
+    parent: Path, *, parent_snapshot: ParentArtifactSnapshot | None = None
+) -> None:
     """Check configured prompt paths against real eligible parent rows."""
     observed: set[str] = set()
-    for row in iter_jsonl(parent / "training_candidates.jsonl"):
+    for row in _iter_parent_jsonl(
+        parent, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+    ):
         source = row.get("source")
         if source not in SOURCE_PROMPT_FIELDS or source in observed:
             continue
@@ -423,10 +461,14 @@ def _validate_source_prompt_fields(parent: Path) -> None:
     raise ValueError("parent has no eligible rows for configured sources: " + ", ".join(missing))
 
 
-def _candidate_image_paths(parent: Path) -> list[Path]:
+def _candidate_image_paths(
+    parent: Path, *, parent_snapshot: ParentArtifactSnapshot | None = None
+) -> list[Path]:
     """Collect every image path referenced by the training candidate catalog."""
     paths: list[Path] = []
-    for row in iter_jsonl(parent / "training_candidates.jsonl"):
+    for row in _iter_parent_jsonl(
+        parent, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+    ):
         raw = row.get("image_path")
         if isinstance(raw, str) and raw:
             paths.append(_absolute_path(Path(raw)))
@@ -455,9 +497,15 @@ def _image_parent_directories(rows: Iterable[Mapping[str, Any]]) -> tuple[Path, 
     return tuple(directories)
 
 
-def _candidate_image_parent_directories(parent: Path) -> tuple[Path, ...]:
+def _candidate_image_parent_directories(
+    parent: Path, *, parent_snapshot: ParentArtifactSnapshot | None = None
+) -> tuple[Path, ...]:
     """Collect candidate image directories without materializing every path."""
-    return _image_parent_directories(iter_jsonl(parent / "training_candidates.jsonl"))
+    return _image_parent_directories(
+        _iter_parent_jsonl(
+            parent, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+        )
+    )
 
 
 def _source_evidence_from_parent(parent_manifest: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -607,6 +655,7 @@ def derive_protected_index_manifest(
     image_rows: Sequence[Mapping[str, Any]] | None = None,
     image_evidence: Sequence[Mapping[str, Any]] | None = None,
     verify_image_evidence: bool = True,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Derive the immutable protected cohort identity from one parent catalog.
 
@@ -618,10 +667,29 @@ def derive_protected_index_manifest(
     if not isinstance(verify_image_evidence, bool):
         raise TypeError("verify_image_evidence must be a boolean")
     parent_release = _validate_directory(parent_release, label="parent release")
-    holdout_path = _ordinary_file(
-        parent_release / "benchmark_holdouts.jsonl", label="protected holdout catalog"
-    )
-    canonical_rows = _load_rows(holdout_path)
+    if parent_snapshot is not None:
+        parent_snapshot.assert_for(parent_release)
+    if parent_snapshot is None:
+        holdout_path = _ordinary_file(
+            parent_release / "benchmark_holdouts.jsonl", label="protected holdout catalog"
+        )
+        holdout_bytes = holdout_path.stat().st_size
+        holdout_sha256 = sha256_file(holdout_path)
+    else:
+        holdout_path = parent_snapshot.path("benchmark_holdouts.jsonl")
+        holdout_bytes, holdout_sha256 = parent_snapshot.binding(
+            "benchmark_holdouts.jsonl"
+        )
+    if parent_snapshot is None:
+        canonical_rows = _load_rows(holdout_path)
+    else:
+        canonical_rows = list(
+            _iter_parent_jsonl(
+                parent_release,
+                "benchmark_holdouts.jsonl",
+                parent_snapshot=parent_snapshot,
+            )
+        )
     if holdout_rows is None:
         rows = canonical_rows
     else:
@@ -746,8 +814,8 @@ def derive_protected_index_manifest(
         },
         "holdout": {
             "path": holdout_path.name,
-            "bytes": holdout_path.stat().st_size,
-            "sha256": sha256_file(holdout_path),
+            "bytes": holdout_bytes,
+            "sha256": holdout_sha256,
         },
         "decoder_sha256": hashlib.sha256(canonical_json_bytes(dict(decoder))).hexdigest(),
         "counts": {
@@ -1082,10 +1150,13 @@ def _build_classifier_calibration(
     model_hash: str,
     decode_workers: int = 8,
     published_source_path: Path | None = None,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> float:
     by_class: dict[str, list[dict[str, Any]]] = {name: [] for name in STRATA}
     seen: set[str] = set()
-    for row in iter_jsonl(parent / "training_candidates.jsonl"):
+    for row in _iter_parent_jsonl(
+        parent, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+    ):
         if row.get("modality") != "image_text" or not row.get("image_path"):
             continue
         expected = _keyword_class(str(row.get("prompt", "")))
@@ -1202,6 +1273,7 @@ def _build_selected_assets_in_directory(
     decode_workers: int = 8,
     published_output_dir: Path | None = None,
     published_config_output: Path | None = None,
+    parent_snapshot: ParentArtifactSnapshot,
 ) -> dict[str, Any]:
     """Build all local selected-view dependencies and the frozen config."""
     from PIL import __version__ as pillow_version
@@ -1215,7 +1287,7 @@ def _build_selected_assets_in_directory(
         Path(published_config_output or config_output)
     )
     parent_release = _validate_directory(Path(parent_release), label="parent release")
-    _validate_parent_release_fast(parent_release)
+    parent_snapshot.assert_for(parent_release)
     output_dir = _validate_directory(
         Path(output_dir), label="selected-view output directory"
     )
@@ -1236,23 +1308,21 @@ def _build_selected_assets_in_directory(
         raise ValueError("decode_workers must be a positive integer")
 
     manifest_path = _ordinary_file(parent_release / "manifest.json", label="parent manifest")
-    parent_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    parent_hash = sha256_file(manifest_path)
+    parent_manifest = parent_snapshot.manifest
+    parent_hash = parent_snapshot.manifest_sha256
+    _validate_parent_release_fast(parent_release, parent_snapshot=parent_snapshot)
+    _assert_parent_artifact_snapshot(parent_snapshot, verify_content=False)
     if parent_manifest.get("release_id") != parent_release.name:
         raise ValueError("parent manifest directory and release_id differ")
-    holdout_path = _manifest_artifact_path(
-        parent_release,
-        parent_manifest,
-        "benchmark_holdouts.jsonl",
-        label="protected holdout catalog",
+    holdout_path = parent_snapshot.path("benchmark_holdouts.jsonl")
+    candidate_path = parent_snapshot.path("training_candidates.jsonl")
+    holdout_rows = list(
+        _iter_parent_jsonl(
+            parent_release,
+            "benchmark_holdouts.jsonl",
+            parent_snapshot=parent_snapshot,
+        )
     )
-    candidate_path = _manifest_artifact_path(
-        parent_release,
-        parent_manifest,
-        "training_candidates.jsonl",
-        label="training candidate catalog",
-    )
-    holdout_rows = _load_rows(holdout_path)
     if len(holdout_rows) != 49_393:
         raise ValueError("protected holdout catalog must contain 49,393 rows")
     prompt_rows = unique_protected_prompts(holdout_rows)
@@ -1261,7 +1331,7 @@ def _build_selected_assets_in_directory(
         raise ValueError("protected prompt count differs from parent manifest")
     if len(image_rows) != int(parent_manifest["protected_unique_images"]):
         raise ValueError("protected image count differs from parent manifest")
-    _validate_source_prompt_fields(parent_release)
+    _validate_source_prompt_fields(parent_release, parent_snapshot=parent_snapshot)
     source_evidence = _source_evidence_from_parent(parent_manifest)
 
     decoder = {
@@ -1303,6 +1373,7 @@ def _build_selected_assets_in_directory(
             parent_release=parent_release,
             clip_checkpoint=checkpoint,
             decoder=decoder,
+            parent_snapshot=parent_snapshot,
         )
 
     source_input_paths = [
@@ -1328,7 +1399,9 @@ def _build_selected_assets_in_directory(
     bundle_input_dirs = [image_index_bundle_path.parent] if image_index_bundle_path else []
     image_input_dirs = list(_image_parent_directories(image_rows))
     seen_image_dirs = set(image_input_dirs)
-    for directory in _candidate_image_parent_directories(parent_release):
+    for directory in _candidate_image_parent_directories(
+        parent_release, parent_snapshot=parent_snapshot
+    ):
         if directory not in seen_image_dirs:
             seen_image_dirs.add(directory)
             image_input_dirs.append(directory)
@@ -1385,6 +1458,7 @@ def _build_selected_assets_in_directory(
         prompt_rows=prompt_rows,
         image_rows=image_rows,
         image_evidence=image_evidence,
+        parent_snapshot=parent_snapshot,
     )
 
     # No producer output is created until all parent, bundle, decoder, and
@@ -1570,6 +1644,15 @@ def _build_selected_assets_in_directory(
         artifact_path=classifier_artifact,
         model_hash=model_hash,
         published_source_path=published_path(classifier_source),
+        parent_snapshot=parent_snapshot,
+    )
+    # The calibration pass reads training_candidates.jsonl again.  Verify the
+    # complete parent closure after that final read and before publishing the
+    # derived configuration and indexes.
+    _revalidate_parent_release_after_reads(
+        parent_release,
+        expected_manifest_sha256=parent_hash,
+        snapshot=parent_snapshot,
     )
 
     config = {
@@ -1716,6 +1799,7 @@ def _fsync_tree(root: Path) -> None:
         os.close(descriptor)
 
 
+@parent_snapshot_scope
 def build_selected_assets(
     *,
     parent_release: Path,
@@ -1776,6 +1860,10 @@ def build_selected_assets(
         protected_input_dirs,
         label="selected-view config output",
     )
+    # Pin every parent artifact before creating staging outputs or invoking
+    # any expensive decoder/model work.  The descriptors remain valid if the
+    # published parent pathname is atomically replaced during this build.
+    parent_snapshot = _capture_parent_artifact_snapshot(parent_candidate)
     final_output_dir.parent.mkdir(parents=True, exist_ok=True)
     _validate_directory(final_output_dir.parent, label="selected-view output parent")
     staging = Path(
@@ -1786,31 +1874,54 @@ def build_selected_assets(
     )
     staging_config = staging / config_relative
     try:
-        config = _build_selected_assets_in_directory(
-            parent_release=parent_release,
-            output_dir=staging,
-            config_output=staging_config,
-            clip_checkpoint=clip_checkpoint,
-            tokenizer_root=tokenizer_root,
-            tokenizer_root_2=tokenizer_root_2,
-            image_index_bundle=image_index_bundle,
-            device=device,
-            batch_size=batch_size,
-            decode_workers=decode_workers,
-            published_output_dir=final_output_dir,
-            published_config_output=final_config_output,
-        )
-        _fsync_tree(staging)
-        os.replace(staging, final_output_dir)
-        descriptor = os.open(final_output_dir.parent, os.O_RDONLY)
         try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        return config
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+            config = _build_selected_assets_in_directory(
+                parent_release=parent_release,
+                output_dir=staging,
+                config_output=staging_config,
+                clip_checkpoint=clip_checkpoint,
+                tokenizer_root=tokenizer_root,
+                tokenizer_root_2=tokenizer_root_2,
+                image_index_bundle=image_index_bundle,
+                device=device,
+                batch_size=batch_size,
+                decode_workers=decode_workers,
+                published_output_dir=final_output_dir,
+                published_config_output=final_config_output,
+                parent_snapshot=parent_snapshot,
+            )
+            _fsync_tree(staging)
+            os.replace(staging, final_output_dir)
+            try:
+                # Close the final publication window: a parent replacement
+                # after the inner build check must not leave stale assets
+                # visible to downstream consumers.
+                _assert_parent_artifact_snapshot(parent_snapshot)
+            except BaseException:
+                shutil.rmtree(final_output_dir, ignore_errors=True)
+                try:
+                    descriptor = os.open(final_output_dir.parent, os.O_RDONLY)
+                except OSError:
+                    pass
+                else:
+                    try:
+                        os.fsync(descriptor)
+                    except OSError:
+                        pass
+                    finally:
+                        os.close(descriptor)
+                raise
+            descriptor = os.open(final_output_dir.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return config
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    finally:
+        parent_snapshot.close()
 
 
 __all__ = [

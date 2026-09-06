@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ if str(EVAL_ROOT) not in sys.path:
     sys.path.insert(0, str(EVAL_ROOT))
 
 from data_catalog import selected_assets
+import data_catalog.selected as selected_module
 from data_catalog.selected import (
     SELECTED_IMAGE_MAX_PIXELS,
     _validate_calibration,
@@ -24,10 +26,13 @@ from data_catalog.selected_assets import (
     SOURCE_PROMPT_FIELDS,
     TOKENIZER_FILE_SHA256,
     _calibration_artifact,
+    _assert_parent_artifact_snapshot,
+    _capture_parent_artifact_snapshot,
     _cyclic_hamming_distances,
     _preflight_selected_asset_destinations,
     _selected_asset_destinations,
     _protected_sample_ids,
+    _revalidate_parent_release_after_reads,
     _source_evidence_from_parent,
     _validate_source_prompt_fields,
     derive_protected_index_manifest,
@@ -328,6 +333,286 @@ def test_selected_asset_preflight_rejects_duplicate_destinations(tmp_path: Path)
         _preflight_selected_asset_destinations(
             (("config", duplicate), ("asset_manifest", duplicate)), []
         )
+
+
+def test_parent_revalidation_rejects_manifest_changed_after_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    manifest = parent / "manifest.json"
+    manifest.write_text('{"release_id":"before"}\n', encoding="utf-8")
+
+    def mutate_after_validation(_path: Path) -> Path:
+        manifest.write_text('{"release_id":"after"}\n', encoding="utf-8")
+        return parent
+
+    monkeypatch.setattr(
+        selected_assets, "_validate_parent_release_fast", mutate_after_validation
+    )
+    with pytest.raises(RuntimeError, match="parent catalog changed"):
+        _revalidate_parent_release_after_reads(
+            parent,
+            expected_manifest_sha256=hashlib.sha256(
+                b'{"release_id":"before"}\n'
+            ).hexdigest(),
+        )
+
+
+def test_parent_snapshot_rejects_atomic_artifact_replacement(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    manifest = parent / "manifest.json"
+    artifact = parent / "training_candidates.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "path": artifact.name,
+                        "bytes": len(b"original\n"),
+                        "sha256": hashlib.sha256(b"original\n").hexdigest(),
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    artifact.write_bytes(b"original\n")
+    snapshot = _capture_parent_artifact_snapshot(
+        parent,
+        json.loads(manifest.read_text(encoding="utf-8")),
+    )
+    replacement = parent / "replacement.jsonl"
+    replacement.write_bytes(b"original\n")
+    replacement.replace(artifact)
+    with pytest.raises(RuntimeError, match="parent catalog changed"):
+        _assert_parent_artifact_snapshot(snapshot)
+
+
+def test_parent_snapshot_reads_pinned_bytes_after_directory_swap(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    alternate = tmp_path / "alternate"
+    parent.mkdir()
+    alternate.mkdir()
+    original = json.dumps({"id": "original"}, sort_keys=True).encode() + b"\n"
+    replacement = json.dumps({"id": "replacement"}, sort_keys=True).encode() + b"\n"
+    for directory, payload in ((parent, original), (alternate, replacement)):
+        artifact = directory / "training_candidates.jsonl"
+        artifact.write_bytes(payload)
+        (directory / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "artifacts": [
+                        {
+                            "path": artifact.name,
+                            "bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    snapshot = _capture_parent_artifact_snapshot(parent)
+    saved = tmp_path / "saved"
+    os.replace(parent, saved)
+    os.replace(alternate, parent)
+    try:
+        consumed = list(snapshot.iter_jsonl("training_candidates.jsonl"))
+    finally:
+        os.replace(parent, alternate)
+        os.replace(saved, parent)
+        snapshot.close()
+    assert consumed == [{"id": "original"}]
+
+
+def test_parent_snapshot_rejects_transient_jsonl_rewrite_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    original = b'{"id":"original"}\n'
+    replacement = b'{"id":"replacement"}\n'
+    artifact = parent / "training_candidates.jsonl"
+    artifact.write_bytes(original)
+    (parent / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "path": artifact.name,
+                        "bytes": len(original),
+                        "sha256": hashlib.sha256(original).hexdigest(),
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    real_iter = selected_module._iter_jsonl_descriptor
+
+    # Model a filesystem whose metadata can remain stale while bytes are
+    # rewritten, as the catalog validator's race tests do.
+    with monkeypatch.context() as patch:
+        patch.setattr(selected_module, "_artifact_identity", lambda _value: (1, 2, 3, 4, 5))
+        snapshot = _capture_parent_artifact_snapshot(parent)
+
+        def rewrite_then_restore(descriptor, path, **kwargs):
+            path.write_bytes(replacement)
+            iterator = real_iter(descriptor, path, **kwargs)
+            try:
+                row = next(iterator)
+            finally:
+                path.write_bytes(original)
+            yield row
+            yield from iterator
+
+        patch.setattr(
+            selected_module,
+            "_iter_jsonl_descriptor",
+            rewrite_then_restore,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="parent catalog changed"):
+                list(snapshot.iter_jsonl("training_candidates.jsonl"))
+        finally:
+            snapshot.close()
+
+
+def test_parent_snapshot_rejects_transient_read_bytes_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    original = b"original\n"
+    replacement = b"replaced!\n"
+    artifact = parent / "training_candidates.jsonl"
+    artifact.write_bytes(original)
+    (parent / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "path": artifact.name,
+                        "bytes": len(original),
+                        "sha256": hashlib.sha256(original).hexdigest(),
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    real_read = selected_module._read_descriptor_bytes
+    with monkeypatch.context() as patch:
+        patch.setattr(selected_module, "_artifact_identity", lambda _value: (1, 2, 3, 4, 5))
+        snapshot = _capture_parent_artifact_snapshot(parent)
+
+        def rewrite_then_restore(descriptor):
+            artifact.write_bytes(replacement)
+            try:
+                return real_read(descriptor)
+            finally:
+                artifact.write_bytes(original)
+
+        patch.setattr(selected_module, "_read_descriptor_bytes", rewrite_then_restore)
+        try:
+            with pytest.raises(RuntimeError, match="parent catalog changed"):
+                snapshot.read_bytes("training_candidates.jsonl")
+        finally:
+            snapshot.close()
+
+
+def test_build_selected_assets_closes_snapshot_when_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[bool] = []
+
+    class _Snapshot:
+        def close(self) -> None:
+            closed.append(True)
+
+    snapshot = _Snapshot()
+
+    def capture(_parent: Path) -> _Snapshot:
+        # The real capture helper registers snapshots in this scope.  Mirror
+        # that ownership contract while keeping this test model-free.
+        selected_module._register_parent_snapshot(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(selected_assets, "_capture_parent_artifact_snapshot", capture)
+    real_validate_directory = selected_assets._validate_directory
+
+    def fail_output_parent(path: Path, *, label: str) -> Path:
+        if label == "selected-view output parent":
+            raise RuntimeError("setup failure")
+        return real_validate_directory(path, label=label)
+
+    monkeypatch.setattr(selected_assets, "_validate_directory", fail_output_parent)
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    output_dir = tmp_path / "outputs" / "selected"
+    with pytest.raises(RuntimeError, match="setup failure"):
+        selected_assets.build_selected_assets(
+            parent_release=input_root / "parent",
+            output_dir=output_dir,
+            config_output=output_dir / "config.json",
+            clip_checkpoint=input_root / "clip.pt",
+            tokenizer_root=input_root / "tokenizer",
+            tokenizer_root_2=input_root / "tokenizer-2",
+        )
+
+    assert closed == [True]
+
+
+def test_build_selected_assets_removes_publication_when_parent_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[bool] = []
+
+    class _Snapshot:
+        def close(self) -> None:
+            closed.append(True)
+
+    snapshot = _Snapshot()
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    output_dir = tmp_path / "outputs" / "selected"
+
+    monkeypatch.setattr(
+        selected_assets,
+        "_capture_parent_artifact_snapshot",
+        lambda _path: snapshot,
+    )
+    monkeypatch.setattr(
+        selected_assets,
+        "_build_selected_assets_in_directory",
+        lambda **_kwargs: {"stub": True},
+    )
+    monkeypatch.setattr(selected_assets, "_fsync_tree", lambda _path: None)
+
+    def parent_changed(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("parent changed after publication")
+
+    monkeypatch.setattr(
+        selected_assets, "_assert_parent_artifact_snapshot", parent_changed
+    )
+    with pytest.raises(RuntimeError, match="parent changed after publication"):
+        selected_assets.build_selected_assets(
+            parent_release=input_root / "parent",
+            output_dir=output_dir,
+            config_output=output_dir / "config.json",
+            clip_checkpoint=input_root / "clip.pt",
+            tokenizer_root=input_root / "tokenizer",
+            tokenizer_root_2=input_root / "tokenizer-2",
+        )
+
+    assert not output_dir.exists()
+    assert closed == [True]
 
 
 def test_source_prompt_fields_match_normalized_catalog_contract() -> None:

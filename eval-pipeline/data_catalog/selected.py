@@ -20,8 +20,10 @@ import threading
 import warnings
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,9 @@ from .builder import (
     CATALOG_SCHEMA,
     REPOSITORY_ROOT,
     _run_git_bytes,
+    _iter_jsonl_descriptor,
+    _sha256_descriptor,
+    _sha256_path_snapshot,
     _validate_formal_git_record,
     _validate_recorded_upstream_ancestry,
     validate_release_artifact_closure,
@@ -464,14 +469,20 @@ def _protected_calibration_sample_ids(ids: Sequence[str], count: int = 128) -> l
     ]
 
 
-def _classifier_calibration_sample_ids(parent_dir: Path) -> list[str]:
+def _classifier_calibration_sample_ids(
+    parent_dir: Path,
+    *,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
+) -> list[str]:
     """Reproduce the producer's balanced, ID-sorted classifier cohort."""
     from .selected_assets import STRATA as ASSET_STRATA
     from .selected_assets import _keyword_class
 
     by_class: dict[str, list[tuple[str, str]]] = {name: [] for name in ASSET_STRATA}
     seen: set[str] = set()
-    for row in iter_jsonl(parent_dir / "training_candidates.jsonl"):
+    for row in _iter_parent_jsonl(
+        parent_dir, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+    ):
         if row.get("modality") != "image_text" or not row.get("image_path"):
             continue
         expected = _keyword_class(str(row.get("prompt", "")))
@@ -591,6 +602,7 @@ def _validate_protected_index_binding(
     parent_dir: Path,
     parent_manifest_sha256: str,
     decoder: Mapping[str, Any],
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Validate frozen cohort evidence and every index's ordered IDs.
 
@@ -631,6 +643,7 @@ def _validate_protected_index_binding(
             if isinstance(frozen_images, list)
             else None,
             verify_image_evidence=True,
+            parent_snapshot=parent_snapshot,
         )
     except (KeyError, OSError, TypeError, ValueError) as exc:
         raise ValueError("cannot derive the protected index manifest from the parent") from exc
@@ -705,7 +718,11 @@ def _validate_protected_index_binding(
 
 
 def _legacy_protected_index_info(
-    protected: Mapping[str, Any], *, parent: Mapping[str, Any], parent_dir: Path
+    protected: Mapping[str, Any],
+    *,
+    parent: Mapping[str, Any],
+    parent_dir: Path,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any] | None:
     """Read the pre-manifest fixture contract when the parent is not formal.
 
@@ -716,7 +733,12 @@ def _legacy_protected_index_info(
     omit the identity manifest.
     """
     try:
-        row_count = sum(1 for _ in iter_jsonl(parent_dir / "benchmark_holdouts.jsonl"))
+        row_count = sum(
+            1
+            for _ in _iter_parent_jsonl(
+                parent_dir, "benchmark_holdouts.jsonl", parent_snapshot=parent_snapshot
+            )
+        )
     except (OSError, ValueError):
         return None
     if row_count == 49393:
@@ -756,6 +778,7 @@ def _validate_config(
     parent: Mapping[str, Any],
     parent_dir: Path,
     parent_manifest_sha256: str,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     expected_keys = {
         "schema",
@@ -928,7 +951,10 @@ def _validate_config(
         and isinstance(parent, Mapping)
     ):
         protected_info = _legacy_protected_index_info(
-            protected, parent=parent, parent_dir=parent_dir
+            protected,
+            parent=parent,
+            parent_dir=parent_dir,
+            parent_snapshot=parent_snapshot,
         )
         if protected_info is None:
             raise ValueError("protected index manifest is required for a formal parent")
@@ -939,6 +965,7 @@ def _validate_config(
             parent_dir=parent_dir,
             parent_manifest_sha256=parent_manifest_sha256,
             decoder=decoder,
+            parent_snapshot=parent_snapshot,
         )
     protected_calibration_enabled = not bool(protected_info.get("legacy"))
     semantic_calibration_binding = (
@@ -970,7 +997,9 @@ def _validate_config(
     )
 
     classifier_sample_ids = (
-        _classifier_calibration_sample_ids(parent_dir)
+        _classifier_calibration_sample_ids(
+            parent_dir, parent_snapshot=parent_snapshot
+        )
         if protected_calibration_enabled
         else None
     )
@@ -1158,10 +1187,17 @@ def _validate_text_check(
         raise ValueError(f"{label} has an exact protected-prompt match")
 
 
-def _load_protected_exact_index(parent_dir: Path) -> dict[str, tuple[str, ...]]:
+def _load_protected_exact_index(
+    parent_dir: Path,
+    *,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
+) -> dict[str, tuple[str, ...]]:
     matches: dict[str, set[str]] = {}
     for row_number, row in enumerate(
-        iter_jsonl(parent_dir / "benchmark_holdouts.jsonl"), 1
+        _iter_parent_jsonl(
+            parent_dir, "benchmark_holdouts.jsonl", parent_snapshot=parent_snapshot
+        ),
+        1,
     ):
         prompt = row.get("prompt")
         row_id = row.get("id")
@@ -1290,6 +1326,7 @@ def _validate_selected_rows(
     *,
     parent_dir: Path,
     frozen: Mapping[str, Any],
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> tuple[dict[str, Any], ...]:
     rows = list(iter_jsonl(payload_path))
     if len(rows) != 96:
@@ -1302,7 +1339,9 @@ def _validate_selected_rows(
 
     candidates: dict[str, dict[str, Any]] = {}
     selected_set = set(selected_ids)
-    for candidate in iter_jsonl(parent_dir / "training_candidates.jsonl"):
+    for candidate in _iter_parent_jsonl(
+        parent_dir, "training_candidates.jsonl", parent_snapshot=parent_snapshot
+    ):
         row_id = candidate.get("id")
         if row_id in selected_set:
             if row_id in candidates:
@@ -1316,7 +1355,9 @@ def _validate_selected_rows(
     image_paths: set[Path] = set()
     raw_hashes: set[str] = set()
     pixel_hashes: set[str] = set()
-    protected_exact = _load_protected_exact_index(parent_dir)
+    protected_exact = _load_protected_exact_index(
+        parent_dir, parent_snapshot=parent_snapshot
+    )
     source_order = {name: index for index, name in enumerate(SOURCES)}
     stratum_order = {name: index for index, name in enumerate(STRATA)}
     observed_order = []
@@ -1508,11 +1549,431 @@ def _artifact_projection(artifact: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_candidate_parent(parent_dir: Path, repository_root: Path) -> dict[str, Any]:
+def _artifact_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Return the identity used to pin one parent artifact path."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+@dataclass
+class _PinnedParentFile:
+    name: str
+    path: Path
+    descriptor: int
+    expected_digest: str
+    expected_bytes: int
+    identity: tuple[int, int, int, int, int]
+
+
+class ParentArtifactSnapshot:
+    """Hold one parent catalog's descriptors for the complete read window.
+
+    Every catalog artifact is opened relative to a pinned directory descriptor.
+    Consumers duplicate those descriptors for JSONL/JSON reads, so replacing
+    and restoring the pathname cannot redirect a downstream read to another
+    release.  The original path is still checked at each boundary to fail
+    closed when a replacement remains visible.
+    """
+
+    def __init__(
+        self,
+        parent_dir: Path,
+        directory_descriptor: int,
+        files: Mapping[str, _PinnedParentFile],
+        manifest: Mapping[str, Any],
+        manifest_sha256: str,
+    ) -> None:
+        self.parent_dir = Path(parent_dir).absolute()
+        self._directory_descriptor = directory_descriptor
+        self._files = dict(files)
+        self.manifest = dict(manifest)
+        self.manifest_sha256 = manifest_sha256
+        self._closed = False
+
+    @property
+    def descriptors(self) -> dict[str, int]:
+        if self._closed:
+            raise RuntimeError("parent artifact snapshot is closed")
+        return {name: item.descriptor for name, item in self._files.items()}
+
+    def path(self, name: str) -> Path:
+        try:
+            return self._files[name].path
+        except KeyError as exc:
+            raise KeyError(f"parent artifact is not pinned: {name}") from exc
+
+    def binding(self, name: str) -> tuple[int, str]:
+        """Return the pinned byte count and digest for one artifact."""
+        item = self._file(name)
+        self._assert_descriptor_identity(item, item.descriptor)
+        return item.expected_bytes, item.expected_digest
+
+    def assert_for(self, parent_dir: Path) -> None:
+        """Require that this snapshot belongs to the supplied parent path."""
+        expected = _absolute_without_symlinks(
+            Path(parent_dir).absolute(), label="parent release"
+        )
+        if self.parent_dir != expected:
+            raise ValueError("parent artifact snapshot path differs from the parent release")
+
+    def duplicate(self, name: str) -> int:
+        if self._closed:
+            raise RuntimeError("parent artifact snapshot is closed")
+        try:
+            return os.dup(self._files[name].descriptor)
+        except (KeyError, OSError) as exc:
+            raise RuntimeError(f"parent artifact is not pinned: {name}") from exc
+
+    def _file(self, name: str) -> _PinnedParentFile:
+        if self._closed:
+            raise RuntimeError("parent artifact snapshot is closed")
+        try:
+            return self._files[name]
+        except KeyError as exc:
+            raise KeyError(f"parent artifact is not pinned: {name}") from exc
+
+    @staticmethod
+    def _assert_descriptor_identity(
+        item: _PinnedParentFile, descriptor: int
+    ) -> None:
+        """Verify that a read still refers to the pinned inode."""
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or _artifact_identity(descriptor_stat) != item.identity
+            ):
+                raise ValueError("pinned parent artifact identity changed")
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("parent catalog changed while it was read") from exc
+
+    @classmethod
+    def _assert_payload(
+        cls, item: _PinnedParentFile, descriptor: int, payload: bytes
+    ) -> None:
+        """Verify the exact bytes exposed by one descriptor read."""
+        cls._assert_descriptor_identity(item, descriptor)
+        if (
+            len(payload) != item.expected_bytes
+            or hashlib.sha256(payload).hexdigest() != item.expected_digest
+        ):
+            raise RuntimeError("parent catalog changed while it was read")
+
+    def read_bytes(self, name: str) -> bytes:
+        item = self._file(name)
+        descriptor = self.duplicate(name)
+        try:
+            payload = _read_descriptor_bytes(descriptor)
+            self._assert_payload(item, descriptor, payload)
+            return payload
+        finally:
+            os.close(descriptor)
+
+    def iter_jsonl(self, name: str):
+        item = self._file(name)
+        descriptor = self.duplicate(name)
+        digest = hashlib.sha256()
+        try:
+            yield from _iter_jsonl_descriptor(
+                descriptor, self.path(name), digest=digest
+            )
+            # The iterator hashes every raw line before exposing its parsed
+            # row.  Check that digest after EOF so a transient rewrite that is
+            # restored before the final snapshot assertion cannot be hidden.
+            payload_size = os.fstat(descriptor).st_size
+            if (
+                payload_size != item.expected_bytes
+                or digest.hexdigest() != item.expected_digest
+            ):
+                raise RuntimeError("parent catalog changed while it was read")
+            self._assert_descriptor_identity(item, descriptor)
+        finally:
+            os.close(descriptor)
+
+    def assert_unchanged(self, *, verify_content: bool = True) -> None:
+        if self._closed:
+            raise RuntimeError("parent artifact snapshot is closed")
+        if type(verify_content) is not bool:
+            raise TypeError("verify_content must be boolean")
+        for item in self._files.values():
+            try:
+                descriptor_stat = os.fstat(item.descriptor)
+                if not stat.S_ISREG(descriptor_stat.st_mode):
+                    raise ValueError("pinned parent artifact is no longer regular")
+                if _artifact_identity(descriptor_stat) != item.identity:
+                    raise ValueError("pinned parent artifact identity changed")
+                path_stat = os.stat(item.path, follow_symlinks=False)
+                if _artifact_identity(path_stat) != item.identity:
+                    raise ValueError("parent artifact pathname identity changed")
+                if verify_content and _sha256_descriptor(item.descriptor) != item.expected_digest:
+                    raise ValueError("pinned parent artifact content changed")
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise RuntimeError("parent catalog changed while it was read") from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for item in self._files.values():
+            try:
+                os.close(item.descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(self._directory_descriptor)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "ParentArtifactSnapshot":
+        if self._closed:
+            raise RuntimeError("parent artifact snapshot is closed")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - last-resort cleanup
+        self.close()
+
+
+_PARENT_SNAPSHOT_SCOPE: ContextVar[list[ParentArtifactSnapshot] | None] = ContextVar(
+    "repldm_parent_snapshot_scope", default=None
+)
+
+
+def _register_parent_snapshot(snapshot: ParentArtifactSnapshot) -> None:
+    """Register a newly captured snapshot with the current owning entrypoint."""
+    owned = _PARENT_SNAPSHOT_SCOPE.get()
+    if owned is not None:
+        owned.append(snapshot)
+
+
+@contextmanager
+def _parent_snapshot_scope():
+    """Close every snapshot captured while one public operation is running."""
+    owned: list[ParentArtifactSnapshot] = []
+    token = _PARENT_SNAPSHOT_SCOPE.set(owned)
+    try:
+        yield
+    finally:
+        for snapshot in reversed(owned):
+            snapshot.close()
+        _PARENT_SNAPSHOT_SCOPE.reset(token)
+
+
+def parent_snapshot_scope(function):
+    """Decorate an entrypoint so parent descriptors always have an owner."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _parent_snapshot_scope():
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def _open_parent_child(directory_descriptor: int, name: str, *, label: str) -> int:
+    if not name or Path(name).name != name or name in {".", ".."}:
+        raise ValueError(f"{label} path is not a basename: {name!r}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable: {name}") from exc
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f"{label} is not a regular file: {name}")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_descriptor_bytes(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 8 * 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _capture_parent_artifact_snapshot(
+    parent_dir: Path,
+    parent: Mapping[str, Any] | None = None,
+    *,
+    manifest_sha256: str | None = None,
+) -> ParentArtifactSnapshot:
+    """Open one parent directory and all catalog artifacts before validation."""
+    parent_dir = _absolute_without_symlinks(Path(parent_dir).absolute(), label="parent release")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        directory_descriptor = os.open(parent_dir, directory_flags)
+    except OSError as exc:
+        raise ValueError(f"candidate parent directory is unavailable: {parent_dir}") from exc
+    files: dict[str, _PinnedParentFile] = {}
+    try:
+        directory_stat = os.fstat(directory_descriptor)
+        path_stat = os.stat(parent_dir, follow_symlinks=False)
+        if not stat.S_ISDIR(directory_stat.st_mode) or _artifact_identity(directory_stat)[:2] != _artifact_identity(path_stat)[:2]:
+            raise ValueError("candidate parent directory changed while it was opened")
+
+        manifest_descriptor = _open_parent_child(
+            directory_descriptor, "manifest.json", label="candidate parent manifest"
+        )
+        files["manifest.json"] = _PinnedParentFile(
+            "manifest.json",
+            parent_dir / "manifest.json",
+            manifest_descriptor,
+            "",
+            0,
+            _artifact_identity(os.fstat(manifest_descriptor)),
+        )
+        manifest_bytes = _read_descriptor_bytes(manifest_descriptor)
+        observed_manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+        if manifest_sha256 is not None and observed_manifest_hash != manifest_sha256:
+            raise ValueError("candidate parent manifest hash differs from its binding")
+        try:
+            loaded = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("candidate parent manifest is not readable JSON") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("candidate parent manifest must contain one JSON object")
+        if parent is not None and dict(parent) != loaded:
+            raise ValueError("candidate parent manifest changed while it was read")
+        parent = loaded
+        manifest_file = files["manifest.json"]
+        manifest_file.expected_digest = observed_manifest_hash
+        manifest_file.expected_bytes = len(manifest_bytes)
+
+        artifacts = parent.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ValueError("candidate parent lacks an artifact inventory")
+        config_snapshot = parent.get("config_snapshot")
+        names: list[tuple[str, str, int, str]] = []
+        if isinstance(config_snapshot, Mapping):
+            config_name = config_snapshot.get("path")
+            config_bytes = config_snapshot.get("bytes")
+            config_hash = config_snapshot.get("sha256")
+            if (
+                isinstance(config_name, str)
+                and isinstance(config_bytes, int)
+                and not isinstance(config_bytes, bool)
+                and config_bytes >= 0
+                and isinstance(config_hash, str)
+                and _SHA256_RE.fullmatch(config_hash)
+            ):
+                names.append((config_name, "config snapshot", config_bytes, config_hash))
+            else:
+                raise ValueError("candidate parent config snapshot is invalid")
+        elif config_snapshot is not None:
+            raise ValueError("candidate parent config snapshot is invalid")
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                raise ValueError("candidate parent artifact binding is invalid")
+            name = artifact.get("path")
+            digest = artifact.get("sha256")
+            size = artifact.get("bytes")
+            if (
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not name
+                or name in {".", ".."}
+                or not isinstance(digest, str)
+                or _SHA256_RE.fullmatch(digest) is None
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+            ):
+                raise ValueError(f"candidate parent artifact binding is invalid: {name!r}")
+            names.append((name, "candidate parent artifact", size, digest))
+        if len({name for name, *_ in names}) != len(names):
+            raise ValueError("candidate parent artifact paths are duplicated")
+        for name, label, expected_bytes, expected_digest in names:
+            descriptor = _open_parent_child(directory_descriptor, name, label=label)
+            status = os.fstat(descriptor)
+            if status.st_size != expected_bytes:
+                os.close(descriptor)
+                raise ValueError(f"candidate parent artifact byte count differs: {name}")
+            files[name] = _PinnedParentFile(
+                name,
+                parent_dir / name,
+                descriptor,
+                expected_digest,
+                expected_bytes,
+                _artifact_identity(status),
+            )
+        snapshot = ParentArtifactSnapshot(
+            parent_dir,
+            directory_descriptor,
+            files,
+            parent,
+            observed_manifest_hash,
+        )
+        _register_parent_snapshot(snapshot)
+        return snapshot
+    except BaseException:
+        for item in files.values():
+            try:
+                os.close(item.descriptor)
+            except OSError:
+                pass
+        os.close(directory_descriptor)
+        raise
+
+
+def _assert_parent_artifact_snapshot(
+    snapshot: ParentArtifactSnapshot, *, verify_content: bool = True
+) -> None:
+    if not isinstance(snapshot, ParentArtifactSnapshot):
+        raise ValueError("parent artifact snapshot is invalid")
+    snapshot.assert_unchanged(verify_content=verify_content)
+
+
+def _iter_parent_jsonl(
+    parent_dir: Path,
+    name: str,
+    *,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
+):
+    """Iterate a parent JSONL artifact through its pinned descriptor when available."""
+    if parent_snapshot is None:
+        yield from iter_jsonl(parent_dir / name)
+    else:
+        parent_snapshot.assert_for(parent_dir)
+        yield from parent_snapshot.iter_jsonl(name)
+
+
+def _validate_candidate_parent(
+    parent_dir: Path,
+    repository_root: Path,
+    *,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
+) -> dict[str, Any]:
     """Validate the published parent closure without replaying its derivations."""
+    if parent_snapshot is not None:
+        parent_snapshot.assert_for(parent_dir)
     return validate_release_artifact_closure(
         parent_dir,
         require_training_ready=False,
+        pinned_descriptors=(parent_snapshot.descriptors if parent_snapshot is not None else None),
     )
 
 
@@ -1520,7 +1981,8 @@ def _validate_parent_binding(
     value: object,
     *,
     repository_root: Path,
-) -> tuple[dict[str, Any], Path, str]:
+    parent_snapshot: ParentArtifactSnapshot | None = None,
+) -> tuple[dict[str, Any], Path, str, ParentArtifactSnapshot]:
     if not isinstance(value, Mapping) or set(value) != {
         "path",
         "release_id",
@@ -1539,10 +2001,28 @@ def _validate_parent_binding(
     parent_dir = parent_manifest_path.parent
     if parent_dir.parent != catalogs_root:
         raise ValueError("candidate parent must be a direct child of DATA/catalogs")
-    parent_hash = sha256_file(parent_manifest_path)
-    if value.get("manifest_sha256") != parent_hash:
-        raise ValueError("candidate parent manifest hash differs from the child binding")
-    parent = _validate_candidate_parent(parent_dir, repository_root)
+    expected_parent_hash = value.get("manifest_sha256")
+    if not isinstance(expected_parent_hash, str) or _SHA256_RE.fullmatch(expected_parent_hash) is None:
+        raise ValueError("candidate parent manifest hash is invalid")
+    # Capture the binding before the expensive closure validation.  Capturing
+    # only after validation leaves a window in which a different valid parent
+    # can be substituted and then become the basis for downstream reads.
+    if parent_snapshot is None:
+        parent_snapshot = _capture_parent_artifact_snapshot(
+            parent_dir, manifest_sha256=expected_parent_hash
+        )
+    elif parent_snapshot.parent_dir != parent_dir:
+        raise ValueError("candidate parent snapshot path differs from its binding")
+    elif parent_snapshot.manifest_sha256 != expected_parent_hash:
+        raise ValueError("candidate parent snapshot hash differs from its binding")
+    parent_candidate = parent_snapshot.manifest
+    parent_hash = parent_snapshot.manifest_sha256
+    parent = _validate_candidate_parent(
+        parent_dir, repository_root, parent_snapshot=parent_snapshot
+    )
+    _assert_parent_artifact_snapshot(parent_snapshot, verify_content=False)
+    if parent != parent_candidate:
+        raise ValueError("candidate parent manifest changed while it was validated")
     if (
         parent.get("schema") != CATALOG_SCHEMA
         or parent.get("release_id") != value.get("release_id")
@@ -1574,12 +2054,17 @@ def _validate_parent_binding(
     if bindings != expected:
         raise ValueError("selected child parent artifact hashes differ from the parent manifest")
     for binding in bindings:
-        _validate_file_binding(
-            binding,
-            label=f"candidate parent artifact {binding['path']}",
-            release_dir=parent_dir,
-        )
-    return parent, parent_dir, parent_hash
+        name = binding["path"]
+        try:
+            pinned = parent_snapshot._files[name]
+        except KeyError as exc:
+            raise ValueError(f"candidate parent artifact is not pinned: {name}") from exc
+        if (
+            binding.get("bytes") != pinned.expected_bytes
+            or binding.get("sha256") != pinned.expected_digest
+        ):
+            raise ValueError(f"candidate parent artifact changed while it was read: {name}")
+    return parent, parent_dir, parent_hash, parent_snapshot
 
 
 def _validate_selected_git(
@@ -1714,6 +2199,7 @@ def _validate_gate_report(
     return report
 
 
+@parent_snapshot_scope
 def validate_selected_view_release(
     release_dir: Path,
     *,
@@ -1721,6 +2207,7 @@ def validate_selected_view_release(
     require_formal: bool = True,
     require_training_ready: bool = True,
     require_gate_report: bool = False,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Validate one content-addressed child release or fail closed."""
     repository_root = _absolute_without_symlinks(
@@ -1800,8 +2287,10 @@ def validate_selected_view_release(
     if report is not None and report["training_ready"] is not training_ready:
         raise ValueError("selected child readiness differs from its gate report")
 
-    parent, parent_dir, parent_hash = _validate_parent_binding(
-        manifest.get("parent_catalog"), repository_root=repository_root
+    parent, parent_dir, parent_hash, parent_snapshot = _validate_parent_binding(
+        manifest.get("parent_catalog"),
+        repository_root=repository_root,
+        parent_snapshot=parent_snapshot,
     )
     config_path = _validate_file_binding(
         manifest.get("config"),
@@ -1820,6 +2309,7 @@ def validate_selected_view_release(
             parent=parent,
             parent_dir=parent_dir,
             parent_manifest_sha256=parent_hash,
+            parent_snapshot=parent_snapshot,
         )
     except (OSError, ValueError):
         failure_codes = (
@@ -1869,7 +2359,10 @@ def validate_selected_view_release(
                 "selected payload descriptor must bind exactly 64 train and 32 validation"
             )
         rows = _validate_selected_rows(
-            payload_path, parent_dir=parent_dir, frozen=frozen
+            payload_path,
+            parent_dir=parent_dir,
+            frozen=frozen,
+            parent_snapshot=parent_snapshot,
         )
         observed_splits = Counter(row["selected_split"] for row in rows)
         if dict(observed_splits) != {"train": 64, "validation": 32}:
@@ -1878,6 +2371,9 @@ def validate_selected_view_release(
             raise ValueError("selected payload exists despite an incomplete gate report")
     elif report is None or report["selection_complete"] is not False:
         raise ValueError("selected child omits a completed selected payload")
+    # The parent was fully validated before row parsing.  Compare pinned
+    # identities here instead of rescanning every multi-gigabyte artifact.
+    _assert_parent_artifact_snapshot(parent_snapshot)
     return manifest
 
 

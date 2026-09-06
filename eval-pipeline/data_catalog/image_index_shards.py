@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -20,7 +21,16 @@ from typing import Any
 import numpy as np
 
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
-from .selected import SELECTED_IMAGE_MAX_PIXELS, decode_image_payload, dct_phash_v1
+from .selected import (
+    SELECTED_IMAGE_MAX_PIXELS,
+    ParentArtifactSnapshot,
+    _assert_parent_artifact_snapshot,
+    _capture_parent_artifact_snapshot,
+    _iter_parent_jsonl,
+    parent_snapshot_scope,
+    decode_image_payload,
+    dct_phash_v1,
+)
 from .selected_assets import (
     _absolute_path,
     _encode_images,
@@ -174,28 +184,57 @@ def _read_json(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _parent_rows(
-    parent_release: Path, *, validate_files: bool, validate_records: bool = True
+    parent_release: Path,
+    *,
+    validate_files: bool,
+    validate_records: bool = True,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
-    validator = _validate_parent_release if validate_records else _validate_parent_release_fast
-    parent_release = validator(parent_release)
-    manifest_path = _ordinary_file(parent_release / "manifest.json", label="parent manifest")
-    manifest = _read_json(manifest_path, label="parent manifest")
+    if parent_snapshot is not None:
+        parent_snapshot.assert_for(parent_release)
+        # Pinning protects each read, but does not replace the formal parent
+        # closure check.  Validate the pinned bytes before consuming any rows.
+        parent_release = _validate_parent_release_fast(
+            parent_release, parent_snapshot=parent_snapshot
+        )
+    if parent_snapshot is None:
+        validator = _validate_parent_release if validate_records else _validate_parent_release_fast
+        parent_release = validator(parent_release)
+        manifest_path = _ordinary_file(parent_release / "manifest.json", label="parent manifest")
+        manifest = _read_json(manifest_path, label="parent manifest")
+    else:
+        manifest = dict(parent_snapshot.manifest)
+        manifest_path = parent_snapshot.path("manifest.json")
     if manifest.get("release_id") != parent_release.name:
         raise ValueError("parent manifest directory and release_id differ")
     if manifest.get("candidate_catalog_complete") is not True:
         raise ValueError("parent catalog is not a complete candidate release")
-    holdout_path = _manifest_artifact_path(
-        parent_release,
-        manifest,
-        "benchmark_holdouts.jsonl",
-        label="protected holdout catalog",
+    holdout_path = (
+        parent_snapshot.path("benchmark_holdouts.jsonl")
+        if parent_snapshot is not None
+        else _manifest_artifact_path(
+            parent_release,
+            manifest,
+            "benchmark_holdouts.jsonl",
+            label="protected holdout catalog",
+        )
     )
     holdout_artifacts = [
         value
         for value in manifest.get("artifacts", [])
         if isinstance(value, Mapping) and value.get("path") == "benchmark_holdouts.jsonl"
     ]
-    rows = _load_rows(holdout_path)
+    rows = (
+        list(
+            _iter_parent_jsonl(
+                parent_release,
+                "benchmark_holdouts.jsonl",
+                parent_snapshot=parent_snapshot,
+            )
+        )
+        if parent_snapshot is not None
+        else _load_rows(holdout_path)
+    )
     if len(rows) != 49_393:
         raise ValueError("protected holdout catalog must contain 49,393 rows")
     if len(holdout_artifacts) != 1 or holdout_artifacts[0].get("rows") != len(rows):
@@ -208,7 +247,13 @@ def _parent_rows(
     expected_images = manifest.get("protected_unique_images")
     if type(expected_images) is not int or len(images) != expected_images:
         raise ValueError("protected image count differs from parent manifest")
-    return manifest, sha256_file(manifest_path), images
+    return (
+        manifest,
+        parent_snapshot.manifest_sha256
+        if parent_snapshot is not None
+        else sha256_file(manifest_path),
+        images,
+    )
 
 
 def _checkpoint_descriptor(checkpoint: Path) -> dict[str, Any]:
@@ -227,6 +272,7 @@ def _build_image_index_shard_in_directory(
     batch_size: int = 32,
     decode_workers: int = 8,
     published_output_dir: Path | None = None,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Encode one deterministic shard of the protected image cohort."""
     if type(batch_size) is not int or batch_size <= 0:
@@ -241,7 +287,10 @@ def _build_image_index_shard_in_directory(
     # opened and decoded below, so repeating 37,160 network ``stat`` calls in
     # every worker only creates avoidable I/O contention.
     parent_manifest, parent_hash, image_rows = _parent_rows(
-        parent_release, validate_files=False, validate_records=False
+        parent_release,
+        validate_files=False,
+        validate_records=False,
+        parent_snapshot=parent_snapshot,
     )
     if type(shard_count) is not int or shard_count <= 0:
         raise ValueError("shard_count must be a positive integer")
@@ -331,6 +380,8 @@ def _build_image_index_shard_in_directory(
         },
     }
     _atomic_json(manifest_path, shard)
+    if parent_snapshot is not None:
+        _assert_parent_artifact_snapshot(parent_snapshot)
     return shard
 
 
@@ -353,6 +404,7 @@ def _fsync_tree(root: Path) -> None:
         os.close(descriptor)
 
 
+@parent_snapshot_scope
 def build_image_index_shard(
     *,
     parent_release: Path,
@@ -381,6 +433,7 @@ def build_image_index_shard(
     final_shard_dir = output_root / stem
     if final_shard_dir.exists():
         raise ValueError(f"image shard output already exists: {final_shard_dir}")
+    parent_snapshot = _capture_parent_artifact_snapshot(parent_path)
     staging = Path(tempfile.mkdtemp(prefix=f".{stem}.staging-", dir=str(output_root)))
     try:
         manifest = _build_image_index_shard_in_directory(
@@ -393,9 +446,28 @@ def build_image_index_shard(
             batch_size=batch_size,
             decode_workers=decode_workers,
             published_output_dir=final_shard_dir,
+            parent_snapshot=parent_snapshot,
         )
         _fsync_tree(staging)
         os.replace(staging, final_shard_dir)
+        try:
+            _assert_parent_artifact_snapshot(parent_snapshot)
+        except BaseException:
+            # Do not leave a published shard whose parent changed during the
+            # final rename window.
+            shutil.rmtree(final_shard_dir, ignore_errors=True)
+            try:
+                descriptor = os.open(output_root, os.O_RDONLY)
+            except OSError:
+                pass
+            else:
+                try:
+                    os.fsync(descriptor)
+                except OSError:
+                    pass
+                finally:
+                    os.close(descriptor)
+            raise
         descriptor = os.open(output_root, os.O_RDONLY)
         try:
             os.fsync(descriptor)
@@ -403,10 +475,10 @@ def build_image_index_shard(
             os.close(descriptor)
         return manifest
     except BaseException:
-        import shutil
-
         shutil.rmtree(staging, ignore_errors=True)
         raise
+    finally:
+        parent_snapshot.close()
 
 
 def _validate_binding(value: object, *, label: str) -> Path:
@@ -625,6 +697,7 @@ def _merge_image_index_shards_in_directory(
     clip_checkpoint: Path,
     shard_count: int | None = None,
     published_output_dir: Path | None = None,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Validate all shards and publish one merged image-index bundle."""
     published_output_dir = _validate_directory(
@@ -640,7 +713,10 @@ def _merge_image_index_shards_in_directory(
         label="merged image output directory",
     )
     parent_manifest, parent_hash, image_rows = _parent_rows(
-        parent_release, validate_files=False, validate_records=False
+        parent_release,
+        validate_files=False,
+        validate_records=False,
+        parent_snapshot=parent_snapshot,
     )
     expected_checkpoint = _checkpoint_descriptor(Path(clip_checkpoint))
     expected_decoder = decoder_contract()
@@ -821,6 +897,8 @@ def _merge_image_index_shards_in_directory(
         },
     }
     _atomic_json(bundle_path, bundle)
+    if parent_snapshot is not None:
+        _assert_parent_artifact_snapshot(parent_snapshot)
     return bundle
 
 
@@ -843,6 +921,7 @@ def _fsync_tree(root: Path) -> None:
         os.close(descriptor)
 
 
+@parent_snapshot_scope
 def merge_image_index_shards(
     *,
     parent_release: Path,
@@ -865,6 +944,7 @@ def merge_image_index_shards(
         raise ValueError("merged image output directory must be a new, absent directory")
     output_root.parent.mkdir(parents=True, exist_ok=True)
     _validate_directory(output_root.parent, label="merged image output parent")
+    parent_snapshot = _capture_parent_artifact_snapshot(parent_path)
     staging = Path(
         tempfile.mkdtemp(
             prefix=f".{output_root.name}.staging-",
@@ -879,9 +959,28 @@ def merge_image_index_shards(
             clip_checkpoint=clip_checkpoint,
             shard_count=shard_count,
             published_output_dir=output_root,
+            parent_snapshot=parent_snapshot,
         )
         _fsync_tree(staging)
         os.replace(staging, output_root)
+        try:
+            _assert_parent_artifact_snapshot(parent_snapshot)
+        except BaseException:
+            # Do not leave a published bundle whose parent changed during the
+            # final rename window.
+            shutil.rmtree(output_root, ignore_errors=True)
+            try:
+                descriptor = os.open(output_root.parent, os.O_RDONLY)
+            except OSError:
+                pass
+            else:
+                try:
+                    os.fsync(descriptor)
+                except OSError:
+                    pass
+                finally:
+                    os.close(descriptor)
+            raise
         descriptor = os.open(output_root.parent, os.O_RDONLY)
         try:
             os.fsync(descriptor)
@@ -889,10 +988,10 @@ def merge_image_index_shards(
             os.close(descriptor)
         return bundle
     except BaseException:
-        import shutil
-
         shutil.rmtree(staging, ignore_errors=True)
         raise
+    finally:
+        parent_snapshot.close()
 
 
 def load_image_index_bundle(
@@ -901,6 +1000,7 @@ def load_image_index_bundle(
     parent_release: Path,
     clip_checkpoint: Path,
     decoder: Mapping[str, Any],
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> tuple[np.ndarray, list[str], list[dict[str, Any]]]:
     """Load a merged bundle and recheck its parent/order before consumption."""
     bundle_path = _ordinary_file(Path(bundle_path), label="image index bundle")
@@ -908,7 +1008,10 @@ def load_image_index_bundle(
     if set(bundle) != _BUNDLE_FIELDS or bundle.get("schema") != IMAGE_BUNDLE_SCHEMA:
         raise ValueError("unsupported image index bundle schema")
     parent_manifest, parent_hash, image_rows = _parent_rows(
-        parent_release, validate_files=False, validate_records=False
+        parent_release,
+        validate_files=False,
+        validate_records=False,
+        parent_snapshot=parent_snapshot,
     )
     expected_checkpoint = _checkpoint_descriptor(Path(clip_checkpoint))
     if (

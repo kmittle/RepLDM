@@ -40,6 +40,7 @@ import numpy as np
 
 from .selected import (
     DecodedImage,
+    ParentArtifactSnapshot,
     _validate_protected_index_binding,
     model_binding_sha256,
 )
@@ -305,7 +306,11 @@ class OpenAIClipSelectedViewRuntime:
     """Concrete gate runtime backed by local OpenAI CLIP assets."""
 
     def __init__(
-        self, config: Mapping[str, Any], parent_dir: Path, repository_root: Path
+        self,
+        config: Mapping[str, Any],
+        parent_dir: Path,
+        repository_root: Path,
+        parent_snapshot: ParentArtifactSnapshot | None = None,
     ):
         if not isinstance(config, Mapping):
             raise RuntimeError("selected-view config must be a mapping")
@@ -362,7 +367,11 @@ class OpenAIClipSelectedViewRuntime:
             )
             try:
                 loaded_parent = json.loads(
-                    parent_manifest_file.read_text(encoding="utf-8")
+                    (
+                        parent_snapshot.read_bytes("manifest.json")
+                        if parent_snapshot is not None
+                        else parent_manifest_file.read_bytes()
+                    ).decode("utf-8")
                 )
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError("parent manifest is not readable JSON") from exc
@@ -414,7 +423,11 @@ class OpenAIClipSelectedViewRuntime:
                 parent_ref = config.get("parent_catalog")
                 if not isinstance(parent_ref, Mapping):
                     raise ValueError("selected config lacks parent catalog binding")
-                observed_parent_hash = _sha256(parent_manifest_file)
+                observed_parent_hash = (
+                    parent_snapshot.manifest_sha256
+                    if parent_snapshot is not None
+                    else _sha256(parent_manifest_file)
+                )
                 if (
                     parent_ref.get("release_id") != parent_manifest.get("release_id")
                     or parent_ref.get("manifest_sha256") != observed_parent_hash
@@ -428,6 +441,7 @@ class OpenAIClipSelectedViewRuntime:
                     decoder=config.get("decoder")
                     if isinstance(config.get("decoder"), Mapping)
                     else {},
+                    parent_snapshot=parent_snapshot,
                 )
             except (
                 OSError,
@@ -969,12 +983,18 @@ class OpenAIClipSelectedViewRuntime:
 
 
 def build_runtime_v1(
-    config: Mapping[str, Any], parent_dir: Path, repository_root: Path
+    config: Mapping[str, Any],
+    parent_dir: Path,
+    repository_root: Path,
+    parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> OpenAIClipSelectedViewRuntime:
     """Build the fixed, local-only selected-view runtime."""
     with _offline_environment():
         return OpenAIClipSelectedViewRuntime(
-            config, Path(parent_dir), Path(repository_root)
+            config,
+            Path(parent_dir),
+            Path(repository_root),
+            parent_snapshot=parent_snapshot,
         )
 
 
