@@ -596,6 +596,20 @@ def test_child_must_bind_exactly_all_fifteen_parent_artifacts(tmp_path: Path) ->
         fixture.validate()
 
 
+def test_child_parent_binding_must_point_to_manifest_file(tmp_path: Path) -> None:
+    fixture = SelectedReleaseFixture(tmp_path)
+    manifest_path = fixture.release / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["parent_catalog"]["path"] = str(
+        (fixture.parent / "training_candidates.jsonl").absolute()
+    )
+    _write_json(manifest_path, manifest)
+    fixture.reseal_child()
+
+    with pytest.raises(ValueError, match="must name manifest.json"):
+        fixture.validate()
+
+
 def test_missing_calibration_artifact_fails_closed(tmp_path: Path) -> None:
     fixture = SelectedReleaseFixture(tmp_path)
     calibration = Path(fixture.config["semantic_text"]["calibration"]["path"])

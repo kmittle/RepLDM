@@ -1993,6 +1993,8 @@ def _validate_parent_binding(
     path_raw = value.get("path")
     if not isinstance(path_raw, str):
         raise ValueError("selected child parent manifest path is invalid")
+    if Path(path_raw).name != "manifest.json":
+        raise ValueError("selected child parent path must name manifest.json")
     parent_manifest_path = _regular_file(Path(path_raw), label="candidate parent manifest")
     catalogs_root = _absolute_without_symlinks(
         repository_root / "DATA" / "catalogs", label="candidate catalog root"
