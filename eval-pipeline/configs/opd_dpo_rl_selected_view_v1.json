@@ -1,0 +1,290 @@
+{
+  "classifier": {
+    "calibration": {
+      "bytes": 11978,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/calibration/classifier_calibration.json",
+      "sha256": "ce6c666d350e442dad73aaac4269bc230ba637a27f02f892164c11f4ca1bdcac"
+    },
+    "class_templates": {
+      "animals": [
+        "a photo of animals",
+        "an animal photograph",
+        "wildlife"
+      ],
+      "architecture": [
+        "a photo of architecture",
+        "a building photograph",
+        "an architectural scene"
+      ],
+      "artwork": [
+        "a painting or artwork",
+        "a fine art image",
+        "an artistic illustration"
+      ],
+      "cgi": [
+        "a 3D rendered CGI image",
+        "a computer generated render",
+        "a 3D scene"
+      ],
+      "food": [
+        "a photo of food",
+        "a food photograph",
+        "a meal"
+      ],
+      "nature": [
+        "a photo of nature",
+        "a nature scene",
+        "a landscape photograph"
+      ],
+      "people": [
+        "a photo of people",
+        "a portrait photograph of a person",
+        "people in a scene"
+      ],
+      "urban": [
+        "a photo of an urban city scene",
+        "a city street photograph",
+        "an urban scene"
+      ]
+    },
+    "confidence_margin": 0.013407222926616669,
+    "model": {
+      "files": [
+        {
+          "bytes": 932768134,
+          "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/formal_assets/f0/clip/ViT-L-14.pt",
+          "sha256": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836"
+        }
+      ],
+      "id": "openai/ViT-L-14",
+      "revision": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836"
+    },
+    "tie_rule": "reject"
+  },
+  "clip_tokenizer_id": "sdxl_tokenizer_1",
+  "decoder": {
+    "exif_transpose": true,
+    "icc_to_srgb": true,
+    "library": "Pillow",
+    "littlecms_version": "2.12",
+    "max_image_pixels": 400000000,
+    "output_mode": "RGB",
+    "pixel_hash": "sha256_rgb_u64be_width_height_bytes_v1",
+    "version": "11.0.0"
+  },
+  "image_embedding": {
+    "calibration": {
+      "bytes": 30727,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/calibration/image_embedding_calibration.json",
+      "sha256": "71a0167be1566b4dfd488ccfe11e0cf517019dc9332569667602637205c05097"
+    },
+    "comparison": "reject_at_or_above",
+    "model": {
+      "files": [
+        {
+          "bytes": 932768134,
+          "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/formal_assets/f0/clip/ViT-L-14.pt",
+          "sha256": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836"
+        }
+      ],
+      "id": "openai/ViT-L-14",
+      "revision": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836"
+    },
+    "threshold": 0.9
+  },
+  "parent_catalog": {
+    "manifest_sha256": "13ab82a890136b968c3bacacfc0cb34d1192b6a9d7702278f5b16884f185613b",
+    "release_id": "catalog-92d0851d436dcc2bd5c9"
+  },
+  "phash": {
+    "calibration": {
+      "bytes": 30715,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/calibration/phash_calibration.json",
+      "sha256": "cee4f5d1076c122a77fea57671ecff738dd9e108143a7048d458a591e19107ad"
+    },
+    "comparison": "reject_at_or_below",
+    "exclude_dc": true,
+    "hash_bits": 64,
+    "implementation": "dct_phash_v1",
+    "low_frequency_size": 8,
+    "resize": 32,
+    "threshold": 12
+  },
+  "protected_index": {
+    "holdout_rows": 49393,
+    "image_embedding": {
+      "bytes": 122331232,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/protected_image_embedding.npz",
+      "sha256": "fcf27b3d3b53c4ea60bf6e78a27f088c26d00d2588d28c360b24400f3beb44f3"
+    },
+    "index_bindings": {
+      "image_embedding": {
+        "ids_sha256": "43e6115a4913a727e3515cb1ca4c102533fb90494160f5278442c44289c3b01b",
+        "manifest_sha256": "28abf1cf427c7b78a61ea11d6894ae02dec30b786d1ef03aff6326bacfe74ec7"
+      },
+      "phash": {
+        "ids_sha256": "43e6115a4913a727e3515cb1ca4c102533fb90494160f5278442c44289c3b01b",
+        "manifest_sha256": "28abf1cf427c7b78a61ea11d6894ae02dec30b786d1ef03aff6326bacfe74ec7"
+      },
+      "semantic_text": {
+        "ids_sha256": "53e5c3247eb939a98da3e75796f76c4ba99771b7bacb007b44e7d0be138c609e",
+        "manifest_sha256": "28abf1cf427c7b78a61ea11d6894ae02dec30b786d1ef03aff6326bacfe74ec7"
+      }
+    },
+    "manifest": {
+      "bytes": 24548044,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/protected_index_manifest.json",
+      "sha256": "44e4d354e94d87a3a972664a9319c0ad1c4941efe605fe68e6499d99647cbcf8"
+    },
+    "manifest_sha256": "28abf1cf427c7b78a61ea11d6894ae02dec30b786d1ef03aff6326bacfe74ec7",
+    "normalized_unique_prompts": 46619,
+    "phash": {
+      "bytes": 2986016,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/protected_phash.jsonl",
+      "sha256": "2a2e0094c9e134d71781608cf1b26f9aad7b6e71cd20ac41d5ea240ab09a7d22"
+    },
+    "semantic_text": {
+      "bytes": 155707972,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/protected_semantic_text.npz",
+      "sha256": "737b8d89311cf164e8cb9cc03f74d18b3cd8bba289bf5e98a297daf83f89aceb"
+    },
+    "unique_images": 37160
+  },
+  "quotas": {
+    "train_per_source_stratum": 4,
+    "train_total": 64,
+    "validation_per_source_stratum": 2,
+    "validation_total": 32
+  },
+  "schema": "repldm.selected_view_config.v2",
+  "selection": {
+    "algorithm": "sha256_seed_nul_record_id_v1",
+    "seed": "2026090401",
+    "tie_rule": "reject"
+  },
+  "semantic_text": {
+    "calibration": {
+      "bytes": 26736,
+      "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/data_prep/selected_assets_92d0851_v1/calibration/semantic_text_calibration.json",
+      "sha256": "532179a2f02c038287faf44a8eb8caea6fa8891592904367e1dd95bfb42dc4eb"
+    },
+    "comparison": "reject_at_or_above",
+    "model": {
+      "files": [
+        {
+          "bytes": 932768134,
+          "path": "/mnt/miah204/bycao/RepLDM/outputs/latent_renderer/formal_assets/f0/clip/ViT-L-14.pt",
+          "sha256": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836"
+        }
+      ],
+      "id": "openai/ViT-L-14",
+      "revision": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836"
+    },
+    "threshold": 0.92
+  },
+  "sources": {
+    "four_k_lsdb": {
+      "license": "CC-BY-4.0",
+      "license_evidence": [
+        {
+          "bytes": 88243102,
+          "path": "/mnt/miah204/bycao/Sana/data/4klsdb/index.jsonl",
+          "sha256": "b9112b3e1994f3be9b9e7a56a75a3e9889ac2c113e3b42f6766ed031142128ce"
+        }
+      ],
+      "license_status": "verified_from_dataset_card",
+      "model_prompt_field": "prompt",
+      "raw_prompt_field": "prompt"
+    },
+    "pixverve_95k": {
+      "license": "Apache-2.0",
+      "license_evidence": [
+        {
+          "bytes": 182733178,
+          "path": "/mnt/miah209/bycao/Pixel-Render/data/PixVerve-95K/PixVerve-95K-metadata/data.jsonl",
+          "sha256": "b85691b46c9bc825a52790948c11c39465e9034476060061fce58edca8cb4da2"
+        }
+      ],
+      "license_status": "verified_from_dataset_card",
+      "model_prompt_field": "source_record.model_prompt",
+      "raw_prompt_field": "source_record.raw_prompt"
+    }
+  },
+  "strata": [
+    "nature",
+    "urban",
+    "people",
+    "food",
+    "artwork",
+    "cgi",
+    "animals",
+    "architecture"
+  ],
+  "tokenizers": [
+    {
+      "add_special_tokens": true,
+      "id": "sdxl_tokenizer_1",
+      "max_tokens": 77,
+      "model": {
+        "files": [
+          {
+            "bytes": 524619,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer/merges.txt",
+            "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a"
+          },
+          {
+            "bytes": 472,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer/special_tokens_map.json",
+            "sha256": "c4864a9376a8401918425bed71fc14fc0e81f9b59ec45c1cf96cccb2df508eac"
+          },
+          {
+            "bytes": 737,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer/tokenizer_config.json",
+            "sha256": "19d7b034cb0cc3ce9766c2231373ab8aa8991fc72e2c8f76558bfaae3de0d563"
+          },
+          {
+            "bytes": 1059962,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer/vocab.json",
+            "sha256": "e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349"
+          }
+        ],
+        "id": "stabilityai/stable-diffusion-xl-base-1.0",
+        "revision": "462165984030d82259a11f4367a4eed129e94a7b"
+      },
+      "truncation": false
+    },
+    {
+      "add_special_tokens": true,
+      "id": "sdxl_tokenizer_2",
+      "max_tokens": 77,
+      "model": {
+        "files": [
+          {
+            "bytes": 524619,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer_2/merges.txt",
+            "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a"
+          },
+          {
+            "bytes": 460,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer_2/special_tokens_map.json",
+            "sha256": "f118ab3a983206e4f32583448de6bd6aae4ee21869135cef1f5848a753cdaab6"
+          },
+          {
+            "bytes": 725,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer_2/tokenizer_config.json",
+            "sha256": "c9d23941f76a41cbd50eda9290f57be7828f0a7a677939e9ef181f7e12bd1bdf"
+          },
+          {
+            "bytes": 1059962,
+            "path": "/mnt/miah204/bycao/RepLDM/pretrained_ckpts/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots/462165984030d82259a11f4367a4eed129e94a7b/tokenizer_2/vocab.json",
+            "sha256": "e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349"
+          }
+        ],
+        "id": "stabilityai/stable-diffusion-xl-base-1.0",
+        "revision": "462165984030d82259a11f4367a4eed129e94a7b"
+      },
+      "truncation": false
+    }
+  ],
+  "view_id": "opd_dpo_rl_selected_view_v1"
+}
