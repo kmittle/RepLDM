@@ -14,8 +14,10 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from multiprocessing import current_process, get_context
 from collections.abc import Iterable, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -24,7 +26,11 @@ from typing import Any
 import numpy as np
 
 from .io import canonical_json_bytes, iter_jsonl, sha256_file
-from .builder import _sha256_path_snapshot, validate_release_artifact_closure
+from .builder import (
+    REPOSITORY_ROOT,
+    _sha256_path_snapshot,
+    validate_release_artifact_closure,
+)
 from .schema import normalize_prompt
 from .selected import (
     ParentArtifactSnapshot,
@@ -72,6 +78,18 @@ STRATA = (
     "architecture",
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# A protected image may be hundreds of megapixels.  Two isolated decoders
+# bound peak host memory while still overlapping filesystem reads.
+_PROTECTED_IMAGE_VERIFY_WORKERS = 2
+_PROTECTED_IMAGE_PARALLEL_THRESHOLD = 128
+_SAFE_PARALLEL_LAUNCHERS = frozenset(
+    (REPOSITORY_ROOT / relative).resolve()
+    for relative in (
+        "eval-pipeline/build_selected_view_assets.py",
+        "eval-pipeline/build_selected_view_release.py",
+        "eval-pipeline/revalidate_selected_view_runtime.py",
+    )
+)
 SOURCE_PROMPT_FIELDS: dict[str, dict[str, str]] = {
     "four_k_lsdb": {
         "model_prompt_field": "prompt",
@@ -625,23 +643,84 @@ def _protected_image_evidence(
     rows: Sequence[Mapping[str, Any]],
     *,
     decoder: Mapping[str, Any],
+    workers: int | None = None,
 ) -> list[dict[str, Any]]:
     """Collect byte and decoded-pixel identities for the canonical image cohort."""
-    evidence: list[dict[str, Any]] = []
-    for row in rows:
-        image_path = _ordinary_file(Path(str(row["image_path"])), label="protected image")
-        decoded = decode_image_payload(image_path, decoder)
-        evidence.append(
-            {
-                "id": str(row["id"]),
-                "image_path": str(image_path),
-                "raw_file_sha256": sha256_file(image_path),
-                "decoded_pixel_sha256": decoded.pixel_sha256,
-                "decoded_width": decoded.width,
-                "decoded_height": decoded.height,
-            }
+    tasks = [
+        (str(row["id"]), str(row["image_path"]), dict(decoder))
+        for row in rows
+    ]
+    if workers is None:
+        workers = (
+            _PROTECTED_IMAGE_VERIFY_WORKERS
+            if len(tasks) >= _PROTECTED_IMAGE_PARALLEL_THRESHOLD
+            else 1
         )
-    return evidence
+    if type(workers) is not int or workers <= 0:
+        raise ValueError("protected image verification workers must be positive")
+    worker_count = min(workers, max(1, len(tasks)))
+    if worker_count == 1:
+        return [_protected_image_evidence_worker(task) for task in tasks]
+
+    # ``spawn`` re-executes the main script.  Only the repository's guarded
+    # entry points may opt into that behavior; pytest, notebooks, and external
+    # scripts stay serial so their top-level code cannot run twice.
+    import __main__
+
+    main_file = getattr(__main__, "__file__", None)
+    if (
+        current_process().daemon
+        or not isinstance(main_file, str)
+        or not Path(main_file).is_file()
+    ):
+        return [_protected_image_evidence_worker(task) for task in tasks]
+    try:
+        main_path = Path(main_file).resolve(strict=True)
+        argv0 = sys.argv[0] if sys.argv else None
+        argv_path = (
+            Path(argv0).resolve(strict=True) if isinstance(argv0, str) else None
+        )
+    except (OSError, RuntimeError):
+        return [_protected_image_evidence_worker(task) for task in tasks]
+    if argv_path != main_path or main_path not in _SAFE_PARALLEL_LAUNCHERS:
+        return [_protected_image_evidence_worker(task) for task in tasks]
+
+    # Use spawned processes because decode_image_payload protects Pillow's
+    # process-global pixel-limit state with a lock. Separate processes retain
+    # the exact decoder contract while allowing independent image reads.
+    context = get_context("spawn")
+    executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=context)
+    try:
+        result = list(executor.map(_protected_image_evidence_worker, tasks, chunksize=4))
+    except BaseException:
+        # Cancel queued work after the first deterministic failure, then wait
+        # for the small number of currently running chunks so no decoder
+        # process survives this helper or overlaps a retry.
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
+        raise
+    else:
+        executor.shutdown(wait=True)
+        return result
+
+
+def _protected_image_evidence_worker(
+    task: tuple[str, str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Read one protected image in an isolated process."""
+    row_id, raw_path, decoder = task
+    image_path = _ordinary_file(Path(raw_path), label="protected image")
+    decoded = decode_image_payload(image_path, decoder)
+    return {
+        "id": row_id,
+        "image_path": str(image_path),
+        "raw_file_sha256": sha256_file(image_path),
+        "decoded_pixel_sha256": decoded.pixel_sha256,
+        "decoded_width": decoded.width,
+        "decoded_height": decoded.height,
+    }
 
 
 def derive_protected_index_manifest(
@@ -655,6 +734,7 @@ def derive_protected_index_manifest(
     image_rows: Sequence[Mapping[str, Any]] | None = None,
     image_evidence: Sequence[Mapping[str, Any]] | None = None,
     verify_image_evidence: bool = True,
+    image_verify_workers: int | None = None,
     parent_snapshot: ParentArtifactSnapshot | None = None,
 ) -> dict[str, Any]:
     """Derive the immutable protected cohort identity from one parent catalog.
@@ -729,7 +809,9 @@ def derive_protected_index_manifest(
             raise ValueError(
                 "metadata-only manifest derivation requires frozen image_evidence"
             )
-        image_records = _protected_image_evidence(images, decoder=decoder)
+        image_records = _protected_image_evidence(
+            images, decoder=decoder, workers=image_verify_workers
+        )
     else:
         try:
             image_records = [dict(value) for value in image_evidence]
@@ -766,21 +848,20 @@ def derive_protected_index_manifest(
             value = record.get(key)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"protected image evidence has an invalid {key}")
-        if verify_image_evidence:
-            # Re-read the bound bytes when a caller supplies cached evidence.
-            # This closes a time-of-check gap between CLIP encoding and
-            # manifest write.  Runtime/config validation intentionally uses
-            # the frozen evidence-only mode below.
-            image_path = _ordinary_file(
-                Path(str(record["image_path"])), label="protected image"
-            )
-            if sha256_file(image_path) != record["raw_file_sha256"]:
+    if verify_image_evidence and image_records:
+        # Re-read every bound image, even when cached evidence is supplied.
+        # The worker returns results in canonical input order; comparisons stay
+        # in the parent so the first deterministic mismatch keeps its error.
+        observed_records = _protected_image_evidence(
+            image_records, decoder=decoder, workers=image_verify_workers
+        )
+        for record, observed in zip(image_records, observed_records):
+            if observed["raw_file_sha256"] != record["raw_file_sha256"]:
                 raise ValueError("protected image raw bytes changed during manifest build")
-            decoded = decode_image_payload(image_path, decoder)
             if (
-                decoded.pixel_sha256 != record["decoded_pixel_sha256"]
-                or decoded.width != record["decoded_width"]
-                or decoded.height != record["decoded_height"]
+                observed["decoded_pixel_sha256"] != record["decoded_pixel_sha256"]
+                or observed["decoded_width"] != record["decoded_width"]
+                or observed["decoded_height"] != record["decoded_height"]
             ):
                 raise ValueError("protected image decoded pixels changed during manifest build")
 

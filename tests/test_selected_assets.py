@@ -836,6 +836,181 @@ def test_metadata_only_manifest_validation_uses_frozen_image_evidence(
     assert observed == fixture["manifest"]
 
 
+def test_protected_image_evidence_parallel_matches_serial(
+    tmp_path: Path,
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+
+    serial = derive_protected_index_manifest(
+        parent,
+        parent_release_id=parent.name,
+        parent_manifest_sha256="a" * 64,
+        decoder=fixture["decoder"],
+        image_verify_workers=1,
+    )
+    parallel = derive_protected_index_manifest(
+        parent,
+        parent_release_id=parent.name,
+        parent_manifest_sha256="a" * 64,
+        decoder=fixture["decoder"],
+        image_verify_workers=2,
+    )
+
+    assert parallel == serial
+
+
+def test_protected_image_evidence_cancels_pool_after_worker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    rows = list(
+        selected_module._iter_parent_jsonl(
+            parent, "benchmark_holdouts.jsonl"
+        )
+    )[:2]
+    calls: list[tuple[bool, bool]] = []
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def map(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("planned worker failure")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool = False) -> None:
+            calls.append((wait, cancel_futures))
+
+    monkeypatch.setattr(selected_assets, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(selected_assets, "get_context", lambda _name: object())
+    monkeypatch.setattr(
+        selected_assets,
+        "current_process",
+        lambda: type("P", (), {"daemon": False})(),
+    )
+    import __main__
+
+    launcher = ROOT / "eval-pipeline" / "build_selected_view_release.py"
+    monkeypatch.setattr(__main__, "__file__", str(launcher))
+    monkeypatch.setattr(sys, "argv", [str(launcher)])
+
+    with pytest.raises(RuntimeError, match="planned worker failure"):
+        selected_assets._protected_image_evidence(
+            rows, decoder=fixture["decoder"], workers=2
+        )
+
+    assert calls == [(True, True)]
+
+
+def test_protected_image_evidence_shuts_down_pool_after_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    rows = list(
+        selected_module._iter_parent_jsonl(parent, "benchmark_holdouts.jsonl")
+    )[:2]
+    calls: list[tuple[bool, bool]] = []
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def map(self, _worker: object, tasks: list[object], **_kwargs: object):
+            return [{"id": task[0]} for task in tasks]
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool = False) -> None:
+            calls.append((wait, cancel_futures))
+
+    monkeypatch.setattr(selected_assets, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(selected_assets, "get_context", lambda _name: object())
+    monkeypatch.setattr(
+        selected_assets,
+        "current_process",
+        lambda: type("P", (), {"daemon": False})(),
+    )
+    import __main__
+
+    launcher = ROOT / "eval-pipeline" / "build_selected_view_release.py"
+    monkeypatch.setattr(__main__, "__file__", str(launcher))
+    monkeypatch.setattr(sys, "argv", [str(launcher)])
+    result = selected_assets._protected_image_evidence(
+        rows, decoder=fixture["decoder"], workers=2
+    )
+
+    assert [row["id"] for row in result] == [row["id"] for row in rows]
+    assert calls == [(True, False)]
+
+
+def test_protected_image_evidence_falls_back_without_importable_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    rows = list(
+        selected_module._iter_parent_jsonl(
+            parent, "benchmark_holdouts.jsonl"
+        )
+    )[:2]
+    calls: list[tuple[str, str]] = []
+
+    def fake_worker(task: tuple[str, str, dict[str, object]]) -> dict[str, str]:
+        calls.append((task[0], task[1]))
+        return {"id": task[0]}
+
+    monkeypatch.setattr(selected_assets, "_protected_image_evidence_worker", fake_worker)
+    monkeypatch.setattr(
+        selected_assets,
+        "ProcessPoolExecutor",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pool must not start")
+        ),
+    )
+    import __main__
+
+    monkeypatch.setattr(__main__, "__file__", "<stdin>")
+    result = selected_assets._protected_image_evidence(
+        rows, decoder=fixture["decoder"], workers=2
+    )
+
+    assert [row["id"] for row in result] == [row["id"] for row in rows]
+    assert len(calls) == 2
+
+
+def test_protected_image_evidence_falls_back_for_unregistered_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parent_manifest, parent, fixture = _small_protected_fixture(tmp_path)
+    rows = list(
+        selected_module._iter_parent_jsonl(parent, "benchmark_holdouts.jsonl")
+    )[:2]
+    calls: list[str] = []
+
+    def fake_worker(task: tuple[str, str, dict[str, object]]) -> dict[str, str]:
+        calls.append(task[0])
+        return {"id": task[0]}
+
+    monkeypatch.setattr(selected_assets, "_protected_image_evidence_worker", fake_worker)
+    monkeypatch.setattr(
+        selected_assets,
+        "ProcessPoolExecutor",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unregistered callers must not start a pool")
+        ),
+    )
+    import __main__
+
+    monkeypatch.setattr(__main__, "__file__", __file__)
+    monkeypatch.setattr(sys, "argv", [__file__])
+    result = selected_assets._protected_image_evidence(
+        rows, decoder=fixture["decoder"], workers=2
+    )
+
+    assert [row["id"] for row in result] == [row["id"] for row in rows]
+    assert calls == [row["id"] for row in rows]
+
+
 def test_metadata_only_manifest_still_binds_holdout_bytes(
     tmp_path: Path,
 ) -> None:
