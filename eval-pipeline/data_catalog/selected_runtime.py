@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .selected import ParentArtifactSnapshot
+
 RUNTIME_REGISTRY_SCHEMA = "repldm.selected_view_runtime_registry.v1"
 RUNTIME_REGISTRY_ID = "selected_view_runtime_v1"
 _BACKEND_MODULE = "data_catalog.selected_runtime_backend"
@@ -47,14 +49,26 @@ def _load_backend(repository_root: Path) -> Any:
 
 
 def build_runtime_v1(
-    config: Mapping[str, Any], parent_dir: Path, repository_root: Path
+    config: Mapping[str, Any],
+    parent_dir: Path,
+    repository_root: Path,
+    parent_snapshot: "ParentArtifactSnapshot | None" = None,
 ) -> Any:
     """Build the one runtime permitted for formal selected-view validation."""
     backend = _load_backend(Path(repository_root))
     factory = getattr(backend, "build_runtime_v1", None)
     if not callable(factory):
         raise RuntimeError("selected-view runtime backend lacks build_runtime_v1")
-    return factory(config, Path(parent_dir), Path(repository_root))
+    if parent_snapshot is None:
+        # Keep the registry compatible with development fixtures and older
+        # backends that predate the pinned-parent contract.
+        return factory(config, Path(parent_dir), Path(repository_root))
+    return factory(
+        config,
+        Path(parent_dir),
+        Path(repository_root),
+        parent_snapshot=parent_snapshot,
+    )
 
 
 def revalidate_release_v1(
@@ -63,7 +77,11 @@ def revalidate_release_v1(
     """Re-run all learned/indexed gates through the fixed runtime entrypoint."""
     # Imports stay local so importing this registry remains cheap and does not
     # initialize model libraries before the caller has passed its own gates.
-    from .selected import validate_selected_view_release
+    from .selected import (
+        _SHA256_RE,
+        _capture_parent_artifact_snapshot,
+        validate_selected_view_release,
+    )
     from .selected_builder import (
         create_selected_view_runtime,
         verify_selected_view_runtime,
@@ -94,24 +112,39 @@ def revalidate_release_v1(
     parent_path = parent_descriptor.get("path")
     if not isinstance(parent_path, str) or not Path(parent_path).is_absolute():
         raise RuntimeError("selected-view parent catalog path is invalid")
+    parent_hash = parent_descriptor.get("manifest_sha256")
+    if not isinstance(parent_hash, str) or _SHA256_RE.fullmatch(parent_hash) is None:
+        raise RuntimeError("selected-view parent catalog hash is invalid")
 
-    runtime = create_selected_view_runtime(
-        build_runtime_v1,
-        config=config,
-        parent_dir=Path(parent_path).parent,
-        repository_root=root,
+    # The first validation owns and closes its internal snapshot.  Capture a
+    # fresh one before loading the production runtime, then keep that same
+    # descriptor set through runtime construction and the final revalidation.
+    parent_snapshot = _capture_parent_artifact_snapshot(
+        Path(parent_path).parent,
+        manifest_sha256=parent_hash,
     )
     try:
-        return verify_selected_view_runtime(
-            release,
-            runtime=runtime,
+        runtime = create_selected_view_runtime(
+            build_runtime_v1,
+            config=config,
+            parent_dir=Path(parent_path).parent,
             repository_root=root,
-            require_formal=True,
+            parent_snapshot=parent_snapshot,
         )
+        try:
+            return verify_selected_view_runtime(
+                release,
+                runtime=runtime,
+                repository_root=root,
+                require_formal=True,
+                parent_snapshot=parent_snapshot,
+            )
+        finally:
+            close = getattr(runtime, "close", None)
+            if callable(close):
+                close()
     finally:
-        close = getattr(runtime, "close", None)
-        if callable(close):
-            close()
+        parent_snapshot.close()
 
 
 __all__ = [
